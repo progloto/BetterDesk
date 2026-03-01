@@ -4,16 +4,26 @@
  */
 
 const axios = require('axios');
+const https = require('https');
 const config = require('../config/config');
 
+// Normalize base URL — ensure /api suffix is present.
+// Users commonly set HBBS_API_URL=http://host:21114 instead of http://host:21114/api
+let baseUrl = config.hbbsApiUrl || 'http://localhost:21114/api';
+if (!baseUrl.endsWith('/api') && !baseUrl.endsWith('/api/')) {
+    baseUrl = baseUrl.replace(/\/+$/, '') + '/api';
+}
+
 // Create axios instance with defaults
+// Allow self-signed certificates for local TLS connections
 const apiClient = axios.create({
-    baseURL: config.hbbsApiUrl,
+    baseURL: baseUrl,
     timeout: config.hbbsApiTimeout,
     headers: {
         'Content-Type': 'application/json',
         'X-API-Key': config.hbbsApiKey
-    }
+    },
+    httpsAgent: new https.Agent({ rejectUnauthorized: false })
 });
 
 /**
@@ -29,15 +39,19 @@ async function getHealth() {
 }
 
 /**
- * Get online peers from HBBS API
+ * Get online peers from HBBS API.
+ * Handles two response formats:
+ *   1. Bare array: [{id, live_online, ...}, ...]  (BetterDesk patched hbbs)
+ *   2. Wrapped:    {success: true, data: [...]}   (standard hbbs API)
+ * Online field may be `live_online` or `online`.
  */
 async function getOnlinePeers() {
     try {
         const { data } = await apiClient.get('/peers');
-        if (data.success && Array.isArray(data.data)) {
-            return data.data.filter(p => p.online);
-        }
-        return [];
+        const peers = Array.isArray(data)
+            ? data
+            : (data && data.success && Array.isArray(data.data) ? data.data : []);
+        return peers.filter(p => p.live_online || p.online);
     } catch (err) {
         console.warn('HBBS API unavailable:', err.message);
         return [];

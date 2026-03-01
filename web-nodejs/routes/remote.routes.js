@@ -1,6 +1,6 @@
 /**
  * BetterDesk Console - Remote Desktop Routes
- * Serves the web-based remote desktop viewer page
+ * Serves the web-based remote desktop viewer page (RustDesk compat + BetterDesk native)
  */
 
 const express = require('express');
@@ -9,6 +9,11 @@ const fs = require('fs');
 const db = require('../services/database');
 const config = require('../config/config');
 const { requireAuth } = require('../middleware/auth');
+
+// Lazy-loaded relay helper — avoid circular require at module load time
+function getRemoteRelay() {
+    try { return require('../services/remoteRelay'); } catch { return null; }
+}
 
 // Read server public key once at startup
 let serverPubKey = '';
@@ -21,7 +26,7 @@ try {
 }
 
 /**
- * GET /remote/:deviceId - Remote desktop viewer page
+ * GET /remote/:deviceId - RustDesk-compatible remote desktop viewer
  */
 router.get('/remote/:deviceId', requireAuth, (req, res) => {
     const deviceId = req.params.deviceId;
@@ -51,6 +56,54 @@ router.get('/remote/:deviceId', requireAuth, (req, res) => {
         // Use viewer layout instead of main layout
         layout: 'viewer'
     });
+});
+
+/**
+ * GET /remote-desktop/:deviceId - BetterDesk native JPEG stream viewer
+ */
+router.get('/remote-desktop/:deviceId', requireAuth, (req, res) => {
+    const deviceId = req.params.deviceId;
+
+    if (!deviceId || !/^[A-Za-z0-9_-]{3,32}$/.test(deviceId)) {
+        return res.redirect('/devices');
+    }
+
+    let device = null;
+    try {
+        const stmt = db.getDatabase().prepare(
+            'SELECT id, hostname, platform, note FROM peer WHERE id = ?'
+        );
+        device = stmt.get(deviceId);
+    } catch { /* non-blocking */ }
+
+    res.render('remote-viewer', {
+        title: device?.hostname ? `Remote — ${device.hostname}` : `Remote — ${deviceId}`,
+        activePage: 'remote',
+        deviceId,
+        device: device || { id: deviceId, hostname: '', platform: '', note: '' },
+        layout: false  // remote-viewer.ejs handles its own layout via include()
+    });
+});
+
+/**
+ * GET /api/remote/sessions - List active native remote sessions
+ */
+router.get('/api/remote/sessions', requireAuth, (req, res) => {
+    const relay = getRemoteRelay();
+    if (!relay) return res.json({ sessions: [] });
+    const sessions = relay.getActiveSessions();
+    res.json({ sessions });
+});
+
+/**
+ * GET /api/remote/session/:deviceId - Get state of a single native remote session
+ */
+router.get('/api/remote/session/:deviceId', requireAuth, (req, res) => {
+    const relay = getRemoteRelay();
+    if (!relay) return res.status(404).json({ error: 'Remote relay not available' });
+    const state = relay.getSessionState(req.params.deviceId);
+    if (!state) return res.status(404).json({ error: 'Session not found' });
+    res.json(state);
 });
 
 module.exports = router;

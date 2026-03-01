@@ -111,7 +111,7 @@ services:
       - DB_PATH=/opt/rustdesk/db_v2.sqlite3
       - API_KEY_PATH=/opt/rustdesk/.api_key
       - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
-      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-change_this_secret_key}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:?Set FLASK_SECRET_KEY in .env or export it}
     networks:
       - betterdesk-net
     restart: unless-stopped

@@ -69,7 +69,8 @@
     function setStatValue(elementId, value) {
         const element = document.getElementById(elementId);
         if (!element) return;
-        element.innerHTML = value;
+        // Use textContent for security (no HTML parsing)
+        element.textContent = value;
     }
     
     /**
@@ -110,18 +111,21 @@
             updateServerStatus('hbbs-status', status.hbbs);
             updateServerStatus('hbbr-status', status.hbbr);
             
-            // Populate port values from server response
-            if (status.api_port) {
-                const apiPortEl = document.getElementById('api-port');
-                if (apiPortEl) apiPortEl.textContent = status.api_port;
-            }
-            if (status.hbbs_port) {
-                const hbbsPortEl = document.getElementById('hbbs-port');
-                if (hbbsPortEl) hbbsPortEl.textContent = status.hbbs_port;
-            }
-            if (status.hbbr_port) {
-                const hbbrPortEl = document.getElementById('hbbr-port');
-                if (hbbrPortEl) hbbrPortEl.textContent = status.hbbr_port;
+            // Populate all port values from server response
+            const portMap = {
+                'api-port': status.api_port,
+                'hbbs-port': status.signal_port || status.hbbs_port,
+                'hbbr-port': status.relay_port || status.hbbr_port,
+                'nat-port': status.nat_port,
+                'ws-signal-port': status.ws_signal_port,
+                'ws-relay-port': status.ws_relay_port,
+                'client-api-port': status.client_api_port,
+                'console-port': status.console_port
+            };
+            
+            for (const [id, value] of Object.entries(portMap)) {
+                const el = document.getElementById(id);
+                if (el && value) el.textContent = value;
             }
             
         } catch (error) {

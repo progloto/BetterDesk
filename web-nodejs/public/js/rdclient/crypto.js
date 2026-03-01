@@ -295,12 +295,43 @@ class RDCrypto {
     }
 
     /**
-     * Enable encryption for the session (resets counters)
+     * Enable encryption for the session (resets counters).
+     * Note: the peer may not yet be encrypting at this point (race condition
+     * where peer sends messages before processing our PublicKey). Use
+     * tryDecrypt() + commitDecrypt() for safe speculative decryption.
      */
     enable() {
         this.enabled = true;
         this._sendSeq = 0;
         this._recvSeq = 0;
+    }
+
+    /**
+     * Attempt to decrypt data WITHOUT committing the receive sequence counter.
+     * Used for speculative decryption when the peer may not yet be encrypting
+     * (e.g., target sends Hash before processing our PublicKey).
+     *
+     * On success, call commitDecrypt(result.seq) to advance the counter.
+     * On failure, the counter is unchanged and the caller can try plaintext.
+     *
+     * @param {Uint8Array} data - MAC + ciphertext
+     * @returns {{ plaintext: Uint8Array, seq: number }|null}
+     */
+    tryDecrypt(data) {
+        if (!this.secretKey) return null;
+        const nextSeq = this._recvSeq + 1;
+        const nonce = this._counterNonce(nextSeq);
+        const result = nacl.secretbox.open(data, nonce, this.secretKey);
+        if (!result) return null;
+        return { plaintext: result, seq: nextSeq };
+    }
+
+    /**
+     * Commit the receive sequence counter after a successful tryDecrypt().
+     * @param {number} seq - The seq value from tryDecrypt result
+     */
+    commitDecrypt(seq) {
+        this._recvSeq = seq;
     }
 
     /**

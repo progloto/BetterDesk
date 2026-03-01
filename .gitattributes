@@ -1,0 +1,45 @@
+# Auto detect text files and normalize line endings
+* text=auto
+
+# Force LF for shell scripts and config files
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.go text eol=lf
+*.js text eol=lf
+*.ejs text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.py text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.sql text eol=lf
+*.proto text eol=lf
+Dockerfile* text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+.env.example text eol=lf
+
+# Force CRLF for Windows scripts
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files — do not diff or normalize
+*.exe binary
+*.db binary
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+
+# Linguist overrides (GitHub language detection)
+*.ejs linguist-language=HTML
+docs/** linguist-documentation
+archive/** linguist-vendored

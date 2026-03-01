@@ -1,0 +1,328 @@
+package db
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func newTestDB(t *testing.T) *SQLiteDB {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func TestOpenAndMigrate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := OpenSQLite(path)
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	// Migrate again should be idempotent
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate (second): %v", err)
+	}
+
+	// File should exist
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Error("database file not created")
+	}
+}
+
+func TestUpsertAndGetPeer(t *testing.T) {
+	db := newTestDB(t)
+
+	peer := &Peer{
+		ID:         "TESTPEER1",
+		UUID:       "uuid-1234",
+		IP:         "192.168.1.100",
+		Hostname:   "desktop-1",
+		OS:         "Windows 10",
+		Version:    "1.2.3",
+		Status:     "ONLINE",
+		NATType:    1,
+		LastOnline: time.Now().Truncate(time.Second),
+	}
+
+	if err := db.UpsertPeer(peer); err != nil {
+		t.Fatalf("UpsertPeer: %v", err)
+	}
+
+	got, err := db.GetPeer("TESTPEER1")
+	if err != nil {
+		t.Fatalf("GetPeer: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetPeer returned nil")
+	}
+
+	if got.ID != "TESTPEER1" {
+		t.Errorf("ID: got %q, want %q", got.ID, "TESTPEER1")
+	}
+	if got.Hostname != "desktop-1" {
+		t.Errorf("Hostname: got %q, want %q", got.Hostname, "desktop-1")
+	}
+	if got.Status != "ONLINE" {
+		t.Errorf("Status: got %q, want %q", got.Status, "ONLINE")
+	}
+}
+
+func TestUpsertPeerUpdate(t *testing.T) {
+	db := newTestDB(t)
+
+	// Insert
+	if err := db.UpsertPeer(&Peer{ID: "P1", Hostname: "host-a", IP: "1.2.3.4", Status: "ONLINE"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update — hostname should be kept (COALESCE with non-empty)
+	if err := db.UpsertPeer(&Peer{ID: "P1", IP: "5.6.7.8", Status: "OFFLINE"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _ := db.GetPeer("P1")
+	if got.IP != "5.6.7.8" {
+		t.Errorf("IP not updated: %q", got.IP)
+	}
+	if got.Hostname != "host-a" {
+		t.Errorf("Hostname should be preserved: got %q", got.Hostname)
+	}
+}
+
+func TestGetPeerNotFound(t *testing.T) {
+	db := newTestDB(t)
+
+	got, err := db.GetPeer("NONEXISTENT")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for missing peer, got %+v", got)
+	}
+}
+
+func TestListPeers(t *testing.T) {
+	db := newTestDB(t)
+
+	for _, id := range []string{"A", "B", "C"} {
+		db.UpsertPeer(&Peer{ID: id, Status: "ONLINE"})
+	}
+
+	peers, err := db.ListPeers(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 3 {
+		t.Errorf("expected 3 peers, got %d", len(peers))
+	}
+}
+
+func TestSoftDelete(t *testing.T) {
+	db := newTestDB(t)
+
+	db.UpsertPeer(&Peer{ID: "DEL1", Status: "ONLINE"})
+	if err := db.DeletePeer("DEL1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not appear in normal list
+	peers, _ := db.ListPeers(false)
+	for _, p := range peers {
+		if p.ID == "DEL1" {
+			t.Error("soft-deleted peer should not appear in normal list")
+		}
+	}
+
+	// Should appear with includeDeleted
+	peers, _ = db.ListPeers(true)
+	found := false
+	for _, p := range peers {
+		if p.ID == "DEL1" {
+			found = true
+			if !p.SoftDeleted {
+				t.Error("soft_deleted flag should be true")
+			}
+		}
+	}
+	if !found {
+		t.Error("soft-deleted peer should appear with includeDeleted=true")
+	}
+}
+
+func TestBanSystem(t *testing.T) {
+	db := newTestDB(t)
+
+	db.UpsertPeer(&Peer{ID: "BAN1", Status: "ONLINE"})
+
+	banned, _ := db.IsPeerBanned("BAN1")
+	if banned {
+		t.Error("peer should not be banned initially")
+	}
+
+	if err := db.BanPeer("BAN1", "test ban"); err != nil {
+		t.Fatal(err)
+	}
+
+	banned, _ = db.IsPeerBanned("BAN1")
+	if !banned {
+		t.Error("peer should be banned after BanPeer")
+	}
+
+	if err := db.UnbanPeer("BAN1"); err != nil {
+		t.Fatal(err)
+	}
+
+	banned, _ = db.IsPeerBanned("BAN1")
+	if banned {
+		t.Error("peer should not be banned after UnbanPeer")
+	}
+}
+
+func TestChangePeerID(t *testing.T) {
+	db := newTestDB(t)
+
+	db.UpsertPeer(&Peer{ID: "OLD1", Hostname: "mypc", Status: "ONLINE"})
+
+	if err := db.ChangePeerID("OLD1", "NEW1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Old ID should not exist
+	old, _ := db.GetPeer("OLD1")
+	if old != nil {
+		t.Error("old peer should not exist after ID change")
+	}
+
+	// New ID should exist with same data
+	new1, _ := db.GetPeer("NEW1")
+	if new1 == nil {
+		t.Fatal("new peer should exist")
+	}
+	if new1.Hostname != "mypc" {
+		t.Errorf("hostname should be preserved: got %q", new1.Hostname)
+	}
+
+	// History should have entry
+	history, _ := db.GetIDChangeHistory("OLD1")
+	if len(history) != 1 {
+		t.Fatalf("expected 1 history entry, got %d", len(history))
+	}
+	if history[0].OldID != "OLD1" || history[0].NewID != "NEW1" {
+		t.Errorf("history mismatch: %+v", history[0])
+	}
+}
+
+func TestChangePeerIDDuplicate(t *testing.T) {
+	db := newTestDB(t)
+
+	db.UpsertPeer(&Peer{ID: "A1", Status: "ONLINE"})
+	db.UpsertPeer(&Peer{ID: "B1", Status: "ONLINE"})
+
+	err := db.ChangePeerID("A1", "B1")
+	if err == nil {
+		t.Error("expected error when changing to existing ID")
+	}
+}
+
+func TestSetAllOffline(t *testing.T) {
+	db := newTestDB(t)
+
+	for _, id := range []string{"X1", "X2", "X3"} {
+		db.UpsertPeer(&Peer{ID: id, Status: "ONLINE"})
+	}
+
+	if err := db.SetAllOffline(); err != nil {
+		t.Fatal(err)
+	}
+
+	peers, _ := db.ListPeers(false)
+	for _, p := range peers {
+		if p.Status != "OFFLINE" {
+			t.Errorf("peer %s status should be OFFLINE, got %q", p.ID, p.Status)
+		}
+	}
+}
+
+func TestGetPeerCount(t *testing.T) {
+	db := newTestDB(t)
+
+	db.UpsertPeer(&Peer{ID: "O1", Status: "ONLINE"})
+	db.UpsertPeer(&Peer{ID: "O2", Status: "ONLINE"})
+	db.UpsertPeer(&Peer{ID: "F1", Status: "OFFLINE"})
+
+	total, online, err := db.GetPeerCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Errorf("total: got %d, want 3", total)
+	}
+	if online != 2 {
+		t.Errorf("online: got %d, want 2", online)
+	}
+}
+
+func TestConfig(t *testing.T) {
+	db := newTestDB(t)
+
+	if err := db.SetConfig("timeout", "15"); err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := db.GetConfig("timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "15" {
+		t.Errorf("config value: got %q, want %q", val, "15")
+	}
+
+	// Update
+	db.SetConfig("timeout", "30")
+	val, _ = db.GetConfig("timeout")
+	if val != "30" {
+		t.Errorf("updated config: got %q, want %q", val, "30")
+	}
+
+	// Delete
+	db.DeleteConfig("timeout")
+	val, _ = db.GetConfig("timeout")
+	if val != "" {
+		t.Errorf("deleted config should return empty, got %q", val)
+	}
+}
+
+func TestHardDelete(t *testing.T) {
+	db := newTestDB(t)
+
+	db.UpsertPeer(&Peer{ID: "HARD1", Status: "ONLINE"})
+
+	if err := db.HardDeletePeer("HARD1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not appear even with includeDeleted
+	peers, _ := db.ListPeers(true)
+	for _, p := range peers {
+		if p.ID == "HARD1" {
+			t.Error("hard-deleted peer should not appear at all")
+		}
+	}
+}

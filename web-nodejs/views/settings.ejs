@@ -16,9 +16,17 @@
                 <span class="material-icons">tune</span>
                 ${_('settings.tab_general')}
             </button>
+            <button class="settings-tab" data-tab="server">
+                <span class="material-icons">dns</span>
+                ${_('settings.tab_server')}
+            </button>
             <button class="settings-tab" data-tab="branding">
                 <span class="material-icons">palette</span>
                 ${_('settings.tab_branding')}
+            </button>
+            <button class="settings-tab" data-tab="backup">
+                <span class="material-icons">backup</span>
+                ${_('settings.tab_backup')}
             </button>
         </div>
         
@@ -149,6 +157,92 @@
                                 </tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        </div>
+        
+        <!-- Server Backend Tab -->
+        <div class="settings-tab-content" id="tab-server">
+        <div class="settings-sections">
+            <!-- Server Backend Selection -->
+            <div class="settings-section">
+                <div class="settings-section-header">
+                    <h2 class="settings-section-title">
+                        <span class="material-icons">dns</span>
+                        ${_('settings.backend_title')}
+                    </h2>
+                    <p class="settings-section-desc">${_('settings.backend_desc')}</p>
+                </div>
+                <div class="settings-section-body">
+                    <div class="backend-selector">
+                        <label class="backend-option" id="backend-opt-rustdesk">
+                            <input type="radio" name="server-backend" value="rustdesk">
+                            <div class="backend-card">
+                                <div class="backend-card-header">
+                                    <span class="material-icons backend-icon">memory</span>
+                                    <div>
+                                        <h3 class="backend-name">RustDesk (hbbs/hbbr)</h3>
+                                        <span class="backend-badge badge-default">${_('settings.backend_original')}</span>
+                                    </div>
+                                </div>
+                                <p class="backend-desc">${_('settings.backend_rustdesk_desc')}</p>
+                                <ul class="backend-features">
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_signal')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_relay')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_basic_api')}</li>
+                                </ul>
+                            </div>
+                        </label>
+                        <label class="backend-option" id="backend-opt-betterdesk">
+                            <input type="radio" name="server-backend" value="betterdesk">
+                            <div class="backend-card">
+                                <div class="backend-card-header">
+                                    <span class="material-icons backend-icon">rocket_launch</span>
+                                    <div>
+                                        <h3 class="backend-name">BetterDesk (Go Server)</h3>
+                                        <span class="backend-badge badge-new">${_('settings.backend_enhanced')}</span>
+                                    </div>
+                                </div>
+                                <p class="backend-desc">${_('settings.backend_betterdesk_desc')}</p>
+                                <ul class="backend-features">
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_signal')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_relay')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_full_api')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_jwt')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_blocklist')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_tags')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_audit')}</li>
+                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_websocket')}</li>
+                                </ul>
+                            </div>
+                        </label>
+                    </div>
+                    
+                    <!-- Connection Status -->
+                    <div class="backend-status-box" id="backend-status-box">
+                        <div class="backend-status-row">
+                            <span class="material-icons">cloud</span>
+                            <span>${_('settings.backend_connection')}:</span>
+                            <span id="backend-health-status" class="backend-health">-</span>
+                        </div>
+                        <div class="backend-status-row">
+                            <span class="material-icons">link</span>
+                            <span>${_('settings.backend_api_url')}:</span>
+                            <span id="backend-api-url" class="text-muted">-</span>
+                        </div>
+                    </div>
+                    
+                    <div class="backend-actions">
+                        <button type="button" class="btn btn-secondary" id="backend-test-btn">
+                            <span class="material-icons">wifi_tethering</span>
+                            ${_('settings.backend_test')}
+                        </button>
+                        <button type="button" class="btn btn-primary" id="backend-save-btn" disabled>
+                            <span class="material-icons">save</span>
+                            ${_('settings.backend_save')}
+                        </button>
                     </div>
                 </div>
             </div>
@@ -440,6 +534,104 @@
                     <span class="material-icons">save</span>
                     ${_('branding.save_branding')}
                 </button>
+            </div>
+        </div>
+        </div>
+        
+        <!-- Backup & Restore Tab -->
+        <div class="settings-tab-content" id="tab-backup">
+        <div class="settings-sections">
+            <!-- Backup Info -->
+            <div class="settings-section">
+                <div class="settings-section-header">
+                    <h2 class="settings-section-title">
+                        <span class="material-icons">backup</span>
+                        ${_('backup.title')}
+                    </h2>
+                    <p class="settings-section-desc">${_('backup.desc')}</p>
+                </div>
+                <div class="settings-section-body">
+                    <div class="backup-stats" id="backup-stats">
+                        <div class="backup-stat-row">
+                            <span class="backup-stat-label">${_('backup.stat_users')}</span>
+                            <span class="backup-stat-value" id="backup-stat-users">-</span>
+                        </div>
+                        <div class="backup-stat-row">
+                            <span class="backup-stat-label">${_('backup.stat_settings')}</span>
+                            <span class="backup-stat-value" id="backup-stat-settings">-</span>
+                        </div>
+                        <div class="backup-stat-row">
+                            <span class="backup-stat-label">${_('backup.stat_folders')}</span>
+                            <span class="backup-stat-value" id="backup-stat-folders">-</span>
+                        </div>
+                        <div class="backup-stat-row">
+                            <span class="backup-stat-label">${_('backup.stat_groups')}</span>
+                            <span class="backup-stat-value" id="backup-stat-groups">-</span>
+                        </div>
+                        <div class="backup-stat-row">
+                            <span class="backup-stat-label">${_('backup.stat_strategies')}</span>
+                            <span class="backup-stat-value" id="backup-stat-strategies">-</span>
+                        </div>
+                        <div class="backup-stat-row">
+                            <span class="backup-stat-label">${_('backup.stat_backend')}</span>
+                            <span class="backup-stat-value" id="backup-stat-backend">-</span>
+                        </div>
+                    </div>
+                    <div class="backup-actions">
+                        <button class="btn btn-primary" id="backup-download-btn">
+                            <span class="material-icons">download</span>
+                            ${_('backup.download')}
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Restore -->
+            <div class="settings-section">
+                <div class="settings-section-header">
+                    <h2 class="settings-section-title">
+                        <span class="material-icons">restore</span>
+                        ${_('backup.restore_title')}
+                    </h2>
+                    <p class="settings-section-desc">${_('backup.restore_desc')}</p>
+                </div>
+                <div class="settings-section-body">
+                    <div class="restore-options">
+                        <label class="restore-option">
+                            <input type="checkbox" id="restore-settings" checked>
+                            <span>${_('backup.opt_settings')}</span>
+                        </label>
+                        <label class="restore-option">
+                            <input type="checkbox" id="restore-branding" checked>
+                            <span>${_('backup.opt_branding')}</span>
+                        </label>
+                        <label class="restore-option">
+                            <input type="checkbox" id="restore-folders" checked>
+                            <span>${_('backup.opt_folders')}</span>
+                        </label>
+                        <label class="restore-option">
+                            <input type="checkbox" id="restore-groups" checked>
+                            <span>${_('backup.opt_groups')}</span>
+                        </label>
+                        <label class="restore-option">
+                            <input type="checkbox" id="restore-addressbooks" checked>
+                            <span>${_('backup.opt_addressbooks')}</span>
+                        </label>
+                        <label class="restore-option restore-option-danger">
+                            <input type="checkbox" id="restore-users">
+                            <span>${_('backup.opt_users')}</span>
+                            <small class="restore-warning">${_('backup.opt_users_warning')}</small>
+                        </label>
+                    </div>
+                    <div class="backup-actions">
+                        <label class="btn btn-warning" id="restore-upload-label">
+                            <span class="material-icons">upload</span>
+                            ${_('backup.upload')}
+                            <input type="file" id="restore-file-input" accept=".json" hidden>
+                        </label>
+                    </div>
+                    <div class="restore-result" id="restore-result" style="display:none;"></div>
+                </div>
             </div>
         </div>
         </div>

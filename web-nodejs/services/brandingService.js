@@ -6,6 +6,38 @@
 
 const db = require('./database');
 
+// Dangerous SVG elements that can execute scripts
+const SVG_DANGEROUS_TAGS = /<\s*(script|foreignobject|iframe|embed|object|applet|animate|set)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi;
+const SVG_DANGEROUS_TAGS_SELFCLOSING = /<\s*(script|foreignobject|iframe|embed|object|applet)[^>]*\/>/gi;
+
+// Dangerous attributes that can execute JavaScript
+const SVG_DANGEROUS_ATTRS = /\s(on\w+|xlink:href\s*=\s*["']javascript:)[^>]*/gi;
+const SVG_JAVASCRIPT_HREF = /\bhref\s*=\s*["']javascript:[^"']*/gi;
+
+/**
+ * Sanitize SVG content to prevent XSS attacks.
+ * Removes script tags, event handlers, and javascript: URLs.
+ * @param {string} svg - Raw SVG string
+ * @returns {string} - Sanitized SVG string
+ */
+function sanitizeSvg(svg) {
+    if (!svg || typeof svg !== 'string') return '';
+    
+    let sanitized = svg;
+    
+    // Remove dangerous elements (script, foreignObject, iframe, etc.)
+    sanitized = sanitized.replace(SVG_DANGEROUS_TAGS, '');
+    sanitized = sanitized.replace(SVG_DANGEROUS_TAGS_SELFCLOSING, '');
+    
+    // Remove event handler attributes (onclick, onload, etc.)
+    sanitized = sanitized.replace(SVG_DANGEROUS_ATTRS, '');
+    
+    // Remove javascript: URLs in href
+    sanitized = sanitized.replace(SVG_JAVASCRIPT_HREF, ' href="');
+    
+    return sanitized;
+}
+
 // Default branding (BetterDesk original theme)
 const DEFAULT_BRANDING = {
     // Brand identity
@@ -13,10 +45,10 @@ const DEFAULT_BRANDING = {
     appDescription: 'RustDesk Server Management',
     
     // Logo configuration
-    logoType: 'icon', // 'icon' | 'svg' | 'image'
-    logoIcon: 'dns',  // Material Icons name (when logoType === 'icon')
-    logoSvg: '',      // Raw SVG markup or SVG path data (when logoType === 'svg')
-    logoUrl: '',      // URL to image file (when logoType === 'image')
+    logoType: 'image', // 'icon' | 'svg' | 'image'
+    logoIcon: 'dns',   // Material Icons name (when logoType === 'icon')
+    logoSvg: '',       // Raw SVG markup or SVG path data (when logoType === 'svg')
+    logoUrl: '/img/betterdesk_icon.png', // URL to image file (when logoType === 'image')
     
     // Favicon (SVG)
     faviconSvg: '',   // Custom favicon SVG (empty = default)
@@ -144,7 +176,12 @@ function saveBranding(updates) {
             if (key === 'colors') {
                 stmt.run(key, JSON.stringify(value));
             } else if (key in DEFAULT_BRANDING) {
-                stmt.run(key, String(value));
+                // Security: Sanitize SVG content to prevent XSS
+                if (key === 'logoSvg' || key === 'faviconSvg') {
+                    stmt.run(key, sanitizeSvg(String(value)));
+                } else {
+                    stmt.run(key, String(value));
+                }
             }
         }
     });

@@ -1,30 +1,53 @@
-# Dockerfile for BetterDesk HBBR (Relay Server)
-# Creates a minimal image with BetterDesk enhanced binaries
-# Based on busybox (minimal) with BetterDesk binaries from hbbs-patch-v2/
+# Dockerfile for BetterDesk HBBR (Relay Server) — DEPRECATED
+#
+# The BetterDesk Go server is now a SINGLE BINARY that includes both
+# signal and relay functionality. This Dockerfile is kept for backwards
+# compatibility but builds the SAME binary as Dockerfile.hbbs.
+#
+# In the current architecture, docker-compose only needs a single
+# 'server' service. See docker-compose.yml for the recommended setup.
 
-# Build minimal image with shell support
-FROM busybox:musl
+# ---- Build stage (shared with Dockerfile.hbbs) ----
+FROM golang:1.25-alpine AS builder
 
-# Create necessary directories
-RUN mkdir -p /root /usr/local/bin /opt/rustdesk
+RUN apk add --no-cache git gcc musl-dev sqlite-dev
 
-# Copy BetterDesk enhanced binaries from local build
-COPY hbbs-patch-v2/hbbr-linux-x86_64 /usr/local/bin/hbbr-betterdesk
-COPY hbbs-patch-v2/hbbs-linux-x86_64 /usr/local/bin/hbbs-betterdesk
+WORKDIR /src
 
-# Make binaries executable
-RUN chmod +x /usr/local/bin/hbbr-betterdesk /usr/local/bin/hbbs-betterdesk
+COPY betterdesk-server/go.mod betterdesk-server/go.sum ./
 
-# Create symlinks for convenience
-RUN ln -s /usr/local/bin/hbbr-betterdesk /usr/bin/hbbr && \
-    ln -s /usr/local/bin/hbbs-betterdesk /usr/bin/hbbs
+RUN go mod download
 
-# Set working directory and environment
-WORKDIR /root
-ENV HOME=/root
+COPY betterdesk-server/ .
 
-# Expose relay port
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags="-s -w -extldflags '-static'" \
+    -tags "sqlite_omit_load_extension netgo osusergo" \
+    -o /betterdesk-server .
+
+# ---- Runtime stage ----
+FROM alpine:3.20
+
+LABEL maintainer="UNITRONIX"
+LABEL description="BetterDesk Server (single binary — signal + relay)"
+LABEL version="2.4.0"
+
+RUN apk add --no-cache ca-certificates curl tini \
+    && addgroup -S betterdesk \
+    && adduser -S -G betterdesk betterdesk
+
+COPY --from=builder /betterdesk-server /usr/local/bin/betterdesk-server
+RUN chmod +x /usr/local/bin/betterdesk-server
+
+RUN mkdir -p /opt/rustdesk && chown betterdesk:betterdesk /opt/rustdesk
+WORKDIR /opt/rustdesk
+
 EXPOSE 21117
 
-# Default command - use BetterDesk enhanced hbbr
-CMD ["/usr/local/bin/hbbr-betterdesk", "-k", "_"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -sf http://localhost:21114/api/health || exit 1
+
+USER betterdesk
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/usr/local/bin/betterdesk-server", "-dir", "/opt/rustdesk"]

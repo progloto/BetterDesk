@@ -12,6 +12,8 @@
         initPasswordForm();
         initTotpSection();
         initBrandingSection();
+        initBackendSection();
+        initBackupSection();
         loadAuditLog();
         loadServerInfo();
         
@@ -37,9 +39,10 @@
         });
         
         // Check URL hash for direct tab navigation
-        if (window.location.hash === '#branding') {
-            const brandingTab = document.querySelector('[data-tab="branding"]');
-            if (brandingTab) brandingTab.click();
+        const hash = window.location.hash.replace('#', '');
+        if (['branding', 'server', 'backup'].includes(hash)) {
+            const tab = document.querySelector(`[data-tab="${hash}"]`);
+            if (tab) tab.click();
         }
     }
     
@@ -542,6 +545,49 @@
     }
     
     /**
+     * Sanitize SVG content to prevent XSS attacks.
+     * Removes potentially dangerous elements and attributes.
+     * @param {string} svg - Raw SVG string
+     * @returns {string} - Sanitized SVG string
+     */
+    function sanitizeSvg(svg) {
+        // Parse the SVG
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(svg, 'image/svg+xml');
+        
+        // Check for parsing errors
+        const parserError = doc.querySelector('parsererror');
+        if (parserError) return '<!-- Invalid SVG -->';
+        
+        const svgEl = doc.querySelector('svg');
+        if (!svgEl) return '<!-- No SVG element found -->';
+        
+        // Remove dangerous elements
+        const dangerousTags = ['script', 'foreignobject', 'iframe', 'embed', 'object', 'applet'];
+        dangerousTags.forEach(tag => {
+            doc.querySelectorAll(tag).forEach(el => el.remove());
+        });
+        
+        // Remove dangerous attributes from all elements
+        const dangerousAttrs = [
+            'onclick', 'ondblclick', 'onmousedown', 'onmouseup', 'onmouseover', 'onmousemove',
+            'onmouseout', 'onmouseenter', 'onmouseleave', 'onkeydown', 'onkeypress', 'onkeyup',
+            'onload', 'onerror', 'onabort', 'onfocus', 'onblur', 'onchange', 'onsubmit', 'onreset',
+            'onselect', 'onunload', 'xlink:href'
+        ];
+        
+        doc.querySelectorAll('*').forEach(el => {
+            dangerousAttrs.forEach(attr => el.removeAttribute(attr));
+            // Remove href pointing to javascript:
+            if (el.hasAttribute('href') && el.getAttribute('href').toLowerCase().trim().startsWith('javascript:')) {
+                el.removeAttribute('href');
+            }
+        });
+        
+        return svgEl.outerHTML;
+    }
+    
+    /**
      * Update logo preview
      */
     function updateLogoPreview() {
@@ -554,7 +600,7 @@
         if (type === 'svg') {
             const svg = document.getElementById('logo-svg-input')?.value || '';
             if (svg.trim()) {
-                preview.innerHTML = `<span class="logo-preview-svg">${svg}</span>`;
+                preview.innerHTML = `<span class="logo-preview-svg">${sanitizeSvg(svg)}</span>`;
             } else {
                 preview.innerHTML = `<span class="material-icons">code</span><span class="logo-preview-text">${Utils.escapeHtml(name)}</span>`;
             }
@@ -736,6 +782,296 @@
                 Notifications.error(error.message || _('errors.server_error'));
             }
         });
+    }
+    
+    // ==================== Server Backend Selection ====================
+    
+    let _currentBackend = null;
+    
+    function initBackendSection() {
+        const radios = document.querySelectorAll('input[name="server-backend"]');
+        const testBtn = document.getElementById('backend-test-btn');
+        const saveBtn = document.getElementById('backend-save-btn');
+        
+        if (!radios.length) return;
+        
+        // Load current backend
+        loadBackendStatus();
+        
+        // Radio change — enable save button when different from current
+        radios.forEach(radio => {
+            radio.addEventListener('change', () => {
+                const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
+                saveBtn.disabled = (selected === _currentBackend);
+            });
+        });
+        
+        // Test connection button
+        testBtn?.addEventListener('click', async () => {
+            const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
+            if (!selected) return;
+            
+            testBtn.disabled = true;
+            testBtn.innerHTML = '<span class="material-icons spin">sync</span> ' + _('settings.backend_testing');
+            
+            try {
+                const result = await Utils.api('/api/settings/backend/test', {
+                    method: 'POST',
+                    body: { backend: selected }
+                });
+                
+                const health = result.health || {};
+                updateBackendHealth(health);
+                
+                if (health.status === 'running') {
+                    Notifications.success(_('settings.backend_test_success'));
+                } else {
+                    Notifications.warning(_('settings.backend_test_failed'));
+                }
+            } catch (error) {
+                Notifications.error(error.message || _('settings.backend_test_failed'));
+                updateBackendHealth({ status: 'error' });
+            } finally {
+                testBtn.disabled = false;
+                testBtn.innerHTML = '<span class="material-icons">wifi_tethering</span> ' + _('settings.backend_test');
+            }
+        });
+        
+        // Save button
+        saveBtn?.addEventListener('click', async () => {
+            const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
+            if (!selected || selected === _currentBackend) return;
+            
+            if (!confirm(_('settings.backend_confirm_switch'))) return;
+            
+            saveBtn.disabled = true;
+            
+            try {
+                const result = await Utils.api('/api/settings/backend', {
+                    method: 'POST',
+                    body: { backend: selected }
+                });
+                
+                _currentBackend = selected;
+                highlightActiveBackend(selected);
+                updateBackendHealth(result.health || {});
+                Notifications.success(_('settings.backend_saved'));
+                saveBtn.disabled = true;
+                
+            } catch (error) {
+                Notifications.error(error.message || _('settings.backend_save_failed'));
+                saveBtn.disabled = false;
+            }
+        });
+    }
+    
+    async function loadBackendStatus() {
+        try {
+            const result = await Utils.api('/api/settings/backend');
+            _currentBackend = result.backend || 'rustdesk';
+            
+            // Select the radio
+            const radio = document.querySelector(`input[name="server-backend"][value="${_currentBackend}"]`);
+            if (radio) radio.checked = true;
+            
+            highlightActiveBackend(_currentBackend);
+            updateBackendHealth(result.health || {});
+            
+        } catch (error) {
+            console.error('Failed to load backend status:', error);
+        }
+    }
+    
+    function highlightActiveBackend(name) {
+        document.querySelectorAll('.backend-option').forEach(opt => {
+            opt.classList.remove('active');
+        });
+        const activeOpt = document.getElementById('backend-opt-' + name);
+        if (activeOpt) activeOpt.classList.add('active');
+    }
+    
+    function updateBackendHealth(health) {
+        const el = document.getElementById('backend-health-status');
+        if (!el) return;
+        
+        const status = health.status || 'unknown';
+        el.className = 'backend-health backend-health-' + status;
+        
+        const labels = {
+            'running': _('settings.backend_status_running'),
+            'unreachable': _('settings.backend_status_unreachable'),
+            'error': _('settings.backend_status_error'),
+            'unknown': _('settings.backend_status_unknown')
+        };
+        el.textContent = labels[status] || status;
+        
+        // Update API URL display
+        const urlEl = document.getElementById('backend-api-url');
+        if (urlEl) {
+            const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
+            urlEl.textContent = health.backend === 'betterdesk' || selected === 'betterdesk'
+                ? (health.api_url || 'BetterDesk Go API')
+                : 'HBBS REST API';
+        }
+    }
+    
+    // ==================== Backup & Restore ====================
+    
+    function initBackupSection() {
+        loadBackupStats();
+        
+        // Download backup
+        document.getElementById('backup-download-btn')?.addEventListener('click', async () => {
+            const btn = document.getElementById('backup-download-btn');
+            if (!btn) return;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="material-icons spinning">sync</span> ' + _('backup.creating');
+            
+            try {
+                const fetchHeaders = {};
+                if (window.BetterDesk && window.BetterDesk.csrfToken) {
+                    fetchHeaders['X-CSRF-Token'] = window.BetterDesk.csrfToken;
+                }
+                const response = await fetch('/api/settings/backup', {
+                    credentials: 'same-origin',
+                    headers: fetchHeaders
+                });
+                if (!response.ok) throw new Error('Backup failed');
+                
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                const date = new Date().toISOString().slice(0, 10);
+                a.download = `betterdesk-backup-${date}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+                
+                Notifications.success(_('backup.download_success'));
+            } catch (error) {
+                Notifications.error(error.message || _('errors.server_error'));
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<span class="material-icons">download</span> ' + _('backup.download');
+            }
+        });
+        
+        // Restore from file
+        document.getElementById('restore-file-input')?.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            if (!file.name.endsWith('.json')) {
+                Notifications.error(_('backup.invalid_json'));
+                e.target.value = '';
+                return;
+            }
+            
+            if (!confirm(_('backup.restore_confirm'))) {
+                e.target.value = '';
+                return;
+            }
+            
+            const resultEl = document.getElementById('restore-result');
+            const label = document.getElementById('restore-upload-label');
+            
+            try {
+                // Read and validate client-side first
+                const text = await file.text();
+                let data;
+                try {
+                    data = JSON.parse(text);
+                } catch {
+                    Notifications.error(_('backup.invalid_json'));
+                    e.target.value = '';
+                    return;
+                }
+                
+                if (data._format !== 'betterdesk-backup') {
+                    Notifications.error(_('backup.invalid_format'));
+                    e.target.value = '';
+                    return;
+                }
+                
+                // Build FormData with options
+                const formData = new FormData();
+                formData.append('backup', file);
+                formData.append('restoreSettings', document.getElementById('restore-settings')?.checked ?? true);
+                formData.append('restoreBranding', document.getElementById('restore-branding')?.checked ?? true);
+                formData.append('restoreUsers', document.getElementById('restore-users')?.checked ?? false);
+                formData.append('restoreFolders', document.getElementById('restore-folders')?.checked ?? true);
+                formData.append('restoreGroups', document.getElementById('restore-groups')?.checked ?? true);
+                formData.append('restoreAddressBooks', document.getElementById('restore-addressbooks')?.checked ?? true);
+                
+                if (label) label.classList.add('loading');
+                
+                const headers = {};
+                if (window.BetterDesk && window.BetterDesk.csrfToken) {
+                    headers['X-CSRF-Token'] = window.BetterDesk.csrfToken;
+                }
+                
+                const response = await fetch('/api/settings/restore', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: headers,
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    Notifications.success(_('backup.restore_success'));
+                    showRestoreResult(result.data, resultEl);
+                } else {
+                    Notifications.error(result.error || _('errors.server_error'));
+                }
+            } catch (error) {
+                Notifications.error(error.message || _('errors.server_error'));
+            } finally {
+                e.target.value = '';
+                if (label) label.classList.remove('loading');
+            }
+        });
+    }
+    
+    async function loadBackupStats() {
+        try {
+            const data = await Utils.api('/api/settings/backup/stats');
+            if (!data) return;
+            
+            const setVal = (id, val) => {
+                const el = document.getElementById(id);
+                if (el) el.textContent = val;
+            };
+            
+            setVal('backup-stat-users', data.users || 0);
+            setVal('backup-stat-settings', data.settings || 0);
+            setVal('backup-stat-folders', data.folders || 0);
+            setVal('backup-stat-groups', (data.userGroups || 0) + (data.deviceGroups || 0));
+            setVal('backup-stat-strategies', data.strategies || 0);
+            setVal('backup-stat-backend', data.backend === 'betterdesk' ? 'BetterDesk Go' : 'RustDesk');
+        } catch { /* silent */ }
+    }
+    
+    function showRestoreResult(data, el) {
+        if (!el) return;
+        el.style.display = 'block';
+        
+        let html = '<div class="restore-result-inner">';
+        if (data.restored.length) {
+            html += `<p class="restore-ok"><span class="material-icons">check_circle</span> ${_('backup.restored')}: <strong>${Utils.escapeHtml(data.restored.join(', '))}</strong></p>`;
+        }
+        if (data.skipped.length) {
+            html += `<p class="restore-skip"><span class="material-icons">skip_next</span> ${_('backup.skipped')}: ${Utils.escapeHtml(data.skipped.join(', '))}</p>`;
+        }
+        if (data.warnings && data.warnings.length) {
+            html += `<p class="restore-warn"><span class="material-icons">warning</span> ${data.warnings.map(w => Utils.escapeHtml(w)).join('<br>')}</p>`;
+        }
+        if (data.backupDate) {
+            html += `<p class="restore-meta">${_('backup.backup_date')}: ${Utils.escapeHtml(data.backupDate)}</p>`;
+        }
+        html += '</div>';
+        el.innerHTML = html;
     }
     
 })();

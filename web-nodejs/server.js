@@ -22,8 +22,13 @@ const { apiLimiter } = require('./middleware/rateLimiter');
 const { csrfTokenProvider, doubleCsrfProtection } = require('./middleware/csrf');
 const authService = require('./services/authService');
 const hbbsApi = require('./services/hbbsApi');
+const serverBackend = require('./services/serverBackend');
 const db = require('./services/database');
 const { initWsProxy } = require('./services/wsRelay');
+const { initBdRelay } = require('./services/bdRelay');
+const { initChatRelay } = require('./services/chatRelay');
+const { initRemoteRelay } = require('./services/remoteRelay');
+const { startDiscoveryService } = require('./services/lanDiscovery');
 const routes = require('./routes');
 const rustdeskApiRoutes = require('./routes/rustdesk-api.routes');
 const { getWanMiddlewareStack } = require('./middleware/wanSecurity');
@@ -33,8 +38,9 @@ const app = express();
 
 // Trust proxy (for rate limiting behind reverse proxy)
 // Configurable via TRUST_PROXY env var: 0=disabled, 1=single proxy, 'loopback'=localhost only
+// Default: false (safest). Set TRUST_PROXY=1 when behind nginx/Apache/cloudflare
 const trustProxy = process.env.TRUST_PROXY !== undefined ? 
-    (isNaN(process.env.TRUST_PROXY) ? process.env.TRUST_PROXY : parseInt(process.env.TRUST_PROXY, 10)) : 1;
+    (isNaN(process.env.TRUST_PROXY) ? process.env.TRUST_PROXY : parseInt(process.env.TRUST_PROXY, 10)) : false;
 app.set('trust proxy', trustProxy);
 
 // View engine setup
@@ -58,19 +64,20 @@ app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 // Cookie parsing
 app.use(cookieParser());
 
-// Session management
-app.use(session({
+// Session management — also kept as a standalone middleware ref for WebSocket upgrades
+const sessionMiddleware = session({
     secret: config.sessionSecret,
     name: 'betterdesk.sid',
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: config.httpsEnabled, // Secure cookies when HTTPS is enabled
+        secure: config.httpsEnabled,
         httpOnly: true,
         sameSite: 'lax',
         maxAge: config.sessionMaxAge
     }
-}));
+});
+app.use(sessionMiddleware);
 
 // Static files
 app.use(express.static(path.join(__dirname, 'public'), {
@@ -269,6 +276,18 @@ async function startServer() {
         
         // Initialize WebSocket proxy for remote desktop client
         initWsProxy(server);
+
+        // Initialize BetterDesk native relay (WebSocket)
+        initBdRelay(server);
+
+        // Initialize Chat relay (WebSocket — agent ↔ operator)
+        initChatRelay(server, sessionMiddleware);
+
+        // Initialize Remote Desktop relay (WebSocket — agent JPEG ↔ browser viewer)
+        initRemoteRelay(server, sessionMiddleware);
+
+        // Start LAN Discovery UDP service
+        startDiscoveryService();
         
         // ============ RustDesk Client API Server (dedicated port) ============
         let apiServer = null;
@@ -279,22 +298,37 @@ async function startServer() {
         // ============ Periodic Housekeeping ============
         const housekeepingInterval = setInterval(() => {
             authService.cleanupHousekeeping();
+            // Clean up old integration data (metrics >7d, audit >90d)
+            try {
+                db.runIntegrationHousekeeping();
+            } catch (err) {
+                // Silent fail — don't crash the server for housekeeping
+            }
         }, 60 * 60 * 1000); // Every hour
         
         // ============ Periodic Online Status Sync ============
         const syncInterval = parseInt(process.env.STATUS_SYNC_INTERVAL, 10) || 15; // seconds
+        const heartbeatStaleThreshold = parseInt(process.env.HEARTBEAT_STALE_THRESHOLD, 10) || 90; // seconds
         const statusSyncInterval = setInterval(async () => {
             try {
-                await hbbsApi.syncOnlineStatus(db.getDb());
+                await serverBackend.syncOnlineStatus();
             } catch (err) {
                 // Silent fail - don't crash the server
+            }
+            // Also clean up stale heartbeat-based online status
+            try {
+                if (typeof db.cleanupStaleOnlinePeers === 'function') {
+                    db.cleanupStaleOnlinePeers(heartbeatStaleThreshold);
+                }
+            } catch (err) {
+                // Silent fail
             }
         }, syncInterval * 1000);
         
         // Initial sync on startup (after short delay for HBBS to be ready)
         setTimeout(async () => {
             try {
-                const result = await hbbsApi.syncOnlineStatus(db.getDb());
+                const result = await serverBackend.syncOnlineStatus();
                 if (result.synced > 0) {
                     console.log(`Initial status sync: ${result.synced} device(s) online`);
                 }
@@ -343,8 +377,8 @@ async function startServer() {
 function startRustDeskApiServer() {
     const apiApp = express();
 
-    // Trust proxy (for correct IP extraction behind reverse proxy)
-    apiApp.set('trust proxy', 1);
+    // Trust proxy (use same configuration as main app — TRUST_PROXY env var)
+    apiApp.set('trust proxy', trustProxy);
 
     // Apply WAN security middleware stack
     const wanMiddleware = getWanMiddlewareStack();
@@ -357,6 +391,10 @@ function startRustDeskApiServer() {
 
     // Mount RustDesk-compatible API routes
     apiApp.use('/', rustdeskApiRoutes);
+
+    // Mount device-facing registration routes (LAN discovery pairing)
+    const registrationRoutes = require('./routes/registration.routes');
+    apiApp.use('/api/bd', registrationRoutes);
 
     // Catch-all for any unmatched routes (should not reach here due to pathWhitelist)
     apiApp.use((req, res) => {
@@ -376,8 +414,20 @@ function startRustDeskApiServer() {
         res.status(500).json({ error: 'Server error' });
     });
 
-    // Start HTTP server
-    const apiServerInstance = http.createServer(apiApp);
+    // Start HTTP or HTTPS server for RustDesk Client API
+    let apiServerInstance;
+    if (config.httpsEnabled) {
+        const sslOptions = loadSslCertificates();
+        if (sslOptions) {
+            apiServerInstance = https.createServer(sslOptions, apiApp);
+            console.log(`  ║   API TLS:   Enabled (HTTPS)`.padEnd(53) + '║');
+        } else {
+            console.warn('WARNING: HTTPS enabled but SSL certs invalid — API falling back to HTTP');
+            apiServerInstance = http.createServer(apiApp);
+        }
+    } else {
+        apiServerInstance = http.createServer(apiApp);
+    }
     
     apiServerInstance.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {

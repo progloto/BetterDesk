@@ -69,7 +69,7 @@
             <% } %>
             
             <div class="flex gap-sm justify-center">
-                <button onclick="location.reload()" class="btn btn-secondary">
+                <button id="btn-retry" class="btn btn-secondary">
                     <span class="material-icons">refresh</span>
                     <%= _('errors.try_again') %>
                 </button>
@@ -80,5 +80,8 @@
             </div>
         </div>
     </div>
+    <script>
+        document.getElementById('btn-retry').addEventListener('click', function() { location.reload(); });
+    </script>
 </body>
 </html>

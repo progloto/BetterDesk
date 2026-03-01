@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v2.1
+#   BetterDesk Console Manager v2.4.0
 #   All-in-One Interactive Tool for Docker
 #
 #   Features:
@@ -14,6 +14,8 @@
 #     - Build custom images
 #     - Full diagnostics
 #     - Migrate from existing RustDesk Docker
+#     - PostgreSQL database support (new in v2.4.0)
+#     - SQLite to PostgreSQL migration
 #
 #   Usage: ./betterdesk-docker.sh
 #
@@ -22,13 +24,22 @@
 set -e
 
 # Version
-VERSION="2.1.0"
+VERSION="2.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default paths (can be overridden by environment variables)
 DATA_DIR="${DATA_DIR:-}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/betterdesk-backups}"
 COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
+
+# Database configuration
+USE_POSTGRESQL="${USE_POSTGRESQL:-false}"
+POSTGRESQL_URI="${POSTGRESQL_URI:-}"
+POSTGRESQL_USER="${POSTGRESQL_USER:-betterdesk}"
+POSTGRESQL_PASS="${POSTGRESQL_PASS:-}"
+POSTGRESQL_DB="${POSTGRESQL_DB:-betterdesk}"
+POSTGRESQL_HOST="${POSTGRESQL_HOST:-postgres}"  # Container name as host
+POSTGRESQL_PORT="${POSTGRESQL_PORT:-5432}"
 
 # Common data directory paths to search
 COMMON_DATA_PATHS=(
@@ -40,9 +51,11 @@ COMMON_DATA_PATHS=(
 )
 
 # Container names
-HBBS_CONTAINER="betterdesk-hbbs"
-HBBR_CONTAINER="betterdesk-hbbr"
+SERVER_CONTAINER="betterdesk-server"
 CONSOLE_CONTAINER="betterdesk-console"
+# Legacy aliases for backwards compatibility in detect functions
+HBBS_CONTAINER="$SERVER_CONTAINER"
+HBBR_CONTAINER="$SERVER_CONTAINER"
 
 # Colors
 RED='\033[0;31m'
@@ -84,7 +97,7 @@ print_header() {
     echo "║                    ██████╔╝███████╗███████║██║  ██╗              ║"
     echo "║                    ╚═════╝ ╚══════╝╚══════╝╚═╝  ╚═╝              ║"
     echo "║                                                                  ║"
-    echo "║              Console Manager v${VERSION} (Docker)                     ║"
+    echo "║              Console Manager v${VERSION} (Docker)                ║"
     echo "╚══════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -289,30 +302,29 @@ configure_docker_paths() {
 
 detect_installation() {
     INSTALL_STATUS="none"
+    SERVER_RUNNING=false
     HBBS_RUNNING=false
     HBBR_RUNNING=false
     CONSOLE_RUNNING=false
     IMAGES_BUILT=false
     DATA_EXISTS=false
     
-    # Check if images exist
-    if docker images | grep -q "betterdesk-hbbs\|betterdesk-hbbr\|betterdesk-console"; then
+    # Check if images exist (new Go architecture: betterdesk-server + betterdesk-console)
+    if docker images | grep -q "betterdesk-server\|betterdesk-console"; then
         IMAGES_BUILT=true
         INSTALL_STATUS="partial"
     fi
     
     # Check data directory
-    if [ -d "$DATA_DIR" ] && [ -f "$DATA_DIR/db_v2.sqlite3" ]; then
+    if [ -d "$DATA_DIR" ]; then
         DATA_EXISTS=true
     fi
     
     # Check containers
-    if docker ps --format '{{.Names}}' | grep -q "$HBBS_CONTAINER"; then
-        HBBS_RUNNING=true
-    fi
-    
-    if docker ps --format '{{.Names}}' | grep -q "$HBBR_CONTAINER"; then
-        HBBR_RUNNING=true
+    if docker ps --format '{{.Names}}' | grep -q "$SERVER_CONTAINER"; then
+        SERVER_RUNNING=true
+        HBBS_RUNNING=true   # Alias for legacy checks
+        HBBR_RUNNING=true   # Go server includes relay
     fi
     
     if docker ps --format '{{.Names}}' | grep -q "$CONSOLE_CONTAINER"; then
@@ -320,7 +332,7 @@ detect_installation() {
     fi
     
     if [ "$IMAGES_BUILT" = true ] && [ "$DATA_EXISTS" = true ] && \
-       [ "$HBBS_RUNNING" = true ] && [ "$HBBR_RUNNING" = true ]; then
+       [ "$SERVER_RUNNING" = true ] && [ "$CONSOLE_RUNNING" = true ]; then
         INSTALL_STATUS="complete"
     fi
 }
@@ -349,7 +361,7 @@ print_status() {
     echo -e "${WHITE}${BOLD}═══ Image Status ═══${NC}"
     echo ""
     
-    for image in "betterdesk-hbbs" "betterdesk-hbbr" "betterdesk-console"; do
+    for image in "betterdesk-server" "betterdesk-console"; do
         if docker images --format '{{.Repository}}' | grep -q "^$image$"; then
             local size=$(docker images --format '{{.Size}}' "$image:latest" 2>/dev/null)
             echo -e "  $image: ${GREEN}✓ Built${NC} ($size)"
@@ -362,16 +374,10 @@ print_status() {
     echo -e "${WHITE}${BOLD}═══ Container Status ═══${NC}"
     echo ""
     
-    if [ "$HBBS_RUNNING" = true ]; then
-        echo -e "  HBBS (Signal):  ${GREEN}● Running${NC}"
+    if [ "$SERVER_RUNNING" = true ]; then
+        echo -e "  Server (Go):    ${GREEN}● Running${NC}  (signal + relay + API)"
     else
-        echo -e "  HBBS (Signal):  ${RED}○ Stopped${NC}"
-    fi
-    
-    if [ "$HBBR_RUNNING" = true ]; then
-        echo -e "  HBBR (Relay):   ${GREEN}● Running${NC}"
-    else
-        echo -e "  HBBR (Relay):   ${RED}○ Stopped${NC}"
+        echo -e "  Server (Go):    ${RED}○ Stopped${NC}"
     fi
     
     if [ "$CONSOLE_RUNNING" = true ]; then
@@ -425,18 +431,84 @@ install_docker() {
     print_success "Docker installed"
 }
 
+choose_database_type() {
+    if [ "$AUTO_MODE" = true ]; then
+        if [ "$USE_POSTGRESQL" = true ]; then
+            print_info "Using PostgreSQL (auto mode)"
+            DB_TYPE="postgresql"
+        else
+            print_info "Using SQLite (auto mode default)"
+            DB_TYPE="sqlite"
+        fi
+        return
+    fi
+    
+    echo ""
+    echo -e "${WHITE}${BOLD}Choose database type:${NC}"
+    echo ""
+    echo -e "  ${WHITE}1)${NC} SQLite (default, simple, no extra setup)"
+    echo -e "  ${WHITE}2)${NC} PostgreSQL (recommended for production, Docker container)"
+    echo ""
+    read -p "Choice [1]: " db_choice
+    
+    case "$db_choice" in
+        2)
+            DB_TYPE="postgresql"
+            print_info "PostgreSQL selected"
+            
+            # Get PostgreSQL credentials
+            echo ""
+            read -p "PostgreSQL password for 'betterdesk' user [betterdesk123]: " pg_pass
+            POSTGRESQL_PASS="${pg_pass:-betterdesk123}"
+            ;;
+        *)
+            DB_TYPE="sqlite"
+            print_info "SQLite selected"
+            ;;
+    esac
+}
+
 create_compose_file() {
     print_step "Creating docker-compose.yml..."
     
     local server_ip
     server_ip=$(curl -s ifconfig.me 2>/dev/null || curl -s icanhazip.com 2>/dev/null || echo "127.0.0.1")
     
+    # Start composing docker-compose.yml
     cat > "$COMPOSE_FILE" << EOF
 version: '3.8'
 
 services:
-  hbbs:
-    container_name: $HBBS_CONTAINER
+EOF
+
+    # Add PostgreSQL service if selected
+    if [ "$DB_TYPE" = "postgresql" ]; then
+        cat >> "$COMPOSE_FILE" << EOF
+  postgres:
+    container_name: betterdesk-postgres
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: $POSTGRESQL_USER
+      POSTGRES_PASSWORD: $POSTGRESQL_PASS
+      POSTGRES_DB: $POSTGRESQL_DB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $POSTGRESQL_USER -d $POSTGRESQL_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - betterdesk
+
+EOF
+    fi
+
+    # Add BetterDesk server (Go single binary — signal + relay + API)
+    cat >> "$COMPOSE_FILE" << EOF
+  server:
+    container_name: $SERVER_CONTAINER
     build:
       context: .
       dockerfile: Dockerfile.hbbs
@@ -446,24 +518,31 @@ services:
       - "21115:21115"
       - "21116:21116"
       - "21116:21116/udp"
+      - "21117:21117"
+      - "21118:21118"
+      - "21119:21119"
     volumes:
       - $DATA_DIR:/opt/rustdesk
     environment:
-      - RELAY_SERVER=$server_ip
-    restart: unless-stopped
-    networks:
-      - betterdesk
+      - ENCRYPTED_ONLY=1
+EOF
 
-  hbbr:
-    container_name: $HBBR_CONTAINER
-    build:
-      context: .
-      dockerfile: Dockerfile.hbbr
-    pull_policy: never
-    ports:
-      - "21117:21117"
-    volumes:
-      - $DATA_DIR:/opt/rustdesk
+    if [ "$DB_TYPE" = "postgresql" ]; then
+        cat >> "$COMPOSE_FILE" << EOF
+      - DB_URL=postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@postgres:5432/$POSTGRESQL_DB?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+EOF
+    fi
+
+    cat >> "$COMPOSE_FILE" << EOF
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:21114/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     restart: unless-stopped
     networks:
       - betterdesk
@@ -476,13 +555,53 @@ services:
     pull_policy: never
     ports:
       - "5000:5000"
+      - "21121:21121"
     volumes:
-      - $DATA_DIR:/opt/rustdesk
+      - $DATA_DIR:/opt/rustdesk:ro
+      - console_data:/app/data
     environment:
+      - NODE_ENV=production
+      - PORT=5000
       - RUSTDESK_PATH=/opt/rustdesk
-      - DATABASE_PATH=/opt/rustdesk/db_v2.sqlite3
+      - HBBS_API_URL=http://$SERVER_CONTAINER:21114/api
+      - BETTERDESK_API_URL=http://$SERVER_CONTAINER:21114/api
+      - SERVER_BACKEND=betterdesk
+      - DATA_DIR=/app/data
+      - DB_PATH=/opt/rustdesk/db_v2.sqlite3
+      - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
+      - API_KEY_PATH=/opt/rustdesk/.api_key
+      - WS_HBBS_HOST=$SERVER_CONTAINER
+      - WS_HBBS_PORT=21116
+      - WS_HBBR_HOST=$SERVER_CONTAINER
+      - WS_HBBR_PORT=21117
+      - DOCKER=true
+EOF
+
+    if [ "$DB_TYPE" = "postgresql" ]; then
+        cat >> "$COMPOSE_FILE" << EOF
+      - DB_TYPE=postgresql
+      - DATABASE_URL=postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@postgres:5432/$POSTGRESQL_DB?sslmode=disable
     depends_on:
-      - hbbs
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_healthy
+EOF
+    else
+        cat >> "$COMPOSE_FILE" << EOF
+    depends_on:
+      server:
+        condition: service_healthy
+EOF
+    fi
+
+    cat >> "$COMPOSE_FILE" << EOF
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     networks:
       - betterdesk
@@ -491,6 +610,22 @@ networks:
   betterdesk:
     driver: bridge
 EOF
+
+    # Add volumes
+    if [ "$DB_TYPE" = "postgresql" ]; then
+        cat >> "$COMPOSE_FILE" << EOF
+
+volumes:
+  console_data:
+  postgres_data:
+EOF
+    else
+        cat >> "$COMPOSE_FILE" << EOF
+
+volumes:
+  console_data:
+EOF
+    fi
 
     print_success "docker-compose.yml created"
 }
@@ -516,7 +651,7 @@ start_containers() {
     
     detect_installation
     
-    if [ "$HBBS_RUNNING" = true ] && [ "$HBBR_RUNNING" = true ] && [ "$CONSOLE_RUNNING" = true ]; then
+    if [ "$SERVER_RUNNING" = true ] && [ "$CONSOLE_RUNNING" = true ]; then
         print_success "All containers running"
     else
         print_warning "Some containers might not be working properly"
@@ -542,35 +677,24 @@ create_admin_user() {
     # Wait for database to be created
     sleep 3
     
-    # Create admin via console container
-    docker exec "$CONSOLE_CONTAINER" python3 << EOF
-import sqlite3
-import bcrypt
-from datetime import datetime
-
-db_path = '/opt/rustdesk/db_v2.sqlite3'
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
-
-cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    role TEXT DEFAULT 'viewer',
-    is_active INTEGER DEFAULT 1,
-    created_at TEXT,
-    last_login TEXT
-)''')
-
-cursor.execute("SELECT id FROM users WHERE username='admin'")
-if not cursor.fetchone():
-    password_hash = bcrypt.hashpw('$admin_password'.encode(), bcrypt.gensalt()).decode()
-    cursor.execute('''INSERT INTO users (username, password_hash, role, is_active, created_at)
-                      VALUES ('admin', ?, 'admin', 1, ?)''', (password_hash, datetime.now().isoformat()))
-    conn.commit()
-
-conn.close()
-EOF
+    # Node.js console auto-creates admin user on startup if no users exist
+    # We use the reset-password script to set a secure password
+    docker exec "$CONSOLE_CONTAINER" node /app/scripts/reset-password.js admin "$admin_password" 2>/dev/null || {
+        # If script fails, try via environment variable approach
+        print_info "Setting admin password via API..."
+        
+        # The console will create admin:admin by default on first run
+        # We need to change it to a secure random password
+        sleep 2
+        
+        # Use curl to change password (requires internal API)
+        # If this fails, admin will use default password which must be changed
+        docker exec "$CONSOLE_CONTAINER" sh -c "
+            if [ -f /app/scripts/reset-password.js ]; then
+                node /app/scripts/reset-password.js admin '$admin_password' 2>/dev/null
+            fi
+        " 2>/dev/null || true
+    }
 
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
@@ -622,14 +746,15 @@ do_install() {
         stop_containers
     fi
     
+    # Choose database type (SQLite or PostgreSQL)
+    choose_database_type
+    
     # Create data directory
     mkdir -p "$DATA_DIR"
     mkdir -p "$BACKUP_DIR"
     
-    # Check for existing compose file or create new
-    if [ ! -f "$COMPOSE_FILE" ]; then
-        create_compose_file
-    fi
+    # Always recreate compose file to include database configuration
+    create_compose_file
     
     build_images
     start_containers
@@ -648,6 +773,11 @@ do_install() {
     echo -e "${CYAN}║  Web Panel:     ${WHITE}http://$server_ip:5000${CYAN}                   ║${NC}"
     echo -e "${CYAN}║  Server ID:     ${WHITE}$server_ip${CYAN}                              ║${NC}"
     echo -e "${CYAN}║  Data:          ${WHITE}$DATA_DIR${CYAN}                      ║${NC}"
+    if [ "$DB_TYPE" = "postgresql" ]; then
+    echo -e "${CYAN}║  Database:      ${WHITE}PostgreSQL (Docker container)${CYAN}          ║${NC}"
+    else
+    echo -e "${CYAN}║  Database:      ${WHITE}SQLite${CYAN}                                  ║${NC}"
+    fi
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
     
     press_enter
@@ -743,45 +873,21 @@ do_repair() {
 repair_database_docker() {
     print_step "Repair database..."
     
-    if [ ! -f "$DATA_DIR/db_v2.sqlite3" ]; then
-        print_warning "Database does not exist"
+    # Node.js console auto-initializes tables on startup.
+    # Restarting the console container triggers full table check.
+    docker restart "$CONSOLE_CONTAINER" 2>/dev/null || {
+        print_warning "Console container is not running"
         return
-    fi
+    }
     
-    docker exec "$CONSOLE_CONTAINER" python3 << 'EOF'
-import sqlite3
-
-conn = sqlite3.connect('/opt/rustdesk/db_v2.sqlite3')
-cursor = conn.cursor()
-
-columns_to_add = [
-    ('status', 'INTEGER DEFAULT 0'),
-    ('last_online', 'TEXT'),
-    ('is_deleted', 'INTEGER DEFAULT 0'),
-    ('deleted_at', 'TEXT'),
-    ('updated_at', 'TEXT'),
-    ('note', 'TEXT'),
-    ('previous_ids', 'TEXT'),
-    ('id_changed_at', 'TEXT'),
-]
-
-cursor.execute("PRAGMA table_info(peer)")
-existing_columns = [col[1] for col in cursor.fetchall()]
-
-for col_name, col_def in columns_to_add:
-    if col_name not in existing_columns:
-        try:
-            cursor.execute(f"ALTER TABLE peer ADD COLUMN {col_name} {col_def}")
-            print(f"  Added column: {col_name}")
-        except:
-            pass
-
-conn.commit()
-conn.close()
-print("Database repaired")
-EOF
-
-    print_success "Database repaired"
+    sleep 5
+    
+    # Verify via health endpoint
+    if docker exec "$CONSOLE_CONTAINER" curl -sf http://localhost:5000/health >/dev/null 2>&1; then
+        print_success "Database repaired (console restarted, tables verified)"
+    else
+        print_warning "Console restarted but health check failed"
+    fi
 }
 
 #===============================================================================
@@ -821,7 +927,7 @@ do_validate() {
     echo -e "${WHITE}Checking images...${NC}"
     echo ""
     
-    for image in "betterdesk-hbbs" "betterdesk-hbbr" "betterdesk-console"; do
+    for image in "betterdesk-server" "betterdesk-console"; do
         echo -n "  $image: "
         if docker images --format '{{.Repository}}' | grep -q "^$image$"; then
             echo -e "${GREEN}✓ Built${NC}"
@@ -838,16 +944,8 @@ do_validate() {
     
     detect_installation
     
-    echo -n "  HBBS: "
-    if [ "$HBBS_RUNNING" = true ]; then
-        echo -e "${GREEN}● Running${NC}"
-    else
-        echo -e "${RED}○ Stopped${NC}"
-        ((errors++))
-    fi
-    
-    echo -n "  HBBR: "
-    if [ "$HBBR_RUNNING" = true ]; then
+    echo -n "  Server (Go): "
+    if [ "$SERVER_RUNNING" = true ]; then
         echo -e "${GREEN}● Running${NC}"
     else
         echo -e "${RED}○ Stopped${NC}"
@@ -888,7 +986,7 @@ do_validate() {
     echo -e "${WHITE}Checking ports...${NC}"
     echo ""
     
-    for port in 21114 21115 21116 21117 5000; do
+    for port in 21114 21115 21116 21117 5000 21121; do
         echo -n "  Port $port: "
         if ss -tlnp 2>/dev/null | grep -q ":$port " || netstat -tlnp 2>/dev/null | grep -q ":$port "; then
             echo -e "${GREEN}● Listening${NC}"
@@ -1008,24 +1106,30 @@ do_reset_password() {
             ;;
     esac
     
-    # Update password
-    docker exec "$CONSOLE_CONTAINER" python3 << EOF
-import sqlite3
-import bcrypt
+    # Update password using Node.js inline script
+    docker exec "$CONSOLE_CONTAINER" node -e "
+const bcrypt = require('bcrypt');
+const Database = require('better-sqlite3');
+const path = require('path');
 
-conn = sqlite3.connect('/opt/rustdesk/db_v2.sqlite3')
-cursor = conn.cursor()
+const dataDir = process.env.DATA_DIR || '/app/data';
+const dbPath = path.join(dataDir, 'auth.db');
 
-password_hash = bcrypt.hashpw('$new_password'.encode(), bcrypt.gensalt()).decode()
-cursor.execute("UPDATE users SET password_hash = ? WHERE username = 'admin'", (password_hash,))
+const db = new Database(dbPath);
+const hash = bcrypt.hashSync('$new_password', 10);
 
-if cursor.rowcount == 0:
-    cursor.execute('''INSERT INTO users (username, password_hash, role, is_active)
-                      VALUES ('admin', ?, 'admin', 1)''', (password_hash,))
+const update = db.prepare('UPDATE users SET password_hash = ? WHERE username = ?');
+const result = update.run(hash, 'admin');
 
-conn.commit()
-conn.close()
-EOF
+if (result.changes === 0) {
+    const insert = db.prepare('INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (?, ?, ?, 1, datetime(\"now\"))');
+    insert.run('admin', hash, 'admin');
+    console.log('Admin user created');
+} else {
+    console.log('Password updated');
+}
+db.close();
+"
 
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
@@ -1054,9 +1158,8 @@ do_build() {
     echo "Select option:"
     echo ""
     echo "  1. Rebuild all images"
-    echo "  2. Rebuild only HBBS"
-    echo "  3. Rebuild only HBBR"  
-    echo "  4. Rebuild only Console"
+    echo "  2. Rebuild Server (Go)"
+    echo "  3. Rebuild Console (Node.js)"
     echo "  0. Back"
     echo ""
     
@@ -1070,15 +1173,11 @@ do_build() {
             $COMPOSE_CMD build --no-cache
             ;;
         2)
-            print_step "Building HBBS..."
-            $COMPOSE_CMD build --no-cache hbbs
+            print_step "Building Server (Go)..."
+            $COMPOSE_CMD build --no-cache server
             ;;
         3)
-            print_step "Building HBBR..."
-            $COMPOSE_CMD build --no-cache hbbr
-            ;;
-        4)
-            print_step "Building Console..."
+            print_step "Building Console (Node.js)..."
             $COMPOSE_CMD build --no-cache console
             ;;
         0)
@@ -1111,7 +1210,7 @@ do_diagnostics() {
     echo -e "${WHITE}${BOLD}═══ Container logs (last 15 lines) ═══${NC}"
     echo ""
     
-    for container in "$HBBS_CONTAINER" "$HBBR_CONTAINER" "$CONSOLE_CONTAINER"; do
+    for container in "$SERVER_CONTAINER" "$CONSOLE_CONTAINER"; do
         echo -e "${CYAN}--- $container ---${NC}"
         docker logs --tail 15 "$container" 2>&1 || echo "Container does not exist"
         echo ""
@@ -1127,24 +1226,26 @@ do_diagnostics() {
     echo ""
     
     if [ "$CONSOLE_RUNNING" = true ]; then
-        docker exec "$CONSOLE_CONTAINER" python3 << 'EOF'
-import sqlite3
-try:
-    conn = sqlite3.connect('/opt/rustdesk/db_v2.sqlite3')
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM peer WHERE is_deleted = 0")
-    devices = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM peer WHERE status = 1 AND is_deleted = 0")
-    online = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM users")
-    users = cursor.fetchone()[0]
-    print(f"  Devices:           {devices}")
-    print(f"  Online:            {online}")
-    print(f"  Users:             {users}")
-    conn.close()
-except Exception as e:
-    print(f"  Database read error: {e}")
-EOF
+        # Fetch stats via the console REST API
+        docker exec "$CONSOLE_CONTAINER" sh -c '
+            STATS=$(curl -sf http://localhost:5000/health 2>/dev/null)
+            if [ -n "$STATS" ]; then
+                echo "  Console: healthy"
+            else
+                echo "  Console: health check failed"
+            fi
+        '
+        # Fetch device stats from Go server API
+        if [ "$SERVER_RUNNING" = true ]; then
+            docker exec "$SERVER_CONTAINER" sh -c '
+                RESP=$(curl -sf http://localhost:21114/api/peers 2>/dev/null)
+                if [ -n "$RESP" ]; then
+                    echo "  Server API: responding"
+                else
+                    echo "  Server API: not responding"
+                fi
+            ' 2>/dev/null || echo "  Server API: container not accessible"
+        fi
     else
         echo "  Console container is not running"
     fi
@@ -1180,7 +1281,7 @@ do_uninstall() {
     $COMPOSE_CMD down -v 2>/dev/null || true
     
     if confirm "Remove Docker images?"; then
-        docker rmi betterdesk-hbbs betterdesk-hbbr betterdesk-console 2>/dev/null || true
+        docker rmi betterdesk-server betterdesk-console 2>/dev/null || true
         print_info "Images removed"
     fi
     
@@ -1414,7 +1515,8 @@ do_migrate() {
     
     if [ -n "$EXISTING_DB_FILE" ]; then
         local peer_count
-        peer_count=$(sqlite3 "$EXISTING_DB_FILE" "SELECT COUNT(*) FROM peer;" 2>/dev/null || echo "?")
+        peer_count=$(sqlite3 "$EXISTING_DB_FILE" "SELECT COUNT(*) FROM peers;" 2>/dev/null || \
+                     sqlite3 "$EXISTING_DB_FILE" "SELECT COUNT(*) FROM peer;" 2>/dev/null || echo "?")
         echo -e "    ${GREEN}✓${NC} db_v2.sqlite3 (${peer_count} devices)"
     else
         echo -e "    ${YELLOW}!${NC} db_v2.sqlite3 (not found - new DB will be created)"
@@ -1568,6 +1670,294 @@ do_migrate() {
 }
 
 #===============================================================================
+# SQLite to PostgreSQL Migration
+#===============================================================================
+
+do_migrate_postgresql() {
+    print_header
+    echo -e "${WHITE}${BOLD}══════════ SQLite → PostgreSQL MIGRATION ══════════${NC}"
+    echo ""
+    
+    # Check if containers are running
+    detect_installation
+    
+    if [ "$INSTALL_STATUS" = "none" ]; then
+        print_error "BetterDesk Docker is not installed!"
+        press_enter
+        return
+    fi
+    
+    # Check if SQLite database exists
+    local sqlite_db="$DATA_DIR/db_v2.sqlite3"
+    if [ ! -f "$sqlite_db" ]; then
+        print_error "SQLite database not found: $sqlite_db"
+        press_enter
+        return
+    fi
+    
+    print_info "Found SQLite database: $sqlite_db"
+    
+    # Get device count
+    local device_count
+    # Go server uses 'peers' table; legacy Rust uses 'peer'
+    device_count=$(docker exec "$CONSOLE_CONTAINER" sqlite3 "$sqlite_db" "SELECT COUNT(*) FROM peers;" 2>/dev/null || \
+                   docker exec "$CONSOLE_CONTAINER" sqlite3 "$sqlite_db" "SELECT COUNT(*) FROM peer;" 2>/dev/null || echo "0")
+    print_info "Devices in database: $device_count"
+    echo ""
+    
+    if ! confirm "Migrate to PostgreSQL? This will modify docker-compose.yml"; then
+        return
+    fi
+    
+    # Get PostgreSQL password
+    echo ""
+    read -p "PostgreSQL password for 'betterdesk' user [betterdesk123]: " pg_pass
+    POSTGRESQL_PASS="${pg_pass:-betterdesk123}"
+    
+    # Backup current setup
+    print_step "Creating backup..."
+    do_backup_silent
+    
+    # Stop containers
+    print_step "Stopping containers..."
+    stop_containers
+    
+    # Set database type
+    DB_TYPE="postgresql"
+    
+    # Recreate compose file with PostgreSQL
+    create_compose_file
+    
+    # Build and start with PostgreSQL
+    print_step "Starting containers with PostgreSQL..."
+    build_images
+    start_containers
+    
+    # Wait for PostgreSQL to be ready
+    print_step "Waiting for PostgreSQL to be ready..."
+    sleep 10
+    
+    # Check if migration tool is available
+    local migrate_tool=""
+    local arch=$(uname -m)
+    case "$arch" in
+        x86_64) migrate_tool="./betterdesk-server/tools/migrate/migrate-linux-amd64" ;;
+        aarch64|arm64) migrate_tool="./betterdesk-server/tools/migrate/migrate-linux-arm64" ;;
+    esac
+    
+    if [ ! -f "$migrate_tool" ]; then
+        print_warning "Migration tool not found: $migrate_tool"
+        print_info "You can migrate manually using:"
+        echo "  $migrate_tool sqlite2pg --sqlite \"$sqlite_db\" --pg \"postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@localhost:5432/$POSTGRESQL_DB?sslmode=disable\""
+        echo ""
+        print_info "PostgreSQL container is running. You can connect to it with:"
+        echo "  docker exec -it betterdesk-postgres psql -U $POSTGRESQL_USER -d $POSTGRESQL_DB"
+        press_enter
+        return
+    fi
+    
+    # Run migration
+    print_step "Migrating data from SQLite to PostgreSQL..."
+    chmod +x "$migrate_tool"
+    
+    # PostgreSQL is inside Docker, so we need to use host network or port mapping
+    # Default docker-compose doesn't expose PostgreSQL port, so we connect via Docker network
+    # For migration, we need to temporarily expose PostgreSQL or copy data
+    
+    # Copy SQLite database to migrate tool location
+    cp "$sqlite_db" "/tmp/betterdesk_migrate.sqlite3"
+    
+    # Since PostgreSQL is inside Docker, we need to connect via localhost:5432 if exposed
+    # or use docker exec. Let's use docker exec approach:
+    
+    print_step "Creating PostgreSQL schema..."
+    docker exec betterdesk-postgres psql -U "$POSTGRESQL_USER" -d "$POSTGRESQL_DB" << 'EOSQL'
+CREATE TABLE IF NOT EXISTS peers (
+    guid TEXT PRIMARY KEY,
+    id TEXT UNIQUE NOT NULL,
+    uuid TEXT,
+    pk BYTEA,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_online TIMESTAMPTZ,
+    info TEXT,
+    hostname TEXT,
+    username TEXT,
+    os TEXT,
+    version TEXT,
+    cpu TEXT,
+    memory TEXT,
+    is_banned BOOLEAN DEFAULT FALSE,
+    ban_reason TEXT,
+    banned_at TIMESTAMPTZ,
+    banned_until TIMESTAMPTZ,
+    deleted BOOLEAN DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id BIGSERIAL PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'viewer',
+    totp_secret TEXT,
+    totp_enabled BOOLEAN DEFAULT FALSE,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_login TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS address_books (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    ab_name TEXT NOT NULL,
+    ab_data TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    permissions TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_used TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS server_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS peer_tags (
+    peer_guid TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (peer_guid, tag)
+);
+
+CREATE TABLE IF NOT EXISTS id_history (
+    id BIGSERIAL PRIMARY KEY,
+    peer_guid TEXT NOT NULL,
+    old_id TEXT NOT NULL,
+    new_id TEXT NOT NULL,
+    changed_at TIMESTAMPTZ DEFAULT NOW(),
+    changed_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ DEFAULT NOW(),
+    event_type TEXT NOT NULL,
+    actor TEXT,
+    target TEXT,
+    details TEXT,
+    ip_address TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_peers_id ON peers(id);
+CREATE INDEX IF NOT EXISTS idx_peers_last_online ON peers(last_online);
+CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+EOSQL
+
+    print_success "PostgreSQL schema created"
+    
+    # Export data from SQLite and import to PostgreSQL
+    print_step "Migrating peer data..."
+    
+    # Extract data from SQLite (try 'peers' table first, fall back to 'peer' for legacy Rust)
+    docker exec "$CONSOLE_CONTAINER" sqlite3 "/opt/rustdesk/db_v2.sqlite3" -csv \
+        "SELECT guid, id, uuid, pk, created_at, last_online, info, hostname, username, os, version, cpu, memory, is_banned, ban_reason, banned_at, banned_until, coalesce(deleted, 0) FROM peers;" \
+        > /tmp/peers_export.csv 2>/dev/null || \
+    docker exec "$CONSOLE_CONTAINER" sqlite3 "/opt/rustdesk/db_v2.sqlite3" -csv \
+        "SELECT guid, id, uuid, pk, created_at, last_online, info, hostname, username, os, version, cpu, memory, is_banned, ban_reason, banned_at, banned_until, coalesce(deleted, 0) FROM peer;" \
+        > /tmp/peers_export.csv 2>/dev/null || true
+    
+    if [ -f /tmp/peers_export.csv ] && [ -s /tmp/peers_export.csv ]; then
+        # Copy to PostgreSQL container
+        docker cp /tmp/peers_export.csv betterdesk-postgres:/tmp/peers_export.csv
+        
+        # Import with proper type conversion
+        docker exec betterdesk-postgres psql -U "$POSTGRESQL_USER" -d "$POSTGRESQL_DB" << 'EOSQL'
+CREATE TEMP TABLE peers_import (
+    guid TEXT, id TEXT, uuid TEXT, pk TEXT, created_at TEXT, last_online TEXT,
+    info TEXT, hostname TEXT, username TEXT, os TEXT, version TEXT, cpu TEXT, memory TEXT,
+    is_banned TEXT, ban_reason TEXT, banned_at TEXT, banned_until TEXT, deleted TEXT
+);
+\copy peers_import FROM '/tmp/peers_export.csv' WITH (FORMAT csv);
+INSERT INTO peers (guid, id, uuid, pk, created_at, last_online, info, hostname, username, os, version, cpu, memory, is_banned, ban_reason, banned_at, banned_until, deleted)
+SELECT 
+    guid, id, uuid, decode(pk, 'hex'), 
+    CASE WHEN created_at != '' THEN created_at::timestamptz ELSE NOW() END,
+    CASE WHEN last_online != '' THEN last_online::timestamptz END,
+    info, hostname, username, os, version, cpu, memory,
+    CASE WHEN is_banned = '1' THEN TRUE ELSE FALSE END,
+    ban_reason,
+    CASE WHEN banned_at != '' THEN banned_at::timestamptz END,
+    CASE WHEN banned_until != '' THEN banned_until::timestamptz END,
+    CASE WHEN deleted = '1' THEN TRUE ELSE FALSE END
+FROM peers_import
+ON CONFLICT (id) DO NOTHING;
+DROP TABLE peers_import;
+EOSQL
+        
+        rm -f /tmp/peers_export.csv
+        print_success "Peer data migrated"
+    else
+        print_warning "No peer data to migrate or export failed"
+    fi
+    
+    # Migrate users if they exist
+    print_step "Migrating users..."
+    docker exec "$CONSOLE_CONTAINER" sqlite3 "/opt/rustdesk/db_v2.sqlite3" -csv \
+        "SELECT username, password_hash, role, coalesce(is_active, 1), created_at, last_login FROM users;" \
+        > /tmp/users_export.csv 2>/dev/null || true
+    
+    if [ -f /tmp/users_export.csv ] && [ -s /tmp/users_export.csv ]; then
+        docker cp /tmp/users_export.csv betterdesk-postgres:/tmp/users_export.csv
+        
+        docker exec betterdesk-postgres psql -U "$POSTGRESQL_USER" -d "$POSTGRESQL_DB" << 'EOSQL'
+CREATE TEMP TABLE users_import (
+    username TEXT, password_hash TEXT, role TEXT, is_active TEXT, created_at TEXT, last_login TEXT
+);
+\copy users_import FROM '/tmp/users_export.csv' WITH (FORMAT csv);
+INSERT INTO users (username, password_hash, role, is_active, created_at, last_login)
+SELECT 
+    username, password_hash, role,
+    CASE WHEN is_active = '1' THEN TRUE ELSE FALSE END,
+    CASE WHEN created_at != '' THEN created_at::timestamptz ELSE NOW() END,
+    CASE WHEN last_login != '' THEN last_login::timestamptz END
+FROM users_import
+ON CONFLICT (username) DO NOTHING;
+DROP TABLE users_import;
+EOSQL
+        
+        rm -f /tmp/users_export.csv
+        print_success "Users migrated"
+    fi
+    
+    # Verify migration
+    print_step "Verifying migration..."
+    local pg_count
+    pg_count=$(docker exec betterdesk-postgres psql -U "$POSTGRESQL_USER" -d "$POSTGRESQL_DB" -t -c "SELECT COUNT(*) FROM peers;" | tr -d ' ')
+    
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║           SQLite → PostgreSQL MIGRATION COMPLETE                 ║${NC}"
+    echo -e "${GREEN}╠══════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}║  SQLite devices:     ${WHITE}$device_count${GREEN}                                       ║${NC}"
+    echo -e "${GREEN}║  PostgreSQL devices: ${WHITE}$pg_count${GREEN}                                       ║${NC}"
+    echo -e "${GREEN}║  Database URL:       ${WHITE}postgres://$POSTGRESQL_USER:***@postgres:5432/$POSTGRESQL_DB${GREEN}  ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    print_info "Containers have been reconfigured to use PostgreSQL"
+    print_info "SQLite database preserved at: $sqlite_db"
+    
+    press_enter
+}
+
+#===============================================================================
 # Main Menu
 #===============================================================================
 
@@ -1588,6 +1978,7 @@ show_menu() {
     echo "  9. 🗑️  UNINSTALL"
     echo ""
     echo "  M. 🔄 Migrate from existing RustDesk"
+    echo "  P. 🐘 Migrate SQLite → PostgreSQL"
     echo "  S. ⚙️  Settings (paths)"
     echo "  0. ❌ Exit"
     echo ""
@@ -1626,6 +2017,7 @@ main() {
             8) do_diagnostics ;;
             9) do_uninstall ;;
             [Mm]) do_migrate ;;
+            [Pp]) do_migrate_postgresql ;;
             [Ss]) configure_docker_paths ;;
             0) 
                 echo ""

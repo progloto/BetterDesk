@@ -8,6 +8,7 @@ const db = require('../services/database');
 const hbbsApi = require('../services/hbbsApi');
 const keyService = require('../services/keyService');
 const config = require('../config/config');
+const serverBackend = require('../services/serverBackend');
 const { requireAuth } = require('../middleware/auth');
 
 /**
@@ -25,11 +26,11 @@ router.get('/', requireAuth, (req, res) => {
  */
 router.get('/api/stats', requireAuth, async (req, res) => {
     try {
-        // Get device stats from database
-        const stats = db.getStats();
+        // Get device stats (delegates to Go API or local DB based on backend)
+        const stats = await serverBackend.getStats();
         
-        // Get HBBS API health
-        const hbbsHealth = await hbbsApi.getHealth();
+        // Get server health
+        const hbbsHealth = await serverBackend.getHealth();
         
         // Get public key info
         const publicKey = keyService.getPublicKey();
@@ -39,6 +40,7 @@ router.get('/api/stats', requireAuth, async (req, res) => {
             data: {
                 devices: stats,
                 hbbs: hbbsHealth,
+                backend: serverBackend.getActiveBackend(),
                 publicKey: publicKey ? true : false
             }
         });
@@ -53,42 +55,68 @@ router.get('/api/stats', requireAuth, async (req, res) => {
 
 /**
  * GET /api/server/status - Get server status
+ * In betterdesk mode: probes the Go server /api/health (single binary serves all).
+ * In rustdesk mode: probes hbbs (health) + hbbr (TCP connect).
+ * Returns a unified shape consumed by dashboard.js.
  */
 router.get('/api/server/status', requireAuth, async (req, res) => {
     try {
-        const hbbsHealth = await hbbsApi.getHealth();
-        
-        // Check HBBR by trying to connect to port 21117
-        let hbbrStatus = { status: 'unknown' };
+        const isBD = serverBackend.isBetterDesk();
+
+        // Primary check: always try the API health endpoint
+        const hbbsHealth = await serverBackend.getHealth();
+        const apiRunning = hbbsHealth && hbbsHealth.status === 'running';
+
+        // Secondary check: TCP probe on relay port (21117)
+        let relayStatus = { status: 'unknown' };
         try {
             const net = require('net');
-            const hbbrCheck = await new Promise((resolve) => {
+            relayStatus = await new Promise((resolve) => {
                 const socket = new net.Socket();
                 socket.setTimeout(2000);
-                socket.on('connect', () => {
-                    socket.destroy();
-                    resolve({ status: 'running' });
-                });
+                socket.on('connect', () => { socket.destroy(); resolve({ status: 'running' }); });
                 socket.on('error', () => resolve({ status: 'stopped' }));
-                socket.on('timeout', () => {
-                    socket.destroy();
-                    resolve({ status: 'stopped' });
-                });
+                socket.on('timeout', () => { socket.destroy(); resolve({ status: 'stopped' }); });
                 socket.connect(config.wsProxy.hbbrPort, config.wsProxy.hbbrHost);
             });
-            hbbrStatus = hbbrCheck;
-        } catch (e) {
-            hbbrStatus = { status: 'unknown' };
-        }
-        
+        } catch { relayStatus = { status: 'unknown' }; }
+
+        // Signal port probe (21116 TCP)
+        let signalStatus = { status: 'unknown' };
+        try {
+            const net = require('net');
+            signalStatus = await new Promise((resolve) => {
+                const socket = new net.Socket();
+                socket.setTimeout(2000);
+                socket.on('connect', () => { socket.destroy(); resolve({ status: 'running' }); });
+                socket.on('error', () => resolve({ status: 'stopped' }));
+                socket.on('timeout', () => { socket.destroy(); resolve({ status: 'stopped' }); });
+                socket.connect(config.wsProxy.hbbsPort, config.wsProxy.hbbsHost);
+            });
+        } catch { signalStatus = { status: 'unknown' }; }
+
+        // Build port map for the UI
+        const apiPort = parseInt(new URL(
+            isBD ? config.betterdeskApiUrl : config.hbbsApiUrl
+        ).port, 10) || 21114;
+
         res.json({
             success: true,
             data: {
-                hbbs: hbbsHealth,
-                hbbr: hbbrStatus,
-                api_port: parseInt(new URL(config.hbbsApiUrl).port, 10) || 21114,
-                hbbs_port: config.wsProxy.hbbsPort,
-                hbbr_port: config.wsProxy.hbbrPort
+                backend: isBD ? 'betterdesk' : 'rustdesk',
+                // Main status indicators
+                hbbs: apiRunning ? { status: 'running' } : { status: 'stopped' },
+                hbbr: relayStatus,
+                signal: signalStatus,
+                // Port values
+                api_port: apiPort,
+                signal_port: config.wsProxy.hbbsPort,
+                relay_port: config.wsProxy.hbbrPort,
+                nat_port: (config.wsProxy.hbbsPort - 1),      // 21115
+                ws_signal_port: (config.wsProxy.hbbsPort + 2), // 21118
+                ws_relay_port: (config.wsProxy.hbbrPort + 2),  // 21119
+                client_api_port: config.apiPort,                // 21121
+                console_port: config.port                       // 5000
             }
         });
     } catch (err) {
@@ -105,7 +133,7 @@ router.get('/api/server/status', requireAuth, async (req, res) => {
  */
 router.post('/api/sync-status', requireAuth, async (req, res) => {
     try {
-        const result = await hbbsApi.syncOnlineStatus(db.getDb());
+        const result = await serverBackend.syncOnlineStatus();
         
         res.json({
             success: true,

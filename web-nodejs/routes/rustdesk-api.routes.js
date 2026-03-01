@@ -1,34 +1,66 @@
 /**
  * BetterDesk Console - RustDesk Client API Routes
  * 
- * RustDesk-compatible login/logout/currentUser endpoints.
+ * RustDesk-compatible API endpoints.
  * Runs on a dedicated port (default 21121) for WAN access.
  * 
- * Protocol Reference:
- *   POST /api/login         - Authenticate (username+password or TFA code)
- *   POST /api/logout        - Revoke token
- *   GET  /api/currentUser   - Get current user info (Bearer auth)
- *   GET  /api/login-options - List available login methods
+ * Protocol Reference — Phase 1 (Core):
+ *   POST /api/login           - Authenticate (username+password or TFA code)
+ *   POST /api/logout          - Revoke token
+ *   GET  /api/currentUser     - Get current user info (Bearer auth)
+ *   GET  /api/login-options   - List available login methods
+ *   POST /api/sysinfo         - Report device system info
+ *   POST /api/heartbeat       - Periodic heartbeat with metrics
+ *   GET  /api/peers           - List peers with sysinfo + status
+ *   GET  /api/server-key      - Get RS public key (Ed25519 base64)
+ * 
+ * Protocol Reference — Phase 2 (Audit):
+ *   POST /api/audit/conn      - Report connection event
+ *   POST /api/audit/file      - Report file transfer event
+ *   POST /api/audit/alarm     - Report security alarm
+ *   GET  /api/audit/conn      - Query connection events
+ *   GET  /api/audit/file      - Query file transfer events
+ *   GET  /api/audit/alarm     - Query alarm events
+ * 
+ * Protocol Reference — Phase 3 (Groups & Strategies):
+ *   GET/POST   /api/user-groups     - User group management
+ *   GET/POST   /api/device-group    - Device group management
+ *   GET        /api/device-group/accessible - Accessible device groups
+ *   GET        /api/strategies      - Access control strategies
  * 
  * @author UNITRONIX
- * @version 1.0.0
+ * @version 2.0.0
  */
 
 const express = require('express');
 const router = express.Router();
+const fs = require('fs');
+const crypto = require('crypto');
 const authService = require('../services/authService');
 const db = require('../services/database');
+const config = require('../config/config');
+
+// ==================== Constants ====================
+
+/** Valid connection types for audit events */
+const CONN_TYPES = [0, 1, 2, 3, 4]; // Remote, FileTransfer, PortForward, Camera, Terminal
+
+/** Valid alarm types */
+const ALARM_TYPES = [0, 1, 2, 3, 4, 5, 6]; // AccessAttempt, BruteForce, IPViolation, Unauthorized, PortScan, MaliciousFile, Custom
+
+/** Maximum lengths for string fields (input sanitization) */
+const MAX_ID_LEN = 32;
+const MAX_HOSTNAME_LEN = 256;
+const MAX_STRING_LEN = 512;
+const MAX_PATH_LEN = 1024;
 
 // ==================== Helper Functions ====================
 
 /**
- * Extract client IP from request (supports proxies)
+ * Extract client IP from request (uses Express trust proxy)
  */
 function getClientIp(req) {
-    return req.headers['x-forwarded-for']?.split(',')[0]?.trim()
-        || req.headers['x-real-ip']
-        || req.socket?.remoteAddress
-        || 'unknown';
+    return req.ip || req.socket?.remoteAddress || 'unknown';
 }
 
 /**
@@ -55,7 +87,54 @@ function buildUserPayload(user) {
     };
 }
 
-// ==================== Endpoints ====================
+/**
+ * Authenticate request via Bearer token — returns user or null
+ */
+function authenticateRequest(req) {
+    const token = extractBearerToken(req);
+    if (!token) return null;
+    return authService.validateAccessToken(token);
+}
+
+/**
+ * Middleware: require Bearer auth
+ */
+function requireAuth(req, res, next) {
+    const user = authenticateRequest(req);
+    if (!user) {
+        return res.status(401).json({ error: 'Authorization required' });
+    }
+    req.authUser = user;
+    next();
+}
+
+/**
+ * Middleware: require admin role
+ */
+function requireAdmin(req, res, next) {
+    if (!req.authUser || req.authUser.role !== 'admin') {
+        return res.status(403).json({ error: 'Admin privileges required' });
+    }
+    next();
+}
+
+/**
+ * Sanitize string input — truncate and strip control chars
+ */
+function sanitizeStr(val, maxLen = MAX_STRING_LEN) {
+    if (typeof val !== 'string') return '';
+    // Strip control characters except newline/tab
+    return val.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').substring(0, maxLen);
+}
+
+/**
+ * Validate device ID format (alphanumeric, max length)
+ */
+function isValidDeviceId(id) {
+    return typeof id === 'string' && id.length > 0 && id.length <= MAX_ID_LEN && /^[a-zA-Z0-9_-]+$/.test(id);
+}
+
+// ==================== Phase 0: Core Auth Endpoints ====================
 
 /**
  * GET /api/login-options
@@ -69,27 +148,190 @@ router.get('/api/login-options', (req, res) => {
 
 /**
  * POST /api/heartbeat
- * RustDesk client sends periodic heartbeat to report status.
- * Must return a valid JSON response to prevent client errors.
+ * RustDesk client sends periodic heartbeat with CPU/memory/disk metrics.
+ * Stores metrics data and updates peer online status.
+ * Device must exist in peer table (prevents phantom entries).
  */
 router.post('/api/heartbeat', (req, res) => {
-    const token = extractBearerToken(req);
-    if (token) {
-        const user = authService.validateAccessToken(token);
-        if (user) {
-            return res.json({ modified_at: new Date().toISOString() });
-        }
+    const body = req.body || {};
+
+    // Extract and validate device ID
+    const deviceId = sanitizeStr(body.id || body.uuid || '', MAX_ID_LEN);
+    if (!deviceId || !isValidDeviceId(deviceId)) {
+        return res.json({ modified_at: new Date().toISOString() });
     }
+
+    // Verify the device exists in the peer table (prevents spoofing phantom devices)
+    const existingDevice = db.getDevice(deviceId);
+    if (!existingDevice) {
+        return res.json({ modified_at: new Date().toISOString() });
+    }
+
+    // Parse metric data from heartbeat payload
+    const cpuUsage = typeof body.cpu === 'number' ? Math.min(100, Math.max(0, body.cpu)) : 0;
+    const memoryUsage = typeof body.memory === 'number' ? Math.min(100, Math.max(0, body.memory)) : 0;
+    const diskUsage = typeof body.disk === 'number' ? Math.min(100, Math.max(0, body.disk)) : 0;
+
+    try {
+        db.insertPeerMetric(deviceId, cpuUsage, memoryUsage, diskUsage);
+        db.updatePeerOnlineStatus(deviceId);
+    } catch (err) {
+        console.warn('[API:HEARTBEAT] Failed to store metrics:', err.message);
+    }
+
+    // Check if we need sysinfo update (missing or stale > 1 hour)
+    try {
+        const sysinfo = db.getPeerSysinfo(deviceId);
+        if (!sysinfo) {
+            // No sysinfo - request client to send it (JSON with "sysinfo" key)
+            console.log(`[API:HEARTBEAT] Requesting sysinfo from ${deviceId} (missing)`);
+            return res.json({ modified_at: new Date().toISOString(), sysinfo: true });
+        }
+        
+        // Check if sysinfo is older than 1 hour
+        const updatedAt = new Date(sysinfo.updated_at).getTime();
+        const oneHourAgo = Date.now() - (60 * 60 * 1000);
+        if (updatedAt < oneHourAgo) {
+            console.log(`[API:HEARTBEAT] Requesting sysinfo refresh from ${deviceId} (stale)`);
+            return res.json({ modified_at: new Date().toISOString(), sysinfo: true });
+        }
+    } catch (err) {
+        // On error, just continue with normal response
+    }
+
     return res.json({ modified_at: new Date().toISOString() });
 });
 
 /**
  * POST /api/sysinfo
- * RustDesk client reports system information.
- * Acknowledge the report.
+ * RustDesk client reports hardware/software info.
+ * Parses and stores CPU, RAM, OS, hostname, displays, encoding, features.
+ * Device must exist in peer table (prevents phantom entries).
+ * 
+ * IMPORTANT: Response must be plain text (not JSON):
+ *   - "SYSINFO_UPDATED" → client activates PRO mode
+ *   - "ID_NOT_FOUND" → client retries immediately
+ *   - Anything else → client waits 120s before retry
  */
 router.post('/api/sysinfo', (req, res) => {
-    return res.json({});
+    const body = req.body || {};
+
+    // Extract and validate device ID
+    const deviceId = sanitizeStr(body.id || body.uuid || '', MAX_ID_LEN);
+    if (!deviceId || !isValidDeviceId(deviceId)) {
+        console.log('[API:SYSINFO] Invalid device ID:', deviceId);
+        return res.type('text/plain').send('ID_NOT_FOUND');
+    }
+
+    // Verify the device exists in the peer table (prevents overwriting unknown devices)
+    const existingDevice = db.getDevice(deviceId);
+    if (!existingDevice) {
+        console.log(`[API:SYSINFO] Device not found: ${deviceId} (must register first)`);
+        return res.type('text/plain').send('ID_NOT_FOUND');
+    }
+
+    try {
+        // RustDesk sends cpu and memory as formatted strings, parse them
+        // cpu: "Intel Core i7-12700K, 5.2GHz, 24/16 cores"
+        // memory: "31.87GB"
+        const cpuRaw = sanitizeStr(body.cpu || '', MAX_STRING_LEN);
+        const memoryRaw = sanitizeStr(body.memory || '', 64);
+
+        // Parse CPU: extract name, frequency, cores
+        let cpuName = '';
+        let cpuCores = 0;
+        let cpuFreqGhz = 0;
+        if (cpuRaw) {
+            // Pattern: "Intel Core i7-12700K, 5.2GHz, 24/16 cores"
+            const cpuMatch = cpuRaw.match(/^([^,]+?)(?:,\s*(\d+\.?\d*)GHz)?(?:,\s*)?(\d+)?\/?(\d+)?\s*cores?$/i);
+            if (cpuMatch) {
+                cpuName = cpuMatch[1]?.trim() || cpuRaw;
+                cpuFreqGhz = parseFloat(cpuMatch[2]) || 0;
+                cpuCores = parseInt(cpuMatch[3]) || parseInt(cpuMatch[4]) || 0;
+            } else {
+                cpuName = cpuRaw; // Use raw if pattern doesn't match
+            }
+        }
+
+        // Parse memory: "31.87GB" → 31.87
+        let memoryGb = 0;
+        if (memoryRaw) {
+            const memMatch = memoryRaw.match(/^(\d+\.?\d*)\s*GB$/i);
+            if (memMatch) {
+                memoryGb = parseFloat(memMatch[1]) || 0;
+            } else if (typeof body.memory === 'number') {
+                memoryGb = body.memory;
+            }
+        }
+
+        // Parse sysinfo fields from RustDesk client payload
+        const sysinfo = {
+            hostname: sanitizeStr(body.hostname || '', MAX_HOSTNAME_LEN),
+            username: sanitizeStr(body.username || '', MAX_HOSTNAME_LEN),
+            platform: sanitizeStr(body.platform || body.os || '', MAX_STRING_LEN),
+            version: sanitizeStr(body.version || '', 64),
+            cpu_name: cpuName || sanitizeStr(body.cpu_name || '', MAX_STRING_LEN),
+            cpu_cores: cpuCores || (typeof body.cpu_num === 'number' ? Math.max(0, Math.min(1024, body.cpu_num)) : 0),
+            cpu_freq_ghz: cpuFreqGhz || (typeof body.cpu_freq === 'number' ? Math.max(0, Math.min(100, body.cpu_freq)) : 0),
+            memory_gb: memoryGb || (typeof body.memory_total === 'number' ? Math.max(0, Math.min(65536, body.memory_total)) : 0),
+            os_full: sanitizeStr(body.os || body.os_full || '', MAX_STRING_LEN),
+            displays: Array.isArray(body.displays) ? body.displays.slice(0, 10) : [],
+            encoding: Array.isArray(body.encoding) ? body.encoding.slice(0, 20) : [],
+            features: typeof body.features === 'object' && body.features !== null ? body.features : {},
+            platform_additions: typeof body.platform_additions === 'object' && body.platform_additions !== null ? body.platform_additions : {}
+        };
+
+        // Limit serialized size of complex objects to prevent storage abuse (M-6)
+        const maxJsonLen = 4096;
+        const displaysJson = JSON.stringify(sysinfo.displays);
+        const encodingJson = JSON.stringify(sysinfo.encoding);
+        const featuresJson = JSON.stringify(sysinfo.features);
+        if (displaysJson.length > maxJsonLen) sysinfo.displays = sysinfo.displays.slice(0, 4);
+        if (encodingJson.length > maxJsonLen) sysinfo.encoding = sysinfo.encoding.slice(0, 5);
+        if (featuresJson.length > maxJsonLen) sysinfo.features = {};
+
+        db.upsertPeerSysinfo(deviceId, sysinfo);
+        console.log(`[API:SYSINFO] ✓ PRO activated for ${deviceId}: ${sysinfo.hostname} (${sysinfo.platform}) CPU: ${sysinfo.cpu_name} RAM: ${sysinfo.memory_gb}GB`);
+
+        // Return plain text "SYSINFO_UPDATED" to activate PRO mode in client
+        return res.type('text/plain').send('SYSINFO_UPDATED');
+    } catch (err) {
+        console.warn('[API:SYSINFO] Failed to store sysinfo:', err.message);
+        // Return error but still indicate the ID was found (client won't retry immediately)
+        return res.type('text/plain').send('ERROR');
+    }
+});
+
+/**
+ * POST /api/sysinfo_ver
+ * RustDesk client checks if sysinfo needs to be re-uploaded.
+ * Returns hash of current sysinfo; if client's hash matches, skip upload.
+ * Empty response or any error triggers full sysinfo upload.
+ */
+router.post('/api/sysinfo_ver', (req, res) => {
+    const body = req.body || {};
+    const deviceId = sanitizeStr(body.id || body.uuid || '', MAX_ID_LEN);
+    
+    if (!deviceId || !isValidDeviceId(deviceId)) {
+        return res.type('text/plain').send('');
+    }
+
+    try {
+        const sysinfo = db.getPeerSysinfo(deviceId);
+        if (sysinfo && sysinfo.raw_json) {
+            // Generate hash of stored sysinfo for comparison (SHA256 truncated)
+            const hash = require('crypto').createHash('sha256')
+                .update(JSON.stringify(sysinfo.raw_json))
+                .digest('hex')
+                .substring(0, 16);
+            return res.type('text/plain').send(hash);
+        }
+    } catch (err) {
+        console.warn('[API:SYSINFO_VER] Error:', err.message);
+    }
+
+    // No sysinfo found - trigger upload
+    return res.type('text/plain').send('');
 });
 
 /**
@@ -152,18 +394,29 @@ router.get('/api/ab/personal', (req, res) => {
 
 /**
  * GET /api/audit
- * Audit log — return empty for now.
+ * Audit log — returns combined audit summary from all audit sources.
  */
 router.get('/api/audit', (req, res) => {
-    const token = extractBearerToken(req);
-    if (!token) {
+    const user = authenticateRequest(req);
+    if (!user) {
         return res.status(401).json({ error: 'Authorization required' });
     }
-    const user = authService.validateAccessToken(token);
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
+    // Return combined recent audit events
+    try {
+        const conns = db.getAuditConnections({ limit: 50 });
+        const files = db.getAuditFiles({ limit: 50 });
+        const alarms = db.getAuditAlarms({ limit: 50 });
+        return res.json({
+            data: {
+                connections: conns,
+                files: files,
+                alarms: alarms
+            }
+        });
+    } catch (err) {
+        console.error('[API:AUDIT] Error:', err.message);
+        return res.json({ data: { connections: [], files: [], alarms: [] } });
     }
-    return res.json({ data: [] });
 });
 
 /**
@@ -233,88 +486,172 @@ router.get('/api/users', (req, res) => {
 
 /**
  * GET /api/peers
- * List peers/devices — return empty for now.
+ * List peers/devices with sysinfo, metrics, and online status.
+ * Returns RustDesk-compatible peer data merged with sysinfo.
  */
 router.get('/api/peers', (req, res) => {
-    const token = extractBearerToken(req);
-    if (!token) {
+    const user = authenticateRequest(req);
+    if (!user) {
         return res.status(401).json({ error: 'Authorization required' });
     }
-    const user = authService.validateAccessToken(token);
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
+
+    try {
+        // Get all devices from peer table
+        const devices = db.getAllDevices({
+            search: req.query.search || '',
+            status: req.query.status || ''
+        });
+
+        // Build sysinfo lookup map
+        const allSysinfo = db.getAllPeerSysinfo();
+        const sysinfoMap = {};
+        for (const si of allSysinfo) {
+            sysinfoMap[si.peer_id] = si;
+        }
+
+        // Merge devices with sysinfo
+        const enrichedPeers = devices.map(device => {
+            const si = sysinfoMap[device.id] || {};
+            return {
+                id: device.id,
+                hostname: si.hostname || device.hostname || '',
+                username: si.username || device.username || '',
+                platform: si.platform || device.platform || '',
+                version: si.version || '',
+                ip: device.ip || '',
+                online: device.online,
+                last_online: device.last_online || '',
+                created_at: device.created_at || '',
+                note: device.note || '',
+                banned: device.banned,
+                pk: device.pk || '',
+                cpu: si.cpu_name || '',
+                memory: si.memory_gb || 0,
+                os: si.os_full || '',
+                displays: si.displays || [],
+                folder_id: device.folder_id
+            };
+        });
+
+        // Pagination
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const pageSize = Math.min(200, Math.max(1, parseInt(req.query.page_size, 10) || 100));
+        const start = (page - 1) * pageSize;
+        const paged = enrichedPeers.slice(start, start + pageSize);
+
+        return res.json({
+            data: paged,
+            total: enrichedPeers.length
+        });
+    } catch (err) {
+        console.error('[API:PEERS] Error:', err.message);
+        return res.json({ data: [], total: 0 });
     }
-    return res.json({ data: [], total: 0 });
 });
 
 /**
  * GET /api/device-group/accessible
  * Returns accessible device groups for the current user.
  */
-router.get('/api/device-group/accessible', (req, res) => {
-    const token = extractBearerToken(req);
-    if (!token) {
-        return res.status(401).json({ error: 'Authorization required' });
+router.get('/api/device-group/accessible', requireAuth, (req, res) => {
+    try {
+        const groups = db.getAllDeviceGroups();
+        return res.json({
+            data: groups.map(g => ({
+                guid: g.guid,
+                name: g.name,
+                note: g.note || '',
+                team_id: g.team_id || '',
+                accessed_count: g.member_count || 0
+            })),
+            total: groups.length
+        });
+    } catch (err) {
+        console.error('[API:DEVICE-GROUP] Error:', err.message);
+        return res.json({ data: [], total: 0 });
     }
-    const user = authService.validateAccessToken(token);
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-    return res.json({
-        data: [{
-            guid: 'default',
-            name: 'Default',
-            note: '',
-            team_id: '',
-            accessed_count: 0
-        }],
-        total: 1
-    });
 });
 
 /**
  * GET /api/device-group
  * List all device groups.
  */
-router.get('/api/device-group', (req, res) => {
-    const token = extractBearerToken(req);
-    if (!token) {
-        return res.status(401).json({ error: 'Authorization required' });
+router.get('/api/device-group', requireAuth, (req, res) => {
+    try {
+        const groups = db.getAllDeviceGroups();
+        return res.json({
+            data: groups.map(g => ({
+                guid: g.guid,
+                name: g.name,
+                note: g.note || '',
+                team_id: g.team_id || '',
+                member_count: g.member_count || 0
+            })),
+            total: groups.length
+        });
+    } catch (err) {
+        console.error('[API:DEVICE-GROUP] Error:', err.message);
+        return res.json({ data: [], total: 0 });
     }
-    const user = authService.validateAccessToken(token);
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
+});
+
+/**
+ * POST /api/device-group
+ * Create or update a device group (admin only).
+ */
+router.post('/api/device-group', requireAuth, requireAdmin, (req, res) => {
+    try {
+        const { guid, name, note, team_id } = req.body || {};
+        if (!name || typeof name !== 'string' || name.trim().length === 0) {
+            return res.status(400).json({ error: 'Group name is required' });
+        }
+
+        if (guid) {
+            // Update existing
+            const updated = db.updateDeviceGroup(guid, {
+                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
+                note: sanitizeStr(note || '', MAX_STRING_LEN),
+                team_id: sanitizeStr(team_id || '', 64)
+            });
+            if (!updated) {
+                return res.status(404).json({ error: 'Group not found' });
+            }
+            return res.json(updated);
+        } else {
+            // Create new
+            const created = db.createDeviceGroup({
+                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
+                note: sanitizeStr(note || '', MAX_STRING_LEN),
+                team_id: sanitizeStr(team_id || '', 64)
+            });
+            return res.json(created);
+        }
+    } catch (err) {
+        console.error('[API:DEVICE-GROUP] Create/update error:', err.message);
+        return res.status(500).json({ error: 'Server error' });
     }
-    return res.json({
-        data: [{
-            guid: 'default',
-            name: 'Default',
-            note: '',
-            team_id: ''
-        }],
-        total: 1
-    });
 });
 
 /**
  * GET /api/user/group
  * Get current user group info.
  */
-router.get('/api/user/group', (req, res) => {
-    const token = extractBearerToken(req);
-    if (!token) {
-        return res.status(401).json({ error: 'Authorization required' });
-    }
-    const user = authService.validateAccessToken(token);
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
-    }
-    return res.json({
-        data: {
-            name: 'Default',
-            guid: 'default'
+router.get('/api/user/group', requireAuth, (req, res) => {
+    try {
+        const groups = db.getAllUserGroups();
+        if (groups.length === 0) {
+            return res.json({ data: { name: 'Default', guid: 'default' } });
         }
-    });
+        // Return the first user group (user group assignment is future work)
+        return res.json({
+            data: {
+                name: groups[0].name,
+                guid: groups[0].guid
+            }
+        });
+    } catch (err) {
+        return res.json({ data: { name: 'Default', guid: 'default' } });
+    }
 });
 
 /**
@@ -585,5 +922,382 @@ function cleanupTfaSessions(sessions) {
         }
     }
 }
+
+// ==================== Security: Server Key Endpoint ====================
+
+/**
+ * GET /api/server-key
+ * Returns the RustDesk Rendezvous Server Ed25519 public key (base64).
+ * This key is used by clients to verify peer identity (signed_id_pk).
+ * Public key is inherently safe to expose — no auth required.
+ */
+router.get('/api/server-key', (req, res) => {
+    try {
+        if (!fs.existsSync(config.pubKeyPath)) {
+            return res.json({ key: '' });
+        }
+        const key = fs.readFileSync(config.pubKeyPath, 'utf8').trim();
+        // Validate: should decode to 32 bytes (Ed25519 public key)
+        const decoded = Buffer.from(key, 'base64');
+        if (decoded.length !== 32) {
+            console.warn('[API:SERVER-KEY] Invalid RS public key length:', decoded.length);
+            return res.json({ key: '' });
+        }
+        return res.json({ key });
+    } catch (err) {
+        console.warn('[API:SERVER-KEY] Error reading public key:', err.message);
+        return res.json({ key: '' });
+    }
+});
+
+/**
+ * GET /api/server-key/fingerprint
+ * Returns SHA-256 fingerprint of RS public key for out-of-band verification.
+ */
+router.get('/api/server-key/fingerprint', (req, res) => {
+    try {
+        if (!fs.existsSync(config.pubKeyPath)) {
+            return res.json({ fingerprint: '', algorithm: 'SHA-256' });
+        }
+        const key = fs.readFileSync(config.pubKeyPath, 'utf8').trim();
+        const hash = crypto.createHash('sha256').update(Buffer.from(key, 'base64')).digest('hex');
+        return res.json({
+            fingerprint: hash.match(/.{2}/g).join(':').toUpperCase(),
+            algorithm: 'SHA-256'
+        });
+    } catch (err) {
+        return res.json({ fingerprint: '', algorithm: 'SHA-256' });
+    }
+});
+
+// ==================== Phase 2: Audit Endpoints ====================
+
+/**
+ * POST /api/audit/conn
+ * Report a connection event from RustDesk client.
+ * Body: { host_id, host_uuid, peer_id, peer_name, action, conn_type, session_id, ip }
+ */
+router.post('/api/audit/conn', (req, res) => {
+    try {
+        const body = req.body || {};
+
+        // Validate required fields
+        if (!body.host_id || typeof body.host_id !== 'string') {
+            return res.status(400).json({ error: 'host_id is required' });
+        }
+
+        // Validate conn_type if provided
+        const connType = typeof body.conn_type === 'number' ? body.conn_type : 0;
+        if (!CONN_TYPES.includes(connType)) {
+            return res.status(400).json({ error: 'Invalid conn_type' });
+        }
+
+        db.insertAuditConnection({
+            host_id: sanitizeStr(body.host_id, MAX_ID_LEN),
+            host_uuid: sanitizeStr(body.host_uuid || '', MAX_ID_LEN),
+            peer_id: sanitizeStr(body.peer_id || '', MAX_ID_LEN),
+            peer_name: sanitizeStr(body.peer_name || '', MAX_HOSTNAME_LEN),
+            action: sanitizeStr(body.action || 'connect', 32),
+            conn_type: connType,
+            session_id: sanitizeStr(body.session_id || '', 64),
+            ip: sanitizeStr(body.ip || getClientIp(req), 64)
+        });
+
+        return res.json({});
+    } catch (err) {
+        console.error('[API:AUDIT/CONN] Error:', err.message);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/audit/conn
+ * Query connection audit events.
+ * Query params: host_id, peer_id, action, limit, offset
+ */
+router.get('/api/audit/conn', requireAuth, (req, res) => {
+    try {
+        const filters = {
+            host_id: req.query.host_id || '',
+            peer_id: req.query.peer_id || '',
+            action: req.query.action || '',
+            limit: Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100)),
+            offset: Math.max(0, parseInt(req.query.offset, 10) || 0)
+        };
+
+        const data = db.getAuditConnections(filters);
+        const total = db.countAuditConnections(filters);
+
+        return res.json({ data, total });
+    } catch (err) {
+        console.error('[API:AUDIT/CONN] Query error:', err.message);
+        return res.json({ data: [], total: 0 });
+    }
+});
+
+/**
+ * POST /api/audit/file
+ * Report a file transfer event.
+ * Body: { host_id, host_uuid, peer_id, direction, path, is_file, num_files, files, ip, peer_name }
+ */
+router.post('/api/audit/file', (req, res) => {
+    try {
+        const body = req.body || {};
+
+        if (!body.host_id || typeof body.host_id !== 'string') {
+            return res.status(400).json({ error: 'host_id is required' });
+        }
+
+        db.insertAuditFile({
+            host_id: sanitizeStr(body.host_id, MAX_ID_LEN),
+            host_uuid: sanitizeStr(body.host_uuid || '', MAX_ID_LEN),
+            peer_id: sanitizeStr(body.peer_id || '', MAX_ID_LEN),
+            direction: [0, 1].includes(body.direction) ? body.direction : 0,
+            path: sanitizeStr(body.path || '', MAX_PATH_LEN),
+            is_file: body.is_file !== false,
+            num_files: typeof body.num_files === 'number' ? Math.max(0, Math.min(10000, body.num_files)) : 0,
+            files: Array.isArray(body.files) ? body.files.slice(0, 100).map(f => ({
+                name: sanitizeStr(typeof f === 'object' && f !== null ? (f.name || '') : String(f || ''), MAX_PATH_LEN),
+                size: typeof f === 'object' && f !== null && typeof f.size === 'number' ? Math.max(0, f.size) : 0
+            })) : [],
+            ip: sanitizeStr(body.ip || getClientIp(req), 64),
+            peer_name: sanitizeStr(body.peer_name || '', MAX_HOSTNAME_LEN)
+        });
+
+        return res.json({});
+    } catch (err) {
+        console.error('[API:AUDIT/FILE] Error:', err.message);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/audit/file
+ * Query file transfer audit events.
+ */
+router.get('/api/audit/file', requireAuth, (req, res) => {
+    try {
+        const filters = {
+            host_id: req.query.host_id || '',
+            peer_id: req.query.peer_id || '',
+            limit: Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100)),
+            offset: Math.max(0, parseInt(req.query.offset, 10) || 0)
+        };
+
+        const data = db.getAuditFiles(filters);
+        const total = db.countAuditFiles(filters);
+
+        return res.json({ data, total });
+    } catch (err) {
+        console.error('[API:AUDIT/FILE] Query error:', err.message);
+        return res.json({ data: [], total: 0 });
+    }
+});
+
+/**
+ * POST /api/audit/alarm
+ * Report a security alarm event.
+ * Body: { alarm_type, alarm_name, host_id, peer_id, ip, details }
+ */
+router.post('/api/audit/alarm', (req, res) => {
+    try {
+        const body = req.body || {};
+
+        const alarmType = typeof body.alarm_type === 'number' ? body.alarm_type : 0;
+        if (!ALARM_TYPES.includes(alarmType)) {
+            return res.status(400).json({ error: 'Invalid alarm_type (0-6)' });
+        }
+
+        db.insertAuditAlarm({
+            alarm_type: alarmType,
+            alarm_name: sanitizeStr(body.alarm_name || '', MAX_STRING_LEN),
+            host_id: sanitizeStr(body.host_id || '', MAX_ID_LEN),
+            peer_id: sanitizeStr(body.peer_id || '', MAX_ID_LEN),
+            ip: sanitizeStr(body.ip || getClientIp(req), 64),
+            details: body.details || {}
+        });
+
+        return res.json({});
+    } catch (err) {
+        console.error('[API:AUDIT/ALARM] Error:', err.message);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+/**
+ * GET /api/audit/alarm
+ * Query security alarm events.
+ */
+router.get('/api/audit/alarm', requireAuth, (req, res) => {
+    try {
+        const filters = {
+            alarm_type: req.query.alarm_type !== undefined ? parseInt(req.query.alarm_type, 10) : undefined,
+            host_id: req.query.host_id || '',
+            limit: Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100)),
+            offset: Math.max(0, parseInt(req.query.offset, 10) || 0)
+        };
+
+        const data = db.getAuditAlarms(filters);
+        const total = db.countAuditAlarms(filters);
+
+        return res.json({ data, total });
+    } catch (err) {
+        console.error('[API:AUDIT/ALARM] Query error:', err.message);
+        return res.json({ data: [], total: 0 });
+    }
+});
+
+// ==================== Phase 3: User Groups ====================
+
+/**
+ * GET /api/user-groups
+ * List all user groups.
+ */
+router.get('/api/user-groups', requireAuth, (req, res) => {
+    try {
+        const groups = db.getAllUserGroups();
+        return res.json({
+            data: groups.map(g => ({
+                guid: g.guid,
+                name: g.name,
+                note: g.note || '',
+                team_id: g.team_id || ''
+            })),
+            total: groups.length
+        });
+    } catch (err) {
+        console.error('[API:USER-GROUPS] Error:', err.message);
+        return res.json({ data: [], total: 0 });
+    }
+});
+
+/**
+ * POST /api/user-groups
+ * Create or update a user group (admin only).
+ */
+router.post('/api/user-groups', requireAuth, requireAdmin, (req, res) => {
+    try {
+        const { guid, name, note, team_id } = req.body || {};
+        if (!name || typeof name !== 'string' || name.trim().length === 0) {
+            return res.status(400).json({ error: 'Group name is required' });
+        }
+
+        if (guid) {
+            const updated = db.updateUserGroup(guid, {
+                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
+                note: sanitizeStr(note || '', MAX_STRING_LEN),
+                team_id: sanitizeStr(team_id || '', 64)
+            });
+            if (!updated) {
+                return res.status(404).json({ error: 'Group not found' });
+            }
+            return res.json(updated);
+        } else {
+            const created = db.createUserGroup({
+                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
+                note: sanitizeStr(note || '', MAX_STRING_LEN),
+                team_id: sanitizeStr(team_id || '', 64)
+            });
+            return res.json(created);
+        }
+    } catch (err) {
+        console.error('[API:USER-GROUPS] Create/update error:', err.message);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ==================== Phase 3: Strategies ====================
+
+/**
+ * GET /api/strategies
+ * List all access control strategies.
+ */
+router.get('/api/strategies', requireAuth, (req, res) => {
+    try {
+        const strategies = db.getAllStrategies();
+        return res.json({
+            data: strategies.map(s => ({
+                guid: s.guid,
+                name: s.name,
+                user_group_guid: s.user_group_guid || '',
+                device_group_guid: s.device_group_guid || '',
+                enabled: s.enabled === 1,
+                permissions: s.permissions || {}
+            })),
+            total: strategies.length
+        });
+    } catch (err) {
+        console.error('[API:STRATEGIES] Error:', err.message);
+        return res.json({ data: [], total: 0 });
+    }
+});
+
+/**
+ * POST /api/strategies
+ * Create or update a strategy (admin only).
+ */
+router.post('/api/strategies', requireAuth, requireAdmin, (req, res) => {
+    try {
+        const { guid, name, user_group_guid, device_group_guid, enabled, permissions } = req.body || {};
+        if (!name || typeof name !== 'string' || name.trim().length === 0) {
+            return res.status(400).json({ error: 'Strategy name is required' });
+        }
+
+        if (guid) {
+            const updated = db.updateStrategy(guid, {
+                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
+                user_group_guid: sanitizeStr(user_group_guid || '', 64),
+                device_group_guid: sanitizeStr(device_group_guid || '', 64),
+                enabled,
+                permissions: typeof permissions === 'object' ? permissions : {}
+            });
+            if (!updated) {
+                return res.status(404).json({ error: 'Strategy not found' });
+            }
+            return res.json(updated);
+        } else {
+            const created = db.createStrategy({
+                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
+                user_group_guid: sanitizeStr(user_group_guid || '', 64),
+                device_group_guid: sanitizeStr(device_group_guid || '', 64),
+                enabled,
+                permissions: typeof permissions === 'object' ? permissions : {}
+            });
+            return res.json(created);
+        }
+    } catch (err) {
+        console.error('[API:STRATEGIES] Create/update error:', err.message);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ==================== Security: Peer Key Endpoint ====================
+
+/**
+ * GET /api/peer-key/:id
+ * Returns the Curve25519 public key for a specific peer (base64).
+ * Requires authentication — keys should only be disclosed to logged-in users.
+ */
+router.get('/api/peer-key/:id', requireAuth, (req, res) => {
+    try {
+        const peerId = sanitizeStr(req.params.id, MAX_ID_LEN);
+        if (!peerId) {
+            return res.status(400).json({ error: 'Invalid peer ID' });
+        }
+
+        const device = db.getDeviceById(peerId);
+        if (!device) {
+            return res.json({ id: peerId, pk: '' });
+        }
+
+        return res.json({
+            id: device.id,
+            pk: device.pk || ''
+        });
+    } catch (err) {
+        console.error('[API:PEER-KEY] Error:', err.message);
+        return res.json({ id: req.params.id, pk: '' });
+    }
+});
 
 module.exports = router;

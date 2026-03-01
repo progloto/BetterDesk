@@ -36,6 +36,6 @@ This directory contains comprehensive documentation for BetterDesk Console.
 ## Additional
 - **[TRANSLATION_SUMMARY.md](TRANSLATION_SUMMARY.md)** - Documentation translation status
 
-## HBBS Patch Documentation
+## Legacy HBBS Patch (Archived)
 
-HBBS-specific documentation is in [hbbs-patch-v2/](../hbbs-patch-v2/).
+The original Rust-based HBBS patch (`hbbs-patch-v2/`) has been replaced by the [Go server](../betterdesk-server/) and moved to `archive/`. See the main [README](../README.md) for current architecture.

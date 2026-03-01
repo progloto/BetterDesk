@@ -25,7 +25,7 @@ fi
 echo "✅ Using: $COMPOSE_CMD"
 
 # Set up environment
-export FLASK_SECRET_KEY=$(openssl rand -hex 32 2>/dev/null || echo "change-this-secret-key")
+export FLASK_SECRET_KEY=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || head -c32 /dev/urandom | xxd -p)
 export RUSTDESK_DATA_PATH="./data"
 
 # Create data directory

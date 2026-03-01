@@ -1,0 +1,178 @@
+package relay
+
+import (
+	"fmt"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/unitronix/betterdesk-server/codec"
+	"github.com/unitronix/betterdesk-server/config"
+	pb "github.com/unitronix/betterdesk-server/proto"
+)
+
+func TestRelayPairing(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.RelayPort = 0 // let OS pick a free port
+
+	// We need to manually listen to get the actual port
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	cfg.RelayPort = port
+	srv := New(cfg)
+
+	ctx, cancel := t.Context(), func() {} // Go 1.21+ t.Context()
+	_ = cancel
+
+	// We can't use t.Context() on older Go — use context.Background
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer srv.Stop()
+
+	uuid := "test-session-uuid-123"
+
+	// Connect side A
+	connA, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial A: %v", err)
+	}
+	defer connA.Close()
+
+	// Connect side B
+	connB, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial B: %v", err)
+	}
+	defer connB.Close()
+
+	// Send RequestRelay from side A
+	reqA := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RequestRelay{
+			RequestRelay: &pb.RequestRelay{
+				Uuid: uuid,
+				Id:   "PEER_B",
+			},
+		},
+	}
+	if err := codec.WriteRawProto(connA, reqA); err != nil {
+		t.Fatalf("write A: %v", err)
+	}
+
+	// Send RequestRelay from side B with same UUID
+	reqB := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RequestRelay{
+			RequestRelay: &pb.RequestRelay{
+				Uuid: uuid,
+				Id:   "PEER_A",
+			},
+		},
+	}
+	if err := codec.WriteRawProto(connB, reqB); err != nil {
+		t.Fatalf("write B: %v", err)
+	}
+
+	// Wait a bit for pairing
+	time.Sleep(200 * time.Millisecond)
+
+	// Read the RelayResponse confirmation from both sides (raw protobuf, no framing header)
+	confirmA, err := codec.ReadRawProto(connA, 5*time.Second)
+	if err != nil {
+		t.Fatalf("read confirm A: %v", err)
+	}
+	if confirmA.GetRelayResponse() == nil {
+		t.Fatal("expected RelayResponse confirmation on A")
+	}
+
+	confirmB, err := codec.ReadRawProto(connB, 5*time.Second)
+	if err != nil {
+		t.Fatalf("read confirm B: %v", err)
+	}
+	if confirmB.GetRelayResponse() == nil {
+		t.Fatal("expected RelayResponse confirmation on B")
+	}
+
+	// Now test bidirectional data relay
+	testData := []byte("Hello from A to B!")
+	connA.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = connA.Write(testData)
+	if err != nil {
+		t.Fatalf("write data A->B: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	connB.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := connB.Read(buf)
+	if err != nil {
+		t.Fatalf("read data B: %v", err)
+	}
+	if string(buf[:n]) != string(testData) {
+		t.Errorf("data mismatch: got %q, want %q", buf[:n], testData)
+	}
+
+	// Test reverse direction
+	reverseData := []byte("Reply from B to A!")
+	connB.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	connB.Write(reverseData)
+
+	connA.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err = connA.Read(buf)
+	if err != nil {
+		t.Fatalf("read data A: %v", err)
+	}
+	if string(buf[:n]) != string(reverseData) {
+		t.Errorf("reverse data mismatch: got %q, want %q", buf[:n], reverseData)
+	}
+
+	// Verify stats
+	if srv.ActiveSessions.Load() != 1 {
+		t.Errorf("active sessions: got %d, want 1", srv.ActiveSessions.Load())
+	}
+	if srv.TotalRelayed.Load() != 1 {
+		t.Errorf("total relayed: got %d, want 1", srv.TotalRelayed.Load())
+	}
+}
+
+func TestRelayHealthCheck(t *testing.T) {
+	cfg := config.DefaultConfig()
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	cfg.RelayPort = port
+	srv := New(cfg)
+	if err := srv.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send health check
+	hc := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_Hc{
+			Hc: &pb.HealthCheck{Token: "relay-test-123"},
+		},
+	}
+	codec.WriteRawProto(conn, hc)
+
+	resp, err := codec.ReadRawProto(conn, 5*time.Second)
+	if err != nil {
+		t.Fatalf("read HC response: %v", err)
+	}
+	if resp.GetHc() == nil || resp.GetHc().Token != "relay-test-123" {
+		t.Error("expected health check response with matching token")
+	}
+}

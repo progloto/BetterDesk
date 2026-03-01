@@ -53,6 +53,13 @@ class RDClient {
         this._rendezvousDecoder = null;
         this._relayDecoder = null;
 
+        // Relay state tracking
+        this._relayFrameIdx = 0;         // Counter for relay frames (debugging)
+        this._relayConfirmReceived = false; // Whether hbbr's RelayResponse confirmation was consumed
+        this._peerEncryptionConfirmed = false; // Whether peer has started encrypting
+        this._keyExchangePending = false;  // True when we have keys ready but haven't sent PublicKey yet
+        this._keyExchangeDone = false;     // True after PublicKey was sent and crypto enabled
+
         // Settings
         this.renderer.setScaleMode(opts.scaleMode || 'fit');
     }
@@ -242,74 +249,97 @@ class RDClient {
                 const frames = this._rendezvousDecoder.feed(rawData);
                 if (frames.length === 0) return; // Incomplete frame, wait for more data
 
-                clearTimeout(timeout);
-                this.conn.off('rendezvous:message', handler);
+                // Process ALL decoded frames — the first may be a KeyExchange
+                // from the server's secure TCP handshake; we skip it and wait
+                // for the actual PunchHoleResponse or RelayResponse.
+                for (const frame of frames) {
+                    try {
+                        const msg = this.proto.decodeRendezvous(frame);
 
-                try {
-                    // Process first complete frame
-                    const msg = this.proto.decodeRendezvous(frames[0]);
+                        // Skip KeyExchange from the Go signal server's NaCl
+                        // secure TCP negotiation — the WS proxy bridges raw TCP
+                        // bytes so we see the server's greeting before our response.
+                        if (msg.keyExchange) {
+                            console.log('[RDClient] Skipping server KeyExchange (secure TCP greeting)');
+                            continue;
+                        }
 
-                    if (msg.punchHoleResponse) {
-                        const resp = msg.punchHoleResponse;
-                        console.log('[RDClient] PunchHoleResponse:', JSON.stringify({
-                            failure: resp.failure,
-                            relayServer: resp.relayServer,
-                            otherFailure: resp.otherFailure,
-                            hasSocketAddr: !!(resp.socketAddr && resp.socketAddr.length),
-                            hasPk: !!(resp.pk && resp.pk.length),
-                            natType: resp.natType
-                        }));
-                        // Check for failure:
-                        // Proto3 default enum = 0 (ID_NOT_EXIST), so we check if we got
-                        // a relay server or socket_addr to determine success
-                        const hasRelay = resp.relayServer && resp.relayServer.length > 0;
-                        const hasSocket = resp.socketAddr && resp.socketAddr.length > 0;
+                        // Skip HealthCheck and other housekeeping messages
+                        if (msg.hc) {
+                            continue;
+                        }
 
-                        if (hasRelay || hasSocket) {
-                            // Successful response
-                            resolve({
-                                relayServer: resp.relayServer || '',
-                                uuid: resp.uuid || '',
-                                pk: resp.pk || null,
+                        if (msg.punchHoleResponse) {
+                            clearTimeout(timeout);
+                            this.conn.off('rendezvous:message', handler);
+                            const resp = msg.punchHoleResponse;
+                            console.log('[RDClient] PunchHoleResponse:', JSON.stringify({
+                                failure: resp.failure,
+                                relayServer: resp.relayServer,
+                                otherFailure: resp.otherFailure,
+                                hasSocketAddr: !!(resp.socketAddr && resp.socketAddr.length),
+                                hasPk: !!(resp.pk && resp.pk.length),
                                 natType: resp.natType
-                            });
-                        } else {
-                            // Failure - map enum values from PunchHoleResponse.Failure
-                            const failureNames = {
-                                0: 'Device not found',     // ID_NOT_EXIST
-                                2: 'Device offline',       // OFFLINE
-                                3: 'License mismatch',     // LICENSE_MISMATCH
-                                4: 'Too many connections'  // LICENSE_OVERUSE
-                            };
-                            const reason = resp.otherFailure
-                                || failureNames[resp.failure]
-                                || `Unknown error (code: ${resp.failure})`;
-                            resolve({ error: reason });
+                            }));
+                            // Check for failure:
+                            // Proto3 default enum = 0 (ID_NOT_EXIST), so we check if we got
+                            // a relay server or socket_addr to determine success
+                            const hasRelay = resp.relayServer && resp.relayServer.length > 0;
+                            const hasSocket = resp.socketAddr && resp.socketAddr.length > 0;
+
+                            if (hasRelay || hasSocket) {
+                                resolve({
+                                    relayServer: resp.relayServer || '',
+                                    uuid: resp.uuid || '',
+                                    pk: resp.pk || null,
+                                    natType: resp.natType
+                                });
+                            } else {
+                                const failureNames = {
+                                    0: 'Device not found',     // ID_NOT_EXIST
+                                    2: 'Device offline',       // OFFLINE
+                                    3: 'License mismatch',     // LICENSE_MISMATCH
+                                    4: 'Too many connections'  // LICENSE_OVERUSE
+                                };
+                                const reason = resp.otherFailure
+                                    || failureNames[resp.failure]
+                                    || `Unknown error (code: ${resp.failure})`;
+                                resolve({ error: reason });
+                            }
+                            return;
                         }
-                    } else if (msg.relayResponse) {
-                        const rr = msg.relayResponse;
-                        console.log('[RDClient] RelayResponse from hbbs:', JSON.stringify({
-                            relayServer: rr.relayServer || '',
-                            uuid: (rr.uuid || '').substring(0, 8) + '...',
-                            id: rr.id || '',
-                            hasPk: !!(rr.pk && rr.pk.length),
-                            refuseReason: rr.refuseReason || ''
-                        }));
-                        if (rr.refuseReason && rr.refuseReason.length > 0) {
-                            resolve({ error: 'Relay refused: ' + rr.refuseReason });
-                        } else {
-                            resolve({
+
+                        if (msg.relayResponse) {
+                            clearTimeout(timeout);
+                            this.conn.off('rendezvous:message', handler);
+                            const rr = msg.relayResponse;
+                            console.log('[RDClient] RelayResponse from hbbs:', JSON.stringify({
                                 relayServer: rr.relayServer || '',
-                                uuid: rr.uuid || '',
-                                pk: rr.pk || null,
-                                id: rr.id || ''
-                            });
+                                uuid: (rr.uuid || '').substring(0, 8) + '...',
+                                id: rr.id || '',
+                                hasPk: !!(rr.pk && rr.pk.length),
+                                refuseReason: rr.refuseReason || ''
+                            }));
+                            if (rr.refuseReason && rr.refuseReason.length > 0) {
+                                resolve({ error: 'Relay refused: ' + rr.refuseReason });
+                            } else {
+                                resolve({
+                                    relayServer: rr.relayServer || '',
+                                    uuid: rr.uuid || '',
+                                    pk: rr.pk || null,
+                                    id: rr.id || ''
+                                });
+                            }
+                            return;
                         }
-                    } else {
-                        resolve({ error: 'Unexpected rendezvous response' });
+
+                        // Unknown message type — log and skip, keep waiting
+                        const fieldNames = Object.keys(msg).filter(k => msg[k] != null && k !== 'union');
+                        console.log('[RDClient] Skipping rendezvous message:', fieldNames.join(', ') || 'empty');
+                    } catch (err) {
+                        // Protobuf decode error — skip this frame and continue
+                        console.warn('[RDClient] Failed to decode rendezvous frame, skipping:', err.message);
                     }
-                } catch (err) {
-                    reject(err);
                 }
             };
 
@@ -320,8 +350,12 @@ class RDClient {
     /**
      * Handle raw incoming relay data (TCP chunks via WebSocket)
      * Uses stream decoder for frame reassembly, then dispatches each complete message.
-     * After hbbr pairs both peers (by UUID), it operates in raw mode - just bridging
-     * TCP bytes between the two connections. All frames are peer-to-peer Messages.
+     *
+     * After hbbr pairs both peers (by UUID), the relay operates in raw mode — just
+     * bridging TCP bytes. However, the FIRST framed message from hbbr is a
+     * RendezvousMessage.RelayResponse confirmation (not a peer Message).
+     * We detect and skip it, then process all subsequent frames as peer Messages.
+     *
      * @param {ArrayBuffer} rawData
      */
     _handleRelayData(rawData) {
@@ -336,25 +370,118 @@ class RDClient {
     }
 
     /**
-     * Handle a single decoded relay frame (protobuf bytes)
-     * After relay is established, all messages are peer-to-peer Message protocol.
-     * hbbr acts as a transparent byte bridge and does NOT send any messages of its own.
+     * Handle a single decoded relay frame (protobuf bytes).
+     *
+     * Frame sequence on a relay connection:
+     *   #1: hbbr RelayResponse confirmation (RendezvousMessage — skip this)
+     *   #2: Target's SignedId (Message, unencrypted)
+     *   #3+: Target's Hash, TestDelay etc. — may be plaintext OR encrypted
+     *        depending on whether the target has processed our PublicKey yet
+     *   #N:  Once peer encryption is confirmed, all subsequent frames are encrypted
+     *
+     * Deferred key exchange: after receiving SignedId we prepare the keys but
+     * do NOT send PublicKey yet.  We wait for the next peer frame:
+     *   • If it is plaintext (e.g. Hash) → peer is NOT encrypting → we skip the
+     *     key exchange entirely and communicate in plaintext.
+     *   • If it is encrypted → peer already processed our PublicKey (shouldn’t
+     *     happen since we haven’t sent it yet in this flow) or peer uses some
+     *     other encryption setup — handled via speculative decrypt.
+     *
      * @param {Uint8Array} frameData - Raw protobuf bytes (frame header already stripped)
      */
     _handleRelayMessage(frameData) {
         try {
+            this._relayFrameIdx++;
+            const idx = this._relayFrameIdx;
+            const hex20 = Array.from(frameData.slice(0, 20))
+                .map(b => b.toString(16).padStart(2, '0')).join(' ');
+            console.log(`[RDClient] Relay frame #${idx}: ${frameData.length} bytes [${hex20}]`);
+
+            // The relay server (hbbr) sends a RendezvousMessage.RelayResponse
+            // as the first frame after pairing both peers.  Skip it.
+            if (!this._relayConfirmReceived) {
+                this._relayConfirmReceived = true;
+                try {
+                    const rdvMsg = this.proto.decodeRendezvous(frameData);
+                    if (rdvMsg.relayResponse) {
+                        const uuid = (rdvMsg.relayResponse.uuid || '').substring(0, 8);
+                        console.log(`[RDClient] Relay confirmation received (UUID: ${uuid}...), skipping`);
+                        return;
+                    }
+                } catch (_e) {
+                    console.log('[RDClient] First relay frame is not a relay confirmation');
+                }
+            }
+
             let data = frameData;
 
-            // Decrypt if encryption is active
-            if (this.crypto.enabled) {
-                data = this.crypto.processIncoming(data);
-                if (!data) {
-                    console.warn('[RDClient] Decryption failed at recvSeq=' + this.crypto._recvSeq);
+            // --- Deferred key exchange decision ---
+            // If we have keys prepared (_keyExchangePending) but haven't sent
+            // PublicKey yet, this frame tells us whether the peer uses encryption.
+            if (this._keyExchangePending && !this._keyExchangeDone) {
+                // Try decoding as plaintext Message first.
+                let isPlaintext = false;
+                try {
+                    const probe = this.proto.decodeMessage(frameData);
+                    // Check if the decoded message has any meaningful field set.
+                    // A plaintext Hash (field 9) with human-readable salt/challenge
+                    // is the strongest signal that the peer is NOT encrypting.
+                    const fields = Object.keys(probe).filter(k => probe[k] != null && k !== 'union');
+                    if (fields.length > 0) {
+                        isPlaintext = true;
+                    }
+                } catch (_e) {
+                    // Decode failed — likely encrypted data
+                }
+
+                if (isPlaintext) {
+                    // Peer is NOT encrypting.  Abandon the key exchange — do NOT
+                    // send PublicKey.  All communication stays in plaintext.
+                    console.log(`[RDClient] Frame #${idx}: peer sent plaintext → skipping key exchange`);
+                    this._keyExchangePending = false;
+                    this._keyExchangeDone = false;
+                    // Fall through to process this frame as plaintext
+                } else {
+                    // Frame doesn't decode as plaintext Message — peer might be
+                    // encrypting (unlikely since we haven't sent PublicKey, but
+                    // handle defensively).  Complete the key exchange now, then
+                    // try to decrypt.
+                    console.log(`[RDClient] Frame #${idx}: not plaintext → completing key exchange`);
+                    this._completeKeyExchange();
+                    // Try to decrypt below
+                }
+            }
+
+            // --- Speculative decryption ---
+            if (this.crypto.secretKey && this._keyExchangeDone) {
+                const spec = this.crypto.tryDecrypt(new Uint8Array(data));
+
+                if (spec) {
+                    this.crypto.commitDecrypt(spec.seq);
+                    data = spec.plaintext;
+
+                    if (!this._peerEncryptionConfirmed) {
+                        this._peerEncryptionConfirmed = true;
+                        console.log(`[RDClient] Peer encryption confirmed at frame #${idx} (seq=${spec.seq})`);
+                    }
+                } else if (this._peerEncryptionConfirmed) {
+                    const failHex = Array.from(frameData.slice(0, 48))
+                        .map(b => b.toString(16).padStart(2, '0')).join(' ');
+                    console.warn(`[RDClient] Decryption FAILED (peer was encrypting)`
+                        + ` nextSeq=${this.crypto._recvSeq + 1} frameLen=${frameData.length}`);
+                    console.warn(`[RDClient] Ciphertext[0..48]: ${failHex}`);
                     return;
+                } else {
+                    // Key exchange done but peer hasn't encrypted yet — plaintext
+                    console.log(`[RDClient] Frame #${idx}: plaintext (peer crypto not yet active)`);
                 }
             }
 
             const msg = this.proto.decodeMessage(data);
+            const fields = Object.keys(msg).filter(k => msg[k] != null && k !== 'union');
+            if (idx <= 10 || fields.length === 0) {
+                console.log(`[RDClient] Frame #${idx} → ${fields.join(', ') || '(empty Message)'}`);
+            }
             this._dispatchMessage(msg);
 
         } catch (err) {
@@ -473,12 +600,14 @@ class RDClient {
      * SignedId.id = 64-byte Ed25519 signature + protobuf(IdPk{ id, pk })
      * where pk is the target's EPHEMERAL Curve25519 public key.
      *
-     * After extracting the key, we perform NaCl box key exchange:
-     * 1. Generate our ephemeral Curve25519 keypair
-     * 2. Generate random 32-byte symmetric key
-     * 3. Encrypt symmetric key: nacl.box(symKey, zeroNonce, theirPk, ourSk)
-     * 4. Send PublicKey { ourPk, encryptedSymKey }
-     * 5. Enable counter-based secretbox encryption with symKey
+     * DEFERRED key exchange: We prepare the cryptographic material but do NOT
+     * send PublicKey yet.  The next incoming frame will tell us whether the
+     * peer uses encryption:
+     *   - Plaintext Hash → peer sent Hash before enabling crypto → skip key
+     *     exchange entirely, communicate in plaintext.
+     *   - Encrypted data → complete the key exchange (send PublicKey, enable
+     *     secretbox). This covers the standard RustDesk flow where the target
+     *     waits for our PublicKey before sending Hash.
      */
     _handleSignedId(signedId) {
         const idBytes = signedId.id;
@@ -499,28 +628,55 @@ class RDClient {
         }
 
         this._emit('log', `Peer identified: ${parsed.peerId}`);
-        console.log('[RDClient] Peer ephemeral pk:', parsed.peerPk.length, 'bytes');
+        const peerPkHex = Array.from(parsed.peerPk.slice(0, 8))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+        console.log(`[RDClient] Peer ephemeral pk: ${parsed.peerPk.length} bytes [${peerPkHex}...]`);
 
-        // Step 1: Generate our ephemeral Curve25519 keypair + symmetric key
+        // Prepare key material but DO NOT send PublicKey yet.
+        // We defer the decision until we see the next peer frame.
         this.crypto.generateKeyPair();
         this.crypto.generateSymmetricKey();
+        this.crypto.setPeerPublicKey(parsed.peerPk);
 
-        // Step 2: Create encrypted key exchange message
-        // nacl.box(symKey, zeroNonce, theirPk, ourSk) → sealed (48 bytes)
-        const keyMsg = this.crypto.createSymmetricKeyMsg(parsed.peerPk);
+        const ourPkHex = Array.from(this.crypto.asymKeyPair.publicKey.slice(0, 8))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+        const symKeyHex = Array.from(this.crypto.secretKey.slice(0, 8))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
+        console.log(`[RDClient] Keys prepared (deferred): ourPk=[${ourPkHex}...] symKey=[${symKeyHex}...]`);
 
-        // Step 3: Send PublicKey with our ephemeral pk + box-encrypted symmetric key
+        this._keyExchangePending = true;
+        this._keyExchangeDone = false;
+        this._emit('log', 'Key exchange prepared, waiting for peer to decide encryption mode...');
+    }
+
+    /**
+     * Complete the deferred key exchange: send PublicKey and enable encryption.
+     * Called when we detect the peer IS using encryption.
+     */
+    _completeKeyExchange() {
+        if (this._keyExchangeDone) return;
+        if (!this.crypto.peerPk) {
+            console.warn('[RDClient] Cannot complete key exchange: no peer pk');
+            return;
+        }
+
+        const keyMsg = this.crypto.createSymmetricKeyMsg(this.crypto.peerPk);
+        console.log(`[RDClient] Completing key exchange: sealed=${keyMsg.symmetricValue.length} bytes`);
+
         const pkMsg = this.proto.buildPublicKey(
-            keyMsg.asymmetricValue,  // our ephemeral Curve25519 pk (32 bytes)
-            keyMsg.symmetricValue    // box-encrypted symmetric key (48 bytes)
+            keyMsg.asymmetricValue,
+            keyMsg.symmetricValue
         );
         this._sendPeerMessage(pkMsg);
 
-        // Step 4: Enable counter-based encryption (both counters start at 0)
-        // From now on, all incoming messages are encrypted by the target
-        // and all our outgoing messages will be encrypted
-        this.crypto.enable();
-        this._emit('log', 'Encryption enabled, waiting for password challenge...');
+        // Enable outgoing encryption (counters start at 0)
+        this.crypto.enabled = true;
+        this.crypto._sendSeq = 0;
+        this.crypto._recvSeq = 0;
+
+        this._keyExchangePending = false;
+        this._keyExchangeDone = true;
+        console.log('[RDClient] Key exchange completed: encryption enabled');
     }
 
     _handleLoginResponse(resp) {

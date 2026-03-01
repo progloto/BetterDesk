@@ -113,10 +113,19 @@ module.exports = {
     pubKeyPath: PUB_KEY_PATH,
     apiKeyPath: API_KEY_PATH,
     
-    // HBBS API
+    // Server backend selection: 'rustdesk' (hbbs/hbbr) or 'betterdesk' (Go server)
+    // Can be overridden at runtime via Settings UI (stored in auth.db)
+    serverBackend: process.env.SERVER_BACKEND || 'betterdesk',
+    
+    // HBBS API (used in 'rustdesk' mode)
     hbbsApiUrl: process.env.HBBS_API_URL || 'http://localhost:21114/api',
     hbbsApiKey: hbbsApiKey,
     hbbsApiTimeout: parseInt(process.env.HBBS_API_TIMEOUT, 10) || 3000,
+    
+    // BetterDesk Go Server API (used in 'betterdesk' mode)
+    betterdeskApiUrl: process.env.BETTERDESK_API_URL || 'http://localhost:21114/api',
+    betterdeskApiKey: process.env.BETTERDESK_API_KEY || hbbsApiKey,
+    betterdeskApiTimeout: parseInt(process.env.BETTERDESK_API_TIMEOUT, 10) || 5000,
     
     // Session
     sessionSecret: sessionSecret,
@@ -138,6 +147,10 @@ module.exports = {
         hbbrHost: process.env.WS_HBBR_HOST || 'localhost',
         hbbrPort: parseInt(process.env.WS_HBBR_PORT, 10) || 21117
     },
+    
+    // Database type: 'sqlite' (default) or 'postgres'
+    dbType: (process.env.DB_TYPE || 'sqlite').toLowerCase(),
+    databaseUrl: process.env.DATABASE_URL || '',
     
     // App info
     appName: 'BetterDesk Console',

@@ -1,0 +1,1085 @@
+package signal
+
+import (
+	"fmt"
+	"log"
+	"net"
+	"regexp"
+	"time"
+
+	"github.com/unitronix/betterdesk-server/config"
+	"github.com/unitronix/betterdesk-server/crypto"
+	"github.com/unitronix/betterdesk-server/db"
+	"github.com/unitronix/betterdesk-server/peer"
+	pb "github.com/unitronix/betterdesk-server/proto"
+)
+
+// handleUDPMessage dispatches a UDP message to the appropriate handler.
+func (s *Server) handleUDPMessage(msg *pb.RendezvousMessage, raddr *net.UDPAddr) {
+	switch {
+	case msg.GetRegisterPeer() != nil:
+		s.handleRegisterPeer(msg.GetRegisterPeer(), raddr)
+	case msg.GetRegisterPk() != nil:
+		s.handleRegisterPk(msg.GetRegisterPk(), raddr)
+	case msg.GetPunchHoleRequest() != nil:
+		s.handlePunchHoleRequest(msg.GetPunchHoleRequest(), raddr)
+	case msg.GetPunchHoleSent() != nil:
+		// Target B tells signal that it's ready — convert to PunchHoleResponse for initiator A
+		s.handlePunchHoleSent(msg.GetPunchHoleSent(), raddr, true)
+	case msg.GetRequestRelay() != nil:
+		s.handleRequestRelay(msg.GetRequestRelay(), raddr)
+	case msg.GetFetchLocalAddr() != nil:
+		s.handleFetchLocalAddr(msg.GetFetchLocalAddr(), raddr)
+	case msg.GetLocalAddr() != nil:
+		s.handleLocalAddr(msg.GetLocalAddr(), raddr)
+	case msg.GetHc() != nil:
+		// Health check — respond with the same token
+		resp := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_Hc{
+				Hc: &pb.HealthCheck{Token: msg.GetHc().Token},
+			},
+		}
+		s.sendUDP(resp, raddr)
+	default:
+		log.Printf("[signal] UDP: unhandled message type from %s", raddr)
+	}
+}
+
+// handleMessage dispatches a TCP/WS message. Returns a response or nil.
+// For PunchHoleRequest and RequestRelay, we return nil (no immediate response)
+// because the signal server holds the TCP connection open and forwards the
+// target's response later via tcpPunchConns.
+func (s *Server) handleMessage(msg *pb.RendezvousMessage, raddr net.Addr) *pb.RendezvousMessage {
+	switch {
+	case msg.GetRegisterPk() != nil:
+		return s.handleRegisterPkTCP(msg.GetRegisterPk(), raddr)
+	case msg.GetPunchHoleRequest() != nil:
+		// TCP punch hole: forward PunchHole to target via UDP.
+		// If target is online, return nil (keep TCP open for later response).
+		// If target is offline/not found, return PunchHoleResponse with failure.
+		udpAddr, _ := net.ResolveUDPAddr("udp", raddr.String())
+		return s.handlePunchHoleRequestTCP(msg.GetPunchHoleRequest(), udpAddr)
+	case msg.GetRequestRelay() != nil:
+		// TCP relay request: forward to target via UDP. No immediate response.
+		// The RelayResponse from target will be forwarded via tcpPunchConns.
+		udpAddr, _ := net.ResolveUDPAddr("udp", raddr.String())
+		s.handleRequestRelayTCP(msg.GetRequestRelay(), udpAddr)
+		return nil
+	case msg.GetRelayResponse() != nil:
+		// Target sends RelayResponse to be forwarded to the initiator via TCP.
+		s.handleRelayResponseForward(msg)
+		return nil
+	case msg.GetPunchHoleSent() != nil:
+		// Target sends PunchHoleSent via TCP — convert to PunchHoleResponse
+		// and forward to initiator via their stored TCP connection.
+		udpAddr, _ := net.ResolveUDPAddr("udp", raddr.String())
+		s.handlePunchHoleSent(msg.GetPunchHoleSent(), udpAddr, false)
+		return nil
+	case msg.GetFetchLocalAddr() != nil:
+		// Forward FetchLocalAddr via UDP (fire-and-forget)
+		udpAddr, _ := net.ResolveUDPAddr("udp", raddr.String())
+		if udpAddr != nil {
+			s.handleFetchLocalAddr(msg.GetFetchLocalAddr(), udpAddr)
+		}
+		return nil
+	case msg.GetLocalAddr() != nil:
+		// Forward LocalAddr via UDP (fire-and-forget)
+		udpAddr, _ := net.ResolveUDPAddr("udp", raddr.String())
+		if udpAddr != nil {
+			s.handleLocalAddr(msg.GetLocalAddr(), udpAddr)
+		}
+		return nil
+	case msg.GetHc() != nil:
+		return &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_Hc{
+				Hc: &pb.HealthCheck{Token: msg.GetHc().Token},
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+// peerIDRegexp validates RustDesk peer ID format: 6-16 alphanumeric chars, hyphens, underscores.
+var peerIDRegexp = regexp.MustCompile(`^[A-Za-z0-9_-]{6,16}$`)
+
+// isValidPeerID checks if a peer ID conforms to the expected format.
+func isValidPeerID(id string) bool {
+	return peerIDRegexp.MatchString(id)
+}
+
+// handleRegisterPeer processes a heartbeat registration from a client.
+// This is the most frequent message — called every ~12 seconds per device.
+func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
+	id := msg.Id
+	if id == "" {
+		return
+	}
+
+	// Validate peer ID format (S7)
+	if !isValidPeerID(id) {
+		log.Printf("[signal] Rejected invalid peer ID format: %q from %s", id, raddr.IP)
+		return
+	}
+
+	// IP rate limiting check
+	if s.limiter != nil && !s.limiter.Allow(raddr.IP.String()) {
+		log.Printf("[signal] Rate limited registration from %s", raddr.IP)
+		return
+	}
+
+	// Blocklist check (IP and ID)
+	if s.blocklist != nil {
+		if s.blocklist.IsIPBlocked(raddr.IP.String()) {
+			log.Printf("[signal] Blocked IP %s tried to register", raddr.IP)
+			return
+		}
+		if s.blocklist.IsIDBlocked(id) {
+			log.Printf("[signal] Blocked ID %s tried to register", id)
+			return
+		}
+	}
+
+	// Check if peer exists in memory map
+	existing := s.peers.Get(id)
+	if existing != nil {
+		// Update heartbeat
+		s.peers.UpdateHeartbeat(id, raddr, msg.Serial)
+
+		// Respond: don't need PK (we already have it)
+		requestPk := len(existing.PK) == 0
+		resp := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_RegisterPeerResponse{
+				RegisterPeerResponse: &pb.RegisterPeerResponse{
+					RequestPk: requestPk,
+				},
+			},
+		}
+		s.sendUDP(resp, raddr)
+
+		// Debounce database status updates — only sync every 60s per peer (P1)
+		if time.Since(existing.LastDBSync) > 60*time.Second {
+			s.db.UpdatePeerStatus(id, "ONLINE", raddr.IP.String())
+			existing.LastDBSync = time.Now()
+		}
+		return
+	}
+
+	// NEW PEER — Dual Key System enrollment check
+	if !s.checkEnrollmentPermission(id, raddr.IP.String()) {
+		log.Printf("[signal] Rejected new peer %s from %s (enrollment policy)", id, raddr.IP)
+		return
+	}
+
+	// New peer — add to memory map
+	// Try to load existing PK from database first (peer may have registered PK before server restart)
+	now := time.Now()
+	entry := &peer.Entry{
+		ID:              id,
+		IP:              raddr.String(),
+		UDPAddr:         raddr,
+		Serial:          msg.Serial,
+		ConnType:        peer.ConnUDP,
+		LastReg:         now,
+		FirstSeen:       now,
+		HeartbeatCount:  1,
+		StatusTier:      peer.StatusOnline,
+		LastStatusCheck: now,
+	}
+
+	// Load PK and UUID from database if available (survives server restarts)
+	if dbPeer, err := s.db.GetPeer(id); err == nil && dbPeer != nil {
+		if len(dbPeer.PK) > 0 {
+			entry.PK = dbPeer.PK
+			log.Printf("[signal] Loaded PK from database for %s (%d bytes)", id, len(entry.PK))
+		}
+		if dbPeer.UUID != "" {
+			entry.UUID = []byte(dbPeer.UUID)
+		}
+	}
+
+	s.peers.Put(entry)
+
+	// Only request PK if we don't have it from database
+	requestPk := len(entry.PK) == 0
+	resp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RegisterPeerResponse{
+			RegisterPeerResponse: &pb.RegisterPeerResponse{
+				RequestPk: requestPk,
+			},
+		},
+	}
+	s.sendUDP(resp, raddr)
+
+	log.Printf("[signal] New peer registered: %s from %s (pk_loaded=%v)", id, raddr, len(entry.PK) > 0)
+	s.db.UpdatePeerStatus(id, "ONLINE", raddr.IP.String())
+}
+
+// handleRegisterPk processes a public key registration.
+func (s *Server) handleRegisterPk(msg *pb.RegisterPk, raddr *net.UDPAddr) {
+	resp := s.processRegisterPk(msg, raddr.String())
+	s.sendUDP(resp, raddr)
+}
+
+// handleRegisterPkTCP handles RegisterPk over TCP (returns response).
+func (s *Server) handleRegisterPkTCP(msg *pb.RegisterPk, raddr net.Addr) *pb.RendezvousMessage {
+	return s.processRegisterPk(msg, raddr.String())
+}
+
+// processRegisterPk is the shared logic for RegisterPk handling.
+func (s *Server) processRegisterPk(msg *pb.RegisterPk, addrStr string) *pb.RendezvousMessage {
+	id := msg.Id
+	if id == "" {
+		return registerPkResponse(pb.RegisterPkResponse_SERVER_ERROR)
+	}
+
+	// Validate peer ID format (S7)
+	if !isValidPeerID(id) {
+		log.Printf("[signal] Rejected invalid peer ID format in RegisterPk: %q", id)
+		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+	}
+
+	// IP blocklist check
+	if s.blocklist != nil {
+		host, _, _ := net.SplitHostPort(addrStr)
+		if host == "" {
+			host = addrStr
+		}
+		if s.blocklist.IsIPBlocked(host) {
+			log.Printf("[signal] Blocked IP %s tried RegisterPk", host)
+			return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+		}
+		if s.blocklist.IsIDBlocked(id) {
+			log.Printf("[signal] Blocked ID %s tried RegisterPk", id)
+			return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+		}
+	}
+
+	// Check for ID change request
+	if msg.OldId != "" {
+		return s.processIDChange(msg)
+	}
+
+	// Handle no_register_device (key-only exchange, no DB entry)
+	if msg.NoRegisterDevice {
+		return registerPkResponse(pb.RegisterPkResponse_OK)
+	}
+
+	// Check ban status
+	banned, _ := s.db.IsPeerBanned(id)
+	if banned {
+		log.Printf("[signal] Rejected banned peer: %s", id)
+		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+	}
+
+	// Get or create peer entry in memory
+	entry := s.peers.Get(id)
+	if entry == nil {
+		entry = &peer.Entry{
+			ID:      id,
+			LastReg: time.Now(),
+		}
+		s.peers.Put(entry)
+	}
+
+	// Check UUID consistency (prevent hijacking)
+	if len(entry.UUID) > 0 && len(msg.Uuid) > 0 {
+		if string(entry.UUID) != string(msg.Uuid) {
+			log.Printf("[signal] UUID mismatch for %s: registered=%x, received=%x",
+				id, entry.UUID, msg.Uuid)
+			return registerPkResponse(pb.RegisterPkResponse_UUID_MISMATCH)
+		}
+	}
+
+	// Store key data
+	entry.UUID = msg.Uuid
+	entry.PK = msg.Pk
+	entry.LastReg = time.Now()
+
+	// Persist to database
+	dbPeer := &db.Peer{
+		ID:     id,
+		UUID:   fmt.Sprintf("%x", msg.Uuid),
+		PK:     msg.Pk,
+		Status: "ONLINE",
+	}
+	if err := s.db.UpsertPeer(dbPeer); err != nil {
+		log.Printf("[signal] Failed to upsert peer %s: %v", id, err)
+	}
+
+	log.Printf("[signal] PK registered for %s (pk=%d bytes)", id, len(msg.Pk))
+
+	return &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RegisterPkResponse{
+			RegisterPkResponse: &pb.RegisterPkResponse{
+				Result:    pb.RegisterPkResponse_OK,
+				KeepAlive: 12, // Suggest 12s heartbeat interval
+			},
+		},
+	}
+}
+
+// processIDChange handles old_id → new id change requests.
+func (s *Server) processIDChange(msg *pb.RegisterPk) *pb.RendezvousMessage {
+	oldID := msg.OldId
+	newID := msg.Id
+
+	// Validate new ID doesn't exist
+	existing := s.peers.Get(newID)
+	if existing != nil {
+		return registerPkResponse(pb.RegisterPkResponse_ID_EXISTS)
+	}
+
+	// Check in database too
+	dbPeer, _ := s.db.GetPeer(newID)
+	if dbPeer != nil {
+		return registerPkResponse(pb.RegisterPkResponse_ID_EXISTS)
+	}
+
+	// Perform the change
+	if err := s.db.ChangePeerID(oldID, newID); err != nil {
+		log.Printf("[signal] ID change %s → %s failed: %v", oldID, newID, err)
+		return registerPkResponse(pb.RegisterPkResponse_SERVER_ERROR)
+	}
+
+	// Update in-memory map
+	oldEntry := s.peers.Remove(oldID)
+	if oldEntry != nil {
+		oldEntry.ID = newID
+		oldEntry.PK = msg.Pk
+		oldEntry.UUID = msg.Uuid
+		s.peers.Put(oldEntry)
+	}
+
+	log.Printf("[signal] ID changed: %s → %s", oldID, newID)
+	return registerPkResponse(pb.RegisterPkResponse_OK)
+}
+
+// handlePunchHoleRequest processes a hole-punch request from the initiator.
+func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDPAddr) {
+	targetID := msg.Id
+	if targetID == "" {
+		return
+	}
+
+	log.Printf("[signal] PunchHoleRequest from %s for target %s", raddr, targetID)
+
+	target := s.peers.Get(targetID)
+
+	// Target not found or offline
+	if target == nil || target.IsExpired(config.RegTimeout) {
+		if target == nil {
+			log.Printf("[signal] PunchHole: target %s not found in peer map", targetID)
+		} else {
+			log.Printf("[signal] PunchHole: target %s expired (last heartbeat: %v ago)", targetID, time.Since(target.LastReg))
+		}
+		resp := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_PunchHoleResponse{
+				PunchHoleResponse: &pb.PunchHoleResponse{
+					Failure:     pb.PunchHoleResponse_OFFLINE,
+					RelayServer: s.getRelayServer(),
+				},
+			},
+		}
+		s.sendUDP(resp, raddr)
+		return
+	}
+
+	// Target is banned
+	if target.Banned {
+		resp := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_PunchHoleResponse{
+				PunchHoleResponse: &pb.PunchHoleResponse{
+					Failure: pb.PunchHoleResponse_OFFLINE,
+				},
+			},
+		}
+		s.sendUDP(resp, raddr)
+		return
+	}
+
+	relayServer := s.getRelayServer()
+	log.Printf("[signal] PunchHole: target %s found (addr=%s, status=%s, lastReg=%v ago), relay=%s",
+		targetID, target.UDPAddr, target.StatusTier, time.Since(target.LastReg), relayServer)
+
+	// If force relay or always use relay
+	if msg.ForceRelay || s.cfg.AlwaysUseRelay {
+		log.Printf("[signal] PunchHole: force relay for %s", targetID)
+		s.sendRelayResponse(target, raddr, msg, relayServer)
+		return
+	}
+
+	// LAN detection: if both peers share the same public IP, they are likely on
+	// the same local network. Include local addresses for direct connection.
+	sameNetwork := isSamePublicIP(raddr, target.UDPAddr)
+	if sameNetwork {
+		log.Printf("[signal] LAN detected: %s and %s share public IP", raddr.IP, target.UDPAddr.IP)
+	}
+
+	// Send PunchHole to the TARGET peer (tell it the initiator's address)
+	punchHole := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_PunchHole{
+			PunchHole: &pb.PunchHole{
+				SocketAddr:   crypto.EncodeAddr(raddr),
+				RelayServer:  relayServer,
+				NatType:      msg.NatType,
+				UdpPort:      msg.UdpPort,
+				ForceRelay:   msg.ForceRelay,
+				UpnpPort:     msg.UpnpPort,
+				SocketAddrV6: msg.SocketAddrV6,
+			},
+		},
+	}
+
+	if target.UDPAddr != nil {
+		s.sendUDP(punchHole, target.UDPAddr)
+	}
+
+	// Send PunchHoleResponse to the INITIATOR with signed PK for E2E.
+	// The original Rust hbbs sends PunchHoleResponse (not PunchHoleSent) to the initiator.
+	// PunchHoleResponse has a 'pk' field for E2E key verification;
+	// PunchHoleSent does NOT have a pk field, so using it breaks E2E encryption.
+	var targetAddr []byte
+	if target.UDPAddr != nil {
+		targetAddr = crypto.EncodeAddr(target.UDPAddr)
+	}
+
+	// Sign the target's PK with server's Ed25519 key for E2E verification.
+	var signedPk []byte
+	if len(target.PK) > 0 {
+		signed, err := s.kp.SignIdPk(targetID, target.PK)
+		if err != nil {
+			log.Printf("[signal] PunchHole: failed to sign PK for %s: %v", targetID, err)
+		} else {
+			signedPk = signed
+			log.Printf("[signal] PunchHole: signed PK for %s (%d bytes)", targetID, len(signedPk))
+		}
+	}
+
+	resp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_PunchHoleResponse{
+			PunchHoleResponse: &pb.PunchHoleResponse{
+				SocketAddr:  targetAddr,
+				Pk:          signedPk,
+				RelayServer: relayServer,
+				Union:       &pb.PunchHoleResponse_NatType{NatType: pb.NatType(target.NATType)},
+			},
+		},
+	}
+	s.sendUDP(resp, raddr)
+}
+
+// handlePunchHoleRequestTCP handles punch hole over TCP/WS.
+// When the target is online, we forward PunchHole to the target via UDP and
+// return nil — the TCP connection stays open so the server can later forward
+// PunchHoleResponse or RelayResponse from the target back to the initiator.
+// Only returns a response (PunchHoleResponse with failure) when the target is
+// offline or not found.
+func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.UDPAddr) *pb.RendezvousMessage {
+	targetID := msg.Id
+	if targetID == "" {
+		return nil
+	}
+
+	log.Printf("[signal] PunchHoleRequest (TCP) from %s for target %s", raddr, targetID)
+
+	target := s.peers.Get(targetID)
+	if target == nil || target.IsExpired(config.RegTimeout) {
+		if target == nil {
+			log.Printf("[signal] PunchHole (TCP): target %s not found in peer map", targetID)
+		} else {
+			log.Printf("[signal] PunchHole (TCP): target %s expired (last heartbeat: %v ago)", targetID, time.Since(target.LastReg))
+		}
+		return &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_PunchHoleResponse{
+				PunchHoleResponse: &pb.PunchHoleResponse{
+					Failure:     pb.PunchHoleResponse_OFFLINE,
+					RelayServer: s.getRelayServer(),
+				},
+			},
+		}
+	}
+
+	relayServer := s.getRelayServer()
+	log.Printf("[signal] PunchHole (TCP): target %s found (addr=%s, status=%s), relay=%s",
+		targetID, target.UDPAddr, target.StatusTier, relayServer)
+
+	// Forward PunchHole to the TARGET peer via UDP (tell it the initiator wants to connect).
+	// The PunchHole carries the initiator's TCP address as socket_addr so the target
+	// can include it in its PunchHoleSent/RelayResponse back to the signal server.
+	if target.UDPAddr != nil {
+		punchHole := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_PunchHole{
+				PunchHole: &pb.PunchHole{
+					SocketAddr:   crypto.EncodeAddr(raddr),
+					RelayServer:  relayServer,
+					NatType:      msg.NatType,
+					UdpPort:      msg.UdpPort,
+					ForceRelay:   msg.ForceRelay,
+					UpnpPort:     msg.UpnpPort,
+					SocketAddrV6: msg.SocketAddrV6,
+				},
+			},
+		}
+		s.sendUDP(punchHole, target.UDPAddr)
+		log.Printf("[signal] PunchHole (TCP): forwarded PunchHole to target %s at %s", targetID, target.UDPAddr)
+	}
+
+	// Return nil — do NOT send anything to the initiator yet.
+	// The TCP connection stays open (keep-alive) and the server will forward
+	// PunchHoleResponse (converted from target's PunchHoleSent) or RelayResponse
+	// later when the target responds.
+	return nil
+}
+
+// handlePunchHoleSent processes a PunchHoleSent message from the target peer.
+// This is sent by the target (B) after it receives PunchHole from the signal
+// server.  "PunchHoleSent" means "B is ready to accept a direct connection".
+//
+// The signal server converts this to a PunchHoleResponse and forwards it to the
+// initiator (A).  For TCP initiators the response goes via tcpPunchConns; for
+// UDP initiators it goes directly via UDP.
+//
+// PunchHoleSent fields: socket_addr (initiator A's addr), id (target B's ID),
+// relay_server, nat_type, version.
+//
+// PunchHoleResponse fields: socket_addr (target B's addr, encoded), pk (target
+// B's public key), relay_server, nat_type.
+func (s *Server) handlePunchHoleSent(phs *pb.PunchHoleSent, senderAddr *net.UDPAddr, viaUDP bool) {
+	if phs == nil || len(phs.SocketAddr) == 0 {
+		return
+	}
+
+	// Decode the initiator's address from socket_addr.
+	initiatorAddr, err := crypto.DecodeAddr(phs.SocketAddr)
+	if err != nil {
+		log.Printf("[signal] PunchHoleSent: cannot decode socket_addr: %v", err)
+		return
+	}
+
+	transport := "TCP"
+	if viaUDP {
+		transport = "UDP"
+	}
+	log.Printf("[signal] %s PunchHoleSent from %s for initiator %s (id=%s)",
+		transport, senderAddr, initiatorAddr, phs.Id)
+
+	// Look up the target's public key and sign it for E2E encryption verification.
+	// RustDesk clients expect signed IdPk in NaCl format: [ signature | IdPk protobuf ]
+	var signedPk []byte
+	targetID := phs.Id
+
+	// Fallback: if phs.Id is empty, try to identify the sender by IP lookup.
+	// Older RustDesk clients may not populate the id field in PunchHoleSent.
+	if targetID == "" {
+		if entry := s.peers.FindByIP(senderAddr.IP); entry != nil {
+			targetID = entry.ID
+			log.Printf("[signal] PunchHoleSent: resolved sender %s to peer %s via IP lookup", senderAddr, targetID)
+		}
+	}
+
+	if targetID != "" {
+		if target := s.peers.Get(targetID); target != nil && len(target.PK) > 0 {
+			// Sign the PK with server's Ed25519 key (enables client E2E verification)
+			signed, err := s.kp.SignIdPk(targetID, target.PK)
+			if err != nil {
+				log.Printf("[signal] Failed to sign PK for %s: %v", targetID, err)
+			} else {
+				signedPk = signed
+				log.Printf("[signal] Signed PK for %s: %d bytes", targetID, len(signedPk))
+			}
+		}
+	}
+
+	if len(signedPk) == 0 {
+		log.Printf("[signal] WARNING: PunchHoleSent from %s — no PK available for target %q, E2E will not be established", senderAddr, targetID)
+	}
+
+	// Build PunchHoleResponse for the initiator.
+	// socket_addr = target's (sender's) address, pk = SIGNED target's public key.
+	resp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_PunchHoleResponse{
+			PunchHoleResponse: &pb.PunchHoleResponse{
+				SocketAddr:  crypto.EncodeAddr(senderAddr),
+				Pk:          signedPk,
+				RelayServer: phs.RelayServer,
+				Union:       &pb.PunchHoleResponse_NatType{NatType: phs.NatType},
+			},
+		},
+	}
+
+	addrStr := normalizeAddrKey(initiatorAddr.String())
+
+	// Try TCP delivery first (initiator may have an open TCP connection).
+	if s.forwardToTCPInitiator(addrStr, resp) {
+		log.Printf("[signal] PunchHoleResponse forwarded via TCP to %s (target=%s)", addrStr, phs.Id)
+		return
+	}
+
+	// UDP delivery — send directly if we came from UDP, or look up the peer.
+	if viaUDP {
+		s.sendUDP(resp, initiatorAddr)
+		log.Printf("[signal] PunchHoleResponse sent via UDP to %s (target=%s)", initiatorAddr, phs.Id)
+		return
+	}
+
+	// TCP source but no TCP conn for initiator — try peer registry.
+	entry := s.peers.FindByIP(initiatorAddr.IP)
+	if entry != nil && entry.UDPAddr != nil {
+		s.sendUDP(resp, entry.UDPAddr)
+		log.Printf("[signal] PunchHoleResponse sent to peer %s at %s via UDP (target=%s)", entry.ID, entry.UDPAddr, phs.Id)
+		return
+	}
+
+	log.Printf("[signal] PunchHoleResponse: cannot deliver to %s (target=%s)", addrStr, phs.Id)
+}
+
+// handleRequestRelay forwards relay setup request to target peer.
+func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
+	targetID := msg.Id
+	log.Printf("[signal] RequestRelay from %s for target %s (uuid=%s, secure=%v, connType=%v)", raddr, targetID, msg.Uuid, msg.Secure, msg.ConnType)
+	target := s.peers.Get(targetID)
+
+	relayServer := s.getRelayServer()
+	if msg.RelayServer != "" {
+		relayServer = msg.RelayServer
+	}
+
+	if target == nil || target.IsExpired(config.RegTimeout) {
+		// Target offline — send relay response with failure
+		resp := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_RelayResponse{
+				RelayResponse: &pb.RelayResponse{
+					RefuseReason: "Target offline",
+					RelayServer:  relayServer,
+				},
+			},
+		}
+		s.sendUDP(resp, raddr)
+		return
+	}
+
+	// Forward relay info to target peer
+	relayResp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RelayResponse{
+			RelayResponse: &pb.RelayResponse{
+				SocketAddr:  crypto.EncodeAddr(raddr),
+				Uuid:        msg.Uuid,
+				RelayServer: relayServer,
+				Union:       &pb.RelayResponse_Id{Id: msg.Id},
+			},
+		},
+	}
+
+	if target.UDPAddr != nil {
+		s.sendUDP(relayResp, target.UDPAddr)
+	}
+
+	// Sign the target's PK for E2E encryption verification
+	var signedPk []byte
+	if len(target.PK) > 0 {
+		signed, err := s.kp.SignIdPk(targetID, target.PK)
+		if err != nil {
+			log.Printf("[signal] Failed to sign PK for %s: %v", targetID, err)
+		} else {
+			signedPk = signed
+			log.Printf("[signal] Signed PK for relay to %s: %d bytes", targetID, len(signedPk))
+		}
+	}
+
+	// Confirm to initiator with SIGNED public key
+	resp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RelayResponse{
+			RelayResponse: &pb.RelayResponse{
+				Uuid:        msg.Uuid,
+				RelayServer: relayServer,
+				Union:       &pb.RelayResponse_Pk{Pk: signedPk},
+			},
+		},
+	}
+	s.sendUDP(resp, raddr)
+}
+
+// handleRequestRelayTCP handles relay setup request over TCP/WS.
+// Forwards RequestRelay to the target peer via UDP. Does NOT send anything
+// back to the initiator — the TCP connection stays open and the server will
+// forward the target's RelayResponse via tcpPunchConns later.
+func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr) {
+	targetID := msg.Id
+	log.Printf("[signal] RequestRelay (TCP) from %s for target %s (uuid=%s, secure=%v, connType=%v)", raddr, targetID, msg.Uuid, msg.Secure, msg.ConnType)
+	target := s.peers.Get(targetID)
+
+	if target == nil || target.IsExpired(config.RegTimeout) {
+		log.Printf("[signal] RequestRelay (TCP): target %s offline", targetID)
+		// Target offline — try to send failure via TCP if possible.
+		// We use tcpPunchConns since that's where the initiator's TCP sink is stored.
+		relayServer := s.getRelayServer()
+		resp := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_RelayResponse{
+				RelayResponse: &pb.RelayResponse{
+					RefuseReason: "Target offline",
+					RelayServer:  relayServer,
+				},
+			},
+		}
+		addrStr := normalizeAddrKey(raddr.String())
+		s.forwardToTCPInitiator(addrStr, resp)
+		return
+	}
+
+	// Forward RequestRelay to target peer via UDP.
+	// The target will generate a UUID, connect to relayAddr, and send
+	// RelayResponse back to the signal server with socket_addr = initiator's addr.
+	if target.UDPAddr != nil {
+		reqRelay := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_RequestRelay{
+				RequestRelay: &pb.RequestRelay{
+					SocketAddr:         crypto.EncodeAddr(raddr),
+					Uuid:               msg.Uuid,
+					Id:                 msg.Id,
+					RelayServer:        s.getRelayServer(),
+					Secure:             msg.Secure,
+					ConnType:           msg.ConnType,
+					Token:              msg.Token,
+					ControlPermissions: msg.ControlPermissions,
+				},
+			},
+		}
+		s.sendUDP(reqRelay, target.UDPAddr)
+		log.Printf("[signal] RequestRelay (TCP): forwarded to %s secure=%v connType=%v", targetID, msg.Secure, msg.ConnType)
+	}
+}
+
+// handleRelayResponseForward forwards a RelayResponse from the target peer to
+// the initiator.  The target sends this after receiving PunchHole/RequestRelay
+// via UDP: it generates a relay UUID, connects to the relay server, and sends
+// RelayResponse to the signal server (TCP) with socket_addr = initiator's
+// address.
+//
+// Following the Rust hbbs behavior:
+// 1. Decode socket_addr to get initiator's address (addr_b in Rust)
+// 2. Clear socket_addr (initiator doesn't need it)
+// 3. Resolve target's PK from id field
+// 4. Set pk field (initiator needs this)
+// 5. Adjust relay_server if needed
+// 6. Forward to initiator via their stored TCP connection (tcpPunchConns)
+func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage) {
+	rr := msg.GetRelayResponse()
+	if rr == nil || len(rr.SocketAddr) == 0 {
+		return
+	}
+
+	initiatorAddr, err := crypto.DecodeAddr(rr.SocketAddr)
+	if err != nil {
+		log.Printf("[signal] RelayResponse forward: cannot decode socket_addr: %v", err)
+		return
+	}
+
+	addrStr := normalizeAddrKey(initiatorAddr.String())
+
+	// Look up the target peer to get its public key and sign it (matching Rust's get_pk).
+	targetID := rr.GetId()
+	var signedPk []byte
+	if targetID != "" {
+		if target := s.peers.Get(targetID); target != nil && len(target.PK) > 0 {
+			// Sign the PK with server's Ed25519 key (enables client E2E verification)
+			signed, err := s.kp.SignIdPk(targetID, target.PK)
+			if err != nil {
+				log.Printf("[signal] Failed to sign PK for %s in RelayResponse: %v", targetID, err)
+			} else {
+				signedPk = signed
+				log.Printf("[signal] Signed PK for %s in RelayResponse: %d bytes", targetID, len(signedPk))
+			}
+		}
+	}
+
+	// Modify the RelayResponse in-place (matching Rust hbbs behavior).
+	// Rust does: rr.socket_addr = Default; rr.set_pk(pk); adjust relay_server;
+	// then forwards the entire rr preserving version, feedback, upnp_port, etc.
+	rr.SocketAddr = nil
+	rr.SocketAddrV6 = nil
+	relayServer := s.getRelayServer()
+	rr.RelayServer = relayServer
+	// Replace union: id → SIGNED pk (initiator needs target's signed public key)
+	rr.Union = &pb.RelayResponse_Pk{Pk: signedPk}
+
+	initiatorResp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RelayResponse{
+			RelayResponse: rr,
+		},
+	}
+
+	// Primary delivery: TCP forwarding via tcpPunchConns.
+	// This is the expected path — the initiator's TCP connection should still be
+	// open because we now return nil from handlePunchHoleRequestTCP.
+	if s.forwardToTCPInitiator(addrStr, initiatorResp) {
+		log.Printf("[signal] RelayResponse forwarded via TCP to %s (uuid=%s, relay=%s, signedPk=%d bytes)", addrStr, rr.Uuid, relayServer, len(signedPk))
+		return
+	}
+
+	// Fallback: peer-map lookup by IP → forward via registered UDP address.
+	entry := s.peers.FindByIP(initiatorAddr.IP)
+	if entry != nil && entry.UDPAddr != nil {
+		s.sendUDP(initiatorResp, entry.UDPAddr)
+		log.Printf("[signal] RelayResponse forwarded to peer %s at %s via UDP (uuid=%s, relay=%s, signedPk=%d bytes)", entry.ID, entry.UDPAddr, rr.Uuid, relayServer, len(signedPk))
+		return
+	}
+
+	log.Printf("[signal] RelayResponse: cannot deliver to %s (no TCP conn, no peer match, uuid=%s)", addrStr, rr.Uuid)
+}
+
+// handleFetchLocalAddr forwards a local address fetch request to the target peer.
+// The FetchLocalAddr message carries socket_addr (who is asking), not an ID.
+// We decode the socket_addr to identify the requester's origin, then forward.
+func (s *Server) handleFetchLocalAddr(msg *pb.FetchLocalAddr, raddr *net.UDPAddr) {
+	// FetchLocalAddr contains the target's socket_addr from a previous PunchHole.
+	// We forward the request to the peer at that address, including the requester's addr.
+	targetAddr, err := crypto.DecodeAddr(msg.SocketAddr)
+	if err != nil || targetAddr == nil {
+		return
+	}
+
+	// Forward to target with requester's address
+	fetch := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_FetchLocalAddr{
+			FetchLocalAddr: &pb.FetchLocalAddr{
+				SocketAddr: crypto.EncodeAddr(raddr),
+			},
+		},
+	}
+	s.sendUDP(fetch, targetAddr)
+}
+
+// handleLocalAddr forwards a LocalAddr response from the target peer back to the
+// requester. This completes the FetchLocalAddr→LocalAddr exchange needed for LAN
+// direct connections.
+func (s *Server) handleLocalAddr(msg *pb.LocalAddr, raddr *net.UDPAddr) {
+	// socket_addr identifies the original requester that initiated FetchLocalAddr.
+	requesterAddr, err := crypto.DecodeAddr(msg.SocketAddr)
+	if err != nil || requesterAddr == nil {
+		return
+	}
+
+	// Forward the LocalAddr (with the responder's local address) to the requester.
+	resp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_LocalAddr{
+			LocalAddr: &pb.LocalAddr{
+				SocketAddr:   crypto.EncodeAddr(raddr),
+				LocalAddr:    msg.LocalAddr,
+				RelayServer:  msg.RelayServer,
+				Id:           msg.Id,
+				Version:      msg.Version,
+				SocketAddrV6: msg.SocketAddrV6,
+			},
+		},
+	}
+	s.sendUDP(resp, requesterAddr)
+}
+
+// handleTestNat handles NAT type detection (TCP port 21115).
+// M8: Also sends ConfigUpdate with relay/rendezvous server info for clients ≥1.3.x.
+func (s *Server) handleTestNat(msg *pb.TestNatRequest, raddr net.Addr) *pb.RendezvousMessage {
+	// Extract the source port from the remote address
+	tcpAddr, ok := raddr.(*net.TCPAddr)
+	if !ok {
+		return nil
+	}
+
+	resp := &pb.TestNatResponse{
+		Port: int32(tcpAddr.Port),
+	}
+
+	// M8: Include ConfigUpdate so clients ≥1.3.x learn about relay/rendezvous
+	// servers. This allows dynamic server reconfiguration without client-side changes.
+	rendezvousServers := s.cfg.GetRelayServers()
+	if s.cfg.RendezvousServers != "" {
+		for _, srv := range splitAndTrim(s.cfg.RendezvousServers) {
+			rendezvousServers = append(rendezvousServers, srv)
+		}
+	}
+	if len(rendezvousServers) > 0 {
+		resp.Cu = &pb.ConfigUpdate{
+			Serial:            msg.Serial + 1,
+			RendezvousServers: rendezvousServers,
+		}
+	}
+
+	return &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_TestNatResponse{
+			TestNatResponse: resp,
+		},
+	}
+}
+
+// splitAndTrim splits a comma-separated string and trims whitespace from each element.
+func splitAndTrim(s string) []string {
+	parts := make([]string, 0)
+	for _, p := range regexp.MustCompile(`\s*,\s*`).Split(s, -1) {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	return parts
+}
+
+// handleOnlineRequest checks which peers are online (TCP port 21115).
+func (s *Server) handleOnlineRequest(msg *pb.OnlineRequest) *pb.RendezvousMessage {
+	states := s.peers.OnlineStates(msg.Peers, config.RegTimeout)
+
+	return &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_OnlineResponse{
+			OnlineResponse: &pb.OnlineResponse{
+				States: states,
+			},
+		},
+	}
+}
+
+// sendRelayResponse sends relay-only response to the initiator when direct connection is skipped.
+// The target's public key is signed with the server's Ed25519 key (NaCl combined format)
+// so the initiator can verify the target's identity for E2E encryption.
+func (s *Server) sendRelayResponse(target *peer.Entry, raddr *net.UDPAddr, msg *pb.PunchHoleRequest, relay string) {
+	// Sign the target's PK with server's Ed25519 key for E2E verification.
+	// Format: [64-byte Ed25519 signature][serialized IdPk protobuf] — NaCl combined mode.
+	// Without signing, clients cannot verify target identity and E2E will fail.
+	var signedPk []byte
+	if len(target.PK) > 0 {
+		signed, err := s.kp.SignIdPk(target.ID, target.PK)
+		if err != nil {
+			log.Printf("[signal] sendRelayResponse: failed to sign PK for %s: %v", target.ID, err)
+		} else {
+			signedPk = signed
+			log.Printf("[signal] sendRelayResponse: signed PK for %s (%d bytes)", target.ID, len(signedPk))
+		}
+	}
+
+	resp := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_PunchHoleResponse{
+			PunchHoleResponse: &pb.PunchHoleResponse{
+				Pk:          signedPk,
+				RelayServer: relay,
+			},
+		},
+	}
+	s.sendUDP(resp, raddr)
+}
+
+// getRelayServer returns the relay server address to advertise to clients.
+// Priority:
+//  1. Explicitly configured relay servers (-relay-servers flag / RELAY_SERVERS env)
+//  2. Server's detected public IP + relay port (auto-detected from UDP socket)
+//  3. Bare :port as last resort
+func (s *Server) getRelayServer() string {
+	relays := s.cfg.GetRelayServers()
+	if len(relays) > 0 {
+		return relays[0]
+	}
+	// Use auto-detected public IP if available
+	if ip, ok := s.localIP.Load().(string); ok && ip != "" {
+		return fmt.Sprintf("%s:%d", ip, s.cfg.RelayPort)
+	}
+	// Fallback: bare port (same host as signal server)
+	return fmt.Sprintf(":%d", s.cfg.RelayPort)
+}
+
+// registerPkResponse is a helper to create a RegisterPkResponse message.
+func registerPkResponse(result pb.RegisterPkResponse_Result) *pb.RendezvousMessage {
+	return &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RegisterPkResponse{
+			RegisterPkResponse: &pb.RegisterPkResponse{
+				Result: result,
+			},
+		},
+	}
+}
+
+// isSamePublicIP returns true if both addresses have the same public IP.
+// Used for LAN detection — peers behind the same NAT share a public IP.
+func isSamePublicIP(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.IP.Equal(b.IP)
+}
+
+// isPrivateIP returns true if the IP is in a private/local range.
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	privateRanges := []struct {
+		network *net.IPNet
+	}{
+		{mustParseCIDR("10.0.0.0/8")},
+		{mustParseCIDR("172.16.0.0/12")},
+		{mustParseCIDR("192.168.0.0/16")},
+		{mustParseCIDR("fc00::/7")},
+	}
+	for _, r := range privateRanges {
+		if r.network.Contains(ip) {
+			return true
+		}
+	}
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast()
+}
+
+func mustParseCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+// checkEnrollmentPermission implements the Dual Key System enrollment policy.
+// Returns true if the peer is allowed to register, false otherwise.
+//
+// Modes:
+//   - "open" (default): All devices can register
+//   - "managed": New devices need to be pre-approved (exist in DB) or have a token
+//   - "locked": Only devices with a valid token binding can register
+func (s *Server) checkEnrollmentPermission(peerID, clientIP string) bool {
+	mode := s.cfg.EnrollmentMode
+	if mode == "" {
+		mode = config.EnrollmentModeOpen
+	}
+
+	// Open mode — always allow (backward compatible)
+	if mode == config.EnrollmentModeOpen {
+		return true
+	}
+
+	// Check if peer already exists in database (re-registration is always allowed)
+	if existingPeer, err := s.db.GetPeer(peerID); err == nil && existingPeer != nil {
+		return true
+	}
+
+	// Managed mode — allow if there's a pending token with this peer ID pre-bound
+	// Admin can pre-bind tokens to specific peer IDs before they register
+	if mode == config.EnrollmentModeManaged {
+		if token, err := s.db.GetDeviceTokenByPeerID(peerID); err == nil && token != nil {
+			if token.Status == db.TokenStatusPending || token.Status == db.TokenStatusActive {
+				// Token is valid — activate and bind to peer
+				log.Printf("[signal] Enrollment: peer %s matched token %s (managed mode)", peerID, token.Name)
+				return true
+			}
+		}
+		// In managed mode, reject unknown devices
+		log.Printf("[signal] Enrollment: rejected unknown peer %s (managed mode, no token)", peerID)
+		return false
+	}
+
+	// Locked mode — only devices with a valid token binding can register
+	if mode == config.EnrollmentModeLocked {
+		if token, err := s.db.GetDeviceTokenByPeerID(peerID); err == nil && token != nil {
+			if token.Status == db.TokenStatusPending || token.Status == db.TokenStatusActive {
+				log.Printf("[signal] Enrollment: peer %s matched token %s (locked mode)", peerID, token.Name)
+				return true
+			}
+		}
+		log.Printf("[signal] Enrollment: rejected peer %s (locked mode, no valid token)", peerID)
+		return false
+	}
+
+	return true
+}

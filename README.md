@@ -1,376 +1,505 @@
-﻿# 🚀 BetterDesk Console
+# 🚀 BetterDesk — RustDesk-Compatible Server & Web Console
 
 <div align="center">
 
+<img src="betterdesk.png" alt="BetterDesk Logo" width="320">
+
+<br><br>
+
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
-![RustDesk](https://img.shields.io/badge/RustDesk-1.1.14-green.svg)
+![Go](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)
 ![Node.js](https://img.shields.io/badge/Node.js-18+-339933.svg)
-![Version](https://img.shields.io/badge/version-2.3.0-brightgreen.svg)
-![Security](https://img.shields.io/badge/Security-TOTP%20%2B%20CSRF-green.svg)
-![Access](https://img.shields.io/badge/LAN%20%2B%20WAN-API-blue.svg)
+![Version](https://img.shields.io/badge/version-2.4.0-brightgreen.svg)
+![Security](https://img.shields.io/badge/Security-TLS%20%2B%20NaCl%20%2B%20TOTP-green.svg)
+![Database](https://img.shields.io/badge/DB-SQLite%20%2B%20PostgreSQL-blue.svg)
 
-**A modern, feature-rich web management console for RustDesk with real-time device monitoring, RustDesk Client API integration, and enterprise-grade security**
+**A clean-room RustDesk-compatible server written in Go — single binary replacing hbbs + hbbr — with full protocol support, TLS everywhere, PostgreSQL backend, and a modern Node.js web management console.**
 
-[Features](#-features) • [Screenshots](#-screenshots) • [Installation](#-installation) • [Client API](#-rustdesk-client-api) • [Documentation](#-documentation) • [Contributing](#-contributing)
+[Architecture](#-architecture) • [Installation](#-installation) • [Configuration](#-configuration) • [Security](#-security-architecture) • [API](#-api-reference) • [Troubleshooting](#-troubleshooting)
 
 </div>
 
 ---
 
-## 📋 Table of Contents
+## ✅ End-to-End Encryption — Fully Working
 
-- [Quick Start](#-quick-start)
-- [Overview](#-overview)
-- [Features](#-features)
-- [Screenshots](#-screenshots)
-- [Architecture](#-architecture)
-- [Installation](#-installation)
-  - [Linux](#-linux-betterdesk-sh)
-  - [Windows](#-windows-betterdeskps1)
-  - [Docker](#-docker-betterdesk-dockersh)
-  - [Migrating from Existing RustDesk](#-migrating-from-existing-rustdesk-docker)
-- [Internationalization](#-internationalization-i18n)
-- [Troubleshooting](#-troubleshooting)
-- [Configuration](#-configuration)
-- [API Documentation](#-api-documentation)
-- [Development](#-development)
-- [Technology Stack](#-technology-stack)
-- [Contributing](#-contributing)
-- [License](#-license)
-- [Credits](#-credits)
+> **E2E encryption between RustDesk clients is fully functional.** Both P2P (punch-hole) and relay sessions establish NaCl-encrypted channels with proper `SignedId` + `PublicKey` handshake. The green lock indicator appears in the RustDesk client for all connection modes.
+>
+> Additionally, you can enable **TLS on relay ports** (`--tls-relay` / `TLS_RELAY=Y`) for an extra transport-level encryption layer on top of the E2E channel.
 
 ---
 
-## 🚀 Quick Start
+## 📋 Table of Contents
 
-**BetterDesk 2.3** features a Node.js web console with RustDesk Client API, TOTP 2FA, and address book sync.
-
-### Linux
-```bash
-git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
-cd Rustdesk-FreeConsole
-chmod +x betterdesk.sh
-
-# Interactive mode
-sudo ./betterdesk.sh
-
-# Automatic mode (recommended)
-sudo ./betterdesk.sh --auto
-```
-
-### Windows (PowerShell as Administrator)
-```powershell
-git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
-cd Rustdesk-FreeConsole
-
-# Interactive mode
-.\betterdesk.ps1
-
-# Automatic mode (recommended)
-.\betterdesk.ps1 -Auto
-```
-
-### Docker
-```bash
-git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
-cd Rustdesk-FreeConsole
-chmod +x betterdesk-docker.sh
-./betterdesk-docker.sh
-```
-
-**All scripts offer an interactive menu with options:**
-1. 🚀 Fresh Installation
-2. ⬆️ Update  
-3. 🔧 Repair Installation
-4. ✅ Validate Installation
-5. 💾 Backup
-6. 🔐 Reset Admin Password
-7. 🔨 Build Binaries
-8. 📊 Diagnostics
-9. 🗑️ Uninstall
-M. 🔄 Migrate from existing RustDesk *(Docker only)*
-C. 🔒 Configure SSL Certificates
-S. ⚙️ Settings (path configuration)
+- [Overview](#-overview)
+- [Architecture](#-architecture)
+- [BetterDesk Go Server](#-betterdesk-go-server)
+  - [Protocol Implementation](#protocol-implementation)
+  - [Cryptography](#cryptography)
+  - [Database Backends](#database-backends)
+  - [TLS Support](#tls-support)
+  - [Rate Limiting & DDoS Protection](#rate-limiting--ddos-protection)
+  - [Enrollment & Device Tokens](#enrollment--device-tokens)
+- [Web Console (Node.js)](#-web-console-nodejs)
+- [Security Architecture](#-security-architecture)
+- [Installation](#-installation)
+  - [Linux](#linux)
+  - [Windows](#windows)
+  - [Docker](#docker)
+- [RustDesk Client Configuration](#-rustdesk-client-configuration)
+  - [Desktop Client Login](#desktop-client-login)
+- [TLS / SSL Certificates](#-tls--ssl-certificates)
+- [Configuration Reference](#-configuration-reference)
+- [API Reference](#-api-reference)
+- [Migration Guide](#-migration-guide)
+- [Monitoring & Metrics](#-monitoring--metrics)
+- [Troubleshooting](#-troubleshooting)
+- [E2E Encryption](#-e2e-encryption)
+- [Technology Stack](#-technology-stack)
+- [Contributing](#-contributing)
+- [License](#-license)
 
 ---
 
 ## 🌟 Overview
 
-**BetterDesk Console** is an enhanced web management interface for [RustDesk](https://github.com/rustdesk/rustdesk) - the open-source remote desktop solution. It extends the standard RustDesk HBBS (HBB Signal Server) with a powerful HTTP API and provides a beautiful, modern web interface for managing your RustDesk infrastructure.
+**BetterDesk** is a complete RustDesk infrastructure solution consisting of two main components:
 
-> **🤖 AI-Assisted Development**: This project was developed with significant assistance from AI coding tools (Claude/GitHub Copilot). While all code has been reviewed, tested, and validated for production use, users should be aware of this development approach.
+1. **BetterDesk Server** — A clean-room Go implementation that replaces both `hbbs` (signal) and `hbbr` (relay) with a **single binary**. It implements the full RustDesk wire protocol, including UDP/TCP/WebSocket signal, TCP/WebSocket relay, NaCl secure handshake, and a comprehensive HTTP REST API.
 
-### Why BetterDesk Console?
+2. **BetterDesk Console** — A Node.js (Express.js) web management panel with device monitoring, TOTP 2FA, RBAC, address book sync, and RustDesk Client API.
 
-- **Real-Time Monitoring**: See which devices are online/offline instantly
-- **Beautiful UI**: Modern glassmorphism design with Material Icons
-- **Authentic Status Detection**: Uses the same algorithm as RustDesk desktop client
-- **RESTful API**: Easy integration with other tools and scripts
-- **Device Management**: Add notes, search, filter, and organize your devices
-- **Open Source**: Fully transparent and customizable
+### Why BetterDesk?
 
----
+| Feature | Original RustDesk Server | BetterDesk Server |
+|---------|------------------------|-------------------|
+| **Binaries** | 2 (hbbs + hbbr) | **1 single binary** |
+| **Language** | Rust | Go (pure Go, no CGO) |
+| **Database** | SQLite only | **SQLite + PostgreSQL** |
+| **TLS** | Not built-in | **TLS everywhere** (auto-detect plain/TLS on same port) |
+| **API** | Minimal | **Full REST API** with JWT + API keys |
+| **Status tracking** | Binary (online/offline) | **4-tier** (Online/Degraded/Critical/Offline) |
+| **Rate limiting** | None | **IP, bandwidth, connection** limits |
+| **Metrics** | None | **Prometheus** exposition format |
+| **Admin console** | None | **TCP admin** (telnet/netcat) |
+| **Device enrollment** | Open only | **Open/Managed/Locked** modes |
+| **Audit trail** | None | **Ring-buffer + JSON file** audit logging |
+| **Hot reload** | Restart required | **SIGHUP** config reload |
+| **Multi-instance** | File-based only | **PostgreSQL LISTEN/NOTIFY** for real-time sync |
+| **Web panel** | None | **Full Node.js console** with TOTP 2FA |
 
-## ✨ Features
-
-### 🎨 Modern Web Interface
-
-- **Glassmorphism Design**: Sleek, modern UI with blur effects and gradients
-- **Material Icons**: Google Material Design icons (fully offline)
-- **Responsive Layout**: Works on desktop and tablet
-- **Dark Theme**: Easy on the eyes, perfect for NOC environments
-- **Real-Time Updates**: Auto-refresh device status
-- **Search & Filter**: Quickly find devices in large deployments
-
-### 🔧 Enhanced HBBS Server
-
-- **HTTP API**: RESTful API on port 21120 with X-API-Key authentication (LAN accessible)
-- **Real-Time Status**: Memory-based device status (no database lag)  
-- **Database Fallback**: Web console automatically falls back to SQLite database when API unavailable
-- **Smart Status Detection**: HBBS automatically updates device status in database during connections
-- **Authentic Algorithm**: Uses RustDesk's official 30-second timeout logic
-- **Thread-Safe**: Shared PeerMap with Arc/RwLock for concurrent access
-- **Zero Breaking Changes**: Fully compatible with existing RustDesk clients
-- **CORS Support**: Easy web console integration
-- **🔥 Bidirectional Ban Enforcement (v8)**: 
-  - Prevents banned devices from initiating connections (source check)
-  - Prevents connections to banned devices (target check)
-  - Works for both P2P and relay connections
-  - Real-time database sync - no restart required
-
-### 📊 Device Management
-
-- **Dashboard View**: Overview with statistics cards (Total, Active, Inactive, Banned, With Notes)
-- **Device List**: Sortable table with ID, notes, status, and timestamps
-- **Device Details**: View complete device information including ban status
-- **Add Notes**: Label devices with custom descriptions
-- **🔒 Device Banning**: Ban/unban devices with reason tracking and administrator info
-  - **Bidirectional Enforcement (v8)**: Banned devices blocked in both directions
-  - Source ban: Banned device cannot initiate any connections
-  - Target ban: Cannot connect to banned devices
-  - Enforced at punch hole and relay request stages
-  - 100% reliability with real-time sync
-- **Soft Delete**: Devices marked as deleted (recoverable) instead of permanent removal
-- **Batch Operations**: Search and filter multiple devices
-- **Public Key Display**: Quick access to server public key
-- **Visual Indicators**: Color-coded status badges, banned device highlighting
-
-### 🔧 Client Generator (UNDER DEVELOPMENT)
-
-> **⚠️ STATUS: IN DEVELOPMENT - NOT YET FUNCTIONAL**  
-> This feature is currently under active development and is not ready for production use. The UI is accessible but the functionality is not yet implemented. Expected completion: TBD.
-
-**Planned features:**
-- **🚀 Custom RustDesk Client Builder**: Generate pre-configured RustDesk clients directly from the web panel
-- **Multi-Platform Support**: Windows (64/32-bit), Linux, Android, macOS
-- **Version Selection**: Choose from multiple RustDesk versions (1.4.2 - 1.4.5)
-- **Pre-Configuration**: Embed server settings, security options, and permissions
-- **Visual Customization**: Upload custom icons and logos
-- **Security Options**: Set permanent passwords, approve modes, LAN discovery
-- **Permission Control**: Granular control over features (clipboard, file transfer, audio, etc.)
-- **Branding**: Custom company name, URLs, and copyright information
-- **Code Changes**: Optional modifications (monitor cycling, offline indicators, version notifications)
-- **One-Click Deployment**: Download ready-to-deploy clients with all settings embedded
-- **Audit Logging**: All client generations are logged for security tracking
-
-See [Client Generator Documentation](docs/CLIENT_GENERATOR.md) for planned feature details.
-
-### 🛡️ Security & Reliability
-
-- **Authentication System (v1.5.0)**:
-  - User login with bcrypt password hashing
-  - Role-based access control (Admin, Operator, Viewer)
-  - Session management with 24-hour tokens
-  - **\ud83c\udf10 Sidebar navigation** with 5 main sections (Dashboard, Public Key, Settings, User Management, About)
-  - **\ud83d\udd11 Password-protected public key access** - requires password verification
-  - **\u2699\ufe0f Settings page** with password change functionality
-  - **\ud83d\udc65 User management panel** (admin only) - create, edit, delete, activate/deactivate users
-  - **\ud83d\udcdd Extended About page** with open source credits and license information
-  - Audit logging for all actions
-- **API Security (v1.4.0)**:
-  - X-API-Key header authentication for HBBS API
-  - 64-character random API keys
-  - Secure key storage with 600 permissions
-  - LAN accessible (0.0.0.0) with authentication protection
-- **Input Validation**: Comprehensive validation for all user inputs
-- **XSS Protection**: Sanitization of user-provided content
-- **SQL Injection Prevention**: Parameterized queries throughout
-- **Bidirectional Ban Enforcement (v8)**: 
-  - Source device ban check (prevents banned devices from connecting)
-  - Target device ban check (prevents connections to banned devices)
-  - No race conditions or timing vulnerabilities
-  - Minimal performance impact (~1ms per check)
-- **Ban Management**: Track who banned devices, when, and why
-- **Confirmation Dialogs**: Explicit confirmation for destructive operations
-- **Automatic Backups**: Installation and update scripts create safety backups
-- **Precompiled Binaries**: No compilation needed, faster deployment
-- **Service Management**: Systemd integration for auto-restart
-- **Graceful Degradation**: Web console works even if API is unavailable
-- **No External Dependencies**: All assets served locally (offline-ready)
-- **Audit Trail**: Timestamps for all device modifications
-
-### 🌍 Internationalization (i18n)
-
-BetterDesk Console supports multiple languages through a JSON-based translation system.
-
-**Features:**
-- **Auto-Detection**: Automatically detects browser language preference
-- **Manual Selection**: Change language via Settings → Language Settings
-- **Persistent**: Language preference saved in cookies (1 year)
-- **Community Translations**: Easy to add new languages via JSON files
-- **Custom Upload**: Upload your own language packs directly from the web panel
-
-**Built-in Languages:**
-- 🇬🇧 English (default)
-- 🇵🇱 Polish (Polski)
-
-**Adding a Custom Language:**
-1. Go to **Settings** → **Language Settings**
-2. Click **Choose JSON File** and select your translation file
-3. The language will be available immediately after upload
-4. Refresh the page to apply translations
-
-**Creating a Language Pack:**
-1. Copy `web/lang/en.json` to `web/lang/[code].json`
-2. Translate all string values
-3. Update the `_meta` section with language info
-4. Upload via the web panel or place in the `lang/` folder
-
-See [Contributing Translations](docs/CONTRIBUTING_TRANSLATIONS.md) for detailed instructions.
-
----
-
-## 📸 Screenshots
-
-### Dashboard Overview
-![Dashboard](screenshots/dashboard.png)
-*Real-time statistics and device status overview*
-
-### Device Management
-![Devices](screenshots/devices-list.png)
-*Comprehensive device list with search and filtering*
-
-### Device Details
-![Details](screenshots/device-details.png)
-*Detailed device information modal*
-
-### Public Key Management
-![Public Key](screenshots/public_key_page.png)
-*Secure public key access with password protection*
-
-### Settings
-![Settings](screenshots/settings_page.png)
-*User settings and password management*
-
-### User Management
-![User Management](screenshots/user_mgmt.png)
-*Multi-user administration panel*
-
-### About
-![About](screenshots/about.png)
-*System information and version details*
+> **🤖 AI-Assisted Development**: This project was developed with significant assistance from AI coding tools (Claude/GitHub Copilot). All code has been reviewed, tested, and validated for production use.
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   RustDesk Clients                      │
-│              (Desktop, Tablet, Web)                      │
-└───────────┬─────────────────────────────────┬────────────┘
-            │  Heartbeat (~30-45s)            │ Login / AB Sync
-            ▼                                 ▼
- ┌────────────────────────────┐  ┌──────────────────────────┐
- │   Enhanced HBBS Server     │  │  RustDesk Client API     │
- │   (Port 21115-21119)       │  │  (Port 21121, WAN)       │
- └────────────┬───────────────┘  │  7-Layer Security Stack  │
-              │                  └────────────┬─────────────┘
-              ▼                               │
- ┌────────────────────────────┐               │
- │   Arc<PeerMap>             │               │
- │   (Shared Memory)          │               │
- └───────────┬────────────────┘               │
-          ┌──┴──────────┐                     │
-          ▼             ▼                     │
- ┌──────────────┐ ┌─────────────┐             │
- │  HTTP API    │ │  SQLite DB  │             │
- │  (Port 21120)│ │  (Persist.) │             │
- └──────┬───────┘ └─────────────┘             │
-        │                                     │
-        ▼                                     ▼
-┌─────────────────────────────────────────────────┐
-│       Web Management Console                    │
-│     Node.js • Express • EJS                     │
-│         (Port 5000, LAN)                        │
-├─────────────┬────────────┬──────────────────────┤
-│ Auth + TOTP │ WebSocket  │ Address Book Sync    │
-│  (bcrypt)   │  Relay     │  (DB persistence)    │
-└─────────────┴────────────┴──────────────────────┘
+RustDesk Desktop/Mobile Clients
+  │
+  ├── UDP (:21116) ──────► Signal Server ──► RegisterPeer, PunchHole, RequestRelay
+  ├── TCP (:21116) ──────► Signal Server ──► NaCl Secure Handshake → encrypted channel
+  ├── TCP (:21115) ──────► NAT Test      ──► TestNatRequest, OnlineRequest, ConfigUpdate
+  ├── WS  (:21118) ──────► WS Signal     ──► WebSocket-based signal (web clients)
+  │
+  ├── TCP (:21117) ──────► Relay Server  ──► UUID pairing → bidirectional io.Copy pipe
+  ├── WS  (:21119) ──────► WS Relay      ──► WebSocket relay (web clients)
+  │
+  └── HTTP (:21121) ─────► Client API    ──► Login, address book sync, heartbeat, sysinfo
+                                              (WAN-facing, 7-layer security stack)
+
+Admin / Web Console
+  │
+  ├── HTTP  (:21114) ────► REST API      ──► JWT/API-key auth → CRUD endpoints
+  ├── WS    (:21114) ────► Event Stream  ──► Real-time peer status push
+  ├── TCP   (admin)  ────► Admin Console ──► telnet/netcat management (127.0.0.1 only)
+  └── HTTP  (:5000)  ────► Web Console   ──► Node.js + Express + EJS (LAN)
+                                              TOTP 2FA, RBAC, device management
+
+Database Layer
+  │
+  ├── SQLite  ──► Pure Go (modernc.org/sqlite), WAL mode, single binary
+  └── PostgreSQL ──► pgx/v5 + pgxpool, LISTEN/NOTIFY, row-level locking
 ```
 
-### Key Components
+### Port Map
 
-1. **Enhanced HBBS**: Modified RustDesk signal server with HTTP API
-2. **RustDesk Client API**: Dedicated WAN-facing API for RustDesk desktop client login, address book sync
-3. **HTTP API**: Axum-based REST API for device queries (LAN)
-4. **PeerMap**: Thread-safe in-memory peer storage (Arc<RwLock>)
-5. **Web Console**: Node.js application with modern UI, TOTP 2FA, CSRF protection
-6. **SQLite Database**: Original RustDesk database (unchanged) + auth database
+| Port | Protocol | Service | Direction |
+|------|----------|---------|-----------|
+| **21114** | HTTP(S) | REST API (Go server) | LAN |
+| **21115** | TCP | NAT type test + OnlineRequest | WAN |
+| **21116** | TCP + UDP | Signal Server (registration, punch hole) | WAN |
+| **21117** | TCP | Relay Server (bidirectional stream) | WAN |
+| **21118** | WS(S) | WebSocket Signal | WAN |
+| **21119** | WS(S) | WebSocket Relay | WAN |
+| **21121** | HTTP | RustDesk Client API (login, AB sync) | WAN |
+| **5000** | HTTP | Web Console (admin panel) | LAN |
 
-### Web Console
-
-| Feature | Details |
-|---------|--------|
-| **Runtime** | Node.js 18+ (Express.js) |
-| **Templates** | EJS |
-| **Database** | better-sqlite3 |
-| **Auth** | bcrypt + TOTP 2FA |
-| **Security** | CSRF, Helmet, rate limiting |
-| **Client API** | RustDesk login + AB sync (port 21121) |
+> All TCP/WS ports support **dual-mode TLS** — plain and TLS on the same port with automatic detection.
 
 ---
 
-## 🚀 Installation
+## 🔧 BetterDesk Go Server
 
-### 📌 Interactive ALL-IN-ONE Scripts (v2.3.0 - Recommended)
+The Go server (`betterdesk-server/`) is a ~20,000 LOC clean-room implementation of the RustDesk signal and relay protocol. It compiles to a **single static binary** with no external dependencies (pure Go, no CGO required).
 
-| Platform | Script | Features |
-|----------|--------|----------|
-| **Linux** | `betterdesk.sh` | ✅ Interactive menu, install, update, backup, diagnostics, SSL config |
-| **Windows** | `betterdesk.ps1` | ✅ Interactive menu, install, update, backup, diagnostics, SSL config |
-| **Docker** | `betterdesk-docker.sh` | ✅ Interactive menu, build images, manage containers |
+### Server Modes
 
-> **💡 New in v2.3.0**: RustDesk Client API (login/address book sync), TOTP 2FA, CSRF protection, SSL certificate configuration!
+```bash
+# Default: run everything (signal + relay + API + admin)
+./betterdesk-server -mode all
 
-### 🐧 Linux (`betterdesk.sh`)
+# Signal only (no relay)
+./betterdesk-server -mode signal
+
+# Relay only
+./betterdesk-server -mode relay
+```
+
+### Protocol Implementation
+
+The server implements the complete RustDesk rendezvous/relay protocol:
+
+#### Signal Protocol (UDP/TCP/WS)
+
+| Message | Direction | Description |
+|---------|-----------|-------------|
+| `RegisterPeer` | Client → Server | Heartbeat registration (~12s interval), updates in-memory peer map |
+| `RegisterPeerResponse` | Server → Client | Suggested heartbeat interval, request online status |
+| `RegisterPk` | Client → Server | Public key registration with UUID consistency check |
+| `RegisterPkResponse` | Server → Client | Registration result |
+| `PunchHoleRequest` | Client A → Server | Request hole-punch to Client B |
+| `PunchHole` | Server → Client B | Forward punch request with Client A's address |
+| `PunchHoleSent` | Client B → Server | Confirm punch sent |
+| `PunchHoleResponse` | Server → Client A | Relay response with Client B's NAT info |
+| `RequestRelay` | Client → Server | Request relay session |
+| `RelayResponse` | Server → Clients | Relay server address + UUID for pairing |
+| `FetchLocalAddr` / `LocalAddr` | Bidirectional | LAN address exchange for direct connections |
+| `TestNatRequest` | Client → Server (:21115) | NAT type detection |
+| `TestNatResponse` | Server → Client | NAT type + `ConfigUpdate` (relay/rendezvous servers) |
+| `OnlineRequest` | Client → Server (:21115) | Bulk online status query (bitmask response) |
+
+#### Relay Protocol (TCP/WS)
+
+The relay is a **pure opaque byte pipe**:
+
+1. Client A connects, sends `RequestRelay{uuid: "..."}` → registered as pending
+2. Client B connects with the same UUID → pair found
+3. Bidirectional `io.Copy` begins immediately (relay is a pure opaque byte pipe)
+4. Timeouts: 30s pairing, 30s idle (extended on activity via `idleTimeoutConn`)
+
+The relay does **not** parse, inspect, or modify traffic between paired clients. E2E encryption is entirely between the two RustDesk clients.
+
+#### Wire Protocol (codec/)
+
+Matches `hbb_common::bytes_codec::BytesCodec`:
+
+- **TCP**: Variable-length framing — bottom 2 bits of header = header length - 1, remaining bits = payload length (little-endian). Supports 1-4 byte headers (max frame: 64 KB)
+- **UDP**: Raw protobuf (no framing)
+- **WebSocket**: Raw protobuf per binary WS frame
+
+### Cryptography
+
+#### Server-Client Secure Handshake (NaCl)
+
+```
+Server                                          Client
+  │                                                │
+  │  KeyExchange{keys: [Ed25519_sign(Cv_pub)]}     │
+  │ ──────────────────────────────────────────────► │
+  │                                                │
+  │  KeyExchange{keys: [client_cv_pub,             │
+  │               nacl_box(symmetric_key)]}         │
+  │ ◄────────────────────────────────────────────── │
+  │                                                │
+  │  ═══ All traffic encrypted with NaCl secretbox ═══
+```
+
+1. Server generates Ed25519 keypair → derives Curve25519 public key → signs with Ed25519
+2. Client verifies signature → generates its own Curve25519 keypair
+3. Client encrypts a random symmetric key using NaCl box (Curve25519 DH)
+4. All subsequent messages use NaCl secretbox with sequential nonces
+5. **Backward compatible**: Auto-detects old (plain) vs new (encrypted) clients
+
+#### Key Storage
+
+- **Private key**: `id_ed25519` file (auto-generated if missing)
+- **Public key**: `id_ed25519.pub` (base64-encoded, same format as original RustDesk)
+- **Key format**: Standard Ed25519 (32-byte seed), compatible with existing RustDesk clients
+
+#### Password Hashing
+
+- **Algorithm**: PBKDF2-HMAC-SHA256
+- **Iterations**: 100,000
+- **Salt**: 16-byte cryptographically random
+- **Comparison**: Constant-time (`subtle.ConstantTimeCompare`)
+
+### Database Backends
+
+#### SQLite (Default)
+
+```bash
+./betterdesk-server -db ./db_v2.sqlite3
+```
+
+- **Driver**: `modernc.org/sqlite` — pure Go, no CGO required
+- **Journal mode**: WAL (Write-Ahead Logging) for concurrent reads
+- **Foreign keys**: Enabled by default
+- **Connection limit**: 1 (SQLite single-writer constraint)
+- **Write serialization**: `sync.RWMutex` around all write operations
+- **Tables**: `peers`, `server_config`, `id_change_history`, `users`, `api_keys`, `device_tokens`
+
+#### PostgreSQL
+
+```bash
+./betterdesk-server -db "postgres://user:password@localhost:5432/betterdesk?sslmode=disable"
+```
+
+- **Driver**: `pgx/v5` with `pgxpool` connection pooling
+- **Pool size**: Configurable via `pool_max_conns` DSN parameter (default: 10)
+- **Native types**: `BOOLEAN`, `BYTEA`, `TIMESTAMPTZ`, `BIGSERIAL`
+- **Row-level locking**: `SELECT ... FOR UPDATE` in `ChangePeerID` (replaces SQLite global mutex)
+- **LISTEN/NOTIFY**: Real-time cross-instance event push for multi-server deployments
+- **Partial indexes**: `WHERE banned = TRUE`, `WHERE peer_id != ''` for performance
+- **Auto-detection**: DSN starting with `postgres://` or `postgresql://` automatically selects PostgreSQL
+
+#### Schema Overview
+
+```sql
+-- Core tables (both backends)
+peers              -- Device records (21 fields: id, uuid, pk, ip, note, status, etc.)
+server_config      -- Key-value configuration store
+id_change_history  -- Device ID change audit trail
+users              -- Admin/operator/viewer accounts (PBKDF2 + TOTP)
+api_keys           -- API key management (SHA256 hash storage)
+device_tokens      -- Enrollment tokens (Dual Key System)
+```
+
+### TLS Support
+
+BetterDesk supports TLS on all transport layers with a unique **dual-mode auto-detection** system:
+
+```bash
+# Enable TLS on signal ports (21116 TCP + 21115 + 21118 WSS)
+./betterdesk-server -tls-signal -tls-cert server.crt -tls-key server.key
+
+# Enable TLS on relay ports (21117 TCP + 21119 WSS)
+./betterdesk-server -tls-relay -tls-cert server.crt -tls-key server.key
+
+# Enable TLS on everything
+./betterdesk-server -tls-signal -tls-relay -tls-cert server.crt -tls-key server.key
+
+# HTTPS on API
+./betterdesk-server -tls-cert server.crt -tls-key server.key -force-https
+```
+
+#### DualModeListener (config/tls.go)
+
+Accepts **both plain and TLS connections on the same port**:
+
+1. Peeks first byte of incoming connection
+2. If `0x16` (TLS ClientHello) → upgrades to `tls.Server()`
+3. Otherwise → passes through as plain TCP via `peekedConn`
+
+This means existing RustDesk clients (no TLS) continue to work alongside TLS-enabled clients without port changes. Minimum TLS version: **TLS 1.2**.
+
+### Rate Limiting & DDoS Protection
+
+| Layer | Type | Default | Configurable |
+|-------|------|---------|-------------|
+| **IP rate limiter** | Sliding window per-IP | 20 registrations/min | Via constants |
+| **Login rate limiter** | Per-IP | 5 attempts / 5 min | Via constants |
+| **Bandwidth limiter** | Token bucket | 1 GB/s global, 16 MB/s per-session | Via constants |
+| **Connection limiter** | Per-IP concurrent | 20 relay connections/IP | `-relay-max-conns-ip` |
+| **TCP punch cache** | TTL + max size | 2 min TTL, 10K max entries | Via constants |
+| **WebSocket origins** | Whitelist | Accept all | `WS_ALLOWED_ORIGINS` env |
+| **Relay idle timeout** | Per-session | 30s (extended on activity) | Via constants |
+| **Relay pair timeout** | Pending sessions | 30s | Via constants |
+
+### Enrollment & Device Tokens
+
+The **Dual Key System** controls which devices can register with the server:
+
+| Mode | Behavior |
+|------|----------|
+| `open` (default) | Accept all device registrations |
+| `managed` | New devices need admin approval OR a valid enrollment token |
+| `locked` | Only devices with pre-issued valid enrollment tokens can register |
+
+```bash
+# Set enrollment mode
+./betterdesk-server -mode all
+# Then via API: PUT /api/enrollment/mode {"mode": "managed"}
+```
+
+Device tokens have statuses: `pending`, `active`, `revoked`, `expired`. Bulk generation is supported via `POST /api/tokens/generate-bulk`.
+
+### 4-Tier Device Status System
+
+```
+ONLINE    → Last heartbeat < 15s ago
+DEGRADED  → 2 consecutive missed heartbeats (15-30s)
+CRITICAL  → 4+ missed heartbeats (30-60s)
+OFFLINE   → Beyond RegTimeout (30s) with no heartbeat
+```
+
+- **Heartbeat interval**: Clients send `RegisterPeer` every ~12s
+- **Cleaner goroutine**: Runs every 3s, checks all peers, publishes status transition events
+- **Debounced DB sync**: Memory → database sync every 60s (avoids write storms)
+
+### Admin TCP Console
+
+A lightweight management interface accessible via `telnet` or `netcat`:
+
+```bash
+./betterdesk-server -admin-port 9090 -admin-password "secret"
+# Then: telnet 127.0.0.1 9090
+```
+
+**Commands**: `status`, `peers [count|info <id>]`, `ban/unban/kick <id>`, `blocklist [add|rm]`, `config [get|set]`, `reload`, `quit`
+
+> Admin console binds to `127.0.0.1` only — never exposed to the network.
+
+---
+
+## 🖥️ Web Console (Node.js)
+
+The web console (`web-nodejs/`) is an Express.js application providing a full-featured management UI.
+
+### Features
+
+- **Dashboard** — Real-time statistics cards (total, active, inactive, banned devices)
+- **Device management** — Search, filter, sort, add notes, ban/unban, change ID
+- **Device details** — Hardware tab (sysinfo), metrics tab (live CPU/RAM/disk bars + history charts)
+- **TOTP 2FA** — Two-factor authentication with `otplib`
+- **RBAC** — Admin, Operator, Viewer roles with permission enforcement
+- **Address book sync** — Full AB storage with `address_books` table
+- **RustDesk Client API** — Dedicated WAN port (21121) with 7-layer security
+- **Desktop connect** — One-click connect via `rustdesk://` URI handler
+- **i18n** — JSON-based translations (English + Polish built-in)
+- **CSRF protection** — Double-submit cookie pattern with `csrf-csrf`
+- **WebSocket** — Real-time status updates from Go server event bus
+
+### RustDesk Client API (Port 21121)
+
+Allows RustDesk desktop clients to:
+- Login/logout with username and password
+- Sync address books across devices
+- Send heartbeats and system information
+- Query device groups and user information
+
+**Security middleware stack (7 layers)**:
+
+| Layer | Protection |
+|-------|-----------|
+| 1 | Request timeout (10s request / 15s headers) |
+| 2 | Security headers (no server fingerprinting) |
+| 3 | Request logger (full audit trail) |
+| 4 | Path whitelist (only known RustDesk endpoints) |
+| 5 | Global rate limit (100 req/15min per IP) |
+| 6 | Login rate limit (5 attempts/15min per IP) |
+| 7 | Body size limit (1KB default, 64KB for address book) |
+
+---
+
+## 🛡️ Security Architecture
+
+### Server-Level Security
+
+| Component | Implementation |
+|-----------|---------------|
+| **Transport encryption** | NaCl secretbox (signal TCP), TLS 1.2+ (all ports), WSS (WebSocket) |
+| **Password storage** | PBKDF2-HMAC-SHA256, 100K iterations, 16-byte random salt |
+| **JWT tokens** | HS256 with HMAC-equal verification (constant-time), configurable expiry, unique JTI |
+| **2FA partial tokens** | 5-minute TTL (prevents long-lived intermediate auth states) |
+| **TOTP 2FA** | RFC 6238 compliant, ±1 time step tolerance, constant-time code comparison |
+| **API authentication** | JWT Bearer token OR API key (`X-API-Key` header, SHA256 hash lookup) |
+| **Input validation** | Peer ID: `^[A-Za-z0-9_-]{6,16}$`, config key: `^[A-Za-z0-9_.\-]{1,64}$` |
+| **SQL injection** | Parameterized queries only, LIKE patterns escape `%` and `_` |
+| **IP blocklist** | IP, CIDR, device ID blocking with hot-reload (SIGHUP) |
+| **Rate limiting** | Per-IP sliding window (registrations, login, TCP connections) |
+| **Bandwidth limiting** | Token bucket (global: 1 GB/s, per-session: 16 MB/s) |
+| **Audit logging** | Ring buffer (10K events) + optional JSON-lines file output |
+| **Error handling** | Never exposes internal details to clients |
+| **Credentials file** | Admin password file written with mode `0600` |
+| **Proxy trust** | `X-Forwarded-For` only when `TRUST_PROXY=Y` |
+
+### Console-Level Security
+
+| Component | Implementation |
+|-----------|---------------|
+| **CSRF** | Double-submit cookie pattern (`csrf-csrf`) |
+| **Session fixation** | Session regeneration after login |
+| **Timing-safe auth** | Pre-computed dummy bcrypt hash for non-existent users |
+| **WebSocket auth** | Session cookie required for WS upgrade |
+| **Helmet** | Security headers (CSP, HSTS, X-Frame-Options) |
+| **Rate limiting** | `express-rate-limit` on all endpoints |
+| **XSS prevention** | HTML sanitization, `textContent` instead of `innerHTML` |
+| **Sort injection** | Whitelisted sort fields and directions |
+
+---
+
+## 📦 Installation
+
+### Prerequisites
+
+| Requirement | Version | Notes |
+|------------|---------|-------|
+| **Go** | 1.21+ | Auto-installed by scripts if missing (downloads Go 1.22.1) |
+| **Node.js** | 18+ | Auto-installed by scripts if missing |
+| **Git** | Any | For cloning the repository |
+| **OS** | Linux (Ubuntu 20.04+, Debian 11+, CentOS 8+), Windows 10+, Docker | |
+| **PostgreSQL** | 14+ | Optional — SQLite is the default |
+
+### Linux
 
 ```bash
 git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
 cd Rustdesk-FreeConsole
 chmod +x betterdesk.sh
 
-# Interactive mode
+# Interactive mode (recommended for first install)
 sudo ./betterdesk.sh
 
-# Automatic mode (recommended)
+# Automatic mode (non-interactive)
 sudo ./betterdesk.sh --auto
+
+# Skip Go binary SHA256 verification
+sudo ./betterdesk.sh --skip-verify
+
+# Custom API port
+API_PORT=21120 sudo ./betterdesk.sh --auto
 ```
 
-### 🪟 Windows (`betterdesk.ps1`)
+The script will:
+1. Install Go toolchain if not present
+2. Compile `betterdesk-server` from source (single binary)
+3. Install Node.js and the web console
+4. Create systemd services (`betterdesk-server.service` + `betterdesk-console.service`)
+5. Generate Ed25519 keys (or preserve existing ones)
+6. Create initial admin user (credentials saved to `.admin_credentials`)
+7. Start all services
+
+### Windows
 
 ```powershell
+# Run PowerShell as Administrator
 git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
 cd Rustdesk-FreeConsole
 
-# Interactive mode (Run as Administrator)
-.\betterdesk.ps1
+# Interactive mode
+.etterdesk.ps1
 
-# Automatic mode (recommended)
-.\betterdesk.ps1 -Auto
+# Automatic mode
+.etterdesk.ps1 -Auto
+
+# Skip verification
+.etterdesk.ps1 -SkipVerify
 ```
 
-### 🐳 Docker (`betterdesk-docker.sh`)
+The script installs Go, compiles the server, sets up NSSM services (`BetterDeskServer` + `BetterDeskConsole`) or scheduled tasks as fallback.
+
+### Docker
 
 ```bash
 git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
@@ -379,821 +508,817 @@ chmod +x betterdesk-docker.sh
 ./betterdesk-docker.sh
 ```
 
----
-
-### � Docker Installation (Alternative)
-
-For containerized deployments using Docker Compose:
+Or manually with Docker Compose:
 
 ```bash
-git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
-cd Rustdesk-FreeConsole
-
-# Build and start (REQUIRED - images are not on Docker Hub)
 docker compose build
 docker compose up -d
 ```
 
-**Full Docker guide**: [DOCKER_TROUBLESHOOTING.md](docs/DOCKER_TROUBLESHOOTING.md)
+> **Note**: Docker images are built locally — they are **not** available on Docker Hub. Always use `docker compose build` first.
 
-### 🔄 Migrating from Existing RustDesk Docker
+### Menu Options
 
-Already running RustDesk with Docker? You can migrate to BetterDesk while preserving your encryption keys, device database, and client connections — **no client-side reconfiguration needed**.
+All scripts provide an interactive menu:
 
-**Automatic (recommended):**
+| Option | Description |
+|--------|-------------|
+| **1** | 🚀 New installation (compile Go server + install Node.js console) |
+| **2** | ⬆️ Update existing installation |
+| **3** | 🔧 Repair installation |
+| **4** | ✅ Validate installation |
+| **5** | 💾 Create backup |
+| **6** | 🔐 Reset admin password |
+| **7** | 🔨 Build/rebuild Go server binary |
+| **8** | 📊 Diagnostics |
+| **9** | 🗑️ Uninstall |
+| **C** | 🔒 Configure SSL/TLS certificates |
+| **M** | 🔄 Migrate from existing RustDesk (Docker) |
+| **P** | 🔀 Database migration (SQLite ↔ PostgreSQL) |
+| **S** | ⚙️ Settings (path configuration) |
+
+### What Gets Installed
+
+```
+/opt/rustdesk/                    # (Linux) or C:\BetterDesk\ (Windows)
+├── betterdesk-server             # Single Go binary (signal + relay + API)
+├── id_ed25519                    # Ed25519 private key (mode 0600)
+├── id_ed25519.pub                # Ed25519 public key (base64)
+├── db_v2.sqlite3                 # SQLite database (if using SQLite)
+├── .admin_credentials            # Initial admin password (mode 0600)
+├── .api_key                      # API key for console ↔ server auth
+└── web-console/                  # Node.js web console
+    ├── server.js
+    ├── package.json
+    ├── .env                      # Console configuration
+    └── ...
+```
+
+---
+
+## 🖥️ RustDesk Client Configuration
+
+After installing BetterDesk server, configure your RustDesk desktop clients to connect to it.
+
+### Basic Setup
+
+1. Open the RustDesk client
+2. Click the **menu (≡)** button → **Network** → **ID/Relay Server**
+3. Fill in:
+
+| Field | Value | Example |
+|-------|-------|---------|
+| **ID Server** | Your server IP or domain | `betterdesk.example.com` |
+| **Relay Server** | Same as ID Server (or leave empty) | `betterdesk.example.com` |
+| **API Server** | `http(s)://<server>:21121` | `http://betterdesk.example.com:21121` |
+| **Key** | Contents of `id_ed25519.pub` on the server | (base64 public key string) |
+
+> **Tip:** The public key can be found in the Web Console under **Dashboard → Server Keys**, or by reading the file `/opt/rustdesk/id_ed25519.pub` (Linux) / `C:\BetterDesk\id_ed25519.pub` (Windows) on the server.
+
+### Mass Deployment
+
+For deploying to many clients, use the RustDesk configuration string:
+
+```
+rustdesk://config/<base64-encoded-json>
+```
+
+JSON structure:
+```json
+{
+  "host": "betterdesk.example.com",
+  "relay": "betterdesk.example.com",
+  "api": "http://betterdesk.example.com:21121",
+  "key": "<contents-of-id_ed25519.pub>"
+}
+```
+
+You can also use the `--config` command-line flag when starting RustDesk:
+```bash
+rustdesk --config '{"host":"betterdesk.example.com","key":"<pubkey>"}'
+```
+
+### Desktop Client Login
+
+RustDesk desktop clients can **log in** to the BetterDesk server using their user account. This enables address book synchronization, device grouping, and audit trail per user.
+
+#### How to Log In
+
+1. Open the RustDesk client
+2. Click the **account icon** (person silhouette) in the bottom-left corner
+3. Enter your **username** and **password** (the same credentials used for the Web Console)
+4. Click **Login**
+
+> **Note:** The login API runs on port **21121** (the RustDesk Client API), not on port 21114 (which is the server management REST API for LAN-only use). Make sure the `API Server` field in the client points to `http(s)://<server>:21121`.
+
+#### What Login Enables
+
+| Feature | Description |
+|---------|-------------|
+| **Address Book Sync** | Your address book is stored server-side and synced across all devices where you're logged in |
+| **User Identity** | Connections are associated with your user account in audit logs |
+| **Device Groups** | Access to pre-configured device groups and strategies |
+| **Heartbeat + Sysinfo** | The client periodically sends system information (CPU, RAM, OS) to the server |
+
+#### Troubleshooting Login
+
+| Problem | Solution |
+|---------|----------|
+| "Login failed" | Verify the API Server field is set to `http://<server>:21121` (not 21114) |
+| "Connection refused" | Ensure port 21121 is open in the firewall and the console is running |
+| TOTP 2FA prompt | Enter the 6-digit code from your authenticator app (if 2FA is enabled for your account) |
+| "Invalid credentials" | Reset password via Web Console → Users, or run the installer with option 6 |
+
+### Ports Required on Client Side
+
+Ensure the following **outbound** ports are accessible from clients to the server:
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 21115 | TCP | NAT type detection (automatic) |
+| 21116 | TCP + UDP | Signal / ID registration |
+| 21117 | TCP | Relay (connection forwarding) |
+| 21118 | TCP (WS) | WebSocket signal (optional, web clients) |
+| 21119 | TCP (WS) | WebSocket relay (optional, web clients) |
+| 21121 | TCP | RustDesk Client API — login, address book sync, heartbeat |
+
+> **Port 21114** is the Go server management REST API (LAN-only) — it is **not** used by RustDesk desktop clients. Do not expose it to the internet.
+
+---
+
+## 🔒 TLS / SSL Certificates
+
+BetterDesk supports TLS on all layers: Go server transport (signal + relay), Go server HTTPS API, and the Node.js web console.
+
+### Self-Signed Certificate (Quick Start)
+
+For testing or internal networks, generate a self-signed certificate:
+
+```bash
+# Create certificate directory
+mkdir -p /opt/rustdesk/ssl
+
+# Generate a self-signed certificate (valid for 3 years)
+openssl req -x509 -nodes -days 1095 -newkey rsa:2048 \
+  -keyout /opt/rustdesk/ssl/betterdesk.key \
+  -out /opt/rustdesk/ssl/betterdesk.crt \
+  -subj "/CN=$(hostname -f)/O=BetterDesk/C=US" \
+  -addext "subjectAltName=DNS:$(hostname -f),DNS:localhost,IP:$(curl -s ifconfig.me),IP:127.0.0.1"
+
+# Secure the private key
+chmod 600 /opt/rustdesk/ssl/betterdesk.key
+```
+
+> **Windows (PowerShell)**:
+> ```powershell
+> New-Item -ItemType Directory -Path "C:\BetterDesk\ssl" -Force
+> openssl req -x509 -nodes -days 1095 -newkey rsa:2048 `
+>   -keyout "C:\BetterDesk\ssl\betterdesk.key" `
+>   -out "C:\BetterDesk\ssl\betterdesk.crt" `
+>   -subj "/CN=localhost/O=BetterDesk"
+> ```
+
+### Applying TLS to Go Server
+
+Once you have certificate files, configure the Go server:
+
+```bash
+# TLS on signal ports (21116 TCP + 21115 + 21118 WSS)
+./betterdesk-server -tls-signal -tls-cert /opt/rustdesk/ssl/betterdesk.crt -tls-key /opt/rustdesk/ssl/betterdesk.key
+
+# TLS on relay ports (21117 TCP + 21119 WSS)
+./betterdesk-server -tls-relay -tls-cert /opt/rustdesk/ssl/betterdesk.crt -tls-key /opt/rustdesk/ssl/betterdesk.key
+
+# TLS everywhere + force HTTPS on API
+./betterdesk-server -tls-signal -tls-relay -force-https \
+  -tls-cert /opt/rustdesk/ssl/betterdesk.crt \
+  -tls-key /opt/rustdesk/ssl/betterdesk.key
+```
+
+For systemd, add the flags to `ExecStart` in `/etc/systemd/system/betterdesk-server.service`:
+```ini
+ExecStart=/opt/rustdesk/betterdesk-server -mode all ... \
+  -tls-signal -tls-relay \
+  -tls-cert /opt/rustdesk/ssl/betterdesk.crt \
+  -tls-key /opt/rustdesk/ssl/betterdesk.key
+```
+
+> **Dual-mode**: BetterDesk auto-detects plain vs TLS on the **same port** (first-byte `0x16` detection). Existing non-TLS clients continue to work without changes.
+
+### Applying TLS to Web Console (Node.js)
+
+Edit the console `.env` file:
+
+```bash
+HTTPS_ENABLED=true
+SSL_CERT_PATH=/opt/rustdesk/ssl/betterdesk.crt
+SSL_KEY_PATH=/opt/rustdesk/ssl/betterdesk.key
+HTTP_REDIRECT_HTTPS=true
+```
+
+Or use the ALL-IN-ONE script menu option **C** (SSL Configuration) which supports:
+- **Let's Encrypt** — automatic certificate via certbot (requires public domain + port 80)
+- **Custom certificate** — provide your own PEM cert + key
+- **Self-signed** — auto-generated for testing
+
+### Let's Encrypt (Production)
+
+For production servers with a public domain:
+
+```bash
+# Install certbot
+sudo apt install certbot  # Debian/Ubuntu
+
+# Obtain certificate (standalone mode, port 80 must be open)
+sudo certbot certonly --standalone -d betterdesk.example.com
+
+# Certificate files:
+# /etc/letsencrypt/live/betterdesk.example.com/fullchain.pem
+# /etc/letsencrypt/live/betterdesk.example.com/privkey.pem
+```
+
+Then configure both the Go server and Node.js console to use these paths.
+
+> **Auto-renewal**: The ALL-IN-ONE script automatically adds a certbot renewal cron job when you use the Let's Encrypt option.
+
+### Automatic TLS During Installation
+
+The ALL-IN-ONE scripts (`betterdesk.sh` / `betterdesk.ps1`) **automatically generate a self-signed certificate** during every fresh installation:
+
+1. **Certificate location**: `<RUSTDESK_PATH>/ssl/betterdesk.crt` + `betterdesk.key`
+2. **Validity**: 3 years, RSA 2048-bit, with SAN (server IP + localhost)
+3. **Go server flags**: `-tls-cert`, `-tls-key`, `-tls-signal`, `-tls-relay`, `-force-https` added automatically
+4. **Node.js console**: `.env` pre-populated with `SSL_CERT_PATH` / `SSL_KEY_PATH` and `BETTERDESK_API_URL` set to `https://`
+5. **Dual-mode**: Existing non-TLS clients continue to work (auto-detection on same port)
+
+You can **upgrade to Let's Encrypt** or a custom certificate at any time using menu option **C**. If certificate generation fails during install (e.g., openssl missing), the server runs without TLS and you can generate certificates later.
+
+---
+
+## ⚙️ Configuration Reference
+
+### CLI Flags
+
+| Flag | Default | Env Var | Description |
+|------|---------|---------|-------------|
+| `-port` | `21116` | `PORT` | Signal port (UDP + TCP) |
+| `-relay-port` | `21117` | `RELAY_PORT` | Relay port (TCP) |
+| `-api-port` | `21114` | `API_PORT` | HTTP REST API port |
+| `-mode` | `all` | `MODE` | Server mode: `all`, `signal`, `relay` |
+| `-db` | `./db_v2.sqlite3` | `DB_URL` | Database DSN — file path (SQLite) or `postgres://...` (PostgreSQL) |
+| `-key-file` | `id_ed25519` | `KEY_FILE` | Ed25519 key file path (without extension) |
+| `-relay-servers` | *(empty)* | `RELAY_SERVERS` | Comma-separated relay addresses for `ConfigUpdate` |
+| `-rendezvous-servers` | *(empty)* | `RENDEZVOUS_SERVERS` | Comma-separated rendezvous addresses |
+| `-mask` | *(empty)* | `MASK` | LAN mask (e.g. `192.168.0.0/24`) |
+| `-always-relay` | `false` | `ALWAYS_USE_RELAY=Y` | Force relay for all connections (no P2P) |
+| `-blocklist` | *(empty)* | `BLOCKLIST_FILE` | Path to IP/ID/CIDR blocklist file |
+| `-audit-log` | *(empty)* | `AUDIT_LOG_FILE` | Path to audit log file (JSON lines) |
+| `-tls-cert` | *(empty)* | `TLS_CERT` | TLS certificate file (PEM) |
+| `-tls-key` | *(empty)* | `TLS_KEY` | TLS private key file (PEM) |
+| `-tls-signal` | `false` | `TLS_SIGNAL=Y` | Enable TLS on signal ports |
+| `-tls-relay` | `false` | `TLS_RELAY=Y` | Enable TLS on relay ports |
+| `-log-format` | `text` | `LOG_FORMAT` | Log format: `text` or `json` |
+| `-admin-port` | `0` | `ADMIN_PORT` | TCP admin console port (0 = disabled) |
+| `-admin-password` | *(empty)* | `ADMIN_PASSWORD` | Admin TCP console password |
+| `-jwt-secret` | *(auto)* | `JWT_SECRET` | JWT signing secret (auto-generated if omitted) |
+| `-jwt-expiry` | `24` | `JWT_EXPIRY_HOURS` | JWT token expiry in hours |
+| `-force-https` | `false` | `FORCE_HTTPS=Y` | Reject non-TLS API requests |
+| `-trust-proxy` | `false` | `TRUST_PROXY=Y` | Trust `X-Forwarded-For` / `X-Real-IP` headers |
+| `-relay-max-conns-ip` | `20` | `RELAY_MAX_CONNS_PER_IP` | Max relay connections per IP |
+| `-init-admin-user` | `admin` | `INIT_ADMIN_USER` | Initial admin username |
+| `-init-admin-pass` | *(auto)* | `INIT_ADMIN_PASS` | Initial admin password (auto-generated if omitted) |
+| `-version` | — | — | Show version and exit |
+
+### Environment-Only Variables
+
+| Env Var | Description |
+|---------|-------------|
+| `WS_ALLOWED_ORIGINS` | Comma-separated allowed WebSocket origins |
+| `ENROLLMENT_MODE` | Device enrollment: `open`, `managed`, or `locked` |
+
+### Protocol Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `RegTimeout` | 30s | Time after last heartbeat to mark peer offline |
+| `HeartbeatCheck` | 3s | Status cleaner goroutine interval |
+| `HeartbeatExpected` | 15s | Expected heartbeat interval from clients |
+| `DegradedThreshold` | 2 missed | Transitions to DEGRADED status |
+| `CriticalThreshold` | 4 missed | Transitions to CRITICAL status |
+| `HeartbeatSuggestion` | 12s | Suggested heartbeat interval sent to clients |
+| `TCPConnTimeout` | 20s | TCP connection establishment timeout |
+| `RelayPairTimeout` | 30s | Time to wait for relay pair match |
+| `RelayIdleTimeout` | 30s | Close idle relay sessions (extended on activity) |
+| `DefaultTotalBandwidth` | 1 GB/s | Global bandwidth limit |
+| `DefaultSingleBandwidth` | 16 MB/s | Per-session bandwidth limit |
+| `IPRateLimitRegistrations` | 20/min | Registration rate limit per IP |
+| `IDChangeCooldown` | 5 min | Minimum interval between ID changes |
+| `MaxFrameSize` | 64 KB | Maximum wire protocol frame size |
+
+### Console Configuration (.env)
+
+```bash
+PORT=5000              # Web console port
+API_PORT=21121         # RustDesk Client API port
+API_ENABLED=true       # Enable/disable Client API
+HTTPS_ENABLED=false    # Enable HTTPS on console
+SSL_CERT_PATH=         # SSL certificate path
+SSL_KEY_PATH=          # SSL key path
+TRUST_PROXY=false      # Trust X-Forwarded-For
+DB_PATH=               # Path to SQLite database
+HBBS_API_URL=          # Go server API URL (http://localhost:21114)
+HBBS_API_KEY=          # API key for Go server
+```
+
+---
+
+## 📡 API Reference
+
+### Authentication
+
+All API requests (except public endpoints) require authentication:
+
+```bash
+# Option 1: JWT Bearer token (from POST /api/auth/login)
+curl -H "Authorization: Bearer <jwt_token>" http://localhost:21114/api/peers
+
+# Option 2: API key
+curl -H "X-API-Key: <your_api_key>" http://localhost:21114/api/peers
+```
+
+### Public Endpoints (No Auth)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/health` | Health check + peer counts |
+| `GET` | `/api/server/stats` | Server stats (memory, goroutines, peer breakdown) |
+| `GET` | `/api/server/pubkey` | Ed25519 public key (base64 + hex) |
+| `GET` | `/metrics` | Prometheus metrics |
+| `POST` | `/api/auth/login` | Login → JWT token |
+| `POST` | `/api/auth/login/2fa` | Complete TOTP 2FA flow |
+
+### Viewer+ Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/peers` | List all peers (`?include_deleted=true`) |
+| `GET` | `/api/peers/{id}` | Get single peer |
+| `GET` | `/api/peers/status/summary` | Aggregate status counts |
+| `GET` | `/api/peers/online` | All online peer snapshots |
+| `GET` | `/api/peers/{id}/status` | Detailed live status (missed beats, transport) |
+| `GET` | `/api/blocklist` | List blocklist entries |
+| `PUT` | `/api/peers/{id}/tags` | Set peer tags |
+| `GET` | `/api/tags/{tag}/peers` | Peers by tag (LIKE pattern, `%_` escaped) |
+| `GET` | `/api/audit/events` | Recent events (`?limit=50&action=peer_banned`) |
+| `GET` | `/api/ws/events` | WebSocket real-time events (`?filter=peer_online`) |
+| `GET` | `/api/auth/me` | Current user info |
+
+### Admin-Only Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `DELETE` | `/api/peers/{id}` | Delete peer (`?hard=true` for permanent) |
+| `POST` | `/api/peers/{id}/ban` | Ban peer (with reason) |
+| `POST` | `/api/peers/{id}/unban` | Unban peer |
+| `POST` | `/api/peers/{id}/change-id` | Change device ID (validated: 6-16 chars, `[A-Za-z0-9_-]`) |
+| `POST` | `/api/blocklist` | Add IP/CIDR/ID to blocklist |
+| `DELETE` | `/api/blocklist/{entry}` | Remove blocklist entry |
+| `GET/PUT` | `/api/config/{key}` | Server configuration (key validated: 1-64 chars) |
+| `GET/POST/PUT/DELETE` | `/api/users`, `/api/users/{id}` | User CRUD |
+| `POST` | `/api/users/{id}/totp/setup` | Generate TOTP secret + QR URI |
+| `POST` | `/api/users/{id}/totp/confirm` | Confirm TOTP enrollment |
+| `DELETE` | `/api/users/{id}/totp` | Disable TOTP |
+| `GET/POST/DELETE` | `/api/keys`, `/api/keys/{id}` | API key management |
+| `GET/POST/PUT/DELETE` | `/api/tokens`, `/api/tokens/{id}` | Device token CRUD |
+| `POST` | `/api/tokens/generate-bulk` | Bulk generate enrollment tokens |
+| `POST` | `/api/tokens/{id}/bind` | Bind token to specific peer ID |
+| `GET/PUT` | `/api/enrollment/mode` | Enrollment mode management |
+
+### Example: Login Flow
+
+```bash
+# Step 1: Login (returns JWT or requires 2FA)
+curl -X POST http://localhost:21114/api/auth/login   -H "Content-Type: application/json"   -d '{"username":"admin","password":"your_password"}'
+
+# Response (no 2FA):
+# {"token":"eyJhbG...","user":{"id":1,"username":"admin","role":"admin"}}
+
+# Response (2FA required):
+# {"requires_2fa":true,"partial_token":"eyJhbG..."}
+
+# Step 2 (if 2FA): Complete with TOTP code
+curl -X POST http://localhost:21114/api/auth/login/2fa   -H "Content-Type: application/json"   -d '{"partial_token":"eyJhbG...","code":"123456"}'
+```
+
+### WebSocket Events
+
+```javascript
+// Connect to real-time event stream
+const ws = new WebSocket('ws://localhost:21114/api/ws/events?filter=peer_online,peer_offline');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  // { "type": "peer_online", "peer_id": "ABC123", "timestamp": "..." }
+};
+```
+
+**Event types**: `peer_online`, `peer_degraded`, `peer_critical`, `peer_offline`, `peer_banned`, `peer_unbanned`, `peer_deleted`, `peer_id_changed`, `blocklist_updated`, `server_stats`
+
+---
+
+## 🔄 Migration Guide
+
+### From Original RustDesk (Rust) to BetterDesk (Go)
+
+The migration tool (`betterdesk-server/tools/migrate/`) supports multiple migration paths:
+
+```bash
+# Compile migration tool
+cd betterdesk-server/tools/migrate
+go build -o migrate .
+
+# Mode 1: Rust hbbs → BetterDesk Go (preserves peer table → peers)
+./migrate -mode rust2go -src /opt/rustdesk/db_v2.sqlite3 -dst /opt/betterdesk/db_v2.sqlite3
+
+# Mode 2: SQLite → PostgreSQL
+./migrate -mode sqlite2pg -src /opt/betterdesk/db_v2.sqlite3   -dst "postgres://user:pass@localhost:5432/betterdesk"
+
+# Mode 3: PostgreSQL → SQLite (reverse)
+./migrate -mode pg2sqlite -src "postgres://..." -dst ./backup.sqlite3
+
+# Mode 4: Node.js console → Go server
+./migrate -mode nodejs2go -src /opt/betterdesk/web-console/betterdesk.db   -dst /opt/betterdesk/db_v2.sqlite3
+
+# Mode 5: Backup
+./migrate -mode backup -src /opt/betterdesk/db_v2.sqlite3
+```
+
+The migration tool auto-detects the source schema (original RustDesk `peer` table vs BetterDesk `peers` table) and maps columns accordingly. Ed25519 keys, UUIDs, ID history, bans, and tags are fully preserved.
+
+### Using ALL-IN-ONE Scripts
+
+Both `betterdesk.sh` and `betterdesk.ps1` include built-in migration options:
+- **Option M** — Migrate from existing RustDesk Docker installation
+- **Option P** — Database migration (SQLite ↔ PostgreSQL)
+
+### From Existing Docker RustDesk
+
 ```bash
 ./betterdesk-docker.sh
 # Select: M (Migrate from existing RustDesk)
 ```
 
-The wizard auto-detects your existing containers and data, creates a backup, then migrates everything to BetterDesk.
+The wizard auto-detects existing containers, creates a backup, and migrates data to BetterDesk.
 
-**Full migration guide**: [DOCKER_MIGRATION.md](docs/DOCKER_MIGRATION.md)
+---
 
-### Prerequisites
+## 📊 Monitoring & Metrics
 
-- **Linux**: Ubuntu 20.04+, Debian 11+, CentOS 8+, Arch Linux
-- **Windows**: Windows 10+, Windows Server 2016+
-- **RustDesk**: Fresh RustDesk installation OR existing working HBBS (script auto-detects)
-- **Node.js**: 18+ (auto-installed by script)
-- **No Compilation Required**: Uses precompiled binaries
+### Prometheus Metrics
 
-> **💡 Fresh Installation Support**: The script automatically detects if you have RustDesk installed and can perform fresh installations or updates accordingly. No need for separate installation procedures!
+Available at `GET /metrics` (no authentication required):
 
-### 🐳 Docker Installation (Alternative)
+```
+# Counters (monotonic)
+betterdesk_registrations_total
+betterdesk_expired_total
+betterdesk_relay_sessions_total
+betterdesk_relay_bytes_total
+betterdesk_bandwidth_throttle_hits_total
+betterdesk_audit_events_total
 
-For containerized deployments using Docker Compose:
+# Gauges (current values)
+betterdesk_uptime_seconds
+betterdesk_peers_total
+betterdesk_peers_online
+betterdesk_peers_degraded
+betterdesk_peers_critical
+betterdesk_peers_offline
+betterdesk_peers_banned
+betterdesk_peers_udp
+betterdesk_peers_tcp
+betterdesk_peers_ws
+betterdesk_relay_active_sessions
+betterdesk_blocklist_entries
+betterdesk_event_subscribers
+betterdesk_goroutines
+betterdesk_memory_alloc_bytes
+betterdesk_memory_sys_bytes
+```
+
+### Grafana Integration
+
+Point a Prometheus scraper at `http://your-server:21114/metrics` and import the metrics above. No additional exporter needed.
+
+### Audit Logging
 
 ```bash
-git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
-cd Rustdesk-FreeConsole
-
-# Build and start (REQUIRED - images are not on Docker Hub)
-docker compose build
-docker compose up -d
+# Enable file-based audit log
+./betterdesk-server -audit-log /var/log/betterdesk/audit.jsonl
 ```
 
-**Full Docker guide**: [docs/DOCKER_TROUBLESHOOTING.md](docs/DOCKER_TROUBLESHOOTING.md)
-
-### What the installation scripts do
-
-- ✅ Detects existing RustDesk installation
-- ✅ Creates automatic backup
-- ✅ Installs BetterDesk enhanced binaries
-- ✅ Installs web console (Node.js)
-- ✅ Runs database migrations
-- ✅ Creates authentication tables and admin user
-- ✅ Configures system services (systemd/Windows services)
-- ✅ Preserves encryption keys
-
-### 🔄 Updating Existing Installation
-
-```bash
-# Linux
-cd Rustdesk-FreeConsole
-git pull origin main
-sudo ./betterdesk.sh  # Select option 2: Update
-
-# Windows (PowerShell as Administrator)
-cd Rustdesk-FreeConsole
-git pull origin main
-.\betterdesk.ps1  # Select option 2: Update
-```
-
-### Quick Database Fix (if devices show as offline)
-
-> **Note**: The `betterdesk.sh` / `betterdesk.ps1` scripts run database migrations automatically. Use manual steps only if needed.
-
-```bash
-# Linux - Use repair option
-sudo ./betterdesk.sh  # Select option 3: Repair
-
-# Or run migration manually
-python3 migrations/v1.5.0_fix_online_status.py
-sudo systemctl restart rustdesksignal betterdesk
-```
-
-```powershell
-# Windows - Use repair option
-.\betterdesk.ps1  # Select option 3: Repair
-```
-
-### ⚠️ Platform-Specific Binaries
-
-The installers automatically select correct binaries for your platform:
-
-| Platform | Binaries | HBBS API Port | Client API Port |
-|----------|----------|---------------|------------------|
-| **Linux x86_64** | `hbbs-patch-v2/hbbs-linux-x86_64`, `hbbr-linux-x86_64` | 21120 | 21121 |
-| **Windows x86_64** | `hbbs-patch-v2/hbbs-windows-x86_64.exe`, `hbbr-windows-x86_64.exe` | 21114 | 21121 |
-
-> **Note**: Do not mix binaries between platforms!
-
-### 🔑 Key Protection (IMPORTANT!)
-
-⚠️ **Your RustDesk encryption keys are CRITICAL!**
-- Losing keys = ALL clients disconnected
-- Changing keys = "Key mismatch" errors on all devices
-- Keys must be backed up before any installation
-
-**BetterDesk automatically:**
-- ✅ Detects existing encryption keys
-- ✅ Creates automatic backups before any changes
-- ✅ Never regenerates keys without explicit confirmation
-
-**If you experience "Key mismatch" errors:**
-```bash
-# Restore from automatic backup
-BACKUP=$(ls -d /opt/rustdesk-backup-* | sort | tail -1)
-sudo cp $BACKUP/id_ed25519* /opt/rustdesk/
-sudo systemctl restart rustdesksignal
-```
-
-📖 **Full guide**: [docs/KEY_TROUBLESHOOTING.md](docs/KEY_TROUBLESHOOTING.md)
+Events logged: login, failed auth, peer banned/unbanned, config changes, ID changes, blocklist modifications. Each event includes timestamp, action, actor, target, IP, and details.
 
 ---
 
 ## 🔧 Troubleshooting
 
-### ⚡ Recent Fixes (31 Jan 2026)
-
-**🐛 Fixed Issues:**
-- ✅ **Docker**: "sh: executable file not found" - Added bash to Dockerfile
-- ✅ **PowerShell**: "Write-Info is not recognized" - Fixed function naming conflicts
-- 📖 **[QUICK_FIX.md](QUICK_FIX.md)** - Quick solutions for reported problems
-- 📖 **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - Complete troubleshooting guide
-
----
-
-### 🚨 "The keys do not match" Error
-
-This is the most common issue after installation. **Don't panic!**
-
-**Quick Fix - Restore from backup:**
-```bash
-# Find most recent backup
-BACKUP=$(ls -d /opt/rustdesk-backup-* | sort | tail -1)
-
-# Restore keys
-sudo systemctl stop rustdesksignal rustdeskrelay
-sudo cp $BACKUP/id_ed25519* /opt/rustdesk/
-sudo chmod 600 /opt/rustdesk/id_ed25519
-sudo chmod 644 /opt/rustdesk/id_ed25519.pub
-sudo systemctl start rustdesksignal rustdeskrelay
-
-# Verify
-cat /opt/rustdesk/id_ed25519.pub
-```
-
-### 📚 Comprehensive Troubleshooting Guides
-
-- **[QUICK_FIX.md](QUICK_FIX.md)** - Fast solutions for recent user-reported issues
-- **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - Docker & PowerShell fixes
-- **[KEY_TROUBLESHOOTING.md](docs/KEY_TROUBLESHOOTING.md)** - Complete key management guide
-- **[UPDATE_GUIDE.md](docs/UPDATE_GUIDE.md)** - Updating existing installations
-
-### 🔧 Key Permission Issues
-
-If you experience key permission problems, fix them manually:
-
-```bash
-# Set correct permissions for encryption keys
-sudo chmod 600 /opt/rustdesk/id_ed25519
-sudo chmod 644 /opt/rustdesk/id_ed25519.pub
-
-# Restart services
-sudo systemctl restart rustdesksignal rustdeskrelay betterdesk
-
-# Verify public key is readable
-cat /opt/rustdesk/id_ed25519.pub
-```
-
-### 🐳 Docker Issues
-
-**Problem**: "Docker RustDesk installation detected" message
-
-**Solutions:**
-1. **Use Docker-compose** (recommended for Docker setups)
-2. **Install web console only** (option 2 during installation)
-3. **Continue with native installation** (if intentional)
-
-#### 🔑 Missing Admin Login Credentials (Docker Compose)
-
-**Problem**: After running `docker compose up -d`, the console doesn't show admin credentials.
-
-**Quick Fix - Use the fix script:**
-
-```bash
-# Linux/macOS
-chmod +x fix-admin.sh
-./fix-admin.sh
-
-# Windows
-fix-admin.bat
-```
-
-**Or set custom credentials in `docker-compose.yml`:**
-
-```yaml
-environment:
-  - ADMIN_USERNAME=admin
-  - ADMIN_PASSWORD=YourSecurePassword123
-```
-
-**Manual option (if scripts don't work):**
-
-```bash
-# Run migration in container
-docker compose exec betterdesk-console python3 -c "
-import sqlite3, secrets, bcrypt
-from datetime import datetime
-
-DB_PATH, USERNAME = '/opt/rustdesk/db_v2.sqlite3', 'admin'
-PASSWORD = secrets.token_urlsafe(12)
-conn = sqlite3.connect(DB_PATH)
-cursor = conn.cursor()
-
-# Create tables
-cursor.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR(50) UNIQUE NOT NULL, password_hash TEXT NOT NULL, role VARCHAR(20) NOT NULL DEFAULT \"viewer\", created_at DATETIME NOT NULL, last_login DATETIME, is_active BOOLEAN NOT NULL DEFAULT 1, CHECK (role IN (\"admin\", \"operator\", \"viewer\")))')
-
-# Create admin if missing
-cursor.execute('SELECT id FROM users WHERE username = ?', (USERNAME,))
-if not cursor.fetchone():
-    password_hash = bcrypt.hashpw(PASSWORD.encode(), bcrypt.gensalt()).decode()
-    cursor.execute('INSERT INTO users (username, password_hash, role, created_at, is_active) VALUES (?, ?, \"admin\", ?, 1)', (USERNAME, password_hash, datetime.now()))
-    print(f'🔐 Username: {USERNAME}\\nPassword: {PASSWORD}\\n⚠️  Change after login!')
-else:
-    print('ℹ️  Admin user already exists')
-
-conn.commit()
-conn.close()
-"
-```
-
----
-
-**After using any option above:**
-1. 🌐 Open: http://localhost:5000
-2. 🔑 Login with the displayed/chosen credentials  
-3. ⚠️ **Immediately change password** in settings!
-
-**Detailed Docker troubleshooting guide**: [DOCKER_TROUBLESHOOTING.md](DOCKER_TROUBLESHOOTING.md)
-
-### Common Issues & Solutions
+### Common Issues
 
 | Symptom | Cause | Solution |
 |---------|-------|----------|
-| "Key mismatch" | Keys changed during install | Restore from backup (see Troubleshooting above) |
-| Wrong key in WebConsole | Multiple `.pub` files | Remove incorrect files or upgrade to v9+ |
-| Services won't start | Permission issues | Fix with: `sudo chmod 600 /opt/rustdesk/id_ed25519` |
-| Can't find backups | Skipped backup during install | Check `/opt/rustdesk-backup-*` directories |
-| Docker detected | Running RustDesk in container | Choose "Web Console only" option |
-| **No admin login (Docker)** | Missing database migration | Run `./fix-admin.sh` or see Docker Issues section |
-| **All devices offline** | Missing `last_online` column | Run `python3 migrations/v1.5.0_fix_online_status.py` |
-| **API not responding** | Old/wrong binaries | Use v2 binaries from `hbbs-patch-v2/` (port 21120) |
-| **Update script not found** | Old version cloned | Run `git pull` to get latest files |
-| **Connect button not working** | Custom RustDesk client | Set custom scheme via browser console (see below) |
-| **"no such table: peer"** | Using original RustDesk binaries | Rebuild Docker: `docker compose build --no-cache` |
-| **"pull access denied"** | Images not on Docker Hub | Build locally: `docker compose build && docker compose up -d` |
-| **DNS failure in Docker build** | Resolver issues (AlmaLinux/CentOS) | See [DOCKER_TROUBLESHOOTING.md](DOCKER_TROUBLESHOOTING.md#problem-dns-failure-during-build-almalinuxcentos) |
+| **Key mismatch** errors | Keys changed during install | Restore from backup: `cp /opt/rustdesk-backup-*/id_ed25519* /opt/rustdesk/` |
+| **All devices offline** | Database missing `last_online` column | Run repair: `sudo ./betterdesk.sh` → option 3 |
+| **API not responding** | Wrong binary or port | Check: `curl http://localhost:21114/api/health` |
+| **E2E encryption** | Not showing green lock | Verify server is v2.4.0+; enable `--tls-relay` for extra layer |
+| **Docker: "pull access denied"** | Images not on Docker Hub | Build locally: `docker compose build` |
+| **Docker: "no such table"** | Wrong binary in container | Rebuild: `docker compose build --no-cache` |
+| **Services won't start** | Permission issues | `sudo chmod 600 /opt/rustdesk/id_ed25519` |
+| **Go compilation fails** | Missing Go toolchain | Script auto-installs, or: `sudo apt install golang-go` |
+| **PostgreSQL connection** | Wrong DSN format | Must start with `postgres://` or `postgresql://` |
+| **Connect button** won't work | Custom RustDesk scheme | Set via browser console: `setCustomScheme('your-scheme')` |
 
-### 🚨 Known Issues (v1.5.0)
+### Diagnostics
 
-#### 1. Devices Show as Offline After Update
-
-**Symptoms:** All devices appear offline in the console, even though they can connect to each other.
-
-**Cause:** Database is missing the `last_online` column required for status detection.
-
-**Solution:**
 ```bash
-# Option 1: Run migration script
-python3 migrations/v1.5.0_fix_online_status.py
+# Linux — run built-in diagnostics
+sudo ./betterdesk.sh  # Select option 8
 
-# Option 2: Add column manually
-sqlite3 /opt/rustdesk/db_v2.sqlite3 "ALTER TABLE peer ADD COLUMN last_online TEXT;"
-sqlite3 /opt/rustdesk/db_v2.sqlite3 "ALTER TABLE peer ADD COLUMN is_deleted INTEGER DEFAULT 0;"
+# Check service status
+sudo systemctl status betterdesk-server
+sudo systemctl status betterdesk-console
 
-# Restart services
-sudo systemctl restart hbbs betterdesk
+# Check logs
+sudo journalctl -u betterdesk-server -n 100 --no-pager
+sudo journalctl -u betterdesk-console -n 100 --no-pager
+
+# Test API
+curl http://localhost:21114/api/health
+curl http://localhost:21114/api/server/stats
+
+# Check metrics
+curl http://localhost:21114/metrics
+
+# Windows — check services
+Get-Service BetterDeskServer
+Get-Service BetterDeskConsole
 ```
 
-#### 2. Connect Button Not Working (Custom Clients)
+### Key Management
 
-**Symptoms:** Clicking "Connect" does nothing or opens wrong application.
-
-**Cause:** You have a personalized RustDesk client with custom URL scheme.
-
-**Solution:** Set your custom scheme via browser console (F12):
-```javascript
-// Replace 'mycompany-rustdesk' with your scheme
-setCustomScheme('mycompany-rustdesk');
-
-// To revert to default:
-clearCustomScheme();
-```
-
-#### 3. API Health Endpoint Not Responding
-
-**Symptoms:** Console cannot determine device status, shows connection errors.
-
-**Cause:** Old HBBS binary without API support or using wrong port.
-
-**Solution:**
 ```bash
-# Copy new v2 binary (recommended)
-sudo cp hbbs-patch-v2/hbbs-linux-x86_64 /opt/rustdesk/hbbs-v8-api
-sudo chmod +x /opt/rustdesk/hbbs-v8-api
+# Backup keys (CRITICAL — losing keys disconnects ALL clients)
+cp /opt/rustdesk/id_ed25519 /opt/rustdesk/id_ed25519.backup
+cp /opt/rustdesk/id_ed25519.pub /opt/rustdesk/id_ed25519.pub.backup
 
-# Update service to use new binary
-sudo sed -i 's/hbbs/hbbs-v8-api/g' /etc/systemd/system/rustdesksignal.service
-sudo systemctl daemon-reload
-sudo systemctl restart rustdesksignal
-
-# v2 uses port 21120 (not 21114)
-```
-
-#### 4. Installer Cannot Find Installation
-
-**Symptoms:** Script reports "Installation directory not found"
-
-**Cause:** Non-standard installation path.
-
-**Solution:**
-```bash
-# Find your installation
-find / -name "server.js" 2>/dev/null
-find / -name "app.py" 2>/dev/null
-find / -name "db_v2.sqlite3" 2>/dev/null
-
-# Use Settings menu to configure paths
-sudo ./betterdesk.sh  # Select option S: Settings
-```
-
-### 📞 Getting Help
-
-**Before asking for help:**
-1. Check the troubleshooting guides above
-2. Run the diagnostics: `sudo ./betterdesk.sh` → Select option 8: Diagnostics
-3. Collect logs:
-   ```bash
-   sudo journalctl -u rustdesksignal -n 50 > ~/rustdesk_logs.txt
-   sudo journalctl -u betterdesk -n 50 >> ~/rustdesk_logs.txt
-   ```
-
-**Where to get help:**
-- 🐛 [GitHub Issues](https://github.com/UNITRONIX/Rustdesk-FreeConsole/issues)
-- 📖 [Documentation](docs/)
-- 💬 [RustDesk Discussions](https://github.com/rustdesk/rustdesk/discussions)
-
----
-
-## ⚙️ Configuration
-
-### HBBS API Port
-
-Default: `21120` (LAN accessible with X-API-Key authentication)
-
-**Security (v1.4.0)**: The API now supports LAN access with proper authentication:
-- \u2705 Binds to `0.0.0.0:21120` (accessible on LAN)
-- \u2705 Requires X-API-Key header for all requests
-- \u2705 64-character random API key generated during installation
-- \u2705 Key stored securely in `/opt/rustdesk/.api_key` with 600 permissions
-- \u2705 Web console automatically uses API key
-- \u2705 No authentication = no access (secure by design)
-
-**API Key Location**: `/opt/rustdesk/.api_key`
-
-To change port, edit `/etc/systemd/system/rustdesksignal.service`:
-```ini
-ExecStart=/opt/rustdesk/hbbs -k _ -p 21115 --api-port 21120
-```
-
-### Web Console Port
-
-Default: `5000` (accessible on LAN)
-
-The web console binds to `0.0.0.0:5000` for LAN access and includes:
-- User authentication (bcrypt passwords)
-- Session management (24-hour tokens)
-- Role-based access control
-- Audit logging
-
-**Node.js Console**: Edit `.env` file:
-```bash
-PORT=5000
-API_PORT=21121
-HTTPS_ENABLED=false
-SSL_CERT_PATH=/path/to/cert.pem
-SSL_KEY_PATH=/path/to/key.pem
+# Restore keys from automatic backup
+BACKUP=$(ls -d /opt/rustdesk-backup-* | sort | tail -1)
+sudo cp $BACKUP/id_ed25519* /opt/rustdesk/
+sudo chmod 600 /opt/rustdesk/id_ed25519
+sudo systemctl restart betterdesk-server
 ```
 
 ### Firewall Configuration
 
 ```bash
-# Allow web console on LAN
-sudo ufw allow from 192.168.0.0/16 to any port 5000 proto tcp
+# RustDesk protocol ports (WAN)
+sudo ufw allow 21115/tcp    # NAT test
+sudo ufw allow 21116/tcp    # Signal (TCP)
+sudo ufw allow 21116/udp    # Signal (UDP)
+sudo ufw allow 21117/tcp    # Relay
+sudo ufw allow 21121/tcp    # RustDesk Client API (login/AB)
 
-# Allow HBBS API on LAN (v2 uses port 21120)
-sudo ufw allow from 192.168.0.0/16 to any port 21120 proto tcp
-
-# Standard RustDesk ports
-sudo ufw allow 21115/tcp
-sudo ufw allow 21116/tcp
-sudo ufw allow 21116/udp
-sudo ufw allow 21117/tcp
-
-# Allow RustDesk Client API (WAN - login/address book)
-sudo ufw allow 21121/tcp
+# Admin ports (LAN only)
+sudo ufw allow from 192.168.0.0/16 to any port 21114 proto tcp  # REST API
+sudo ufw allow from 192.168.0.0/16 to any port 5000 proto tcp   # Web Console
 ```
 
 ---
 
-## 📱 RustDesk Client API
+## 🔐 E2E Encryption
 
-BetterDesk v2.3.0 includes a dedicated **RustDesk Client API** that allows desktop clients to:
-- **Login/Logout** with username and password
-- **Sync address books** across devices
-- **Send heartbeats** and system information
-- **Query device groups** and user information
+### Overview
 
-### Configuration
+RustDesk clients support end-to-end encryption for remote desktop sessions. BetterDesk Server fully supports this — both P2P (hole-punch) and relay-mode connections establish an encrypted E2E channel with NaCl key exchange.
 
-The Client API runs on a **dedicated WAN-facing port** (default `21121`), isolated from the admin panel (port `5000`).
+### How It Works
 
-```bash
-# Environment variables
-API_PORT=21121          # Client API port (default: 21121)
-API_ENABLED=true        # Enable/disable Client API
-```
+1. Client A requests connection to Client B via the signal server
+2. Signal server facilitates hole-punching (sends `PunchHoleResponse` with Client B's public key) or relay setup (sends `RelayResponse` with relay UUID and `SignIdPk` credential)
+3. Once connected (P2P or relay), clients perform an **asymmetric key exchange** using NaCl (`Message.SignedId` + `Message.PublicKey`)
+4. All subsequent session traffic (video, audio, clipboard, files) is encrypted end-to-end
 
-### RustDesk Desktop Client Setup
+### Key Implementation Details
 
-1. In the RustDesk client, go to **Settings** → **Network**
-2. Set **API Server** to `http://your-server-ip:21121`
-3. Go to **Settings** → **Account** → **Login**
-4. Enter your BetterDesk username and password
+| Component | Implementation |
+|-----------|---------------|
+| **PunchHoleResponse** | Includes `pk` field (responder's public key) for E2E handshake initiation |
+| **RelayResponse** | Uses `SignIdPk()` NaCl combined format (64-byte Ed25519 signature + IdPk protobuf) |
+| **Relay server** | Pure opaque byte pipe — does **not** send its own `RelayResponse` confirmation, allowing clients to exchange `Message.SignedId` / `Message.PublicKey` directly |
+| **Transport layer** | Optional TLS via `--tls-relay` for defense-in-depth on top of E2E |
 
-> **Note**: Users with TOTP 2FA enabled must enter the verification code in the client's verification field.
+### Verified Behavior
 
-### Security
-
-The Client API is protected by a **7-layer security middleware stack**:
-
-| Layer | Protection |
-|-------|-----------|
-| 1. Request Timeout | 10s request / 15s headers timeout |
-| 2. Security Headers | No server fingerprinting |
-| 3. Request Logger | Full audit trail |
-| 4. Path Whitelist | Only known RustDesk endpoints |
-| 5. Global Rate Limit | 100 req/15min per IP |
-| 6. Login Rate Limit | 5 login attempts/15min per IP |
-| 7. Body Size Limit | 1KB per request (64KB for AB) |
-
-### Client API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/login` | POST | Authenticate user (returns access token) |
-| `/api/logout` | POST | Invalidate session |
-| `/api/currentUser` | GET | Get current user info |
-| `/api/heartbeat` | POST | Client heartbeat |
-| `/api/sysinfo` | POST | Report system information |
-| `/api/ab` | GET/POST | Address book (get/save) |
-| `/api/ab/personal` | GET/POST | Personal address book |
-| `/api/ab/tags` | GET | Address book tags |
-| `/api/users` | GET | User list |
-| `/api/peers` | GET | Peer/device list |
-| `/api/device-group` | GET | Device groups |
-| `/api/login-options` | GET | Available login options |
+- Green lock indicator appears in the RustDesk client for all connection modes
+- `Message.SignedId` + `Message.PublicKey` handshake confirmed between peers via debug logging
+- Compatible with RustDesk clients v1.1.9+ (standard and custom builds)
 
 ---
 
-## 📚 API Documentation (HBBS)
+## 🛠️ Technology Stack
 
-### Base URL
-```
-http://<server-ip>:21120/api
-```
+### BetterDesk Go Server
 
-### Authentication
+| Component | Technology |
+|-----------|-----------|
+| **Language** | Go 1.21+ (pure Go, no CGO) |
+| **Protocol** | RustDesk rendezvous + relay (protobuf) |
+| **Crypto** | NaCl (Curve25519 + secretbox), Ed25519 (`golang.org/x/crypto`) |
+| **Database** | SQLite (`modernc.org/sqlite`), PostgreSQL (`pgx/v5` + `pgxpool`) |
+| **WebSocket** | `coder/websocket` |
+| **Protobuf** | `google.golang.org/protobuf` |
+| **TLS** | Standard library `crypto/tls` (min TLS 1.2) |
 
-**All API requests require X-API-Key header:**
-```bash
-curl -H "X-API-Key: YOUR_API_KEY_HERE" http://192.168.1.100:21120/api/health
-```
+### Web Console (Node.js)
 
-**API Key Location**: `/opt/rustdesk/.api_key`
-
-To retrieve your API key:
-```bash
-sudo cat /opt/rustdesk/.api_key
-```
-
-### Endpoints
-
-#### Health Check
-```http
-GET /api/health
-Headers: X-API-Key: <your-api-key>
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "data": "RustDesk API is running",
-  "error": null
-}
-```
-
-#### List All Peers
-```http
-GET /api/peers
-Headers: X-API-Key: <your-api-key>
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "data": [
-    {
-      "id": "1234567890",
-      "note": "Production Server",
-      "online": true
-    },
-    {
-      "id": "9876543210",
-      "note": null,
-      "online": false
-    }
-  ],
-  "error": null
-}
-```
-
-**Error Response (No/Invalid API Key)**:
-```json
-{
-  "error": "Unauthorized: Invalid or missing API key"
-}
-```
-Status Code: 401
-
-### Status Detection Algorithm
-
-A device is considered **online** if:
-1. It exists in the `PeerMap` (in-memory storage)
-2. Last registration time is less than **30 seconds** ago
-
-```rust
-const REG_TIMEOUT: i32 = 30_000; // milliseconds
-
-online = peer_exists && (last_reg_time.elapsed() < REG_TIMEOUT)
-```
-
-This is the **exact same algorithm** used by RustDesk desktop client.
-
----
-
-## 🛠️ Development
-
-### Running Demo Version (Mock Data)
-
-For screenshots or testing without real devices:
-
-```bash
-cd web
-python3 app_demo.py
-```
-
-Access at: `http://localhost:5001`
-
-### Project Structure
-
-```
-BetterDeskConsole/
-├── README.md                    # This file
-├── LICENSE                      # AGPL-3.0 License
-├── VERSION                      # Current version number
-├── betterdesk.sh                # Linux ALL-IN-ONE installer (v2.3.0)
-├── betterdesk.ps1               # Windows ALL-IN-ONE installer (v2.3.0)
-├── betterdesk-docker.sh         # Docker installer
-├── docker-compose.yml           # Docker orchestration
-├── screenshots/                 # UI screenshots
-├── web/                         # Flask web console (legacy, deprecated)
-│   ├── app.py                   # Flask application
-│   ├── requirements.txt         # Python dependencies
-│   └── ...
-├── web-nodejs/                  # Node.js web console
-│   ├── server.js                # Express application (dual port: 5000 + 21121)
-│   ├── package.json             # npm dependencies
-│   ├── views/                   # EJS templates
-│   ├── public/                  # Static assets (CSS, JS)
-│   ├── routes/                  # API routes (panel + RustDesk Client API)
-│   ├── middleware/              # Security, CSRF, WAN, i18n, rate limiting
-│   ├── services/                # Auth, DB, WebSocket relay
-│   └── ...
-├── hbbs-patch-v2/               # HBBS modifications (v2.x)
-│   ├── hbbs-linux-x86_64        # Pre-compiled Linux binary
-│   ├── hbbr-linux-x86_64        # Pre-compiled Linux binary
-│   ├── hbbs-windows-x86_64.exe  # Pre-compiled Windows binary
-│   ├── hbbr-windows-x86_64.exe  # Pre-compiled Windows binary
-│   └── src/                     # Source code modifications
-├── migrations/                  # Database migration scripts
-├── docs/                        # Documentation
-├── dev_modules/                 # Development tools
-└── scripts/legacy/              # Legacy scripts (deprecated)
-```
-
-### Building from Source
-
-```bash
-# Clone RustDesk server
-git clone https://github.com/rustdesk/rustdesk-server.git
-cd rustdesk-server
-
-# Copy patched files
-cp ../hbbs-patch/src/* src/
-
-# Add dependencies
-cargo add axum --features "http1,json,tokio"
-cargo add tower-http --features "cors"
-cargo add tokio --features "full"
-
-# Build
-cargo build --release --bin hbbs
-```
-
-### Running Tests
-
-```bash
-# Test HBBS API
-curl http://localhost:21120/api/health
-
-# Test Web Console
-curl http://localhost:5000
-
-# Check services
-sudo systemctl status rustdesksignal.service
-sudo systemctl status betterdesk.service
-```
-
----
-
-## 🎨 Technology Stack
-
-### Backend
-
-- **[RustDesk HBBS](https://github.com/rustdesk/rustdesk-server)**: Original signal server (AGPL-3.0)
-- **[Rust](https://www.rust-lang.org/)**: Systems programming language
-- **[Axum](https://github.com/tokio-rs/axum)**: Web framework for Rust
-- **[Tokio](https://tokio.rs/)**: Async runtime for Rust
-- **[SQLite](https://www.sqlite.org/)**: Database (RustDesk original)
-
-### Web Console (Node.js - Recommended)
-
-- **[Node.js](https://nodejs.org/)**: JavaScript runtime (v18+)
-- **[Express.js](https://expressjs.com/)**: Fast, minimalist web framework
-- **[EJS](https://ejs.co/)**: Embedded JavaScript templating
-- **[better-sqlite3](https://github.com/WiseLibs/better-sqlite3)**: Fast SQLite3 driver
-- **[bcrypt](https://www.npmjs.com/package/bcrypt)**: Password hashing
-- **[otplib](https://www.npmjs.com/package/otplib)**: TOTP two-factor authentication
-- **[csrf-csrf](https://www.npmjs.com/package/csrf-csrf)**: CSRF protection
-- **[Helmet](https://helmetjs.github.io/)**: Security headers
-- **[express-rate-limit](https://www.npmjs.com/package/express-rate-limit)**: Rate limiting
-
-### Web Console (Flask - Legacy)
-
-> **Note**: Flask console is no longer maintained. Use Node.js console for all new installations.
-
-- **[Flask](https://flask.palletsprojects.com/)**: Python web framework
-- **[Jinja2](https://jinja.palletsprojects.com/)**: Template engine
-- **[bcrypt](https://pypi.org/project/bcrypt/)**: Password hashing
+| Component | Technology |
+|-----------|-----------|
+| **Runtime** | Node.js 18+ |
+| **Framework** | Express.js |
+| **Templates** | EJS |
+| **Database** | better-sqlite3 |
+| **Auth** | bcrypt + TOTP (`otplib`) |
+| **Security** | csrf-csrf, Helmet, express-rate-limit |
+| **Client API** | Dedicated port with 7-layer security |
 
 ### Frontend
 
-- **HTML5**: Semantic markup
-- **CSS3**: Glassmorphism effects, animations, gradients
-- **JavaScript (ES6+)**: Dynamic UI updates
-- **[Material Icons](https://fonts.google.com/icons)**: Icon set (offline)
+| Component | Technology |
+|-----------|-----------|
+| **UI** | HTML5, CSS3 (glassmorphism), JavaScript ES6+ |
+| **Icons** | Material Icons (offline) |
+| **Charts** | Live metric bars + history charts |
+| **i18n** | JSON-based translations |
 
 ### DevOps
 
-- **Systemd**: Service management (Linux)
-- **NSSM/Scheduled Tasks**: Service management (Windows)
-- **Docker**: Containerization
-- **Bash/PowerShell**: Installation scripting
-- **Git**: Version control
+| Component | Technology |
+|-----------|-----------|
+| **Linux services** | systemd (`betterdesk-server.service` + `betterdesk-console.service`) |
+| **Windows services** | NSSM (`BetterDeskServer` + `BetterDeskConsole`) |
+| **Docker** | Docker Compose with local image builds |
+| **Installation** | Bash (`betterdesk.sh`) + PowerShell (`betterdesk.ps1`) ALL-IN-ONE |
+| **CI/CD** | GitHub Actions (multi-platform build) |
+
+---
+
+## 🏗️ Building from Source
+
+### Go Server
+
+```bash
+cd betterdesk-server
+
+# Linux (amd64)
+CGO_ENABLED=0 go build -ldflags="-s -w" -o betterdesk-server .
+
+# Linux (arm64)
+CGO_ENABLED=0 GOARCH=arm64 go build -ldflags="-s -w" -o betterdesk-server-arm64 .
+
+# Windows
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o betterdesk-server.exe .
+```
+
+### Migration Tool
+
+```bash
+cd betterdesk-server/tools/migrate
+go build -o migrate .
+```
+
+### Node.js Console
+
+```bash
+cd web-nodejs
+npm install
+npm start
+```
+
+---
+
+## 🌍 Internationalization (i18n)
+
+BetterDesk Console supports multiple languages through JSON-based translations.
+
+**Built-in languages**: 🇬🇧 English (default), 🇵🇱 Polish
+
+**Adding a new language**:
+1. Copy `web-nodejs/lang/en.json` → `web-nodejs/lang/{code}.json`
+2. Translate all string values
+3. Update the `_meta` section with language info
+4. Upload via Settings → Language Settings or place in the `lang/` folder
+
+See [Contributing Translations](docs/CONTRIBUTING_TRANSLATIONS.md) for details.
+
+---
+
+## 📂 Project Structure
+
+```
+Rustdesk-FreeConsole/
+├── betterdesk-server/           # Go server (~20K LOC)
+│   ├── main.go                  # Entry point, flags, boot sequence
+│   ├── signal/                  # Signal server (UDP/TCP/WS)
+│   ├── relay/                   # Relay server (TCP/WS)
+│   ├── api/                     # HTTP REST API + auth handlers
+│   ├── crypto/                  # Ed25519, NaCl, Curve25519, address codec
+│   ├── db/                      # Database interface + SQLite + PostgreSQL
+│   ├── config/                  # Configuration, constants, TLS, DualModeListener
+│   ├── codec/                   # Wire protocol framing (TCP + WS)
+│   ├── peer/                    # Concurrent in-memory peer map (4-tier status)
+│   ├── security/                # IP/ID/CIDR blocklist
+│   ├── auth/                    # JWT, PBKDF2, RBAC roles, TOTP 2FA
+│   ├── ratelimit/               # IP limiter, bandwidth limiter, conn limiter
+│   ├── metrics/                 # Prometheus text exposition
+│   ├── audit/                   # Ring-buffer audit log
+│   ├── events/                  # Pub/sub event bus (11 event types)
+│   ├── logging/                 # Text/JSON structured logging
+│   ├── admin/                   # TCP management console
+│   ├── reload/                  # Hot-reload (SIGHUP / manual)
+│   ├── proto/                   # Generated protobuf (rendezvous + message)
+│   └── tools/migrate/           # Migration tool (5 modes)
+├── web-nodejs/                  # Node.js web console
+│   ├── server.js                # Express app (dual port: 5000 + 21121)
+│   ├── routes/                  # API routes (panel + Client API)
+│   ├── middleware/              # Security, CSRF, WAN, i18n, rate limiting
+│   ├── services/                # Auth, DB, WebSocket relay
+│   ├── views/                   # EJS templates
+│   ├── public/                  # Static assets (CSS, JS)
+│   └── lang/                    # i18n translations (EN, PL)
+├── betterdesk.sh                # Linux ALL-IN-ONE installer (v2.4.0)
+├── betterdesk.ps1               # Windows ALL-IN-ONE installer (v2.4.0)
+├── betterdesk-docker.sh         # Docker installer (v2.4.0)
+├── docker-compose.yml           # Docker orchestration
+├── migrations/                  # Database migration scripts
+├── docs/                        # Documentation
+├── dev_modules/                 # Development & testing utilities
+└── archive/                     # Archived: Rust binaries, Flask console
+```
 
 ---
 
 ## 🤝 Contributing
 
-Contributions are welcome! Here's how you can help:
+Contributions are welcome! See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
 
 ### Reporting Issues
 
-- Use the [GitHub Issues](https://github.com/UNITRONIX/Rustdesk-FreeConsole/issues) page
-- Include system info (OS, RustDesk version, etc.)
-- Provide logs from systemd: `journalctl -u betterdesk.service`
+1. Run diagnostics: `sudo ./betterdesk.sh` → option 8
+2. Collect logs: `journalctl -u betterdesk-server -n 100`
+3. Open a [GitHub Issue](https://github.com/UNITRONIX/Rustdesk-FreeConsole/issues) with system info, logs, and reproduction steps
 
 ### Pull Requests
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit your changes: `git commit -m 'Add amazing feature'`
-4. Push to the branch: `git push origin feature/amazing-feature`
-5. Open a Pull Request
-
-### Development Guidelines
-
-- Follow existing code style
-- Update documentation for new features
-- Test with real RustDesk clients
-- Ensure backward compatibility
+1. Fork → branch (`feature/your-feature`) → commit → push → PR
+2. Follow existing code style and conventions
+3. Update documentation and i18n keys for new features
+4. Test with real RustDesk clients on both Linux and Windows
 
 ---
 
 ## 📄 License
 
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [LICENSE](LICENSE).
 
-The HBBS patches inherit RustDesk's original AGPL-3.0 license. The web console and scripts are also AGPL-3.0 for license consistency across the project.
+The Go server is a clean-room implementation. The web console and installation scripts are also AGPL-3.0 for license consistency.
 
 ---
 
 ## 🙏 Credits
 
-### Open Source Components
-
-- **[RustDesk](https://github.com/rustdesk/rustdesk)**: The amazing open-source remote desktop solution
-- **[RustDesk Server](https://github.com/rustdesk/rustdesk-server)**: Original HBBS and HBBR servers
-- **[Axum](https://github.com/tokio-rs/axum)**: Modern web framework for Rust
-- **[Flask](https://flask.palletsprojects.com/)**: Micro web framework for Python
-- **[Material Icons](https://fonts.google.com/icons)**: Google's Material Design icons
-- **[Font Awesome](https://fontawesome.com/)**: Icon inspiration (not used in final version)
-
-### Inspiration
-
-- RustDesk's simple yet powerful architecture
-- Modern web design trends (glassmorphism, neumorphism)
-- NOC (Network Operations Center) monitoring dashboards
-
-### Special Thanks
-
-- RustDesk development team for creating an excellent open-source alternative
-- The Rust community for amazing tools and libraries
-- Contributors and testers who helped improve this project
+- **[RustDesk](https://github.com/rustdesk/rustdesk)** — The open-source remote desktop solution
+- **[RustDesk Server](https://github.com/rustdesk/rustdesk-server)** — Original HBBS/HBBR reference implementation
+- **[pgx](https://github.com/jackc/pgx)** — PostgreSQL driver for Go
+- **[coder/websocket](https://github.com/coder/websocket)** — WebSocket library for Go
+- **[modernc.org/sqlite](https://modernc.org/sqlite)** — Pure Go SQLite driver
+- **[Material Icons](https://fonts.google.com/icons)** — Google Material Design icons
 
 ---
 
 ## 📞 Support
 
-- **Documentation**: Check the [docs/](docs/) folder
+- **Documentation**: [docs/](docs/)
 - **Issues**: [GitHub Issues](https://github.com/UNITRONIX/Rustdesk-FreeConsole/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/UNITRONIX/Rustdesk-FreeConsole/discussions)
-- **RustDesk Community**: [RustDesk Discord](https://discord.gg/nDceKgxnkV)
-
----
-
-## 🌐 Links
-
-- **GitHub**: https://github.com/UNITRONIX/Rustdesk-FreeConsole
-- **RustDesk**: https://rustdesk.com/
-- **RustDesk GitHub**: https://github.com/rustdesk/rustdesk
-
----
-
-## 📚 Documentation
-
-### Core Documentation
-- **[README.md](README.md)** - This file (overview and installation)
-- **[LICENSE](LICENSE)** - AGPL-3.0 License
-- **[VERSION](VERSION)** - Current version number
-
-### Additional Documentation ([docs/](docs/))
-- **[CHANGELOG.md](docs/CHANGELOG.md)** - Complete version history
-- **[CONTRIBUTING.md](docs/CONTRIBUTING.md)** - How to contribute
-- **[INSTALLATION_V1.4.0.md](docs/INSTALLATION_V1.4.0.md)** - Detailed installation guide
-- **[UPDATE_GUIDE.md](docs/UPDATE_GUIDE.md)** - Update instructions
-- **[KEY_TROUBLESHOOTING.md](docs/KEY_TROUBLESHOOTING.md)** - Key troubleshooting guide
-- **[PORT_SECURITY.md](docs/PORT_SECURITY.md)** - Port security information
-- **[PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)** - Project structure overview
-
-### Technical Documentation
-- **[hbbs-patch/](hbbs-patch/)** - HBBS modification documentation
-- **[dev_modules/](dev_modules/)** - Development and testing tools
 
 ---
 
 <div align="center">
 
-**Made with ❤️ by the community**
+**Made with ❤️ by UNITRONIX & the community**
 
 If you find this project useful, please consider giving it a ⭐ on GitHub!
 
-[⬆ Back to Top](#-betterdesk-console)
+[⬆ Back to Top](#-betterdesk--rustdesk-compatible-server--web-console)
 
 </div>

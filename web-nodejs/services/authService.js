@@ -4,7 +4,7 @@
  */
 
 const bcrypt = require('bcrypt');
-const { TOTP, generateSecret, generateURI, verifySync } = require('otplib');
+const { authenticator } = require('otplib');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
 const db = require('./database');
@@ -77,12 +77,15 @@ async function ensureDefaultAdmin() {
     }
     
     const defaultUsername = process.env.DEFAULT_ADMIN_USERNAME || 'admin';
-    const defaultPassword = process.env.DEFAULT_ADMIN_PASSWORD || 'admin';
+    const defaultPassword = process.env.DEFAULT_ADMIN_PASSWORD || require('crypto').randomBytes(16).toString('hex');
     
     const hash = await hashPassword(defaultPassword);
     db.createUser(defaultUsername, hash, 'admin');
     
     console.log(`Created default admin user: ${defaultUsername}`);
+    if (!process.env.DEFAULT_ADMIN_PASSWORD) {
+        console.log(`Generated admin password: ${defaultPassword}`);
+    }
     console.log('IMPORTANT: Change the default password immediately!');
     
     return true;
@@ -156,18 +159,13 @@ async function generateTotpSetup(userId) {
     }
     
     // Generate secret
-    const secret = generateSecret();
+    const secret = authenticator.generateSecret();
     
     // Save secret to DB (not yet enabled)
     db.saveTotpSecret(userId, secret);
     
     // Generate otpauth URI
-    const otpauthUrl = generateURI({
-        issuer: 'BetterDesk Console',
-        label: user.username,
-        secret,
-        type: 'totp'
-    });
+    const otpauthUrl = authenticator.keyuri(user.username, 'BetterDesk Console', secret);
     
     // Generate QR code as data URL
     const qrCodeDataUrl = await QRCode.toDataURL(otpauthUrl, {
@@ -197,12 +195,12 @@ function verifyAndEnableTotp(userId, token) {
     }
     
     // Verify the token against the stored secret
-    const result = verifySync({
+    const isValid = authenticator.verify({
         token,
         secret: user.totp_secret
     });
     
-    if (!result || !result.valid) {
+    if (!isValid) {
         return { success: false, error: 'Invalid verification code' };
     }
     
@@ -227,12 +225,12 @@ function verifyTotpCode(userId, token) {
         return false;
     }
     
-    const result = verifySync({
+    const isValid = authenticator.verify({
         token,
         secret: user.totp_secret
     });
     
-    return result && result.valid;
+    return isValid;
 }
 
 /**

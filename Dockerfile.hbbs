@@ -1,35 +1,68 @@
-# Dockerfile for BetterDesk HBBS (Signal Server)
-# Creates a minimal image with BetterDesk enhanced binaries (HTTP API support)
-# Based on busybox (minimal) with BetterDesk binaries from hbbs-patch-v2/
+# Dockerfile for BetterDesk Server (Go)
+# Multi-stage build: compile from source, then copy to minimal runtime image
+#
+# The BetterDesk server is a single binary that replaces both hbbs and hbbr.
+# It provides: signal (UDP/TCP/WS), relay (TCP/WS), HTTP API, admin console.
+#
+# Build: docker build -f Dockerfile.hbbs -t betterdesk-server:local .
 
-# Build minimal image with shell support
-FROM busybox:musl
+# ---- Build stage ----
+FROM golang:1.25-alpine AS builder
 
-# Create necessary directories
-RUN mkdir -p /root /usr/local/bin /opt/rustdesk
+RUN apk add --no-cache git gcc musl-dev sqlite-dev
 
-# Copy BetterDesk enhanced binaries from local build
-# These binaries include HTTP API and extended peer tracking
-COPY hbbs-patch-v2/hbbs-linux-x86_64 /usr/local/bin/hbbs-betterdesk
-COPY hbbs-patch-v2/hbbr-linux-x86_64 /usr/local/bin/hbbr-betterdesk
+WORKDIR /src
 
-# Make binaries executable
-RUN chmod +x /usr/local/bin/hbbs-betterdesk /usr/local/bin/hbbr-betterdesk
+# Copy Go module files first (cache dependencies)
+COPY betterdesk-server/go.mod betterdesk-server/go.sum ./
 
-# Create symlinks for convenience
-RUN ln -s /usr/local/bin/hbbs-betterdesk /usr/bin/hbbs && \
-    ln -s /usr/local/bin/hbbr-betterdesk /usr/bin/hbbr
+RUN go mod download
 
-# Set working directory and environment
-WORKDIR /root
-ENV HOME=/root
+# Copy full source
+COPY betterdesk-server/ .
 
-# Expose ports
+# Build static binary
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags="-s -w -extldflags '-static'" \
+    -tags "sqlite_omit_load_extension netgo osusergo" \
+    -o /betterdesk-server .
+
+# ---- Runtime stage ----
+FROM alpine:3.20
+
+LABEL maintainer="UNITRONIX"
+LABEL description="BetterDesk Server - RustDesk-compatible signal + relay"
+LABEL version="2.4.0"
+
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    tini \
+    && addgroup -S betterdesk \
+    && adduser -S -G betterdesk betterdesk
+
+COPY --from=builder /betterdesk-server /usr/local/bin/betterdesk-server
+RUN chmod +x /usr/local/bin/betterdesk-server
+
+# Create data directory
+RUN mkdir -p /opt/rustdesk && chown betterdesk:betterdesk /opt/rustdesk
+
+WORKDIR /opt/rustdesk
+
+# Ports:
+# 21114 - HTTP API
 # 21115 - NAT type test
-# 21116/tcp - TCP hole punching  
-# 21116/udp - ID registration and heartbeat
-# 21114 - HTTP API (BetterDesk)
-EXPOSE 21115 21116/tcp 21116/udp 21114
+# 21116 - Signal (TCP+UDP)
+# 21117 - Relay (TCP)
+# 21118 - WebSocket Signal
+# 21119 - WebSocket Relay
+EXPOSE 21114 21115 21116/tcp 21116/udp 21117 21118 21119
 
-# Default command - use BetterDesk enhanced hbbs with API
-CMD ["/usr/local/bin/hbbs-betterdesk", "-k", "_", "--api-port", "21114"]
+# Health check via API
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -sf http://localhost:21114/api/health || exit 1
+
+USER betterdesk
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/usr/local/bin/betterdesk-server", "-dir", "/opt/rustdesk"]

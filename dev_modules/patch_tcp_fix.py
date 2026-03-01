@@ -3,7 +3,7 @@
    and add debug logging to diagnose the actual flow."""
 import sys
 
-filepath = '/home/unitronix/rustdesk-server-1.1.14/src/rendezvous_server.rs'
+filepath = sys.argv[1] if len(sys.argv) > 1 else 'rustdesk-server-1.1.14/src/rendezvous_server.rs'
 
 with open(filepath, 'r') as f:
     content = f.read()

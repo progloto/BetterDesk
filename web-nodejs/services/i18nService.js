@@ -14,12 +14,28 @@ const LANGUAGE_META = {
     'de': { name: 'German', native: 'Deutsch', flag: '🇩🇪', rtl: false },
     'fr': { name: 'French', native: 'Français', flag: '🇫🇷', rtl: false },
     'es': { name: 'Spanish', native: 'Español', flag: '🇪🇸', rtl: false },
+    'it': { name: 'Italian', native: 'Italiano', flag: '🇮🇹', rtl: false },
+    'pt': { name: 'Portuguese', native: 'Português', flag: '🇵🇹', rtl: false },
+    'nl': { name: 'Dutch', native: 'Nederlands', flag: '🇳🇱', rtl: false },
     'ru': { name: 'Russian', native: 'Русский', flag: '🇷🇺', rtl: false },
     'zh': { name: 'Chinese', native: '中文', flag: '🇨🇳', rtl: false },
     'ja': { name: 'Japanese', native: '日本語', flag: '🇯🇵', rtl: false },
     'ar': { name: 'Arabic', native: 'العربية', flag: '🇸🇦', rtl: true },
     'he': { name: 'Hebrew', native: 'עברית', flag: '🇮🇱', rtl: true }
 };
+
+// Security: Language code validation regex (prevents path traversal)
+// Must be 2-8 lowercase letters only (ISO 639-1 codes)
+const VALID_LANG_CODE = /^[a-z]{2,8}$/;
+
+/**
+ * Validate language code format to prevent path traversal attacks.
+ * @param {string} code - Language code to validate
+ * @returns {boolean} - True if valid
+ */
+function isValidLangCode(code) {
+    return typeof code === 'string' && VALID_LANG_CODE.test(code);
+}
 
 class TranslationManager {
     constructor() {
@@ -59,6 +75,12 @@ class TranslationManager {
      * Load a single language file
      */
     loadLanguage(code) {
+        // Security: Validate language code to prevent path traversal
+        if (!isValidLangCode(code)) {
+            console.warn(`i18n: Invalid language code rejected: ${code}`);
+            return false;
+        }
+        
         const filePath = path.join(config.langDir, `${code}.json`);
         
         try {
@@ -215,6 +237,11 @@ class TranslationManager {
      * Add or update a language
      */
     saveLanguage(code, translations) {
+        // Security: Validate language code to prevent path traversal
+        if (!isValidLangCode(code)) {
+            return { success: false, error: 'Invalid language code format' };
+        }
+        
         const filePath = path.join(config.langDir, `${code}.json`);
         
         try {
@@ -230,6 +257,11 @@ class TranslationManager {
      * Delete a language file
      */
     deleteLanguage(code) {
+        // Security: Validate language code to prevent path traversal
+        if (!isValidLangCode(code)) {
+            return { success: false, error: 'Invalid language code format' };
+        }
+        
         // Don't allow deleting default or core languages
         if (code === 'en' || code === 'pl') {
             return { success: false, error: 'Cannot delete core language' };

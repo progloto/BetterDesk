@@ -6,6 +6,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../services/database');
+const serverBackend = require('../services/serverBackend');
 const { requireAuth } = require('../middleware/auth');
 
 /**
@@ -209,12 +210,13 @@ router.post('/api/folders/:id/devices', requireAuth, (req, res) => {
 /**
  * PATCH /api/devices/:id/folder - Assign single device to folder
  */
-router.patch('/api/devices/:id/folder', requireAuth, (req, res) => {
+router.patch('/api/devices/:id/folder', requireAuth, async (req, res) => {
     try {
         const deviceId = req.params.id;
         const { folderId } = req.body;
         
-        const device = db.getDeviceById(deviceId);
+        // Use serverBackend to verify device exists (works in both modes)
+        const device = await serverBackend.getDeviceById(deviceId);
         if (!device) {
             return res.status(404).json({
                 success: false,

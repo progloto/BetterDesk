@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v2.3.0
+#   BetterDesk Console Manager v2.4.0
 #   All-in-One Interactive Tool for Linux
 #
 #   Features:
@@ -21,17 +21,20 @@
 #     - RustDesk Client API (login, address book sync)
 #     - TOTP Two-Factor Authentication
 #     - SSL/TLS certificate configuration
+#     - PostgreSQL database support (new in v2.4.0)
+#     - SQLite to PostgreSQL migration
 #
 #   Usage: 
 #     Interactive: sudo ./betterdesk.sh
 #     Auto mode:   sudo ./betterdesk.sh --auto
+#     PostgreSQL:  sudo ./betterdesk.sh --auto --postgresql
 #
 #===============================================================================
 
 set -e
 
 # Version
-VERSION="2.3.0"
+VERSION="2.4.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Auto mode flag
@@ -54,6 +57,15 @@ while [[ $# -gt 0 ]]; do
             PREFERRED_CONSOLE_TYPE="nodejs"
             shift
             ;;
+        --postgresql|--postgres)
+            USE_POSTGRESQL=true
+            shift
+            ;;
+        --pg-uri)
+            POSTGRESQL_URI="$2"
+            USE_POSTGRESQL=true
+            shift 2
+            ;;
         --flask)
             echo "WARNING: Flask console is deprecated and no longer available in v2.3.0"
             echo "Node.js console will be installed instead."
@@ -66,10 +78,21 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: sudo ./betterdesk.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --auto, -a      Run in automatic mode (non-interactive)"
-            echo "  --skip-verify   Skip SHA256 verification of binaries"
-            echo "  --nodejs        Install Node.js web console (default)"
-            echo "  --help, -h      Show this help message"
+            echo "  --auto, -a       Run in automatic mode (non-interactive)"
+            echo "  --skip-verify    Skip SHA256 verification of binaries"
+            echo "  --nodejs         Install Node.js web console (default)"
+            echo "  --postgresql     Use PostgreSQL instead of SQLite"
+            echo "  --pg-uri URI     PostgreSQL connection URI (implies --postgresql)"
+            echo "  --help, -h       Show this help message"
+            echo ""
+            echo "Environment variables:"
+            echo "  USE_POSTGRESQL=true     Use PostgreSQL"
+            echo "  POSTGRESQL_URI=...      PostgreSQL connection URI"
+            echo "  POSTGRESQL_USER=...     PostgreSQL username (default: betterdesk)"
+            echo "  POSTGRESQL_PASS=...     PostgreSQL password (auto-generated if empty)"
+            echo "  POSTGRESQL_DB=...       PostgreSQL database (default: betterdesk)"
+            echo "  POSTGRESQL_HOST=...     PostgreSQL host (default: localhost)"
+            echo "  POSTGRESQL_PORT=...     PostgreSQL port (default: 5432)"
             exit 0
             ;;
         *)
@@ -79,9 +102,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Binary checksums (SHA256) - v2.1.3
-HBBS_LINUX_X86_64_SHA256="E7946CDE57CEF1AB1FC3D8669AA0FBD7DC3BBCE0233B8071D981ED430B1F4328"
-HBBR_LINUX_X86_64_SHA256="AD10925081B39A0A44C4460928935CF61D4F5335DC34A11E6942CC21E17B7B05"
+# Go server source directory
+GO_SERVER_SOURCE="$SCRIPT_DIR/betterdesk-server"
+
+# Minimum Go version required for compilation
+GO_MIN_VERSION="1.21"
 
 # Default paths (can be overridden by environment variables)
 RUSTDESK_PATH="${RUSTDESK_PATH:-}"
@@ -91,6 +116,15 @@ BACKUP_DIR="${BACKUP_DIR:-/opt/rustdesk-backups}"
 
 # API configuration
 API_PORT="${API_PORT:-21120}"
+
+# Database configuration
+USE_POSTGRESQL="${USE_POSTGRESQL:-false}"  # true = PostgreSQL, false = SQLite
+POSTGRESQL_URI="${POSTGRESQL_URI:-}"       # postgres://user:pass@host:5432/dbname
+POSTGRESQL_USER="${POSTGRESQL_USER:-betterdesk}"
+POSTGRESQL_PASS="${POSTGRESQL_PASS:-}"
+POSTGRESQL_DB="${POSTGRESQL_DB:-betterdesk}"
+POSTGRESQL_HOST="${POSTGRESQL_HOST:-localhost}"
+POSTGRESQL_PORT="${POSTGRESQL_PORT:-5432}"
 
 # Common installation paths to search
 COMMON_RUSTDESK_PATHS=(
@@ -148,7 +182,7 @@ print_header() {
     echo "║                    ██████╔╝███████╗███████║██║  ██╗              ║"
     echo "║                    ╚═════╝ ╚══════╝╚══════╝╚═╝  ╚═╝              ║"
     echo "║                                                                  ║"
-    echo "║                  Console Manager v${VERSION}                          ║"
+    echo "║                  Console Manager v${VERSION}                     ║"
     echo "╚══════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -288,9 +322,12 @@ show_service_logs() {
 graceful_stop_services() {
     print_step "Stopping services gracefully..."
     
-    local services=("betterdesk" "rustdesksignal" "rustdeskrelay")
+    # New Go services (primary)
+    local services=("betterdesk-console" "betterdesk-server")
+    # Legacy services (for migration)
+    local legacy_services=("betterdesk" "rustdesksignal" "rustdeskrelay")
     
-    # Stop services in order
+    # Stop current services
     for service in "${services[@]}"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             print_info "Stopping $service..."
@@ -298,12 +335,21 @@ graceful_stop_services() {
         fi
     done
     
-    # Wait for each service to stop
-    for service in "${services[@]}"; do
+    # Stop legacy services if they exist
+    for service in "${legacy_services[@]}"; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            print_info "Stopping legacy $service..."
+            systemctl stop "$service" 2>/dev/null || true
+        fi
+    done
+    
+    # Wait for services to stop
+    for service in "${services[@]}" "${legacy_services[@]}"; do
         wait_for_service_stop "$service" 15
     done
     
-    # Kill any stale processes
+    # Kill any stale processes (Go and legacy Rust)
+    kill_stale_processes "betterdesk-server"
     kill_stale_processes "hbbs"
     kill_stale_processes "hbbr"
     
@@ -320,12 +366,12 @@ start_services_with_verification() {
     local has_errors=false
     
     # Check ports before starting
-    if ! check_port_available "21116" "hbbs"; then
+    if ! check_port_available "21116" "signal"; then
         print_error "Port 21116 (ID server) is not available"
         has_errors=true
     fi
     
-    if ! check_port_available "21117" "hbbr"; then
+    if ! check_port_available "21117" "relay"; then
         print_error "Port 21117 (relay) is not available"
         has_errors=true
     fi
@@ -337,40 +383,34 @@ start_services_with_verification() {
     fi
     
     # Enable services
-    systemctl enable rustdesksignal rustdeskrelay betterdesk 2>/dev/null || true
+    systemctl enable betterdesk-server betterdesk-console 2>/dev/null || true
     
-    # Start HBBS first (signal server)
-    print_info "Starting rustdesksignal (hbbs)..."
-    systemctl start rustdesksignal
-    sleep 2
+    # Start Go server (signal + relay + API in one binary)
+    print_info "Starting betterdesk-server (Go)..."
+    systemctl start betterdesk-server
+    sleep 3
     
-    if ! verify_service_health "rustdesksignal" "21116" 10; then
-        print_error "Failed to start rustdesksignal"
+    if ! verify_service_health "betterdesk-server" "21116" 10; then
+        print_error "Failed to start betterdesk-server"
         return 1
     fi
-    print_success "rustdesksignal started and healthy"
+    print_success "betterdesk-server started and healthy"
     
-    # Start HBBR (relay server)
-    print_info "Starting rustdeskrelay (hbbr)..."
-    systemctl start rustdeskrelay
-    sleep 2
-    
-    if ! verify_service_health "rustdeskrelay" "21117" 10; then
-        print_error "Failed to start rustdeskrelay"
-        return 1
+    # Verify relay port is also listening
+    if ! verify_service_health "betterdesk-server" "21117" 5; then
+        print_warning "Relay port 21117 may not be ready yet"
     fi
-    print_success "rustdeskrelay started and healthy"
     
-    # Start console
-    print_info "Starting betterdesk (web console)..."
-    systemctl start betterdesk
+    # Start Node.js console
+    print_info "Starting betterdesk-console (Node.js)..."
+    systemctl start betterdesk-console
     sleep 2
     
-    if ! verify_service_health "betterdesk" "5000" 10; then
+    if ! verify_service_health "betterdesk-console" "5000" 10; then
         print_warning "Web console may not be running correctly"
         # Don't fail for console - it's not critical
     else
-        print_success "betterdesk console started and healthy"
+        print_success "betterdesk-console started and healthy"
     fi
     
     print_success "All services started and verified"
@@ -394,9 +434,14 @@ detect_installation() {
     if [ -d "$RUSTDESK_PATH" ]; then
         INSTALL_STATUS="partial"
         
-        # Check binaries
-        if [ -f "$RUSTDESK_PATH/hbbs" ] || [ -f "$RUSTDESK_PATH/hbbs-v8-api" ]; then
+        # Check Go server binary (primary) or legacy Rust binaries
+        if [ -f "$RUSTDESK_PATH/betterdesk-server" ]; then
             BINARIES_OK=true
+            SERVER_TYPE="go"
+        elif [ -f "$RUSTDESK_PATH/hbbs" ] || [ -f "$RUSTDESK_PATH/hbbs-v8-api" ]; then
+            BINARIES_OK=true
+            SERVER_TYPE="rust"
+            print_warning "Legacy Rust binaries detected. Consider upgrading to Go server."
         fi
         
         # Check database
@@ -419,18 +464,24 @@ detect_installation() {
         fi
     fi
     
-    # Check services
-    if systemctl is-active --quiet rustdesksignal 2>/dev/null || \
-       systemctl is-active --quiet hbbs 2>/dev/null; then
+    # Check services (Go server or legacy Rust)
+    if systemctl is-active --quiet betterdesk-server 2>/dev/null; then
+        HBBS_RUNNING=true
+        HBBR_RUNNING=true  # Go server handles both
+    elif systemctl is-active --quiet rustdesksignal 2>/dev/null || \
+         systemctl is-active --quiet hbbs 2>/dev/null; then
         HBBS_RUNNING=true
     fi
     
-    if systemctl is-active --quiet rustdeskrelay 2>/dev/null || \
-       systemctl is-active --quiet hbbr 2>/dev/null; then
-        HBBR_RUNNING=true
+    if ! [ "$HBBR_RUNNING" = true ]; then
+        if systemctl is-active --quiet rustdeskrelay 2>/dev/null || \
+           systemctl is-active --quiet hbbr 2>/dev/null; then
+            HBBR_RUNNING=true
+        fi
     fi
     
-    if systemctl is-active --quiet betterdesk 2>/dev/null; then
+    if systemctl is-active --quiet betterdesk-console 2>/dev/null || \
+       systemctl is-active --quiet betterdesk 2>/dev/null; then
         CONSOLE_RUNNING=true
     fi
 }
@@ -462,7 +513,7 @@ auto_detect_paths() {
     
     # If RUSTDESK_PATH is already set (via env var), validate it
     if [ -n "$RUSTDESK_PATH" ]; then
-        if [ -d "$RUSTDESK_PATH" ] && { [ -f "$RUSTDESK_PATH/hbbs" ] || [ -f "$RUSTDESK_PATH/hbbs-v8-api" ]; }; then
+        if [ -d "$RUSTDESK_PATH" ] && { [ -f "$RUSTDESK_PATH/betterdesk-server" ] || [ -f "$RUSTDESK_PATH/hbbs" ] || [ -f "$RUSTDESK_PATH/hbbs-v8-api" ]; }; then
             print_info "Using configured RustDesk path: $RUSTDESK_PATH"
             found=true
         else
@@ -474,7 +525,7 @@ auto_detect_paths() {
     # Auto-detect if not found
     if [ -z "$RUSTDESK_PATH" ]; then
         for path in "${COMMON_RUSTDESK_PATHS[@]}"; do
-            if [ -d "$path" ] && { [ -f "$path/hbbs" ] || [ -f "$path/hbbs-v8-api" ]; }; then
+            if [ -d "$path" ] && { [ -f "$path/betterdesk-server" ] || [ -f "$path/hbbs" ] || [ -f "$path/hbbs-v8-api" ]; }; then
                 RUSTDESK_PATH="$path"
                 print_success "Detected RustDesk installation: $RUSTDESK_PATH"
                 found=true
@@ -688,16 +739,26 @@ print_status() {
     echo -e "${WHITE}${BOLD}═══ Services Status ═══${NC}"
     echo ""
     
-    if [ "$HBBS_RUNNING" = true ]; then
-        echo -e "  HBBS (Signal): ${GREEN}● Active${NC}"
+    # Check if using Go server (single binary) or legacy Rust (two binaries)
+    if [ "${SERVER_TYPE:-}" = "go" ] || systemctl is-active --quiet betterdesk-server 2>/dev/null; then
+        if systemctl is-active --quiet betterdesk-server 2>/dev/null; then
+            echo -e "  BetterDesk Server (Go): ${GREEN}● Active${NC} (Signal + Relay + API)"
+        else
+            echo -e "  BetterDesk Server (Go): ${RED}○ Inactive${NC}"
+        fi
     else
-        echo -e "  HBBS (Signal): ${RED}○ Inactive${NC}"
-    fi
-    
-    if [ "$HBBR_RUNNING" = true ]; then
-        echo -e "  HBBR (Relay):  ${GREEN}● Active${NC}"
-    else
-        echo -e "  HBBR (Relay):  ${RED}○ Inactive${NC}"
+        # Legacy Rust servers
+        if [ "$HBBS_RUNNING" = true ]; then
+            echo -e "  HBBS (Signal): ${GREEN}● Active${NC} ${YELLOW}(Legacy Rust)${NC}"
+        else
+            echo -e "  HBBS (Signal): ${RED}○ Inactive${NC}"
+        fi
+        
+        if [ "$HBBR_RUNNING" = true ]; then
+            echo -e "  HBBR (Relay):  ${GREEN}● Active${NC} ${YELLOW}(Legacy Rust)${NC}"
+        else
+            echo -e "  HBBR (Relay):  ${RED}○ Inactive${NC}"
+        fi
     fi
     
     if [ "$CONSOLE_RUNNING" = true ]; then
@@ -710,76 +771,190 @@ print_status() {
 }
 
 #===============================================================================
-# Binary Verification Functions
+# Go Installation and Compilation
 #===============================================================================
 
-verify_binary_checksum() {
-    local file_path="$1"
-    local expected_hash="$2"
-    local file_name=$(basename "$file_path")
+check_go_installed() {
+    if command -v go &> /dev/null; then
+        local go_version
+        go_version=$(go version | awk '{print $3}' | sed 's/go//')
+        local go_major=$(echo "$go_version" | cut -d'.' -f1)
+        local go_minor=$(echo "$go_version" | cut -d'.' -f2)
+        local min_major=$(echo "$GO_MIN_VERSION" | cut -d'.' -f1)
+        local min_minor=$(echo "$GO_MIN_VERSION" | cut -d'.' -f2)
+        
+        if [ "$go_major" -gt "$min_major" ] || ([ "$go_major" -eq "$min_major" ] && [ "$go_minor" -ge "$min_minor" ]); then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+install_golang() {
+    print_step "Installing Go $GO_MIN_VERSION+..."
     
-    if [ ! -f "$file_path" ]; then
-        print_error "File not found: $file_path"
+    # Ensure architecture is detected
+    if [ -z "$ARCH_NAME" ]; then
+        detect_architecture
+    fi
+    
+    if check_go_installed; then
+        local go_version=$(go version | awk '{print $3}' | sed 's/go//')
+        print_info "Go $go_version is already installed"
+        return 0
+    fi
+    
+    local go_version="1.22.1"
+    local go_arch=""
+    
+    case "$ARCH_NAME" in
+        x86_64) go_arch="amd64" ;;
+        aarch64) go_arch="arm64" ;;
+        armv7*) go_arch="armv6l" ;;
+        *) print_error "Unsupported architecture: $ARCH_NAME"; return 1 ;;
+    esac
+    
+    local go_tarball="go${go_version}.linux-${go_arch}.tar.gz"
+    local go_url="https://go.dev/dl/$go_tarball"
+    
+    print_info "Downloading Go $go_version for $go_arch..."
+    
+    cd /tmp
+    if command -v wget &> /dev/null; then
+        wget -q --show-progress "$go_url" -O "$go_tarball" || wget "$go_url" -O "$go_tarball"
+    elif command -v curl &> /dev/null; then
+        curl -fSL --progress-bar "$go_url" -o "$go_tarball"
+    else
+        print_error "Neither wget nor curl available"
         return 1
     fi
     
-    print_info "Verifying $file_name..."
-    local actual_hash
-    actual_hash=$(sha256sum "$file_path" | awk '{print toupper($1)}')
+    print_info "Installing Go to /usr/local/go..."
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf "$go_tarball"
+    rm "$go_tarball"
     
-    if [ "$actual_hash" = "$expected_hash" ]; then
-        print_success "$file_name: SHA256 OK"
+    # Add to PATH for current session
+    export PATH=$PATH:/usr/local/go/bin
+    
+    # Add to system-wide PATH
+    if [ ! -f /etc/profile.d/go.sh ]; then
+        echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
+        chmod +x /etc/profile.d/go.sh
+    fi
+    
+    if check_go_installed; then
+        print_success "Go $go_version installed successfully"
         return 0
     else
-        print_error "$file_name: SHA256 MISMATCH!"
-        print_error "  Expected: $expected_hash"
-        print_error "  Got:      $actual_hash"
+        print_error "Go installation failed"
         return 1
     fi
 }
 
-verify_binaries() {
-    print_step "Verifying BetterDesk binaries..."
+compile_go_server() {
+    print_step "Compiling BetterDesk Go server..."
     
-    local bin_source="$SCRIPT_DIR/hbbs-patch-v2"
-    local errors=0
+    if [ ! -d "$GO_SERVER_SOURCE" ]; then
+        print_error "Go server source not found: $GO_SERVER_SOURCE"
+        return 1
+    fi
+    
+    # Ensure Go is available
+    export PATH=$PATH:/usr/local/go/bin
+    
+    if ! check_go_installed; then
+        if ! install_golang; then
+            print_error "Go is required for compilation"
+            return 1
+        fi
+    fi
+    
+    cd "$GO_SERVER_SOURCE"
+    
+    # Clean previous builds
+    rm -f betterdesk-server betterdesk-server-linux-*
+    
+    # Build
+    print_info "Building BetterDesk server for $ARCH_NAME..."
+    local output_name="betterdesk-server"
+    
+    # Download dependencies
+    print_info "Downloading Go modules..."
+    go mod download
+    
+    # Build with optimizations
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o "$output_name" .
+    
+    if [ -f "$output_name" ]; then
+        chmod +x "$output_name"
+        local size=$(du -h "$output_name" | cut -f1)
+        print_success "Compiled: $output_name ($size)"
+        return 0
+    else
+        print_error "Compilation failed"
+        return 1
+    fi
+}
+
+#===============================================================================
+# Binary Verification Functions
+#===============================================================================
+
+verify_go_binary() {
+    local binary_path="$1"
+    
+    if [ -z "$binary_path" ]; then
+        binary_path="$GO_SERVER_SOURCE/betterdesk-server"
+    fi
+    
+    if [ ! -f "$binary_path" ]; then
+        # Check installed location
+        binary_path="$RUSTDESK_PATH/betterdesk-server"
+    fi
+    
+    if [ ! -f "$binary_path" ]; then
+        return 1
+    fi
+    
+    # Verify it's executable
+    if [ -x "$binary_path" ]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+verify_binaries() {
+    print_step "Verifying BetterDesk server..."
     
     if [ "$SKIP_VERIFY" = true ]; then
         print_warning "Verification skipped (--skip-verify)"
         return 0
     fi
     
-    # Verify based on architecture
-    case "$ARCH_NAME" in
-        x86_64)
-            if [ -f "$bin_source/hbbs-linux-x86_64" ]; then
-                verify_binary_checksum "$bin_source/hbbs-linux-x86_64" "$HBBS_LINUX_X86_64_SHA256" || ((errors++))
-            fi
-            if [ -f "$bin_source/hbbr-linux-x86_64" ]; then
-                verify_binary_checksum "$bin_source/hbbr-linux-x86_64" "$HBBR_LINUX_X86_64_SHA256" || ((errors++))
-            fi
-            ;;
-        aarch64)
-            print_warning "ARM64 binaries - checksum verification not available"
-            print_info "Consider building from source for ARM64"
-            ;;
-        *)
-            print_warning "Unknown architecture - checksum verification skipped"
-            ;;
-    esac
+    # Check for precompiled binary
+    local found=false
     
-    if [ $errors -gt 0 ]; then
-        print_error "Binary verification failed! $errors error(s)"
-        print_warning "Binaries may be corrupted or outdated."
-        if [ "$AUTO_MODE" = false ]; then
-            if ! confirm "Continue anyway?"; then
-                return 1
-            fi
-        else
-            return 1
+    if [ -f "$GO_SERVER_SOURCE/betterdesk-server" ]; then
+        if verify_go_binary "$GO_SERVER_SOURCE/betterdesk-server"; then
+            local size=$(du -h "$GO_SERVER_SOURCE/betterdesk-server" | cut -f1)
+            print_success "Found compiled binary in source directory ($size)"
+            found=true
         fi
-    else
-        print_success "All binaries verified"
+    fi
+    
+    if [ -f "$RUSTDESK_PATH/betterdesk-server" ]; then
+        if verify_go_binary "$RUSTDESK_PATH/betterdesk-server"; then
+            local size=$(du -h "$RUSTDESK_PATH/betterdesk-server" | cut -f1)
+            print_success "Found installed binary ($size)"
+            found=true
+        fi
+    fi
+    
+    if [ "$found" = false ]; then
+        print_warning "No BetterDesk server binary found"
+        print_info "Binary will be compiled during installation"
     fi
     
     return 0
@@ -806,6 +981,199 @@ install_dependencies() {
     fi
     
     print_success "Dependencies installed"
+}
+
+#===============================================================================
+# PostgreSQL Installation Functions
+#===============================================================================
+
+install_postgresql() {
+    print_step "Installing PostgreSQL..."
+    
+    if command -v psql &> /dev/null; then
+        local pg_version=$(psql --version | grep -oP '\d+' | head -1)
+        print_success "PostgreSQL $pg_version already installed"
+        return 0
+    fi
+    
+    if command -v apt-get &> /dev/null; then
+        apt-get update -qq
+        apt-get install -y -qq postgresql postgresql-contrib
+    elif command -v dnf &> /dev/null; then
+        dnf install -y -q postgresql-server postgresql
+        postgresql-setup --initdb 2>/dev/null || true
+    elif command -v yum &> /dev/null; then
+        yum install -y -q postgresql-server postgresql
+        postgresql-setup initdb 2>/dev/null || true
+    elif command -v pacman &> /dev/null; then
+        pacman -Sy --noconfirm postgresql
+        su - postgres -c "initdb -D /var/lib/postgres/data" 2>/dev/null || true
+    else
+        print_error "Cannot install PostgreSQL automatically."
+        print_info "Please install PostgreSQL manually and run the script again."
+        return 1
+    fi
+    
+    # Start PostgreSQL service
+    systemctl start postgresql 2>/dev/null || service postgresql start 2>/dev/null || true
+    systemctl enable postgresql 2>/dev/null || true
+    
+    # Verify installation
+    if command -v psql &> /dev/null; then
+        print_success "PostgreSQL installed and started"
+        return 0
+    else
+        print_error "PostgreSQL installation failed!"
+        return 1
+    fi
+}
+
+setup_postgresql_database() {
+    print_step "Setting up PostgreSQL database for BetterDesk..."
+    
+    # Generate password if not set
+    if [ -z "$POSTGRESQL_PASS" ]; then
+        POSTGRESQL_PASS=$(openssl rand -base64 16 | tr -d '/+=' | head -c 16)
+        print_info "Generated PostgreSQL password"
+    fi
+    
+    # Check if PostgreSQL is running
+    if ! systemctl is-active --quiet postgresql 2>/dev/null; then
+        systemctl start postgresql 2>/dev/null || service postgresql start 2>/dev/null
+        sleep 2
+    fi
+    
+    # Create user and database
+    print_step "Creating PostgreSQL user '$POSTGRESQL_USER'..."
+    sudo -u postgres psql -c "CREATE USER $POSTGRESQL_USER WITH PASSWORD '$POSTGRESQL_PASS' CREATEDB;" 2>/dev/null || {
+        print_warning "User might already exist, trying to update password..."
+        sudo -u postgres psql -c "ALTER USER $POSTGRESQL_USER WITH PASSWORD '$POSTGRESQL_PASS';" 2>/dev/null || true
+    }
+    
+    print_step "Creating PostgreSQL database '$POSTGRESQL_DB'..."
+    sudo -u postgres psql -c "CREATE DATABASE $POSTGRESQL_DB OWNER $POSTGRESQL_USER;" 2>/dev/null || {
+        print_warning "Database might already exist"
+    }
+    
+    # Build connection URI
+    POSTGRESQL_URI="postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@$POSTGRESQL_HOST:$POSTGRESQL_PORT/$POSTGRESQL_DB?sslmode=disable"
+    
+    # Test connection
+    print_step "Testing PostgreSQL connection..."
+    if PGPASSWORD="$POSTGRESQL_PASS" psql -U "$POSTGRESQL_USER" -h "$POSTGRESQL_HOST" -p "$POSTGRESQL_PORT" -d "$POSTGRESQL_DB" -c "SELECT 1;" &>/dev/null; then
+        print_success "PostgreSQL connection successful!"
+        print_info "Connection URI: postgres://$POSTGRESQL_USER:****@$POSTGRESQL_HOST:$POSTGRESQL_PORT/$POSTGRESQL_DB"
+    else
+        print_error "PostgreSQL connection failed!"
+        print_info "Check PostgreSQL pg_hba.conf for local connections"
+        return 1
+    fi
+    
+    return 0
+}
+
+choose_database_type() {
+    if [ "$AUTO_MODE" = true ]; then
+        # In auto mode, use environment variable or default to SQLite
+        if [ "$USE_POSTGRESQL" = "true" ]; then
+            print_info "Auto mode: Using PostgreSQL"
+            return 0
+        else
+            print_info "Auto mode: Using SQLite (default)"
+            USE_POSTGRESQL="false"
+            return 0
+        fi
+    fi
+    
+    echo ""
+    echo -e "${WHITE}${BOLD}Select Database Type:${NC}"
+    echo ""
+    echo -e "  ${GREEN}1.${NC} SQLite (default, lightweight, no setup required)"
+    echo -e "  ${GREEN}2.${NC} PostgreSQL (recommended for production, better performance)"
+    echo ""
+    
+    read -p "Choose database type [1]: " db_choice
+    db_choice="${db_choice:-1}"
+    
+    case $db_choice in
+        2)
+            USE_POSTGRESQL="true"
+            print_info "Selected: PostgreSQL"
+            
+            # Ask for PostgreSQL details or use defaults
+            echo ""
+            read -p "PostgreSQL host [$POSTGRESQL_HOST]: " pg_host
+            POSTGRESQL_HOST="${pg_host:-$POSTGRESQL_HOST}"
+            
+            read -p "PostgreSQL port [$POSTGRESQL_PORT]: " pg_port
+            POSTGRESQL_PORT="${pg_port:-$POSTGRESQL_PORT}"
+            
+            read -p "PostgreSQL database [$POSTGRESQL_DB]: " pg_db
+            POSTGRESQL_DB="${pg_db:-$POSTGRESQL_DB}"
+            
+            read -p "PostgreSQL user [$POSTGRESQL_USER]: " pg_user
+            POSTGRESQL_USER="${pg_user:-$POSTGRESQL_USER}"
+            
+            read -sp "PostgreSQL password (leave empty to generate): " pg_pass
+            echo ""
+            POSTGRESQL_PASS="${pg_pass:-}"
+            ;;
+        *)
+            USE_POSTGRESQL="false"
+            print_info "Selected: SQLite"
+            ;;
+    esac
+}
+
+migrate_sqlite_to_postgresql() {
+    print_step "Migrating existing SQLite data to PostgreSQL..."
+    
+    local sqlite_db="$RUSTDESK_PATH/db_v2.sqlite3"
+    
+    if [ ! -f "$sqlite_db" ]; then
+        print_info "No existing SQLite database found, skipping migration"
+        return 0
+    fi
+    
+    # Find migration binary
+    local migrate_bin=""
+    if [ -f "$SCRIPT_DIR/betterdesk-server/tools/migrate/migrate-linux-amd64" ]; then
+        migrate_bin="$SCRIPT_DIR/betterdesk-server/tools/migrate/migrate-linux-amd64"
+    elif [ -f "$SCRIPT_DIR/tools/migrate/migrate-linux-amd64" ]; then
+        migrate_bin="$SCRIPT_DIR/tools/migrate/migrate-linux-amd64"
+    elif [ -f "/opt/betterdesk-go/migrate" ]; then
+        migrate_bin="/opt/betterdesk-go/migrate"
+    fi
+    
+    if [ -z "$migrate_bin" ]; then
+        print_warning "Migration binary not found, skipping automatic migration"
+        print_info "You can migrate manually using: M -> 3 (SQLite → PostgreSQL)"
+        return 0
+    fi
+    
+    chmod +x "$migrate_bin"
+    
+    # Check if SQLite has data
+    local peer_count
+    peer_count=$(sqlite3 "$sqlite_db" "SELECT COUNT(*) FROM peer;" 2>/dev/null || echo "0")
+    
+    if [ "$peer_count" -gt 0 ]; then
+        print_info "Found $peer_count devices in SQLite database"
+        
+        if [ "$AUTO_MODE" = true ] || confirm "Migrate existing data to PostgreSQL?"; then
+            print_step "Creating backup before migration..."
+            "$migrate_bin" -mode backup -src "$sqlite_db" 2>&1 || true
+            
+            print_step "Running SQLite → PostgreSQL migration (nodejs2go mode)..."
+            if "$migrate_bin" -mode nodejs2go -src "$sqlite_db" -dst "$POSTGRESQL_URI" 2>&1; then
+                print_success "Migration completed! $peer_count devices migrated."
+            else
+                print_warning "Migration had issues, check output above"
+            fi
+        fi
+    else
+        print_info "SQLite database is empty, no migration needed"
+    fi
 }
 
 #===============================================================================
@@ -907,6 +1275,19 @@ install_nodejs_console() {
     local nodejs_admin_password
     nodejs_admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
     
+    # Determine database configuration
+    local db_config=""
+    if [ "$USE_POSTGRESQL" = "true" ] && [ -n "$POSTGRESQL_URI" ]; then
+        db_config="# Database: PostgreSQL
+DB_TYPE=postgres
+DATABASE_URL=$POSTGRESQL_URI
+DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3"
+    else
+        db_config="# Database: SQLite
+DB_TYPE=sqlite
+DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3"
+    fi
+    
     # Create .env file (always update to ensure correct paths)
     cat > "$CONSOLE_PATH/.env" << EOF
 # BetterDesk Node.js Console Configuration
@@ -916,15 +1297,19 @@ NODE_ENV=production
 # RustDesk paths (critical for key/QR code generation)
 RUSTDESK_DIR=$RUSTDESK_PATH
 KEYS_PATH=$RUSTDESK_PATH
-DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3
 PUB_KEY_PATH=$RUSTDESK_PATH/id_ed25519.pub
 API_KEY_PATH=$RUSTDESK_PATH/.api_key
+
+$db_config
 
 # Auth database location
 DATA_DIR=$CONSOLE_PATH/data
 
 # HBBS API
 HBBS_API_URL=http://localhost:$API_PORT/api
+
+# Server backend (betterdesk = Go server, rustdesk = legacy Rust)
+SERVER_BACKEND=betterdesk
 
 # Default admin credentials (used only on first startup)
 DEFAULT_ADMIN_USERNAME=admin
@@ -936,10 +1321,13 @@ SESSION_SECRET=$(openssl rand -hex 32)
 # HTTPS (set to true and provide certificate paths to enable)
 HTTPS_ENABLED=false
 HTTPS_PORT=5443
-SSL_CERT_PATH=
-SSL_KEY_PATH=
+SSL_CERT_PATH=$RUSTDESK_PATH/ssl/betterdesk.crt
+SSL_KEY_PATH=$RUSTDESK_PATH/ssl/betterdesk.key
 SSL_CA_PATH=
 HTTP_REDIRECT_HTTPS=true
+
+# Go server API URL (uses HTTPS when TLS certificates are present)
+BETTERDESK_API_URL=http://localhost:$API_PORT/api
 EOF
     print_info "Created .env configuration file"
     
@@ -957,7 +1345,7 @@ EOF
 }
 
 install_binaries() {
-    print_step "Installing BetterDesk binaries..."
+    print_step "Installing BetterDesk Go Server..."
     
     # Ensure architecture is detected
     if [ -z "$ARCH_NAME" ]; then
@@ -965,85 +1353,53 @@ install_binaries() {
     fi
     
     # Safety: stop services before copying (prevents "Text file busy")
-    if systemctl is-active --quiet rustdesksignal 2>/dev/null || \
-       systemctl is-active --quiet rustdeskrelay 2>/dev/null; then
+    if systemctl is-active --quiet betterdesk-server 2>/dev/null; then
         print_info "Stopping running services before binary installation..."
         graceful_stop_services
     fi
     
     mkdir -p "$RUSTDESK_PATH"
     
-    # Check for pre-compiled binaries
-    local bin_source=""
+    local go_binary="$GO_SERVER_SOURCE/betterdesk-server"
     
-    if [ -f "$SCRIPT_DIR/hbbs-patch-v2/hbbs-linux-$ARCH_NAME" ]; then
-        bin_source="$SCRIPT_DIR/hbbs-patch-v2"
-        print_info "Found binaries in hbbs-patch-v2/"
-    elif [ -f "$SCRIPT_DIR/server/binaries/linux/hbbs" ]; then
-        bin_source="$SCRIPT_DIR/server/binaries/linux"
-        print_info "Found binaries in server/binaries/linux/"
+    # Check for pre-compiled binary first
+    if [ -f "$go_binary" ]; then
+        print_info "Found pre-compiled Go server binary"
     else
-        print_error "BetterDesk binaries not found!"
-        print_info "Expected: $SCRIPT_DIR/hbbs-patch-v2/hbbs-linux-$ARCH_NAME"
-        print_info "Architecture detected: $ARCH_NAME"
-        print_info "Run 'Build binaries' option or download prebuilt files."
-        return 1
+        # Compile from source
+        print_info "Pre-compiled binary not found, compiling from source..."
+        
+        # Ensure Go is installed
+        if ! check_go_installed; then
+            print_info "Installing Go toolchain..."
+            if ! install_golang; then
+                print_error "Failed to install Go toolchain"
+                return 1
+            fi
+        fi
+        
+        # Compile the Go server
+        if ! compile_go_server; then
+            print_error "Failed to compile Go server"
+            return 1
+        fi
     fi
     
-    # Verify binaries before installation
+    # Verify binary before installation
     if ! verify_binaries; then
         print_error "Aborting installation due to verification failure"
         return 1
     fi
     
-    # Copy binaries
-    if [ -f "$bin_source/hbbs-linux-$ARCH_NAME" ]; then
-        cp "$bin_source/hbbs-linux-$ARCH_NAME" "$RUSTDESK_PATH/hbbs"
-        print_success "Installed hbbs (signal server)"
-    elif [ -f "$bin_source/hbbs" ]; then
-        cp "$bin_source/hbbs" "$RUSTDESK_PATH/hbbs"
-    fi
+    # Copy binary
+    cp "$go_binary" "$RUSTDESK_PATH/betterdesk-server"
+    chmod +x "$RUSTDESK_PATH/betterdesk-server"
     
-    if [ -f "$bin_source/hbbr-linux-$ARCH_NAME" ]; then
-        cp "$bin_source/hbbr-linux-$ARCH_NAME" "$RUSTDESK_PATH/hbbr"
-        print_success "Installed hbbr (relay server)"
-    elif [ -f "$bin_source/hbbr" ]; then
-        cp "$bin_source/hbbr" "$RUSTDESK_PATH/hbbr"
-    fi
-    
-    chmod +x "$RUSTDESK_PATH/hbbs" "$RUSTDESK_PATH/hbbr"
-    
-    print_success "BetterDesk binaries v$VERSION installed"
+    print_success "BetterDesk Go Server v$VERSION installed"
+    print_info "Single binary replaces both hbbs (signal) and hbbr (relay)"
 }
 
-install_flask_console() {
-    print_step "Installing Flask (Python) Web Console..."
-    
-    mkdir -p "$CONSOLE_PATH"
-    
-    # Copy web files
-    if [ -d "$SCRIPT_DIR/web" ] && [ -f "$SCRIPT_DIR/web/app.py" ]; then
-        cp -r "$SCRIPT_DIR/web/"* "$CONSOLE_PATH/"
-    else
-        print_error "Flask web/ folder not found in project!"
-        return 1
-    fi
-    
-    # Setup Python environment
-    print_step "Configuring Python environment..."
-    
-    cd "$CONSOLE_PATH"
-    python3 -m venv venv 2>/dev/null || python3 -m virtualenv venv
-    source venv/bin/activate
-    
-    pip install --quiet --upgrade pip
-    pip install --quiet -r requirements.txt
-    
-    deactivate
-    
-    CONSOLE_TYPE="flask"
-    print_success "Flask Web Console installed"
-}
+# Flask console removed in v2.3.0 - archived to archive/web-flask/
 
 install_console() {
     # Always install Node.js console (Flask removed in v2.3.0)
@@ -1103,6 +1459,71 @@ migrate_console() {
     print_success "Old $from_type console backed up to $backup_path"
 }
 
+generate_ssl_certificates() {
+    print_step "Generating self-signed TLS certificates..."
+    
+    local ssl_dir="$RUSTDESK_PATH/ssl"
+    
+    # Skip if certificates already exist
+    if [ -f "$ssl_dir/betterdesk.crt" ] && [ -f "$ssl_dir/betterdesk.key" ]; then
+        print_info "TLS certificates already exist at $ssl_dir"
+        print_info "Skipping certificate generation (use SSL config menu to regenerate)"
+        return 0
+    fi
+    
+    # Ensure openssl is available
+    if ! command -v openssl &>/dev/null; then
+        print_warning "openssl not found - skipping TLS certificate generation"
+        print_info "Install openssl and use SSL config menu (option C) to generate later"
+        return 1
+    fi
+    
+    mkdir -p "$ssl_dir"
+    
+    # Detect server IP for SAN (Subject Alternative Name)
+    local server_ip
+    server_ip=$(curl -s ifconfig.me 2>/dev/null || curl -s icanhazip.com 2>/dev/null || echo "127.0.0.1")
+    
+    # Generate certificate with SAN extension (valid for 3 years)
+    openssl req -x509 -nodes -days 1095 -newkey rsa:2048 \
+        -keyout "$ssl_dir/betterdesk.key" \
+        -out "$ssl_dir/betterdesk.crt" \
+        -subj "/CN=$server_ip/O=BetterDesk/C=US" \
+        -addext "subjectAltName=IP:$server_ip,IP:127.0.0.1,DNS:localhost" \
+        2>&1 || {
+        print_warning "Certificate generation failed (openssl too old for -addext?)"
+        # Fallback without SAN for older openssl
+        openssl req -x509 -nodes -days 1095 -newkey rsa:2048 \
+            -keyout "$ssl_dir/betterdesk.key" \
+            -out "$ssl_dir/betterdesk.crt" \
+            -subj "/CN=$server_ip/O=BetterDesk/C=US" \
+            2>&1 || {
+            print_error "Failed to generate self-signed certificate"
+            return 1
+        }
+    }
+    
+    # Secure private key permissions
+    chmod 600 "$ssl_dir/betterdesk.key"
+    chmod 644 "$ssl_dir/betterdesk.crt"
+    
+    # Also symlink to console SSL directory for Node.js
+    if [ -d "$CONSOLE_PATH" ]; then
+        local console_ssl="$CONSOLE_PATH/ssl"
+        mkdir -p "$console_ssl"
+        ln -sf "$ssl_dir/betterdesk.crt" "$console_ssl/betterdesk.crt" 2>/dev/null || \
+            cp -f "$ssl_dir/betterdesk.crt" "$console_ssl/betterdesk.crt"
+        ln -sf "$ssl_dir/betterdesk.key" "$console_ssl/betterdesk.key" 2>/dev/null || \
+            cp -f "$ssl_dir/betterdesk.key" "$console_ssl/betterdesk.key"
+    fi
+    
+    print_success "Self-signed TLS certificate generated"
+    print_info "Certificate: $ssl_dir/betterdesk.crt (valid 3 years)"
+    print_info "Private key: $ssl_dir/betterdesk.key"
+    print_info "SAN: IP:$server_ip, IP:127.0.0.1, DNS:localhost"
+    return 0
+}
+
 setup_services() {
     print_step "Configuring systemd services..."
     
@@ -1113,39 +1534,38 @@ setup_services() {
     print_info "Server IP: $server_ip"
     print_info "API Port: $API_PORT"
     
-    # HBBS service (Signal Server with HTTP API)
-    cat > /etc/systemd/system/rustdesksignal.service << EOF
+    # Build database configuration
+    local db_arg=""
+    if [ "$USE_POSTGRESQL" = "true" ] && [ -n "$POSTGRESQL_URI" ]; then
+        db_arg="-db \"$POSTGRESQL_URI\""
+        print_info "Database: PostgreSQL"
+    else
+        db_arg="-db \"$RUSTDESK_PATH/db_v2.sqlite3\""
+        print_info "Database: SQLite"
+    fi
+    
+    # Build TLS arguments if certificates exist
+    local tls_arg=""
+    local ssl_dir="$RUSTDESK_PATH/ssl"
+    if [ -f "$ssl_dir/betterdesk.crt" ] && [ -f "$ssl_dir/betterdesk.key" ]; then
+        tls_arg="-tls-cert $ssl_dir/betterdesk.crt -tls-key $ssl_dir/betterdesk.key -tls-signal -tls-relay -force-https"
+        print_info "TLS: Enabled (cert found at $ssl_dir/)"
+    else
+        print_info "TLS: Disabled (no certificate found)"
+    fi
+    
+    # BetterDesk Go Server (single binary replacing hbbs+hbbr)
+    cat > /etc/systemd/system/betterdesk-server.service << EOF
 [Unit]
-Description=BetterDesk Signal Server v$VERSION
+Description=BetterDesk Go Server v$VERSION (Signal + Relay + API)
 Documentation=https://github.com/UNITRONIX/Rustdesk-FreeConsole
-After=network.target
+After=network.target postgresql.service
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=$RUSTDESK_PATH
-ExecStart=$RUSTDESK_PATH/hbbs -r $server_ip -k _ --api-port $API_PORT
-Restart=always
-RestartSec=5
-LimitNOFILE=1000000
-Environment=RUST_BACKTRACE=1
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # HBBR service (Relay Server)
-    cat > /etc/systemd/system/rustdeskrelay.service << EOF
-[Unit]
-Description=BetterDesk Relay Server v$VERSION
-Documentation=https://github.com/UNITRONIX/Rustdesk-FreeConsole
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$RUSTDESK_PATH
-ExecStart=$RUSTDESK_PATH/hbbr -k _
+ExecStart=$RUSTDESK_PATH/betterdesk-server -mode all -relay $server_ip $db_arg -key-file $RUSTDESK_PATH/id_ed25519 -api-port $API_PORT $tls_arg
 Restart=always
 RestartSec=5
 LimitNOFILE=1000000
@@ -1154,13 +1574,46 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
 
-    # Console service (Web Interface) - depends on console type
+    print_success "Created betterdesk-server.service (Go)"
+    
+    # Remove legacy Rust services if they exist
+    if [ -f /etc/systemd/system/rustdesksignal.service ]; then
+        systemctl stop rustdesksignal 2>/dev/null || true
+        systemctl disable rustdesksignal 2>/dev/null || true
+        rm -f /etc/systemd/system/rustdesksignal.service
+        print_info "Removed legacy rustdesksignal.service"
+    fi
+    
+    if [ -f /etc/systemd/system/rustdeskrelay.service ]; then
+        systemctl stop rustdeskrelay 2>/dev/null || true
+        systemctl disable rustdeskrelay 2>/dev/null || true
+        rm -f /etc/systemd/system/rustdeskrelay.service
+        print_info "Removed legacy rustdeskrelay.service"
+    fi
+
+    # Console service (Web Interface) - Node.js only
     if [ "$CONSOLE_TYPE" = "nodejs" ]; then
-        cat > /etc/systemd/system/betterdesk.service << EOF
+        # Build database environment variables
+        local db_env=""
+        if [ "$USE_POSTGRESQL" = "true" ] && [ -n "$POSTGRESQL_URI" ]; then
+            db_env="Environment=DB_TYPE=postgres
+Environment=DATABASE_URL=$POSTGRESQL_URI"
+        else
+            db_env="Environment=DB_TYPE=sqlite
+Environment=DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3"
+        fi
+        
+        # Use HTTPS API URL when TLS certificates are available
+        local api_scheme="http"
+        if [ -n "$tls_arg" ]; then
+            api_scheme="https"
+        fi
+        
+        cat > /etc/systemd/system/betterdesk-console.service << EOF
 [Unit]
 Description=BetterDesk Web Console (Node.js)
 Documentation=https://github.com/UNITRONIX/Rustdesk-FreeConsole
-After=network.target rustdesksignal.service
+After=network.target betterdesk-server.service postgresql.service
 
 [Service]
 Type=simple
@@ -1172,8 +1625,10 @@ Environment=NODE_ENV=production
 Environment=RUSTDESK_DIR=$RUSTDESK_PATH
 Environment=KEYS_PATH=$RUSTDESK_PATH
 Environment=DATA_DIR=$CONSOLE_PATH/data
-Environment=DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3
-Environment=HBBS_API_URL=http://localhost:$API_PORT/api
+$db_env
+Environment=HBBS_API_URL=$api_scheme://localhost:$API_PORT/api
+Environment=BETTERDESK_API_URL=$api_scheme://localhost:$API_PORT/api
+Environment=SERVER_BACKEND=betterdesk
 Environment=PORT=5000
 Restart=always
 RestartSec=5
@@ -1181,13 +1636,21 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-        print_info "Created Node.js console service"
+        print_success "Created betterdesk-console.service (Node.js)"
+        
+        # Remove legacy betterdesk.service if exists
+        if [ -f /etc/systemd/system/betterdesk.service ]; then
+            systemctl stop betterdesk 2>/dev/null || true
+            systemctl disable betterdesk 2>/dev/null || true
+            rm -f /etc/systemd/system/betterdesk.service
+            print_info "Removed legacy betterdesk.service"
+        fi
     fi
 
     systemctl daemon-reload
     
     print_success "Systemd services configured"
-    print_info "Services: rustdesksignal, rustdeskrelay, betterdesk"
+    print_info "Services: betterdesk-server, betterdesk-console"
 }
 
 run_migrations() {
@@ -1281,13 +1744,32 @@ do_install() {
     print_info "Starting BetterDesk Console v$VERSION installation..."
     echo ""
     
+    # Choose database type (SQLite or PostgreSQL)
+    choose_database_type
+    
     # Stop services if running (prevents "Text file busy" error)
     graceful_stop_services
     
     install_dependencies
+    
+    # Install and configure PostgreSQL if selected
+    if [ "$USE_POSTGRESQL" = "true" ]; then
+        install_postgresql || { print_error "PostgreSQL installation failed"; return 1; }
+        setup_postgresql_database || { print_error "PostgreSQL setup failed"; return 1; }
+    fi
+    
     detect_architecture
     install_binaries || { print_error "Binary installation failed"; return 1; }
     install_console
+    
+    # Generate self-signed TLS certificates (default for fresh installs)
+    generate_ssl_certificates
+    
+    # Migrate existing SQLite data to PostgreSQL if applicable
+    if [ "$USE_POSTGRESQL" = "true" ]; then
+        migrate_sqlite_to_postgresql
+    fi
+    
     setup_services
     run_migrations
     create_admin_user
@@ -1309,12 +1791,24 @@ do_install() {
         public_key=$(cat "$RUSTDESK_PATH/id_ed25519.pub")
     fi
     
+    local db_type_info="SQLite"
+    if [ "$USE_POSTGRESQL" = "true" ]; then
+        db_type_info="PostgreSQL"
+    fi
+    
+    local tls_status="Disabled"
+    if [ -f "$RUSTDESK_PATH/ssl/betterdesk.crt" ] && [ -f "$RUSTDESK_PATH/ssl/betterdesk.key" ]; then
+        tls_status="Self-signed (auto-generated)"
+    fi
+    
     echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║              INSTALLATION INFO                             ║${NC}"
     echo -e "${CYAN}╠════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║  Panel Web:     ${WHITE}http://$server_ip:5000${CYAN}                        ║${NC}"
     echo -e "${CYAN}║  API Port:      ${WHITE}$API_PORT${CYAN}                                     ║${NC}"
     echo -e "${CYAN}║  Server ID:     ${WHITE}$server_ip${CYAN}                                    ║${NC}"
+    echo -e "${CYAN}║  Database:      ${WHITE}$db_type_info${CYAN}                                 ║${NC}"
+    echo -e "${CYAN}║  TLS:           ${WHITE}$tls_status${CYAN}                                   ║${NC}"
     echo -e "${CYAN}║  Key:           ${WHITE}${public_key:0:20}...${CYAN}                          ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
     
@@ -1409,24 +1903,33 @@ do_repair() {
 }
 
 repair_binaries() {
-    print_step "Repairing binaries (enhanced v2.1.2)..."
+    print_step "Repairing BetterDesk Go Server..."
     
     detect_architecture
     
-    # Verify we have binaries to install
-    local bin_source="$SCRIPT_DIR/hbbs-patch-v2"
-    if [ ! -f "$bin_source/hbbs-linux-$ARCH_NAME" ] || [ ! -f "$bin_source/hbbr-linux-$ARCH_NAME" ]; then
-        print_error "BetterDesk binaries not found in $bin_source/"
-        print_info "Expected: hbbs-linux-$ARCH_NAME and hbbr-linux-$ARCH_NAME"
-        return 1
+    local go_binary="$GO_SERVER_SOURCE/betterdesk-server"
+    
+    # Check if Go binary exists, or compile it
+    if [ ! -f "$go_binary" ]; then
+        print_info "Go server binary not found, checking if we can compile..."
+        
+        if ! check_go_installed; then
+            print_info "Installing Go toolchain..."
+            if ! install_golang; then
+                print_error "Failed to install Go toolchain"
+                return 1
+            fi
+        fi
+        
+        if ! compile_go_server; then
+            print_error "Failed to compile Go server"
+            return 1
+        fi
     fi
     
     # Create backup before repair
-    if [ -f "$RUSTDESK_PATH/hbbs" ]; then
-        cp "$RUSTDESK_PATH/hbbs" "$RUSTDESK_PATH/hbbs.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    fi
-    if [ -f "$RUSTDESK_PATH/hbbr" ]; then
-        cp "$RUSTDESK_PATH/hbbr" "$RUSTDESK_PATH/hbbr.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    if [ -f "$RUSTDESK_PATH/betterdesk-server" ]; then
+        cp "$RUSTDESK_PATH/betterdesk-server" "$RUSTDESK_PATH/betterdesk-server.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
     fi
     
     # Gracefully stop all services
@@ -1435,22 +1938,16 @@ repair_binaries() {
     # Extra safety: wait and verify files are not in use
     sleep 2
     
-    # Check if binaries are still locked (Text file busy prevention)
-    if lsof "$RUSTDESK_PATH/hbbs" 2>/dev/null | grep -q .; then
-        print_error "hbbs binary is still in use!"
-        kill_stale_processes "hbbs"
+    # Check if binary is still locked (Text file busy prevention)
+    if lsof "$RUSTDESK_PATH/betterdesk-server" 2>/dev/null | grep -q .; then
+        print_error "betterdesk-server binary is still in use!"
+        kill_stale_processes "betterdesk-server"
         sleep 2
     fi
     
-    if lsof "$RUSTDESK_PATH/hbbr" 2>/dev/null | grep -q .; then
-        print_error "hbbr binary is still in use!"
-        kill_stale_processes "hbbr"
-        sleep 2
-    fi
-    
-    # Now install binaries
+    # Now install binary
     if ! install_binaries; then
-        print_error "Failed to install binaries"
+        print_error "Failed to install binary"
         return 1
     fi
     
@@ -1461,7 +1958,7 @@ repair_binaries() {
         return 1
     fi
     
-    print_success "Binaries repaired and services verified!"
+    print_success "Go server binary repaired and services verified!"
 }
 
 repair_database() {
@@ -1511,27 +2008,21 @@ EOF
 }
 
 repair_services() {
-    print_step "Repairing systemd services (enhanced v2.1.2)..."
+    print_step "Repairing systemd services..."
     
     # Stop services gracefully first
     graceful_stop_services
     
     # Backup existing service files
-    for svc in rustdesksignal rustdeskrelay betterdesk; do
+    for svc in betterdesk-server betterdesk-console rustdesksignal rustdeskrelay betterdesk; do
         if [ -f "/etc/systemd/system/${svc}.service" ]; then
             cp "/etc/systemd/system/${svc}.service" "/etc/systemd/system/${svc}.service.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
         fi
     done
     
-    # Verify paths exist
-    if [ ! -f "$RUSTDESK_PATH/hbbs" ]; then
-        print_error "hbbs binary not found at $RUSTDESK_PATH/hbbs"
-        print_info "Run 'Repair binaries' first"
-        return 1
-    fi
-    
-    if [ ! -f "$RUSTDESK_PATH/hbbr" ]; then
-        print_error "hbbr binary not found at $RUSTDESK_PATH/hbbr"
+    # Verify Go server binary exists
+    if [ ! -f "$RUSTDESK_PATH/betterdesk-server" ]; then
+        print_error "betterdesk-server binary not found at $RUSTDESK_PATH/betterdesk-server"
         print_info "Run 'Repair binaries' first"
         return 1
     fi
@@ -1544,7 +2035,7 @@ repair_services() {
         print_error "Services failed to start after repair"
         print_info "Restoring backup service files..."
         
-        for svc in rustdesksignal rustdeskrelay betterdesk; do
+        for svc in betterdesk-server betterdesk-console; do
             backup_file=$(ls -t /etc/systemd/system/${svc}.service.backup.* 2>/dev/null | head -1)
             if [ -n "$backup_file" ]; then
                 cp "$backup_file" "/etc/systemd/system/${svc}.service"
@@ -1563,7 +2054,7 @@ repair_permissions() {
     
     chown -R root:root "$RUSTDESK_PATH" 2>/dev/null || true
     chmod 755 "$RUSTDESK_PATH"
-    chmod +x "$RUSTDESK_PATH/hbbs" "$RUSTDESK_PATH/hbbr" 2>/dev/null || true
+    chmod +x "$RUSTDESK_PATH/betterdesk-server" 2>/dev/null || true
     chmod 644 "$DB_PATH" 2>/dev/null || true
     
     print_success "Permissions repaired"
@@ -1604,18 +2095,13 @@ do_validate() {
         ((errors++))
     fi
     
-    # Check binaries
-    echo -n "  HBBS binary: "
-    if [ -x "$RUSTDESK_PATH/hbbs" ]; then
-        echo -e "${GREEN}✓${NC}"
-    else
-        echo -e "${RED}✗ Not found or missing permissions${NC}"
-        ((errors++))
-    fi
-    
-    echo -n "  HBBR binary: "
-    if [ -x "$RUSTDESK_PATH/hbbr" ]; then
-        echo -e "${GREEN}✓${NC}"
+    # Check Go server binary
+    echo -n "  BetterDesk Server (Go): "
+    if [ -x "$RUSTDESK_PATH/betterdesk-server" ]; then
+        echo -e "${GREEN}✓ Single binary (signal + relay + API)${NC}"
+    elif [ -x "$RUSTDESK_PATH/hbbs" ] && [ -x "$RUSTDESK_PATH/hbbr" ]; then
+        echo -e "${YELLOW}! Legacy Rust binaries (consider upgrading to Go)${NC}"
+        ((warnings++))
     else
         echo -e "${RED}✗ Not found or missing permissions${NC}"
         ((errors++))
@@ -1626,10 +2112,13 @@ do_validate() {
     if [ -f "$DB_PATH" ]; then
         echo -e "${GREEN}✓${NC}"
         
-        # Check tables
-        echo -n "    - Table peer: "
-        if sqlite3 "$DB_PATH" "SELECT 1 FROM peer LIMIT 1" 2>/dev/null; then
+        # Check tables (Go uses 'peers', legacy uses 'peer')
+        echo -n "    - Table peers: "
+        if sqlite3 "$DB_PATH" "SELECT 1 FROM peers LIMIT 1" 2>/dev/null; then
             echo -e "${GREEN}✓${NC}"
+        elif sqlite3 "$DB_PATH" "SELECT 1 FROM peer LIMIT 1" 2>/dev/null; then
+            echo -e "${YELLOW}! Legacy schema (peer)${NC}"
+            ((warnings++))
         else
             echo -e "${YELLOW}! Empty or not found${NC}"
             ((warnings++))
@@ -1648,8 +2137,8 @@ do_validate() {
     fi
     
     # Check keys
-    echo -n "  Public key: "
-    if [ -f "$RUSTDESK_PATH/id_ed25519.pub" ]; then
+    echo -n "  Ed25519 key: "
+    if [ -f "$RUSTDESK_PATH/id_ed25519.pub" ] || [ -f "$RUSTDESK_PATH/id_ed25519" ]; then
         echo -e "${GREEN}✓${NC}"
     else
         echo -e "${YELLOW}! Will be generated on first start${NC}"
@@ -1661,18 +2150,46 @@ do_validate() {
     echo -e "${WHITE}Checking services...${NC}"
     echo ""
     
-    for service in rustdesksignal rustdeskrelay betterdesk; do
-        echo -n "  $service: "
-        if systemctl is-active --quiet "$service" 2>/dev/null; then
-            echo -e "${GREEN}● Active${NC}"
-        elif systemctl is-enabled --quiet "$service" 2>/dev/null; then
-            echo -e "${YELLOW}○ Enabled but inactive${NC}"
-            ((warnings++))
-        else
-            echo -e "${RED}○ Disabled${NC}"
-            ((errors++))
-        fi
-    done
+    # Check Go server service first
+    echo -n "  betterdesk-server (Go): "
+    if systemctl is-active --quiet betterdesk-server 2>/dev/null; then
+        echo -e "${GREEN}● Active (signal + relay + API)${NC}"
+    elif systemctl is-enabled --quiet betterdesk-server 2>/dev/null; then
+        echo -e "${YELLOW}○ Enabled but inactive${NC}"
+        ((warnings++))
+    elif systemctl list-unit-files betterdesk-server.service &>/dev/null 2>&1; then
+        echo -e "${RED}○ Disabled${NC}"
+        ((errors++))
+    else
+        # Check legacy Rust services
+        echo -e "${CYAN}Not installed${NC}"
+        
+        for service in rustdesksignal rustdeskrelay; do
+            echo -n "  $service (Legacy Rust): "
+            if systemctl is-active --quiet "$service" 2>/dev/null; then
+                echo -e "${GREEN}● Active${NC}"
+            elif systemctl is-enabled --quiet "$service" 2>/dev/null; then
+                echo -e "${YELLOW}○ Enabled but inactive${NC}"
+                ((warnings++))
+            else
+                echo -e "${RED}○ Disabled${NC}"
+                ((errors++))
+            fi
+        done
+    fi
+    
+    echo -n "  betterdesk-console (Node.js): "
+    if systemctl is-active --quiet betterdesk-console 2>/dev/null; then
+        echo -e "${GREEN}● Active${NC}"
+    elif systemctl is-active --quiet betterdesk 2>/dev/null; then
+        echo -e "${GREEN}● Active (legacy name)${NC}"
+    elif systemctl is-enabled --quiet betterdesk-console 2>/dev/null; then
+        echo -e "${YELLOW}○ Enabled but inactive${NC}"
+        ((warnings++))
+    else
+        echo -e "${RED}○ Disabled${NC}"
+        ((errors++))
+    fi
     
     # Check ports
     echo ""
@@ -2079,24 +2596,33 @@ do_diagnostics() {
     echo -e "${WHITE}${BOLD}═══ Service logs (last 10 lines) ═══${NC}"
     echo ""
     
-    echo -e "${CYAN}--- rustdesksignal ---${NC}"
-    journalctl -u rustdesksignal -n 10 --no-pager 2>/dev/null || echo "No logs found"
+    # Check for Go server first, then legacy Rust services
+    if systemctl list-unit-files betterdesk-server.service &>/dev/null 2>&1; then
+        echo -e "${CYAN}--- betterdesk-server (Go) ---${NC}"
+        journalctl -u betterdesk-server -n 10 --no-pager 2>/dev/null || echo "No logs found"
+    else
+        echo -e "${CYAN}--- rustdesksignal (Legacy Rust) ---${NC}"
+        journalctl -u rustdesksignal -n 10 --no-pager 2>/dev/null || echo "No logs found"
+        
+        echo ""
+        echo -e "${CYAN}--- rustdeskrelay (Legacy Rust) ---${NC}"
+        journalctl -u rustdeskrelay -n 10 --no-pager 2>/dev/null || echo "No logs found"
+    fi
     
     echo ""
-    echo -e "${CYAN}--- rustdeskrelay ---${NC}"
-    journalctl -u rustdeskrelay -n 10 --no-pager 2>/dev/null || echo "No logs found"
-    
-    echo ""
-    echo -e "${CYAN}--- betterdesk ---${NC}"
-    journalctl -u betterdesk -n 10 --no-pager 2>/dev/null || echo "No logs found"
+    echo -e "${CYAN}--- betterdesk-console (Node.js) ---${NC}"
+    journalctl -u betterdesk-console -n 10 --no-pager 2>/dev/null || \
+        journalctl -u betterdesk -n 10 --no-pager 2>/dev/null || echo "No logs found"
     
     echo ""
     echo -e "${WHITE}${BOLD}═══ Database statistics ═══${NC}"
     echo ""
     
     if [ -f "$DB_PATH" ]; then
-        local device_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE is_deleted = 0" 2>/dev/null || echo "0")
-        local online_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE status = 1 AND is_deleted = 0" 2>/dev/null || echo "0")
+        local device_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE is_deleted = 0" 2>/dev/null || \
+                            sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE is_deleted = 0" 2>/dev/null || echo "0")
+        local online_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE status = 1 AND is_deleted = 0" 2>/dev/null || \
+                            sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE status = 1 AND is_deleted = 0" 2>/dev/null || echo "0")
         local user_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users" 2>/dev/null || echo "0")
         
         echo "  Devices:           $device_count"
@@ -2113,11 +2639,11 @@ do_diagnostics() {
     
     local port_issues=0
     local port_defs=(
-        "21114:TCP:hbbs:HBBS API"
-        "21115:TCP:hbbs:NAT Test"
-        "21116:TCP:hbbs:ID Server (TCP)"
-        "21116:UDP:hbbs:ID Server (UDP)"
-        "21117:TCP:hbbr:Relay Server"
+        "21114:TCP:betterdesk-server|hbbs:API Server"
+        "21115:TCP:betterdesk-server|hbbs:NAT Test"
+        "21116:TCP:betterdesk-server|hbbs:ID Server (TCP)"
+        "21116:UDP:betterdesk-server|hbbs:ID Server (UDP)"
+        "21117:TCP:betterdesk-server|hbbr:Relay Server"
         "5000:TCP:node:Web Console"
         "21121:TCP:node:Client API (WAN)"
     )
@@ -2234,7 +2760,7 @@ do_diagnostics() {
     echo -e "${WHITE}${BOLD}═══ API connectivity ═══${NC}"
     echo ""
     
-    local api_port="${API_PORT:-21114}"
+    local api_port="${API_PORT:-21120}"
     
     printf "  HBBS API (%s):     " "$api_port"
     if curl -sfo /dev/null --connect-timeout 3 "http://127.0.0.1:${api_port}/api/server-info" 2>/dev/null; then
@@ -2313,10 +2839,18 @@ do_uninstall() {
     fi
     
     print_step "Stopping services..."
+    # Stop Go server (primary)
+    systemctl stop betterdesk-server betterdesk-console 2>/dev/null || true
+    systemctl disable betterdesk-server betterdesk-console 2>/dev/null || true
+    # Stop legacy Rust services if they exist
     systemctl stop rustdesksignal rustdeskrelay betterdesk 2>/dev/null || true
     systemctl disable rustdesksignal rustdeskrelay betterdesk 2>/dev/null || true
     
     print_step "Removing service files..."
+    # Remove Go services
+    rm -f /etc/systemd/system/betterdesk-server.service
+    rm -f /etc/systemd/system/betterdesk-console.service
+    # Remove legacy services
     rm -f /etc/systemd/system/rustdesksignal.service
     rm -f /etc/systemd/system/rustdeskrelay.service
     rm -f /etc/systemd/system/betterdesk.service
@@ -2496,6 +3030,239 @@ do_configure_ssl() {
 }
 
 #===============================================================================
+# Database Migration Functions
+#===============================================================================
+
+do_migrate_database() {
+    print_header
+    echo -e "${WHITE}${BOLD}══════════ DATABASE MIGRATION ══════════${NC}"
+    echo ""
+
+    # Locate migration binary
+    local migrate_bin=""
+    local arch=$(uname -m)
+    local search_paths=(
+        "$SCRIPT_DIR/betterdesk-server/tools/migrate/migrate-linux-amd64"
+        "$SCRIPT_DIR/tools/migrate/migrate-linux-amd64"
+        "$RUSTDESK_PATH/migrate"
+        "/usr/local/bin/betterdesk-migrate"
+    )
+
+    for p in "${search_paths[@]}"; do
+        if [ -f "$p" ] && [ -x "$p" ]; then
+            migrate_bin="$p"
+            break
+        fi
+    done
+
+    if [ -z "$migrate_bin" ]; then
+        # Try to find non-executable and make it executable
+        for p in "${search_paths[@]}"; do
+            if [ -f "$p" ]; then
+                chmod +x "$p"
+                migrate_bin="$p"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$migrate_bin" ]; then
+        print_error "Migration binary not found!"
+        print_info "Expected at: $SCRIPT_DIR/betterdesk-server/tools/migrate/migrate-linux-amd64"
+        print_info "Build it with: cd betterdesk-server && go build -o tools/migrate/migrate-linux-amd64 ./tools/migrate/"
+        press_enter
+        return
+    fi
+
+    print_info "Migration binary: $migrate_bin"
+    echo ""
+    echo -e "  ${WHITE}Migrate databases between different BetterDesk components.${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Migration Modes:${NC}"
+    echo -e "  ${GREEN}1.${NC} Rust → Go        Migrate from legacy Rust hbbs database to Go server"
+    echo -e "  ${GREEN}2.${NC} Node.js → Go     Migrate from Node.js web console to Go server"
+    echo -e "  ${GREEN}3.${NC} SQLite → PostgreSQL  Migrate BetterDesk Go SQLite to PostgreSQL"
+    echo -e "  ${GREEN}4.${NC} PostgreSQL → SQLite  Migrate PostgreSQL back to SQLite"
+    echo -e "  ${GREEN}5.${NC} Backup           Create timestamped backup of SQLite database"
+    echo ""
+    echo -e "  ${RED}0.${NC} Back to main menu"
+    echo ""
+
+    read -p "Select migration mode: " mig_choice
+
+    case $mig_choice in
+        1)
+            # Rust → Go
+            echo ""
+            local default_src="$RUSTDESK_PATH/db_v2.sqlite3"
+            read -p "Source Rust database [$default_src]: " src_db
+            src_db="${src_db:-$default_src}"
+
+            if [ ! -f "$src_db" ]; then
+                print_error "Source database not found: $src_db"
+                press_enter
+                return
+            fi
+
+            read -p "Destination (SQLite path or postgres:// URI) [new file next to source]: " dst_db
+
+            print_step "Creating backup before migration..."
+            "$migrate_bin" -mode backup -src "$src_db" 2>&1 || true
+
+            print_step "Running Rust → Go migration..."
+            if [ -n "$dst_db" ]; then
+                "$migrate_bin" -mode rust2go -src "$src_db" -dst "$dst_db" 2>&1
+            else
+                "$migrate_bin" -mode rust2go -src "$src_db" 2>&1
+            fi
+
+            if [ $? -eq 0 ]; then
+                print_success "Rust → Go migration completed successfully!"
+            else
+                print_error "Migration failed. Check the output above for details."
+            fi
+            ;;
+        2)
+            # Node.js → Go
+            echo ""
+            local default_src="$RUSTDESK_PATH/db_v2.sqlite3"
+            local default_auth="$CONSOLE_PATH/data/auth.db"
+
+            read -p "Source Node.js peer database [$default_src]: " src_db
+            src_db="${src_db:-$default_src}"
+
+            if [ ! -f "$src_db" ]; then
+                print_error "Source peer database not found: $src_db"
+                press_enter
+                return
+            fi
+
+            read -p "Node.js auth database [$default_auth]: " auth_db
+            auth_db="${auth_db:-$default_auth}"
+
+            read -p "Destination (SQLite path or postgres:// URI) [new file next to source]: " dst_db
+
+            print_step "Creating backup before migration..."
+            "$migrate_bin" -mode backup -src "$src_db" 2>&1 || true
+            if [ -f "$auth_db" ]; then
+                "$migrate_bin" -mode backup -src "$auth_db" 2>&1 || true
+            fi
+
+            print_step "Running Node.js → Go migration..."
+            local cmd="$migrate_bin -mode nodejs2go -src $src_db"
+            if [ -f "$auth_db" ]; then
+                cmd="$cmd -node-auth $auth_db"
+            fi
+            if [ -n "$dst_db" ]; then
+                cmd="$cmd -dst $dst_db"
+            fi
+            eval "$cmd" 2>&1
+
+            if [ $? -eq 0 ]; then
+                print_success "Node.js → Go migration completed successfully!"
+            else
+                print_error "Migration failed. Check the output above for details."
+            fi
+            ;;
+        3)
+            # SQLite → PostgreSQL
+            echo ""
+            local default_src="$RUSTDESK_PATH/db_v2.sqlite3"
+            read -p "Source SQLite database [$default_src]: " src_db
+            src_db="${src_db:-$default_src}"
+
+            if [ ! -f "$src_db" ]; then
+                print_error "Source database not found: $src_db"
+                press_enter
+                return
+            fi
+
+            read -p "PostgreSQL connection URI (postgres://user:pass@host:5432/dbname): " pg_uri
+            if [ -z "$pg_uri" ]; then
+                print_error "PostgreSQL URI is required"
+                press_enter
+                return
+            fi
+
+            print_step "Creating backup before migration..."
+            "$migrate_bin" -mode backup -src "$src_db" 2>&1 || true
+
+            print_step "Running SQLite → PostgreSQL migration..."
+            "$migrate_bin" -mode sqlite2pg -src "$src_db" -dst "$pg_uri" 2>&1
+
+            if [ $? -eq 0 ]; then
+                print_success "SQLite → PostgreSQL migration completed successfully!"
+                print_info "Update your BetterDesk Go server config: DB_URL=$pg_uri"
+            else
+                print_error "Migration failed. Check the output above for details."
+            fi
+            ;;
+        4)
+            # PostgreSQL → SQLite
+            echo ""
+            read -p "PostgreSQL connection URI (postgres://user:pass@host:5432/dbname): " pg_uri
+            if [ -z "$pg_uri" ]; then
+                print_error "PostgreSQL URI is required"
+                press_enter
+                return
+            fi
+
+            local default_dst="$RUSTDESK_PATH/db_v2.sqlite3"
+            read -p "Destination SQLite file [$default_dst]: " dst_db
+            dst_db="${dst_db:-$default_dst}"
+
+            if [ -f "$dst_db" ]; then
+                print_warning "Destination file exists: $dst_db"
+                if ! confirm "Overwrite (backup will be created first)?"; then
+                    press_enter
+                    return
+                fi
+                "$migrate_bin" -mode backup -src "$dst_db" 2>&1 || true
+            fi
+
+            print_step "Running PostgreSQL → SQLite migration..."
+            "$migrate_bin" -mode pg2sqlite -src "$pg_uri" -dst "$dst_db" 2>&1
+
+            if [ $? -eq 0 ]; then
+                print_success "PostgreSQL → SQLite migration completed successfully!"
+            else
+                print_error "Migration failed. Check the output above for details."
+            fi
+            ;;
+        5)
+            # Backup
+            echo ""
+            local default_src="$RUSTDESK_PATH/db_v2.sqlite3"
+            read -p "SQLite database to backup [$default_src]: " src_db
+            src_db="${src_db:-$default_src}"
+
+            if [ ! -f "$src_db" ]; then
+                print_error "Database not found: $src_db"
+                press_enter
+                return
+            fi
+
+            print_step "Creating backup..."
+            "$migrate_bin" -mode backup -src "$src_db" 2>&1
+
+            if [ $? -eq 0 ]; then
+                print_success "Backup created successfully!"
+            else
+                print_error "Backup failed."
+            fi
+            ;;
+        0)
+            return
+            ;;
+        *)
+            print_warning "Invalid option"
+            ;;
+    esac
+
+    press_enter
+}
+
+#===============================================================================
 # Main Menu
 #===============================================================================
 
@@ -2516,6 +3283,7 @@ show_menu() {
     echo "  9. 🗑️  UNINSTALL"
     echo ""
     echo "  C. 🔒 Configure SSL certificates"
+    echo "  M. 🔄 Database migration"
     echo "  S. ⚙️  Settings (paths)"
     echo "  0. ❌ Exit"
     echo ""
@@ -2557,6 +3325,7 @@ main() {
             8) do_diagnostics ;;
             9) do_uninstall ;;
             [Cc]) do_configure_ssl ;;
+            [Mm]) do_migrate_database ;;
             [Ss]) configure_paths ;;
             0) 
                 echo ""

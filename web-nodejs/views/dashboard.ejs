@@ -74,11 +74,12 @@
             </div>
             
             <div class="server-status-grid">
+                <!-- Signal Server -->
                 <div class="server-status-card">
                     <div class="server-status-header">
                         <span class="server-status-title">
                             <span class="material-icons">router</span>
-                            HBBS (Signal Server)
+                            Signal Server
                         </span>
                         <span class="server-status-indicator" id="hbbs-status">
                             <span class="status-dot"></span>
@@ -87,21 +88,30 @@
                     </div>
                     <div class="server-status-details">
                         <div class="server-detail-row">
-                            <span class="server-detail-label">${_('server.port')}</span>
+                            <span class="server-detail-label">Signal (TCP/UDP)</span>
                             <span class="server-detail-value" id="hbbs-port">-</span>
                         </div>
                         <div class="server-detail-row">
-                            <span class="server-detail-label">${_('server.api_port')}</span>
+                            <span class="server-detail-label">NAT Test (TCP)</span>
+                            <span class="server-detail-value" id="nat-port">-</span>
+                        </div>
+                        <div class="server-detail-row">
+                            <span class="server-detail-label">WS Signal</span>
+                            <span class="server-detail-value" id="ws-signal-port">-</span>
+                        </div>
+                        <div class="server-detail-row">
+                            <span class="server-detail-label">REST API (HTTP)</span>
                             <span class="server-detail-value" id="api-port">-</span>
                         </div>
                     </div>
                 </div>
                 
+                <!-- Relay Server -->
                 <div class="server-status-card">
                     <div class="server-status-header">
                         <span class="server-status-title">
                             <span class="material-icons">swap_horiz</span>
-                            HBBR (Relay Server)
+                            Relay Server
                         </span>
                         <span class="server-status-indicator" id="hbbr-status">
                             <span class="status-dot"></span>
@@ -110,8 +120,36 @@
                     </div>
                     <div class="server-status-details">
                         <div class="server-detail-row">
-                            <span class="server-detail-label">${_('server.port')}</span>
+                            <span class="server-detail-label">Relay (TCP)</span>
                             <span class="server-detail-value" id="hbbr-port">-</span>
+                        </div>
+                        <div class="server-detail-row">
+                            <span class="server-detail-label">WS Relay</span>
+                            <span class="server-detail-value" id="ws-relay-port">-</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Web Console  -->
+                <div class="server-status-card">
+                    <div class="server-status-header">
+                        <span class="server-status-title">
+                            <span class="material-icons">web</span>
+                            Web Console
+                        </span>
+                        <span class="server-status-indicator running">
+                            <span class="status-dot"></span>
+                            <span class="status-text">${_('status.running')}</span>
+                        </span>
+                    </div>
+                    <div class="server-status-details">
+                        <div class="server-detail-row">
+                            <span class="server-detail-label">Console (HTTP)</span>
+                            <span class="server-detail-value" id="console-port">-</span>
+                        </div>
+                        <div class="server-detail-row">
+                            <span class="server-detail-label">Client API (HTTP)</span>
+                            <span class="server-detail-value" id="client-api-port">-</span>
                         </div>
                     </div>
                 </div>

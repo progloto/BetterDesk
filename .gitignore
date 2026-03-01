@@ -103,7 +103,7 @@ Thumbs.db
 # Project specific
 screenshots/*.png
 !screenshots/.gitkeep
-web/static/uploads/
+web-nodejs/uploads/
 *.key
 *.pem
 id_*.pub
@@ -121,17 +121,48 @@ config.local.*
 .coverage
 htmlcov/
 .pytest_cache/
+test_*.sh
+
+# Dev scripts with potential sensitive data (instance keys, signatures, IDs)
+web-nodejs/_test_*.sh
+web-nodejs/_fix_*.sh
+dev_modules/verify_nacl.py
+dev_modules/verify_signature.py
+dev_modules/verify_e2e_signature.py
+_write_readme.py
 
 # Experimental/Dev-only (not ready for production)
 dev_modules/betterdesk-builder/
 
-# BetterDesk Go server (separate project, not ready for release)
-betterdesk-server/
-.github/go-server-context.md
+# BetterDesk Desktop Client (development paused — using RustDesk client instead)
+betterdesk-client/
 
-# RustDesk server build source (only compiled binaries are shipped)
-rustdesk-server-1.1.14/
+# BetterDesk Go server binary files (compiled locally, not shipped in repo)
+betterdesk-server/betterdesk-server
+betterdesk-server/betterdesk-server-*
+betterdesk-server/*.exe
+betterdesk-server/*.key
+betterdesk-server/*.pem
+betterdesk-server/id_ed25519*
+betterdesk-server/test_*.go
+betterdesk-server/_test_*
 
 # Node.js
 node_modules/
 package-lock.json
+
+# Root-level image duplicates (originals in web-nodejs/public/img/)
+/betterdesk.png
+/betterdesk_icon.png
+
+# Internal dev/analysis documents (not for public repo)
+.github/audyt_bezpieczenstwa.md
+.github/RUSTDESK_SZYFROWANIE.md
+.github/rustdesk_client_server_data_analysis.md
+.github/rustdesk_encryption_analysis.md
+.github/new_functions.md
+.github/rustdesk_client.md
+
+# Legacy Rust binaries (archived, removed from repo)
+hbbs-patch/
+hbbs-patch-v2/

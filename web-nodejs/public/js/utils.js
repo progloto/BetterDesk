@@ -104,6 +104,26 @@ const Utils = {
     },
     
     /**
+     * Sanitize color value to prevent XSS
+     * Only allows valid hex colors (#RGB, #RRGGBB) and named colors
+     */
+    sanitizeColor(color) {
+        if (!color || typeof color !== 'string') return '#808080';
+        // Allow hex colors
+        if (/^#[0-9A-Fa-f]{3}$/.test(color) || /^#[0-9A-Fa-f]{6}$/.test(color)) {
+            return color;
+        }
+        // Allow safe named colors
+        const safeColors = ['red', 'green', 'blue', 'yellow', 'orange', 'purple', 'pink', 
+                           'cyan', 'magenta', 'brown', 'gray', 'grey', 'black', 'white',
+                           'lime', 'teal', 'navy', 'maroon', 'olive', 'aqua', 'silver'];
+        if (safeColors.includes(color.toLowerCase())) {
+            return color;
+        }
+        return '#808080'; // Default gray
+    },
+    
+    /**
      * Parse URL query parameters
      */
     getQueryParams() {
@@ -124,10 +144,14 @@ const Utils = {
     },
     
     /**
-     * Generate a simple unique ID
+     * Generate a simple unique ID (using crypto.randomUUID when available)
      */
     generateId() {
-        return 'id-' + Math.random().toString(36).substr(2, 9);
+        if (window.crypto && window.crypto.randomUUID) {
+            return 'id-' + crypto.randomUUID().split('-')[0];
+        }
+        // Fallback for older browsers
+        return 'id-' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
     },
     
     /**

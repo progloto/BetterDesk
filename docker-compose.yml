@@ -1,68 +1,50 @@
 # BetterDesk Console - Docker Compose Setup
-# This is a complete Docker setup that includes RustDesk servers and BetterDesk Console
-# IMPORTANT: Images must be built locally - do NOT try to pull from Docker Hub!
-# Use: docker compose build && docker compose up -d
+# Architecture: Go server (single binary) + Node.js web console
+#
+# IMPORTANT: Images are built locally - do NOT try to pull from Docker Hub!
+# Usage: docker compose build && docker compose up -d
+#
+# The Go server replaces separate hbbs/hbbr — it handles signal, relay,
+# and HTTP API in a single process.
 
 version: '3.8'
 
 services:
-  # RustDesk HBBS (Signal Server) with BetterDesk API
-  # Built from Dockerfile.hbbs with BetterDesk enhanced binaries
-  hbbs:
+  # BetterDesk Server (Go) — replaces hbbs + hbbr
+  # Single binary: signal (21116), relay (21117), API (21114), NAT test (21115)
+  server:
     build:
       context: .
       dockerfile: Dockerfile.hbbs
-    image: betterdesk-hbbs:local
+    image: betterdesk-server:local
     pull_policy: never
-    container_name: betterdesk-hbbs
-    hostname: betterdesk-hbbs
-    # BetterDesk binary with HTTP API enabled on port 21114
-    command: ["/usr/local/bin/hbbs-betterdesk", "-k", "_", "--api-port", "21114"]
+    container_name: betterdesk-server
+    hostname: betterdesk-server
+    command: ["/usr/local/bin/betterdesk-server", "-dir", "/opt/rustdesk"]
     ports:
-      - "21115:21115"           # TCP hole punching
-      - "21116:21116/tcp"       # TCP relay
-      - "21116:21116/udp"       # UDP hole punching
-      - "21114:21114"           # HTTP API (BetterDesk)
+      - "21114:21114"           # HTTP API
+      - "21115:21115"           # NAT type test
+      - "21116:21116/tcp"       # Signal TCP
+      - "21116:21116/udp"       # Signal UDP
+      - "21117:21117"           # Relay TCP
+      - "21118:21118"           # WebSocket Signal
+      - "21119:21119"           # WebSocket Relay
     volumes:
-      - rustdesk-data:/root     # RustDesk data persistence
+      - rustdesk-data:/opt/rustdesk
     environment:
-      - ALWAYS_USE_RELAY=N
       - ENCRYPTED_ONLY=1
     networks:
       - betterdesk-net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "21116"]
+      test: ["CMD", "curl", "-sf", "http://localhost:21114/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
 
-  # RustDesk HBBR (Relay Server) with BetterDesk
-  # Built from Dockerfile.hbbr with BetterDesk enhanced binaries
-  hbbr:
-    build:
-      context: .
-      dockerfile: Dockerfile.hbbr
-    image: betterdesk-hbbr:local
-    pull_policy: never
-    container_name: betterdesk-hbbr
-    hostname: betterdesk-hbbr
-    # BetterDesk relay binary
-    command: ["/usr/local/bin/hbbr-betterdesk", "-k", "_"]
-    ports:
-      - "21117:21117"           # Relay port
-    volumes:
-      - rustdesk-data:/root     # Shared data with HBBS
-    networks:
-      - betterdesk-net
-    restart: unless-stopped
-    depends_on:
-      hbbs:
-        condition: service_healthy
-
-  # BetterDesk Console Web Interface
-  betterdesk-console:
+  # BetterDesk Console — Node.js Web Interface
+  console:
     build:
       context: .
       dockerfile: Dockerfile.console
@@ -71,34 +53,45 @@ services:
     container_name: betterdesk-console
     hostname: betterdesk-console
     ports:
-      - "5000:5000"             # Web console port
+      - "5000:5000"             # Web console
+      - "21121:21121"           # RustDesk Client API (WAN)
     volumes:
-      - rustdesk-data:/opt/rustdesk:ro    # Read-only access to RustDesk data
-      - console-data:/app/data            # Console-specific data
+      - rustdesk-data:/opt/rustdesk:ro    # Read-only access to server data (keys, db)
+      - console-data:/app/data            # Console-specific data (auth.db, sessions)
     environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - SERVER_BACKEND=betterdesk
+      - HBBS_API_URL=http://betterdesk-server:21114/api
+      - BETTERDESK_API_URL=http://betterdesk-server:21114/api
+      - RUSTDESK_PATH=/opt/rustdesk
+      - DATA_DIR=/app/data
       - DB_PATH=/opt/rustdesk/db_v2.sqlite3
-      - API_KEY_PATH=/opt/rustdesk/.api_key
       - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
-      - HBBS_API_URL=http://hbbs:21114/api
-      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY:-$(openssl rand -hex 32)}
-      - FLASK_ENV=production
-      # Optional: Set custom admin credentials (remove to use auto-generated)
+      - API_KEY_PATH=/opt/rustdesk/.api_key
+      - SESSION_SECRET=${SESSION_SECRET:-}
+      - WS_HBBS_HOST=betterdesk-server
+      - WS_HBBS_PORT=21116
+      - WS_HBBR_HOST=betterdesk-server
+      - WS_HBBR_PORT=21117
+      - DOCKER=true
+      # Optional: Set custom admin credentials for first run
       # - ADMIN_USERNAME=admin
       # - ADMIN_PASSWORD=YourSecurePassword123
-      # - SKIP_AUTO_MIGRATION=false
     networks:
       - betterdesk-net
     restart: unless-stopped
     depends_on:
-      - hbbs
+      server:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health || exit 1"]
+      test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
 
-  # Nginx Reverse Proxy (Optional)
+  # Nginx Reverse Proxy (Optional — only with --profile nginx)
   nginx:
     image: nginx:alpine
     container_name: betterdesk-nginx
@@ -112,9 +105,9 @@ services:
       - betterdesk-net
     restart: unless-stopped
     depends_on:
-      - betterdesk-console
+      - console
     profiles:
-      - nginx   # Only start with: docker-compose --profile nginx up
+      - nginx
 
 volumes:
   rustdesk-data:
@@ -123,7 +116,7 @@ volumes:
       type: none
       o: bind
       device: ${RUSTDESK_DATA_PATH:-./data}
-  
+
   console-data:
     driver: local
 
@@ -133,8 +126,3 @@ networks:
     ipam:
       config:
         - subnet: 172.28.0.0/16
-
-# Security Notice:
-# - Watchtower has been removed (archived project - security risk)
-# - For updates, manually pull new images: docker-compose pull && docker-compose up -d
-# - Or use modern alternatives like Renovate, Dependabot, or manual update scripts

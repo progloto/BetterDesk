@@ -1,0 +1,3003 @@
+/**
+ * BetterDesk Console — Database Adapter
+ *
+ * Provides a unified async interface over SQLite (better-sqlite3) and
+ * PostgreSQL (pg).  Every public method returns a Promise so that callers
+ * don't need to know which backend is active.
+ *
+ * Selection:
+ *   DB_TYPE=sqlite   (default, zero-config, single-user / small installs)
+ *   DB_TYPE=postgres  (enterprise, multi-user, multiple operators)
+ *
+ * PostgreSQL connection string:
+ *   DATABASE_URL=postgres://user:pass@host:5432/betterdesk
+ *
+ * The adapter exposes higher-level domain methods (peers, users, tokens, …)
+ * instead of raw SQL, so the rest of the codebase stays database-agnostic.
+ */
+
+'use strict';
+
+// ---------------------------------------------------------------------------
+//  Imports
+// ---------------------------------------------------------------------------
+
+const path = require('path');
+
+// Lazy-loaded drivers — keeps startup fast when one backend isn't installed.
+let _sqlite = null;
+let _pg = null;
+
+function getSqliteDriver() {
+    if (!_sqlite) _sqlite = require('better-sqlite3');
+    return _sqlite;
+}
+
+function getPgDriver() {
+    if (!_pg) _pg = require('pg');
+    return _pg;
+}
+
+// ---------------------------------------------------------------------------
+//  Configuration
+// ---------------------------------------------------------------------------
+
+const DB_TYPE = (process.env.DB_TYPE || 'sqlite').toLowerCase();
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+// ---------------------------------------------------------------------------
+//  Security Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Escape special characters in LIKE patterns to prevent SQL injection.
+ * PostgreSQL and SQLite both use backslash as escape character.
+ * @param {string} str - User input to escape
+ * @returns {string} - Escaped string safe for LIKE patterns
+ */
+function escapeLikePattern(str) {
+    if (!str || typeof str !== 'string') return '';
+    // Escape backslash first, then % and _
+    return str.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+// ---------------------------------------------------------------------------
+//  Interface contract — every adapter must implement these
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {Object} DbAdapter
+ * @property {function(): Promise<void>}  init
+ * @property {function(): Promise<void>}  close
+ *
+ * -- Peers --
+ * @property {function(Object): Promise<Object[]>}  getAllPeers
+ * @property {function(string): Promise<Object|null>}  getPeerById
+ * @property {function(Object): Promise<void>}  upsertPeer
+ * @property {function(string, Object): Promise<void>}  updatePeer
+ * @property {function(string): Promise<void>}  softDeletePeer
+ * @property {function(string, boolean, string): Promise<void>}  setBanStatus
+ * @property {function(): Promise<Object>}  getPeerStats
+ * @property {function(): Promise<void>}  resetAllOnlineStatus
+ * @property {function(string[]): Promise<void>}  markPeersOnline
+ *
+ * -- Users --
+ * @property {function(string): Promise<Object|null>}  getUserByUsername
+ * @property {function(number): Promise<Object|null>}  getUserById
+ * @property {function(string, string, string): Promise<Object>}  createUser
+ * @property {function(number, string): Promise<void>}  updateUserPassword
+ * @property {function(number): Promise<void>}  touchLastLogin
+ * @property {function(): Promise<boolean>}  hasUsers
+ * @property {function(): Promise<Object[]>}  getAllUsers
+ * @property {function(number, string): Promise<void>}  updateUserRole
+ * @property {function(number): Promise<void>}  deleteUser
+ * @property {function(): Promise<number>}  countAdmins
+ *
+ * -- TOTP --
+ * @property {function(number, string): Promise<void>}  saveTotpSecret
+ * @property {function(number, string): Promise<void>}  enableTotp
+ * @property {function(number): Promise<void>}  disableTotp
+ * @property {function(number, string): Promise<void>}  useRecoveryCode
+ *
+ * -- Token --
+ * @property {function(Object): Promise<void>}  createAccessToken
+ * @property {function(string): Promise<Object|null>}  getAccessToken
+ * @property {function(string): Promise<void>}  touchAccessToken
+ * @property {function(string): Promise<void>}  revokeAccessToken
+ * @property {function(number, string): Promise<void>}  revokeUserClientTokens
+ * @property {function(number): Promise<void>}  revokeAllUserTokens
+ * @property {function(): Promise<void>}  cleanupExpiredTokens
+ *
+ * -- Login tracking --
+ * @property {function(string, string, boolean): Promise<void>}  recordLoginAttempt
+ * @property {function(string, number): Promise<number>}  countRecentFailedAttempts
+ * @property {function(string, number): Promise<number>}  countRecentFailedAttemptsFromIp
+ * @property {function(string, string, number): Promise<void>}  lockAccount
+ * @property {function(string): Promise<Object|null>}  getAccountLockout
+ * @property {function(string): Promise<void>}  clearAccountLockout
+ *
+ * -- Folders --
+ * @property {function(): Promise<Object[]>}  getAllFolders
+ * @property {function(number): Promise<Object|null>}  getFolderById
+ * @property {function(Object): Promise<Object>}  createFolder
+ * @property {function(number, Object): Promise<void>}  updateFolder
+ * @property {function(number): Promise<void>}  deleteFolder
+ * @property {function(string, number|null): Promise<void>}  assignDeviceToFolder
+ *
+ * -- Address books --
+ * @property {function(number, string): Promise<Object|null>}  getAddressBook
+ * @property {function(number, string, string): Promise<void>}  saveAddressBook
+ *
+ * -- Audit --
+ * @property {function(number|null, string, string, string): Promise<void>}  logAction
+ * @property {function(number, number): Promise<Object[]>}  getAuditLogs
+ *
+ * -- Settings --
+ * @property {function(string): Promise<string|null>}  getSetting
+ * @property {function(string, string): Promise<void>}  setSetting
+ * @property {function(): Promise<Object>}  getAllSettings
+ *
+ * -- Sessions (enterprise) --
+ * @property {function(Object): Promise<void>}  createSession
+ * @property {function(string): Promise<Object|null>}  getSession
+ * @property {function(string): Promise<void>}  deleteSession
+ * @property {function(): Promise<void>}  cleanupExpiredSessions
+ */
+
+// =========================================================================
+//  SQLite adapter
+// =========================================================================
+
+function createSqliteAdapter(config) {
+    const Database = getSqliteDriver();
+    let mainDb = null;
+    let authDb = null;
+
+    /** open helper */
+    function openMain() {
+        if (mainDb) return mainDb;
+        mainDb = new Database(config.dbPath, { readonly: false, fileMustExist: false });
+        mainDb.pragma('journal_mode = WAL');
+        mainDb.pragma('foreign_keys = ON');
+        return mainDb;
+    }
+
+    function openAuth() {
+        if (authDb) return authDb;
+        const authDbPath = path.join(config.dataDir, 'auth.db');
+        authDb = new Database(authDbPath, { readonly: false, fileMustExist: false });
+        authDb.pragma('journal_mode = WAL');
+        authDb.pragma('foreign_keys = ON');
+        return authDb;
+    }
+
+    // ---- Schema bootstrap ----
+
+    function ensurePeerTable(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS peer (
+                id TEXT PRIMARY KEY,
+                uuid TEXT DEFAULT '',
+                pk BLOB,
+                note TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now')),
+                status_online INTEGER DEFAULT 0,
+                last_online TEXT,
+                is_deleted INTEGER DEFAULT 0,
+                info TEXT DEFAULT '',
+                ip TEXT DEFAULT '',
+                "user" TEXT DEFAULT '',
+                is_banned INTEGER DEFAULT 0,
+                banned_at TEXT,
+                banned_reason TEXT DEFAULT '',
+                folder_id INTEGER DEFAULT NULL
+            )
+        `);
+        const cols = [
+            { name: 'status_online', sql: 'INTEGER DEFAULT 0' },
+            { name: 'last_online', sql: 'TEXT' },
+            { name: 'is_deleted', sql: 'INTEGER DEFAULT 0' },
+            { name: 'user', sql: 'TEXT DEFAULT \'\'' },
+            { name: 'is_banned', sql: 'INTEGER DEFAULT 0' },
+            { name: 'banned_at', sql: 'TEXT' },
+            { name: 'banned_reason', sql: 'TEXT DEFAULT \'\'' },
+            { name: 'folder_id', sql: 'INTEGER DEFAULT NULL' },
+        ];
+        const existing = new Set(db.prepare('PRAGMA table_info(peer)').all().map(c => c.name));
+        for (const c of cols) {
+            if (!existing.has(c.name)) {
+                try { db.exec(`ALTER TABLE peer ADD COLUMN ${c.name} ${c.sql}`); } catch (_) {}
+            }
+        }
+    }
+
+    function ensureAuthTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'admin',
+                created_at TEXT DEFAULT (datetime('now')),
+                last_login TEXT,
+                totp_secret TEXT DEFAULT NULL,
+                totp_enabled INTEGER DEFAULT 0,
+                totp_recovery_codes TEXT DEFAULT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                details TEXT,
+                ip_address TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS access_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                client_id TEXT DEFAULT '',
+                client_uuid TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL,
+                last_used TEXT,
+                ip_address TEXT DEFAULT '',
+                revoked INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                ip_address TEXT DEFAULT '',
+                success INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS account_lockouts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                locked_until TEXT NOT NULL,
+                attempt_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                color TEXT DEFAULT '#6366f1',
+                icon TEXT DEFAULT 'folder',
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS address_books (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                ab_type TEXT DEFAULT 'legacy',
+                data TEXT DEFAULT '{}',
+                updated_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(user_id, ab_type),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS relay_sessions (
+                id TEXT PRIMARY KEY,
+                initiator_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                initiator_pk TEXT,
+                target_pk TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT (datetime('now')),
+                expires_at TEXT NOT NULL
+            );
+        `);
+    }
+
+    function ensureInventoryTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS device_inventory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                hardware TEXT DEFAULT '{}',
+                software TEXT DEFAULT '{}',
+                collected_at TEXT,
+                received_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(device_id)
+            );
+            CREATE TABLE IF NOT EXISTS device_telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                cpu_usage_percent REAL DEFAULT 0,
+                memory_used_bytes INTEGER DEFAULT 0,
+                memory_total_bytes INTEGER DEFAULT 0,
+                uptime_secs INTEGER DEFAULT 0,
+                timestamp TEXT,
+                received_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(device_id)
+            );
+        `);
+    }
+
+    function ensureActivityTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS activity_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                app_name TEXT NOT NULL DEFAULT '',
+                window_title TEXT NOT NULL DEFAULT '',
+                category TEXT DEFAULT 'other',
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                duration_secs INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS activity_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                idle_seconds INTEGER DEFAULT 0,
+                session_count INTEGER DEFAULT 0,
+                total_active_secs INTEGER DEFAULT 0,
+                reported_at TEXT NOT NULL,
+                received_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(device_id, reported_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_device ON activity_sessions (device_id);
+            CREATE INDEX IF NOT EXISTS idx_activity_time ON activity_sessions (started_at);
+        `);
+    }
+
+    function ensureTicketTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                status TEXT DEFAULT 'open',
+                priority TEXT DEFAULT 'medium',
+                category TEXT DEFAULT 'general',
+                device_id TEXT DEFAULT NULL,
+                created_by TEXT NOT NULL,
+                assigned_to TEXT DEFAULT NULL,
+                sla_due_at TEXT DEFAULT NULL,
+                resolved_at TEXT DEFAULT NULL,
+                closed_at TEXT DEFAULT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS ticket_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                author TEXT NOT NULL,
+                body TEXT NOT NULL,
+                is_internal INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS ticket_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                mimetype TEXT DEFAULT 'application/octet-stream',
+                size_bytes INTEGER DEFAULT 0,
+                storage_path TEXT NOT NULL,
+                uploaded_by TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+            );
+        `);
+    }
+
+    function ensureAlertTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS alert_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 1,
+                condition_type TEXT NOT NULL,
+                condition_op TEXT NOT NULL DEFAULT 'gt',
+                condition_value REAL NOT NULL DEFAULT 0,
+                severity TEXT DEFAULT 'warning',
+                scope_device_id TEXT DEFAULT NULL,
+                cooldown_secs INTEGER DEFAULT 300,
+                notify_emails TEXT DEFAULT '',
+                created_by TEXT DEFAULT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS alert_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id INTEGER NOT NULL,
+                device_id TEXT DEFAULT NULL,
+                severity TEXT DEFAULT 'warning',
+                message TEXT NOT NULL DEFAULT '',
+                triggered_at TEXT NOT NULL,
+                acknowledged INTEGER DEFAULT 0,
+                acknowledged_by TEXT DEFAULT NULL,
+                acknowledged_at TEXT DEFAULT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (rule_id) REFERENCES alert_rules(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS remote_commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                command_type TEXT NOT NULL DEFAULT 'shell',
+                payload TEXT NOT NULL DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                result TEXT DEFAULT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                executed_at TEXT DEFAULT NULL,
+                completed_at TEXT DEFAULT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_alert_history_rule ON alert_history (rule_id);
+            CREATE INDEX IF NOT EXISTS idx_alert_history_device ON alert_history (device_id);
+            CREATE INDEX IF NOT EXISTS idx_remote_commands_device ON remote_commands (device_id, status);
+        `);
+    }
+
+    // ---- Parse helpers ----
+
+    function ensureNetworkTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS network_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                host TEXT DEFAULT '',
+                port INTEGER DEFAULT NULL,
+                url TEXT DEFAULT NULL,
+                check_type TEXT NOT NULL DEFAULT 'ping',
+                timeout_ms INTEGER DEFAULT 5000,
+                interval_ms INTEGER DEFAULT 60000,
+                enabled INTEGER DEFAULT 1,
+                last_status TEXT DEFAULT NULL,
+                last_check_at TEXT DEFAULT NULL,
+                last_rtt_ms REAL DEFAULT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS network_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                rtt_ms REAL DEFAULT NULL,
+                status_code INTEGER DEFAULT NULL,
+                error_msg TEXT DEFAULT NULL,
+                checked_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY (target_id) REFERENCES network_targets(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_network_checks_target ON network_checks (target_id);
+            CREATE INDEX IF NOT EXISTS idx_network_checks_time ON network_checks (checked_at);
+        `);
+    }
+
+    // -- DataGuard / DLP tables -------------------------------------------
+    function ensureDataGuardTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS dlp_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 1,
+                rules TEXT DEFAULT '[]',
+                created_at DATETIME DEFAULT (datetime('now')),
+                updated_at DATETIME DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS dlp_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                event_source TEXT NOT NULL DEFAULT 'unknown',
+                event_type TEXT NOT NULL DEFAULT 'info',
+                policy_id INTEGER DEFAULT NULL,
+                policy_name TEXT DEFAULT '',
+                action TEXT DEFAULT 'log',
+                details TEXT DEFAULT '{}',
+                created_at DATETIME DEFAULT (datetime('now')),
+                FOREIGN KEY (policy_id) REFERENCES dlp_policies(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dlp_events_device ON dlp_events (device_id);
+            CREATE INDEX IF NOT EXISTS idx_dlp_events_time ON dlp_events (created_at);
+            CREATE INDEX IF NOT EXISTS idx_dlp_events_source ON dlp_events (event_source);
+        `);
+    }
+
+    // -- Saved reports table -----------------------------------------------
+    function ensureReportTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS saved_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                report_type TEXT NOT NULL,
+                filters TEXT DEFAULT '{}',
+                payload TEXT DEFAULT '{}',
+                created_by TEXT NOT NULL DEFAULT 'admin',
+                created_at DATETIME DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_saved_reports_type ON saved_reports (report_type);
+        `);
+    }
+
+    // -- LAN Discovery / Pending Registrations ----------------------------
+    function ensureRegistrationTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS pending_registrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                hostname TEXT DEFAULT '',
+                platform TEXT DEFAULT '',
+                version TEXT DEFAULT '',
+                ip_address TEXT DEFAULT '',
+                public_key TEXT DEFAULT '',
+                uuid TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                approved_by TEXT DEFAULT NULL,
+                approved_at TEXT DEFAULT NULL,
+                rejected_reason TEXT DEFAULT '',
+                access_token TEXT DEFAULT NULL,
+                console_url TEXT DEFAULT NULL,
+                server_address TEXT DEFAULT NULL,
+                server_key TEXT DEFAULT NULL,
+                created_at DATETIME DEFAULT (datetime('now')),
+                updated_at DATETIME DEFAULT (datetime('now')),
+                UNIQUE(device_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_reg_status ON pending_registrations (status);
+            CREATE INDEX IF NOT EXISTS idx_pending_reg_device ON pending_registrations (device_id);
+        `);
+    }
+
+    // -- Multi-tenancy tables ----------------------------------------------
+    function ensureTenantTables(db) {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS tenants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                contact_name TEXT DEFAULT '',
+                contact_email TEXT DEFAULT '',
+                max_devices INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                active INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT (datetime('now')),
+                updated_at DATETIME DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS tenant_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                assigned_at DATETIME DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, device_id),
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS tenant_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                assigned_at DATETIME DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, user_id),
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_tenant_devices_tenant ON tenant_devices (tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_tenant_devices_device ON tenant_devices (device_id);
+            CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant ON tenant_users (tenant_id);
+        `);
+    }
+
+    function parsePeer(row) {
+        if (!row) return null;
+        let info = {};
+        if (row.info) { try { info = JSON.parse(row.info); } catch (_) {} }
+        return {
+            id: row.id,
+            uuid: row.uuid || '',
+            pk: row.pk || null,
+            hostname: row.note || info.hostname || '',
+            username: typeof row.user === 'string' ? row.user : '',
+            platform: info.os || info.platform || '',
+            ip: info.ip || row.ip || '',
+            note: row.note || '',
+            online: row.status_online === 1,
+            banned: row.is_banned === 1,
+            created_at: row.created_at,
+            last_online: row.last_online,
+            ban_reason: row.banned_reason || '',
+            folder_id: row.folder_id || null,
+            info: row.info || '',
+        };
+    }
+
+    // ========= Adapter object =========
+
+    return {
+        type: 'sqlite',
+
+        async init() {
+            const main = openMain();
+            const auth = openAuth();
+            ensurePeerTable(main);
+            ensureInventoryTables(main);
+            ensureActivityTables(main);
+            ensureTicketTables(auth);
+            ensureAlertTables(auth);
+            ensureNetworkTables(main);
+            ensureDataGuardTables(main);
+            ensureReportTables(main);
+            ensureTenantTables(main);
+            ensureRegistrationTables(main);
+            ensureAuthTables(auth);
+            console.log('[DB] SQLite adapter initialized');
+        },
+
+        async close() {
+            if (mainDb) { mainDb.close(); mainDb = null; }
+            if (authDb) { authDb.close(); authDb = null; }
+        },
+
+        // ---- Peers ----
+
+        async getAllPeers(filters = {}) {
+            const db = openMain();
+            let where = 'WHERE is_deleted = 0';
+            const params = [];
+            if (filters.online !== undefined) { where += ' AND status_online = ?'; params.push(filters.online ? 1 : 0); }
+            if (filters.banned !== undefined) { where += ' AND is_banned = ?'; params.push(filters.banned ? 1 : 0); }
+            if (filters.search) { where += ` AND (id LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\' OR "user" LIKE ? ESCAPE '\\')`; const s = `%${escapeLikePattern(filters.search)}%`; params.push(s, s, s); }
+            if (filters.folder_id !== undefined) {
+                if (filters.folder_id === null) { where += ' AND folder_id IS NULL'; }
+                else { where += ' AND folder_id = ?'; params.push(filters.folder_id); }
+            }
+            const rows = db.prepare(`SELECT * FROM peer ${where} ORDER BY id`).all(...params);
+            return rows.map(parsePeer);
+        },
+
+        async getPeerById(id) {
+            return parsePeer(openMain().prepare('SELECT * FROM peer WHERE id = ? AND is_deleted = 0').get(id));
+        },
+
+        async upsertPeer({ id, uuid, pk, info, ip }) {
+            openMain().prepare(`
+                INSERT INTO peer (id, uuid, pk, info, ip, status_online, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, datetime('now'))
+                ON CONFLICT(id) DO UPDATE SET
+                    uuid = COALESCE(excluded.uuid, uuid),
+                    pk = COALESCE(excluded.pk, pk),
+                    info = COALESCE(excluded.info, info),
+                    ip = COALESCE(excluded.ip, ip),
+                    status_online = 1,
+                    last_online = datetime('now'),
+                    is_deleted = 0
+            `).run(id, uuid || '', pk || null, info || '', ip || '');
+        },
+
+        async updatePeer(id, data) {
+            const db = openMain();
+            if (data.note !== undefined) db.prepare('UPDATE peer SET note = ? WHERE id = ?').run(data.note, id);
+            if (data.user !== undefined) db.prepare('UPDATE peer SET "user" = ? WHERE id = ?').run(data.user, id);
+            if (data.info !== undefined) db.prepare('UPDATE peer SET info = ? WHERE id = ?').run(data.info, id);
+        },
+
+        async softDeletePeer(id) {
+            openMain().prepare('UPDATE peer SET is_deleted = 1 WHERE id = ?').run(id);
+        },
+
+        async setBanStatus(id, banned, reason = '') {
+            openMain().prepare(`
+                UPDATE peer SET is_banned = ?, banned_at = CASE WHEN ? THEN datetime('now') ELSE NULL END, banned_reason = ?
+                WHERE id = ?
+            `).run(banned ? 1 : 0, banned ? 1 : 0, reason, id);
+        },
+
+        async getPeerStats() {
+            const db = openMain();
+            const total = db.prepare('SELECT COUNT(*) as c FROM peer WHERE is_deleted = 0').get().c;
+            const online = db.prepare('SELECT COUNT(*) as c FROM peer WHERE is_deleted = 0 AND status_online = 1').get().c;
+            const banned = db.prepare('SELECT COUNT(*) as c FROM peer WHERE is_deleted = 0 AND is_banned = 1').get().c;
+            return { total, online, banned, offline: total - online };
+        },
+
+        async resetAllOnlineStatus() {
+            openMain().prepare('UPDATE peer SET status_online = 0').run();
+        },
+
+        async markPeersOnline(ids) {
+            if (!ids.length) return;
+            const db = openMain();
+            const placeholders = ids.map(() => '?').join(',');
+            db.prepare(`UPDATE peer SET status_online = 1, last_online = datetime('now') WHERE id IN (${placeholders})`).run(...ids);
+        },
+
+        // ---- Users ----
+
+        async getUserByUsername(username) {
+            return openAuth().prepare('SELECT * FROM users WHERE username = ?').get(username) || null;
+        },
+        async getUserById(id) {
+            return openAuth().prepare('SELECT * FROM users WHERE id = ?').get(id) || null;
+        },
+        async createUser(username, passwordHash, role = 'admin') {
+            const info = openAuth().prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)').run(username, passwordHash, role);
+            return { id: info.lastInsertRowid, username, role };
+        },
+        async updateUserPassword(id, passwordHash) {
+            openAuth().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, id);
+        },
+        async touchLastLogin(id) {
+            openAuth().prepare("UPDATE users SET last_login = datetime('now') WHERE id = ?").run(id);
+        },
+        async hasUsers() {
+            return (openAuth().prepare('SELECT COUNT(*) as c FROM users').get().c) > 0;
+        },
+        async getAllUsers() {
+            return openAuth().prepare('SELECT id, username, role, created_at, last_login, totp_enabled FROM users ORDER BY id').all();
+        },
+        async updateUserRole(id, role) {
+            openAuth().prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
+        },
+        async deleteUser(id) {
+            openAuth().prepare('DELETE FROM users WHERE id = ?').run(id);
+        },
+        async countAdmins() {
+            return openAuth().prepare("SELECT COUNT(*) as c FROM users WHERE role = 'admin'").get().c;
+        },
+
+        // ---- TOTP ----
+
+        async saveTotpSecret(userId, secret) {
+            openAuth().prepare('UPDATE users SET totp_secret = ? WHERE id = ?').run(secret, userId);
+        },
+        async enableTotp(userId, recoveryCodes) {
+            openAuth().prepare('UPDATE users SET totp_enabled = 1, totp_recovery_codes = ? WHERE id = ?').run(recoveryCodes, userId);
+        },
+        async disableTotp(userId) {
+            openAuth().prepare('UPDATE users SET totp_enabled = 0, totp_secret = NULL, totp_recovery_codes = NULL WHERE id = ?').run(userId);
+        },
+        async useRecoveryCode(userId, updatedCodes) {
+            openAuth().prepare('UPDATE users SET totp_recovery_codes = ? WHERE id = ?').run(updatedCodes, userId);
+        },
+
+        // ---- Access tokens ----
+
+        async createAccessToken({ token, userId, clientId, clientUuid, expiresAt, ipAddress }) {
+            openAuth().prepare(`
+                INSERT INTO access_tokens (token, user_id, client_id, client_uuid, expires_at, ip_address)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run(token, userId, clientId || '', clientUuid || '', expiresAt, ipAddress || '');
+        },
+        async getAccessToken(token) {
+            return openAuth().prepare("SELECT * FROM access_tokens WHERE token = ? AND revoked = 0 AND expires_at > datetime('now')").get(token) || null;
+        },
+        async touchAccessToken(token) {
+            openAuth().prepare("UPDATE access_tokens SET last_used = datetime('now') WHERE token = ?").run(token);
+        },
+        async revokeAccessToken(token) {
+            openAuth().prepare('UPDATE access_tokens SET revoked = 1 WHERE token = ?').run(token);
+        },
+        async revokeUserClientTokens(userId, clientUuid) {
+            openAuth().prepare('UPDATE access_tokens SET revoked = 1 WHERE user_id = ? AND client_uuid = ?').run(userId, clientUuid);
+        },
+        async revokeAllUserTokens(userId) {
+            openAuth().prepare('UPDATE access_tokens SET revoked = 1 WHERE user_id = ?').run(userId);
+        },
+        async cleanupExpiredTokens() {
+            openAuth().prepare("DELETE FROM access_tokens WHERE expires_at < datetime('now') OR revoked = 1").run();
+        },
+
+        // ---- Login tracking ----
+
+        async recordLoginAttempt(username, ipAddress, success) {
+            openAuth().prepare('INSERT INTO login_attempts (username, ip_address, success) VALUES (?, ?, ?)').run(username, ipAddress, success ? 1 : 0);
+        },
+        async countRecentFailedAttempts(username, windowMinutes) {
+            return openAuth().prepare(`
+                SELECT COUNT(*) as c FROM login_attempts
+                WHERE username = ? AND success = 0
+                    AND created_at > datetime('now', '-' || ? || ' minutes')
+            `).get(username, windowMinutes).c;
+        },
+        async countRecentFailedAttemptsFromIp(ipAddress, windowMinutes) {
+            return openAuth().prepare(`
+                SELECT COUNT(*) as c FROM login_attempts
+                WHERE ip_address = ? AND success = 0
+                    AND created_at > datetime('now', '-' || ? || ' minutes')
+            `).get(ipAddress, windowMinutes).c;
+        },
+        async lockAccount(username, lockedUntil, attemptCount) {
+            openAuth().prepare(`
+                INSERT INTO account_lockouts (username, locked_until, attempt_count)
+                VALUES (?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET locked_until = excluded.locked_until, attempt_count = excluded.attempt_count
+            `).run(username, lockedUntil, attemptCount);
+        },
+        async getAccountLockout(username) {
+            return openAuth().prepare("SELECT * FROM account_lockouts WHERE username = ? AND locked_until > datetime('now')").get(username) || null;
+        },
+        async clearAccountLockout(username) {
+            openAuth().prepare('DELETE FROM account_lockouts WHERE username = ?').run(username);
+        },
+
+        // ---- Folders ----
+
+        async getAllFolders() {
+            return openAuth().prepare('SELECT * FROM folders ORDER BY sort_order, name').all();
+        },
+        async getFolderById(id) {
+            return openAuth().prepare('SELECT * FROM folders WHERE id = ?').get(id) || null;
+        },
+        async createFolder({ name, color, icon, sort_order }) {
+            const info = openAuth().prepare('INSERT INTO folders (name, color, icon, sort_order) VALUES (?, ?, ?, ?)').run(name, color || '#6366f1', icon || 'folder', sort_order || 0);
+            return { id: info.lastInsertRowid, name, color, icon, sort_order };
+        },
+        async updateFolder(id, { name, color, icon, sort_order }) {
+            const sets = [];
+            const params = [];
+            if (name !== undefined) { sets.push('name = ?'); params.push(name); }
+            if (color !== undefined) { sets.push('color = ?'); params.push(color); }
+            if (icon !== undefined) { sets.push('icon = ?'); params.push(icon); }
+            if (sort_order !== undefined) { sets.push('sort_order = ?'); params.push(sort_order); }
+            if (!sets.length) return;
+            params.push(id);
+            openAuth().prepare(`UPDATE folders SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+        },
+        async deleteFolder(id) {
+            openMain().prepare('UPDATE peer SET folder_id = NULL WHERE folder_id = ?').run(id);
+            openAuth().prepare('DELETE FROM folders WHERE id = ?').run(id);
+        },
+        async assignDeviceToFolder(deviceId, folderId) {
+            openMain().prepare('UPDATE peer SET folder_id = ? WHERE id = ?').run(folderId, deviceId);
+        },
+
+        // ---- Address books ----
+
+        async getAddressBook(userId, abType = 'legacy') {
+            return openAuth().prepare('SELECT * FROM address_books WHERE user_id = ? AND ab_type = ?').get(userId, abType) || null;
+        },
+        async saveAddressBook(userId, abType, data) {
+            openAuth().prepare(`
+                INSERT INTO address_books (user_id, ab_type, data, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(user_id, ab_type) DO UPDATE SET data = excluded.data, updated_at = datetime('now')
+            `).run(userId, abType, data);
+        },
+
+        // ---- Audit ----
+
+        async logAction(userId, action, details, ipAddress) {
+            openAuth().prepare('INSERT INTO audit_log (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)').run(userId, action, details, ipAddress);
+        },
+        async getAuditLogs(limit = 100, offset = 0) {
+            return openAuth().prepare(`
+                SELECT a.*, u.username FROM audit_log a
+                LEFT JOIN users u ON a.user_id = u.id
+                ORDER BY a.created_at DESC LIMIT ? OFFSET ?
+            `).all(limit, offset);
+        },
+
+        // ---- Settings ----
+
+        async getSetting(key) {
+            const row = openAuth().prepare('SELECT value FROM settings WHERE key = ?').get(key);
+            return row ? row.value : null;
+        },
+        async setSetting(key, value) {
+            openAuth().prepare(`
+                INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+            `).run(key, value);
+        },
+        async getAllSettings() {
+            const rows = openAuth().prepare('SELECT key, value FROM settings').all();
+            const result = {};
+            for (const r of rows) result[r.key] = r.value;
+            return result;
+        },
+
+        // ---- Tickets ----
+
+        async createTicket({ title, description, priority, category, deviceId, createdBy, assignedTo, slaDueAt }) {
+            const info = openAuth().prepare(`
+                INSERT INTO tickets (title, description, priority, category, device_id, created_by, assigned_to, sla_due_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(title, description || '', priority || 'medium', category || 'general', deviceId || null, createdBy, assignedTo || null, slaDueAt || null);
+            return { id: Number(info.lastInsertRowid), title };
+        },
+
+        async getTicketById(id) {
+            return openAuth().prepare('SELECT * FROM tickets WHERE id = ?').get(id) || null;
+        },
+
+        async getAllTickets(filters = {}) {
+            const db = openAuth();
+            let where = 'WHERE 1=1';
+            const params = [];
+            if (filters.status) { where += ' AND status = ?'; params.push(filters.status); }
+            if (filters.priority) { where += ' AND priority = ?'; params.push(filters.priority); }
+            if (filters.category) { where += ' AND category = ?'; params.push(filters.category); }
+            if (filters.assigned_to) { where += ' AND assigned_to = ?'; params.push(filters.assigned_to); }
+            if (filters.device_id) { where += ' AND device_id = ?'; params.push(filters.device_id); }
+            if (filters.created_by) { where += ' AND created_by = ?'; params.push(filters.created_by); }
+            if (filters.search) { where += ` AND (title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\')`; const s = `%${escapeLikePattern(filters.search)}%`; params.push(s, s); }
+            return db.prepare(`SELECT * FROM tickets ${where} ORDER BY created_at DESC`).all(...params);
+        },
+
+        async updateTicket(id, data) {
+            const db = openAuth();
+            const sets = [];
+            const params = [];
+            for (const key of ['title', 'description', 'status', 'priority', 'category', 'assigned_to', 'sla_due_at']) {
+                if (data[key] !== undefined) { sets.push(`${key} = ?`); params.push(data[key]); }
+            }
+            if (data.status === 'resolved' && !data.resolved_at) { sets.push("resolved_at = datetime('now')"); }
+            if (data.status === 'closed' && !data.closed_at) { sets.push("closed_at = datetime('now')"); }
+            sets.push("updated_at = datetime('now')");
+            params.push(id);
+            db.prepare(`UPDATE tickets SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+        },
+
+        async deleteTicket(id) {
+            const db = openAuth();
+            db.prepare('DELETE FROM ticket_comments WHERE ticket_id = ?').run(id);
+            db.prepare('DELETE FROM ticket_attachments WHERE ticket_id = ?').run(id);
+            db.prepare('DELETE FROM tickets WHERE id = ?').run(id);
+        },
+
+        async getTicketStats() {
+            const db = openAuth();
+            const total = db.prepare('SELECT COUNT(*) as c FROM tickets').get().c;
+            const open = db.prepare("SELECT COUNT(*) as c FROM tickets WHERE status = 'open'").get().c;
+            const inProgress = db.prepare("SELECT COUNT(*) as c FROM tickets WHERE status = 'in_progress'").get().c;
+            const resolved = db.prepare("SELECT COUNT(*) as c FROM tickets WHERE status = 'resolved'").get().c;
+            const closed = db.prepare("SELECT COUNT(*) as c FROM tickets WHERE status = 'closed'").get().c;
+            return { total, open, in_progress: inProgress, resolved, closed };
+        },
+
+        async addTicketComment(ticketId, author, body, isInternal = false) {
+            const info = openAuth().prepare(`
+                INSERT INTO ticket_comments (ticket_id, author, body, is_internal) VALUES (?, ?, ?, ?)
+            `).run(ticketId, author, body, isInternal ? 1 : 0);
+            openAuth().prepare("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(ticketId);
+            return { id: Number(info.lastInsertRowid) };
+        },
+
+        async getTicketComments(ticketId) {
+            return openAuth().prepare('SELECT * FROM ticket_comments WHERE ticket_id = ? ORDER BY created_at ASC').all(ticketId);
+        },
+
+        async addTicketAttachment(ticketId, { filename, mimetype, sizeBytes, storagePath, uploadedBy }) {
+            const info = openAuth().prepare(`
+                INSERT INTO ticket_attachments (ticket_id, filename, mimetype, size_bytes, storage_path, uploaded_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run(ticketId, filename, mimetype || 'application/octet-stream', sizeBytes || 0, storagePath, uploadedBy);
+            return { id: Number(info.lastInsertRowid) };
+        },
+
+        async getTicketAttachments(ticketId) {
+            return openAuth().prepare('SELECT * FROM ticket_attachments WHERE ticket_id = ? ORDER BY created_at ASC').all(ticketId);
+        },
+
+        async getAttachmentById(id) {
+            return openAuth().prepare('SELECT * FROM ticket_attachments WHERE id = ?').get(id) || null;
+        },
+
+        // ---- Inventory ----
+
+        async upsertInventory(deviceId, hardware, software, collectedAt) {
+            openMain().prepare(`
+                INSERT INTO device_inventory (device_id, hardware, software, collected_at, received_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(device_id) DO UPDATE SET
+                    hardware = excluded.hardware,
+                    software = excluded.software,
+                    collected_at = excluded.collected_at,
+                    received_at = datetime('now')
+            `).run(deviceId, JSON.stringify(hardware), JSON.stringify(software || {}), collectedAt || new Date().toISOString());
+        },
+
+        async getInventory(deviceId) {
+            const row = openMain().prepare('SELECT * FROM device_inventory WHERE device_id = ?').get(deviceId);
+            if (!row) return null;
+            return {
+                device_id: row.device_id,
+                hardware: JSON.parse(row.hardware || '{}'),
+                software: JSON.parse(row.software || '{}'),
+                collected_at: row.collected_at,
+                received_at: row.received_at,
+            };
+        },
+
+        async getAllInventories() {
+            return openMain().prepare('SELECT * FROM device_inventory ORDER BY received_at DESC').all().map(row => ({
+                device_id: row.device_id,
+                hardware: JSON.parse(row.hardware || '{}'),
+                software: JSON.parse(row.software || '{}'),
+                collected_at: row.collected_at,
+                received_at: row.received_at,
+            }));
+        },
+
+        async upsertTelemetry(deviceId, data) {
+            openMain().prepare(`
+                INSERT INTO device_telemetry (device_id, cpu_usage_percent, memory_used_bytes, memory_total_bytes, uptime_secs, timestamp, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(device_id) DO UPDATE SET
+                    cpu_usage_percent = excluded.cpu_usage_percent,
+                    memory_used_bytes = excluded.memory_used_bytes,
+                    memory_total_bytes = excluded.memory_total_bytes,
+                    uptime_secs = excluded.uptime_secs,
+                    timestamp = excluded.timestamp,
+                    received_at = datetime('now')
+            `).run(deviceId, data.cpu_usage_percent ?? 0, data.memory_used_bytes ?? 0, data.memory_total_bytes ?? 0, data.uptime_secs ?? 0, data.timestamp || new Date().toISOString());
+        },
+
+        async getTelemetry(deviceId) {
+            const row = openMain().prepare('SELECT * FROM device_telemetry WHERE device_id = ?').get(deviceId);
+            if (!row) return null;
+            return {
+                device_id: row.device_id,
+                cpu_usage_percent: row.cpu_usage_percent,
+                memory_used_bytes: row.memory_used_bytes,
+                memory_total_bytes: row.memory_total_bytes,
+                uptime_secs: row.uptime_secs,
+                timestamp: row.timestamp,
+                received_at: row.received_at,
+            };
+        },
+
+        // ---- Alert rules & automation ----
+
+        async getAlertRules(filters = {}) {
+            let sql = 'SELECT * FROM alert_rules WHERE 1=1';
+            const params = [];
+            if (filters.enabled !== undefined) { sql += ' AND enabled = ?'; params.push(filters.enabled ? 1 : 0); }
+            if (filters.condition_type) { sql += ' AND condition_type = ?'; params.push(filters.condition_type); }
+            sql += ' ORDER BY created_at DESC';
+            return openAuth().prepare(sql).all(...params);
+        },
+
+        async getAlertRuleById(id) {
+            return openAuth().prepare('SELECT * FROM alert_rules WHERE id = ?').get(id) || null;
+        },
+
+        async createAlertRule(rule) {
+            const info = openAuth().prepare(`
+                INSERT INTO alert_rules (name, description, enabled, condition_type, condition_op, condition_value,
+                    severity, scope_device_id, cooldown_secs, notify_emails, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(rule.name, rule.description || '', rule.enabled !== false ? 1 : 0,
+                rule.condition_type, rule.condition_op || 'gt', rule.condition_value || 0,
+                rule.severity || 'warning', rule.scope_device_id || null,
+                rule.cooldown_secs || 300, rule.notify_emails || '', rule.created_by || null);
+            return { id: info.lastInsertRowid, ...rule };
+        },
+
+        async updateAlertRule(id, data) {
+            const sets = [];
+            const params = [];
+            for (const key of ['name', 'description', 'condition_type', 'condition_op', 'condition_value',
+                'severity', 'scope_device_id', 'cooldown_secs', 'notify_emails']) {
+                if (data[key] !== undefined) { sets.push(`${key} = ?`); params.push(data[key]); }
+            }
+            if (data.enabled !== undefined) { sets.push('enabled = ?'); params.push(data.enabled ? 1 : 0); }
+            if (!sets.length) return;
+            sets.push("updated_at = datetime('now')");
+            params.push(id);
+            openAuth().prepare(`UPDATE alert_rules SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+        },
+
+        async deleteAlertRule(id) {
+            openAuth().prepare('DELETE FROM alert_rules WHERE id = ?').run(id);
+        },
+
+        async createAlert(alert) {
+            const info = openAuth().prepare(`
+                INSERT INTO alert_history (rule_id, device_id, severity, message, triggered_at)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(alert.rule_id, alert.device_id || null, alert.severity || 'warning',
+                alert.message || '', alert.triggered_at || new Date().toISOString());
+            return { id: info.lastInsertRowid, ...alert };
+        },
+
+        async getRecentAlert(ruleId, deviceId, cooldownSecs) {
+            return openAuth().prepare(`
+                SELECT * FROM alert_history
+                WHERE rule_id = ? AND device_id = ?
+                  AND triggered_at > datetime('now', '-' || ? || ' seconds')
+                ORDER BY triggered_at DESC LIMIT 1
+            `).get(ruleId, deviceId, cooldownSecs) || null;
+        },
+
+        async getAlertHistory(filters = {}) {
+            let sql = 'SELECT h.*, r.name as rule_name FROM alert_history h LEFT JOIN alert_rules r ON h.rule_id = r.id WHERE 1=1';
+            const params = [];
+            if (filters.device_id) { sql += ' AND h.device_id = ?'; params.push(filters.device_id); }
+            if (filters.severity) { sql += ' AND h.severity = ?'; params.push(filters.severity); }
+            if (filters.acknowledged !== undefined) { sql += ' AND h.acknowledged = ?'; params.push(filters.acknowledged ? 1 : 0); }
+            sql += ' ORDER BY h.triggered_at DESC';
+            if (filters.limit) { sql += ' LIMIT ?'; params.push(filters.limit); }
+            return openAuth().prepare(sql).all(...params);
+        },
+
+        async acknowledgeAlert(id, username) {
+            openAuth().prepare(`
+                UPDATE alert_history SET acknowledged = 1, acknowledged_by = ?, acknowledged_at = datetime('now')
+                WHERE id = ?
+            `).run(username, id);
+        },
+
+        // ---- Remote commands ----
+
+        async createRemoteCommand(cmd) {
+            const info = openAuth().prepare(`
+                INSERT INTO remote_commands (device_id, command_type, payload, status, created_by)
+                VALUES (?, ?, ?, 'pending', ?)
+            `).run(cmd.device_id, cmd.command_type || 'shell', cmd.payload || '',
+                cmd.created_by || 'admin');
+            return { id: info.lastInsertRowid, device_id: cmd.device_id, status: 'pending' };
+        },
+
+        async getPendingCommands(deviceId) {
+            return openAuth().prepare(
+                "SELECT * FROM remote_commands WHERE device_id = ? AND status = 'pending' ORDER BY created_at ASC"
+            ).all(deviceId);
+        },
+
+        async updateRemoteCommand(id, data) {
+            const sets = [];
+            const params = [];
+            if (data.status) { sets.push('status = ?'); params.push(data.status); }
+            if (data.result !== undefined) { sets.push('result = ?'); params.push(data.result); }
+            if (data.status === 'running') { sets.push("executed_at = datetime('now')"); }
+            if (data.status === 'completed' || data.status === 'failed') { sets.push("completed_at = datetime('now')"); }
+            if (!sets.length) return;
+            params.push(id);
+            openAuth().prepare(`UPDATE remote_commands SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+        },
+
+        async getRemoteCommands(filters = {}) {
+            let sql = 'SELECT * FROM remote_commands WHERE 1=1';
+            const params = [];
+            if (filters.device_id) { sql += ' AND device_id = ?'; params.push(filters.device_id); }
+            if (filters.status) { sql += ' AND status = ?'; params.push(filters.status); }
+            sql += ' ORDER BY created_at DESC';
+            if (filters.limit) { sql += ' LIMIT ?'; params.push(filters.limit); }
+            return openAuth().prepare(sql).all(...params);
+        },
+
+        async getRemoteCommandById(id) {
+            return openAuth().prepare('SELECT * FROM remote_commands WHERE id = ?').get(id) || null;
+        },
+
+        // ---- Activity monitoring ----
+
+        async insertActivitySessions(deviceId, sessions) {
+            const stmt = openMain().prepare(`
+                INSERT INTO activity_sessions (device_id, app_name, window_title, category, started_at, ended_at, duration_secs)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `);
+            const tx = openMain().transaction((items) => {
+                for (const s of items) {
+                    stmt.run(deviceId, s.app_name || '', s.window_title || '', s.category || 'other',
+                        s.started_at, s.ended_at, s.duration_secs || 0);
+                }
+            });
+            tx(sessions);
+        },
+
+        async upsertActivitySummary(deviceId, data) {
+            openMain().prepare(`
+                INSERT INTO activity_summaries (device_id, idle_seconds, session_count, total_active_secs, reported_at, received_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(device_id, reported_at) DO UPDATE SET
+                    idle_seconds = excluded.idle_seconds,
+                    session_count = excluded.session_count,
+                    total_active_secs = excluded.total_active_secs,
+                    received_at = datetime('now')
+            `).run(deviceId, data.idle_seconds ?? 0, data.session_count ?? 0,
+                data.total_active_secs ?? 0, data.reported_at || new Date().toISOString());
+        },
+
+        async getActivitySessions(deviceId, { from, to, limit } = {}) {
+            let sql = 'SELECT * FROM activity_sessions WHERE device_id = ?';
+            const params = [deviceId];
+            if (from) { sql += ' AND started_at >= ?'; params.push(from); }
+            if (to) { sql += ' AND ended_at <= ?'; params.push(to); }
+            sql += ' ORDER BY started_at DESC';
+            if (limit) { sql += ' LIMIT ?'; params.push(limit); }
+            return openMain().prepare(sql).all(...params);
+        },
+
+        async getActivitySummaries(deviceId, { from, to } = {}) {
+            let sql = 'SELECT * FROM activity_summaries WHERE device_id = ?';
+            const params = [deviceId];
+            if (from) { sql += ' AND reported_at >= ?'; params.push(from); }
+            if (to) { sql += ' AND reported_at <= ?'; params.push(to); }
+            sql += ' ORDER BY reported_at DESC';
+            return openMain().prepare(sql).all(...params);
+        },
+
+        async getAllActivitySummaries({ from, to } = {}) {
+            let sql = `SELECT s.*, (
+                SELECT COUNT(*) FROM activity_sessions a
+                WHERE a.device_id = s.device_id
+                  AND a.started_at >= s.reported_at
+            ) as detail_count
+            FROM activity_summaries s WHERE 1=1`;
+            const params = [];
+            if (from) { sql += ' AND s.reported_at >= ?'; params.push(from); }
+            if (to) { sql += ' AND s.reported_at <= ?'; params.push(to); }
+            sql += ' ORDER BY s.received_at DESC';
+            return openMain().prepare(sql).all(...params);
+        },
+
+        async getTopApps(deviceId, { from, to, limit } = {}) {
+            let sql = `SELECT app_name, category,
+                SUM(duration_secs) as total_secs,
+                COUNT(*) as session_count
+            FROM activity_sessions WHERE device_id = ?`;
+            const params = [deviceId];
+            if (from) { sql += ' AND started_at >= ?'; params.push(from); }
+            if (to) { sql += ' AND ended_at <= ?'; params.push(to); }
+            sql += ' GROUP BY app_name ORDER BY total_secs DESC';
+            if (limit) { sql += ' LIMIT ?'; params.push(limit || 10); }
+            return openMain().prepare(sql).all(...params);
+        },
+
+        // ---- Relay sessions (enterprise) ----
+
+        async createSession({ id, initiatorId, targetId, initiatorPk, expiresAt }) {
+            openAuth().prepare(`
+                INSERT INTO relay_sessions (id, initiator_id, target_id, initiator_pk, status, expires_at)
+                VALUES (?, ?, ?, ?, 'pending', ?)
+            `).run(id, initiatorId, targetId, initiatorPk || null, expiresAt);
+        },
+        async getSession(id) {
+            return openAuth().prepare("SELECT * FROM relay_sessions WHERE id = ? AND expires_at > datetime('now')").get(id) || null;
+        },
+        async updateSession(id, data) {
+            const sets = [];
+            const params = [];
+            if (data.status !== undefined) { sets.push('status = ?'); params.push(data.status); }
+            if (data.target_pk !== undefined) { sets.push('target_pk = ?'); params.push(data.target_pk); }
+            if (!sets.length) return;
+            params.push(id);
+            openAuth().prepare(`UPDATE relay_sessions SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+        },
+        async deleteSession(id) {
+            openAuth().prepare('DELETE FROM relay_sessions WHERE id = ?').run(id);
+        },
+        async cleanupExpiredSessions() {
+            openAuth().prepare("DELETE FROM relay_sessions WHERE expires_at < datetime('now')").run();
+        },
+
+        // ---- Network monitoring ----
+
+        async getNetworkTargets(filters = {}) {
+            let sql = 'SELECT * FROM network_targets WHERE 1=1';
+            const params = [];
+            if (filters.enabled !== undefined) { sql += ' AND enabled = ?'; params.push(filters.enabled ? 1 : 0); }
+            if (filters.check_type) { sql += ' AND check_type = ?'; params.push(filters.check_type); }
+            sql += ' ORDER BY name';
+            return openMain().prepare(sql).all(...params);
+        },
+        async getNetworkTargetById(id) {
+            return openMain().prepare('SELECT * FROM network_targets WHERE id = ?').get(id) || null;
+        },
+        async createNetworkTarget(data) {
+            const stmt = openMain().prepare(`
+                INSERT INTO network_targets (name, host, port, url, check_type, timeout_ms, interval_ms, enabled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            const r = stmt.run(data.name, data.host, data.port, data.url, data.check_type,
+                data.timeout_ms || 5000, data.interval_ms || 60000, data.enabled !== false ? 1 : 0);
+            return this.getNetworkTargetById(r.lastInsertRowid);
+        },
+        async updateNetworkTarget(id, data) {
+            const sets = [];
+            const params = [];
+            if (data.name !== undefined) { sets.push('name = ?'); params.push(data.name); }
+            if (data.host !== undefined) { sets.push('host = ?'); params.push(data.host); }
+            if (data.port !== undefined) { sets.push('port = ?'); params.push(data.port); }
+            if (data.url !== undefined) { sets.push('url = ?'); params.push(data.url); }
+            if (data.check_type !== undefined) { sets.push('check_type = ?'); params.push(data.check_type); }
+            if (data.timeout_ms !== undefined) { sets.push('timeout_ms = ?'); params.push(data.timeout_ms); }
+            if (data.interval_ms !== undefined) { sets.push('interval_ms = ?'); params.push(data.interval_ms); }
+            if (data.enabled !== undefined) { sets.push('enabled = ?'); params.push(data.enabled ? 1 : 0); }
+            if (data.last_status !== undefined) { sets.push('last_status = ?'); params.push(data.last_status); }
+            if (data.last_check_at !== undefined) { sets.push('last_check_at = ?'); params.push(data.last_check_at); }
+            if (data.last_rtt_ms !== undefined) { sets.push('last_rtt_ms = ?'); params.push(data.last_rtt_ms); }
+            if (!sets.length) return null;
+            sets.push("updated_at = datetime('now')");
+            params.push(id);
+            openMain().prepare(`UPDATE network_targets SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+            return this.getNetworkTargetById(id);
+        },
+        async deleteNetworkTarget(id) {
+            const r = openMain().prepare('DELETE FROM network_targets WHERE id = ?').run(id);
+            return r.changes > 0;
+        },
+        async insertNetworkCheck(data) {
+            openMain().prepare(`
+                INSERT INTO network_checks (target_id, status, rtt_ms, status_code, error_msg)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(data.target_id, data.status, data.rtt_ms, data.status_code, data.error_msg);
+        },
+        async getNetworkCheckHistory(targetId, { limit, from, to } = {}) {
+            let sql = 'SELECT * FROM network_checks WHERE target_id = ?';
+            const params = [targetId];
+            if (from) { sql += ' AND checked_at >= ?'; params.push(from); }
+            if (to) { sql += ' AND checked_at <= ?'; params.push(to); }
+            sql += ' ORDER BY checked_at DESC';
+            if (limit) { sql += ' LIMIT ?'; params.push(limit); }
+            return openMain().prepare(sql).all(...params);
+        },
+
+        // -- DataGuard / DLP -------------------------------------------------
+        async getDlpPolicies() {
+            return openMain().prepare('SELECT * FROM dlp_policies ORDER BY id').all();
+        },
+        async getDlpPolicyById(id) {
+            return openMain().prepare('SELECT * FROM dlp_policies WHERE id = ?').get(id) || null;
+        },
+        async createDlpPolicy(data) {
+            const r = openMain().prepare(`
+                INSERT INTO dlp_policies (name, description, enabled, rules)
+                VALUES (?, ?, ?, ?)
+            `).run(
+                data.name,
+                data.description || '',
+                data.enabled !== undefined ? (data.enabled ? 1 : 0) : 1,
+                typeof data.rules === 'string' ? data.rules : JSON.stringify(data.rules || [])
+            );
+            return this.getDlpPolicyById(r.lastInsertRowid);
+        },
+        async updateDlpPolicy(id, data) {
+            const sets = [];
+            const params = [];
+            if (data.name !== undefined) { sets.push('name = ?'); params.push(data.name); }
+            if (data.description !== undefined) { sets.push('description = ?'); params.push(data.description); }
+            if (data.enabled !== undefined) { sets.push('enabled = ?'); params.push(data.enabled ? 1 : 0); }
+            if (data.rules !== undefined) {
+                sets.push('rules = ?');
+                params.push(typeof data.rules === 'string' ? data.rules : JSON.stringify(data.rules));
+            }
+            if (!sets.length) return null;
+            sets.push("updated_at = datetime('now')");
+            params.push(id);
+            openMain().prepare(`UPDATE dlp_policies SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+            return this.getDlpPolicyById(id);
+        },
+        async deleteDlpPolicy(id) {
+            const r = openMain().prepare('DELETE FROM dlp_policies WHERE id = ?').run(id);
+            return r.changes > 0;
+        },
+        async insertDlpEvent(data) {
+            const r = openMain().prepare(`
+                INSERT INTO dlp_events (device_id, event_source, event_type, policy_id, policy_name, action, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                data.device_id,
+                data.event_source || 'unknown',
+                data.event_type || 'info',
+                data.policy_id || null,
+                data.policy_name || '',
+                data.action || 'log',
+                typeof data.details === 'string' ? data.details : JSON.stringify(data.details || {})
+            );
+            return { id: Number(r.lastInsertRowid) };
+        },
+        async getDlpEvents({ device_id, event_source, event_type, limit, from, to } = {}) {
+            let sql = 'SELECT * FROM dlp_events WHERE 1=1';
+            const params = [];
+            if (device_id) { sql += ' AND device_id = ?'; params.push(device_id); }
+            if (event_source) { sql += ' AND event_source = ?'; params.push(event_source); }
+            if (event_type) { sql += ' AND event_type = ?'; params.push(event_type); }
+            if (from) { sql += ' AND created_at >= ?'; params.push(from); }
+            if (to) { sql += ' AND created_at <= ?'; params.push(to); }
+            sql += ' ORDER BY created_at DESC';
+            if (limit) { sql += ' LIMIT ?'; params.push(limit); }
+            return openMain().prepare(sql).all(...params);
+        },
+        async getDlpEventStats() {
+            const row = openMain().prepare(`
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN action = 'block' THEN 1 ELSE 0 END) AS blocked,
+                    SUM(CASE WHEN action = 'log' THEN 1 ELSE 0 END) AS logged,
+                    SUM(CASE WHEN event_source = 'usb' THEN 1 ELSE 0 END) AS usb_events,
+                    SUM(CASE WHEN event_source = 'file' THEN 1 ELSE 0 END) AS file_events
+                FROM dlp_events
+            `).get();
+            return row || { total: 0, blocked: 0, logged: 0, usb_events: 0, file_events: 0 };
+        },
+
+        // -- Saved Reports ----------------------------------------------------
+        async getSavedReports() {
+            return openMain().prepare('SELECT * FROM saved_reports ORDER BY created_at DESC').all();
+        },
+        async getSavedReportById(id) {
+            return openMain().prepare('SELECT * FROM saved_reports WHERE id = ?').get(id) || null;
+        },
+        async createSavedReport(data) {
+            const r = openMain().prepare(`
+                INSERT INTO saved_reports (title, report_type, filters, payload, created_by)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(data.title, data.report_type, data.filters || '{}', data.payload || '{}', data.created_by || 'admin');
+            return this.getSavedReportById(r.lastInsertRowid);
+        },
+        async deleteSavedReport(id) {
+            const r = openMain().prepare('DELETE FROM saved_reports WHERE id = ?').run(id);
+            return r.changes > 0;
+        },
+
+        // -- Multi-Tenancy ----------------------------------------------------
+        async getTenants() {
+            return openMain().prepare('SELECT * FROM tenants ORDER BY name').all();
+        },
+        async getTenantById(id) {
+            return openMain().prepare('SELECT * FROM tenants WHERE id = ?').get(id) || null;
+        },
+        async createTenant(data) {
+            const r = openMain().prepare(`
+                INSERT INTO tenants (name, slug, contact_name, contact_email, max_devices, notes, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                data.name, data.slug, data.contact_name || '', data.contact_email || '',
+                data.max_devices || 0, data.notes || '', data.active !== undefined ? (data.active ? 1 : 0) : 1
+            );
+            return this.getTenantById(r.lastInsertRowid);
+        },
+        async updateTenant(id, data) {
+            const sets = [];
+            const params = [];
+            if (data.name !== undefined) { sets.push('name = ?'); params.push(data.name); }
+            if (data.slug !== undefined) { sets.push('slug = ?'); params.push(data.slug); }
+            if (data.contact_name !== undefined) { sets.push('contact_name = ?'); params.push(data.contact_name); }
+            if (data.contact_email !== undefined) { sets.push('contact_email = ?'); params.push(data.contact_email); }
+            if (data.max_devices !== undefined) { sets.push('max_devices = ?'); params.push(data.max_devices); }
+            if (data.notes !== undefined) { sets.push('notes = ?'); params.push(data.notes); }
+            if (data.active !== undefined) { sets.push('active = ?'); params.push(data.active ? 1 : 0); }
+            if (!sets.length) return this.getTenantById(id);
+            sets.push("updated_at = datetime('now')");
+            params.push(id);
+            openMain().prepare(`UPDATE tenants SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+            return this.getTenantById(id);
+        },
+        async deleteTenant(id) {
+            const r = openMain().prepare('DELETE FROM tenants WHERE id = ?').run(id);
+            return r.changes > 0;
+        },
+        async getTenantDevices(tenantId) {
+            const rows = openMain().prepare(`
+                SELECT td.*, p.info, p.note, p.status_online, p.is_banned, p.ip, p.last_online
+                FROM tenant_devices td
+                LEFT JOIN peer p ON p.id = td.device_id AND (p.is_deleted = 0 OR p.is_deleted IS NULL)
+                WHERE td.tenant_id = ?
+                ORDER BY td.assigned_at DESC
+            `).all(tenantId);
+            return rows.map(r => ({
+                device_id: r.device_id,
+                assigned_at: r.assigned_at,
+                online: r.status_online === 1,
+                hostname: r.note || '',
+                ip: r.ip || '',
+            }));
+        },
+        async assignDeviceToTenant(tenantId, deviceId) {
+            try {
+                openMain().prepare(`
+                    INSERT OR REPLACE INTO tenant_devices (tenant_id, device_id) VALUES (?, ?)
+                `).run(tenantId, deviceId);
+                return true;
+            } catch (_) { return false; }
+        },
+        async removeDeviceFromTenant(tenantId, deviceId) {
+            const r = openMain().prepare('DELETE FROM tenant_devices WHERE tenant_id = ? AND device_id = ?').run(tenantId, deviceId);
+            return r.changes > 0;
+        },
+        async getTenantUsers(tenantId) {
+            return openMain().prepare(`
+                SELECT tu.user_id, tu.assigned_at
+                FROM tenant_users tu
+                WHERE tu.tenant_id = ?
+                ORDER BY tu.assigned_at DESC
+            `).all(tenantId);
+        },
+        async assignUserToTenant(tenantId, userId) {
+            try {
+                openMain().prepare(`
+                    INSERT OR REPLACE INTO tenant_users (tenant_id, user_id) VALUES (?, ?)
+                `).run(tenantId, userId);
+                return true;
+            } catch (_) { return false; }
+        },
+        async removeUserFromTenant(tenantId, userId) {
+            const r = openMain().prepare('DELETE FROM tenant_users WHERE tenant_id = ? AND user_id = ?').run(tenantId, userId);
+            return r.changes > 0;
+        },
+
+        // ---- Pending Registrations ----
+
+        async getPendingRegistrations(filters = {}) {
+            const db = openMain();
+            let where = 'WHERE 1=1';
+            const params = [];
+            if (filters.status) { where += ' AND status = ?'; params.push(filters.status); }
+            if (filters.search) {
+                where += ' AND (device_id LIKE ? OR hostname LIKE ? OR ip_address LIKE ?)';
+                const s = `%${filters.search}%`;
+                params.push(s, s, s);
+            }
+            const order = 'ORDER BY created_at DESC';
+            return db.prepare(`SELECT * FROM pending_registrations ${where} ${order}`).all(...params);
+        },
+
+        async getPendingRegistrationById(id) {
+            return openMain().prepare('SELECT * FROM pending_registrations WHERE id = ?').get(id) || null;
+        },
+
+        async getPendingRegistrationByDeviceId(deviceId) {
+            return openMain().prepare('SELECT * FROM pending_registrations WHERE device_id = ?').get(deviceId) || null;
+        },
+
+        async createPendingRegistration(data) {
+            const db = openMain();
+            // Upsert: if device already has a pending/rejected request, update it
+            const existing = db.prepare('SELECT id, status FROM pending_registrations WHERE device_id = ?').get(data.device_id);
+            if (existing) {
+                if (existing.status === 'approved') {
+                    // Already approved — return existing without changes
+                    return db.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(existing.id);
+                }
+                db.prepare(`
+                    UPDATE pending_registrations
+                    SET hostname = ?, platform = ?, version = ?, ip_address = ?, public_key = ?, uuid = ?,
+                        status = 'pending', rejected_reason = '', updated_at = datetime('now')
+                    WHERE id = ?
+                `).run(data.hostname || '', data.platform || '', data.version || '', data.ip_address || '', data.public_key || '', data.uuid || '', existing.id);
+                return db.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(existing.id);
+            }
+            const r = db.prepare(`
+                INSERT INTO pending_registrations (device_id, hostname, platform, version, ip_address, public_key, uuid)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(data.device_id, data.hostname || '', data.platform || '', data.version || '', data.ip_address || '', data.public_key || '', data.uuid || '');
+            return db.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(r.lastInsertRowid);
+        },
+
+        async approvePendingRegistration(id, approvedBy, serverConfig = {}) {
+            const db = openMain();
+            db.prepare(`
+                UPDATE pending_registrations
+                SET status = 'approved', approved_by = ?, approved_at = datetime('now'),
+                    access_token = ?, console_url = ?, server_address = ?, server_key = ?,
+                    updated_at = datetime('now')
+                WHERE id = ? AND status = 'pending'
+            `).run(
+                approvedBy || 'admin',
+                serverConfig.access_token || null,
+                serverConfig.console_url || null,
+                serverConfig.server_address || null,
+                serverConfig.server_key || null,
+                id
+            );
+            return db.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(id) || null;
+        },
+
+        async rejectPendingRegistration(id, reason = '') {
+            const db = openMain();
+            db.prepare(`
+                UPDATE pending_registrations
+                SET status = 'rejected', rejected_reason = ?, updated_at = datetime('now')
+                WHERE id = ? AND status = 'pending'
+            `).run(reason, id);
+            return db.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(id) || null;
+        },
+
+        async deletePendingRegistration(id) {
+            const r = openMain().prepare('DELETE FROM pending_registrations WHERE id = ?').run(id);
+            return r.changes > 0;
+        },
+
+        async getPendingRegistrationCount() {
+            const row = openMain().prepare("SELECT COUNT(*) as count FROM pending_registrations WHERE status = 'pending'").get();
+            return row ? row.count : 0;
+        },
+    };
+}
+
+// =========================================================================
+//  PostgreSQL adapter
+// =========================================================================
+
+function createPostgresAdapter() {
+    const { Pool } = getPgDriver();
+    let pool = null;
+
+    function getPool() {
+        if (!pool) {
+            pool = new Pool({ connectionString: DATABASE_URL, max: 20, idleTimeoutMillis: 30000 });
+            pool.on('error', (err) => console.error('[DB/PG] Idle client error:', err.message));
+        }
+        return pool;
+    }
+
+    /** Run a single-statement query. */
+    async function q(text, params = []) {
+        return getPool().query(text, params);
+    }
+
+    /** Get a single row or null. */
+    async function one(text, params = []) {
+        const { rows } = await q(text, params);
+        return rows[0] || null;
+    }
+
+    /** Get all rows. */
+    async function all(text, params = []) {
+        const { rows } = await q(text, params);
+        return rows;
+    }
+
+    // ---- Schema bootstrap ----
+
+    async function ensureSchema() {
+        await q(`
+            CREATE TABLE IF NOT EXISTS peer (
+                id TEXT PRIMARY KEY,
+                uuid TEXT DEFAULT '',
+                pk BYTEA,
+                note TEXT DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                status_online BOOLEAN DEFAULT FALSE,
+                last_online TIMESTAMPTZ,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                info JSONB DEFAULT '{}',
+                ip TEXT DEFAULT '',
+                "user" TEXT DEFAULT '',
+                is_banned BOOLEAN DEFAULT FALSE,
+                banned_at TIMESTAMPTZ,
+                banned_reason TEXT DEFAULT '',
+                folder_id INTEGER DEFAULT NULL
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT DEFAULT 'admin',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                last_login TIMESTAMPTZ,
+                totp_secret TEXT DEFAULT NULL,
+                totp_enabled BOOLEAN DEFAULT FALSE,
+                totp_recovery_codes TEXT DEFAULT NULL
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                action TEXT NOT NULL,
+                details TEXT,
+                ip_address TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS access_tokens (
+                id SERIAL PRIMARY KEY,
+                token TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                client_id TEXT DEFAULT '',
+                client_uuid TEXT DEFAULT '',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                last_used TIMESTAMPTZ,
+                ip_address TEXT DEFAULT '',
+                revoked BOOLEAN DEFAULT FALSE
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id SERIAL PRIMARY KEY,
+                username TEXT NOT NULL,
+                ip_address TEXT DEFAULT '',
+                success BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS account_lockouts (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                locked_until TIMESTAMPTZ NOT NULL,
+                attempt_count INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS folders (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                color TEXT DEFAULT '#6366f1',
+                icon TEXT DEFAULT 'folder',
+                sort_order INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS address_books (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                ab_type TEXT DEFAULT 'legacy',
+                data JSONB DEFAULT '{}',
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(user_id, ab_type)
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS relay_sessions (
+                id TEXT PRIMARY KEY,
+                initiator_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                initiator_pk TEXT,
+                target_pk TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS device_inventory (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL UNIQUE,
+                hardware JSONB DEFAULT '{}',
+                software JSONB DEFAULT '{}',
+                collected_at TIMESTAMPTZ,
+                received_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS device_telemetry (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL UNIQUE,
+                cpu_usage_percent REAL DEFAULT 0,
+                memory_used_bytes BIGINT DEFAULT 0,
+                memory_total_bytes BIGINT DEFAULT 0,
+                uptime_secs INTEGER DEFAULT 0,
+                timestamp TIMESTAMPTZ,
+                received_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS tickets (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                status TEXT DEFAULT 'open',
+                priority TEXT DEFAULT 'medium',
+                category TEXT DEFAULT 'general',
+                device_id TEXT DEFAULT NULL,
+                created_by TEXT NOT NULL,
+                assigned_to TEXT DEFAULT NULL,
+                sla_due_at TIMESTAMPTZ DEFAULT NULL,
+                resolved_at TIMESTAMPTZ DEFAULT NULL,
+                closed_at TIMESTAMPTZ DEFAULT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS ticket_comments (
+                id SERIAL PRIMARY KEY,
+                ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+                author TEXT NOT NULL,
+                body TEXT NOT NULL,
+                is_internal BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS ticket_attachments (
+                id SERIAL PRIMARY KEY,
+                ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                mimetype TEXT DEFAULT 'application/octet-stream',
+                size_bytes INTEGER DEFAULT 0,
+                storage_path TEXT NOT NULL,
+                uploaded_by TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS activity_sessions (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                app_name TEXT NOT NULL DEFAULT '',
+                window_title TEXT NOT NULL DEFAULT '',
+                category TEXT DEFAULT 'other',
+                started_at TIMESTAMPTZ NOT NULL,
+                ended_at TIMESTAMPTZ NOT NULL,
+                duration_secs INTEGER DEFAULT 0,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS activity_summaries (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                idle_seconds INTEGER DEFAULT 0,
+                session_count INTEGER DEFAULT 0,
+                total_active_secs INTEGER DEFAULT 0,
+                reported_at TIMESTAMPTZ NOT NULL,
+                received_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(device_id, reported_at)
+            )
+        `);
+
+        // Alert rules & automation tables
+        await q(`
+            CREATE TABLE IF NOT EXISTS alert_rules (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                enabled BOOLEAN DEFAULT TRUE,
+                condition_type TEXT NOT NULL,
+                condition_op TEXT NOT NULL DEFAULT 'gt',
+                condition_value REAL NOT NULL DEFAULT 0,
+                severity TEXT DEFAULT 'warning',
+                scope_device_id TEXT DEFAULT NULL,
+                cooldown_secs INTEGER DEFAULT 300,
+                notify_emails TEXT DEFAULT '',
+                created_by TEXT DEFAULT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS alert_history (
+                id SERIAL PRIMARY KEY,
+                rule_id INTEGER NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+                device_id TEXT DEFAULT NULL,
+                severity TEXT DEFAULT 'warning',
+                message TEXT NOT NULL DEFAULT '',
+                triggered_at TIMESTAMPTZ NOT NULL,
+                acknowledged BOOLEAN DEFAULT FALSE,
+                acknowledged_by TEXT DEFAULT NULL,
+                acknowledged_at TIMESTAMPTZ DEFAULT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS remote_commands (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                command_type TEXT NOT NULL DEFAULT 'shell',
+                payload TEXT NOT NULL DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                result TEXT DEFAULT NULL,
+                created_by TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                executed_at TIMESTAMPTZ DEFAULT NULL,
+                completed_at TIMESTAMPTZ DEFAULT NULL
+            )
+        `);
+
+        // Network monitoring tables
+        await q(`
+            CREATE TABLE IF NOT EXISTS network_targets (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                host TEXT DEFAULT '',
+                port INTEGER DEFAULT NULL,
+                url TEXT DEFAULT NULL,
+                check_type TEXT NOT NULL DEFAULT 'ping',
+                timeout_ms INTEGER DEFAULT 5000,
+                interval_ms INTEGER DEFAULT 60000,
+                enabled BOOLEAN DEFAULT TRUE,
+                last_status TEXT DEFAULT NULL,
+                last_check_at TIMESTAMPTZ DEFAULT NULL,
+                last_rtt_ms REAL DEFAULT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS network_checks (
+                id SERIAL PRIMARY KEY,
+                target_id INTEGER NOT NULL REFERENCES network_targets(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                rtt_ms REAL DEFAULT NULL,
+                status_code INTEGER DEFAULT NULL,
+                error_msg TEXT DEFAULT NULL,
+                checked_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        // Create indexes
+        await q('CREATE INDEX IF NOT EXISTS idx_peer_online ON peer (status_online) WHERE NOT is_deleted');
+        await q('CREATE INDEX IF NOT EXISTS idx_peer_deleted ON peer (is_deleted)');
+        await q('CREATE INDEX IF NOT EXISTS idx_token_lookup ON access_tokens (token) WHERE NOT revoked');
+        await q('CREATE INDEX IF NOT EXISTS idx_relay_sessions_expires ON relay_sessions (expires_at)');
+        await q('CREATE INDEX IF NOT EXISTS idx_activity_device ON activity_sessions (device_id)');
+        await q('CREATE INDEX IF NOT EXISTS idx_activity_time ON activity_sessions (started_at)');
+        await q('CREATE INDEX IF NOT EXISTS idx_alert_history_rule ON alert_history (rule_id)');
+        await q('CREATE INDEX IF NOT EXISTS idx_alert_history_device ON alert_history (device_id)');
+        await q('CREATE INDEX IF NOT EXISTS idx_remote_commands_device ON remote_commands (device_id, status)');
+        await q('CREATE INDEX IF NOT EXISTS idx_network_checks_target ON network_checks (target_id)');
+        await q('CREATE INDEX IF NOT EXISTS idx_network_checks_time ON network_checks (checked_at)');
+
+        // DataGuard / DLP tables
+        await q(`
+            CREATE TABLE IF NOT EXISTS dlp_policies (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                enabled BOOLEAN DEFAULT TRUE,
+                rules JSONB DEFAULT '[]',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q(`
+            CREATE TABLE IF NOT EXISTS dlp_events (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                event_source TEXT NOT NULL DEFAULT 'unknown',
+                event_type TEXT NOT NULL DEFAULT 'info',
+                policy_id INTEGER DEFAULT NULL REFERENCES dlp_policies(id) ON DELETE SET NULL,
+                policy_name TEXT DEFAULT '',
+                action TEXT DEFAULT 'log',
+                details JSONB DEFAULT '{}',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        await q('CREATE INDEX IF NOT EXISTS idx_dlp_events_device ON dlp_events (device_id)');
+        await q('CREATE INDEX IF NOT EXISTS idx_dlp_events_time ON dlp_events (created_at)');
+        await q('CREATE INDEX IF NOT EXISTS idx_dlp_events_source ON dlp_events (event_source)');
+
+        // Saved reports table
+        await q(`
+            CREATE TABLE IF NOT EXISTS saved_reports (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                report_type TEXT NOT NULL,
+                filters JSONB DEFAULT '{}',
+                payload JSONB DEFAULT '{}',
+                created_by TEXT NOT NULL DEFAULT 'admin',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await q('CREATE INDEX IF NOT EXISTS idx_saved_reports_type ON saved_reports (report_type)');
+
+        // Multi-tenancy tables
+        await q(`
+            CREATE TABLE IF NOT EXISTS tenants (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                contact_name TEXT DEFAULT '',
+                contact_email TEXT DEFAULT '',
+                max_devices INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await q(`
+            CREATE TABLE IF NOT EXISTS tenant_devices (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL,
+                assigned_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(tenant_id, device_id)
+            )
+        `);
+        await q(`
+            CREATE TABLE IF NOT EXISTS tenant_users (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL,
+                assigned_at TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(tenant_id, user_id)
+            )
+        `);
+        await q('CREATE INDEX IF NOT EXISTS idx_tenant_devices_tenant ON tenant_devices (tenant_id)');
+        await q('CREATE INDEX IF NOT EXISTS idx_tenant_devices_device ON tenant_devices (device_id)');
+        await q('CREATE INDEX IF NOT EXISTS idx_tenant_users_tenant ON tenant_users (tenant_id)');
+
+        // -- Pending Registrations
+        await q(`
+            CREATE TABLE IF NOT EXISTS pending_registrations (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL UNIQUE,
+                hostname TEXT DEFAULT '',
+                platform TEXT DEFAULT '',
+                version TEXT DEFAULT '',
+                ip_address TEXT DEFAULT '',
+                public_key TEXT DEFAULT '',
+                uuid TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                approved_by TEXT DEFAULT NULL,
+                approved_at TIMESTAMPTZ DEFAULT NULL,
+                rejected_reason TEXT DEFAULT '',
+                access_token TEXT DEFAULT NULL,
+                console_url TEXT DEFAULT NULL,
+                server_address TEXT DEFAULT NULL,
+                server_key TEXT DEFAULT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        await q('CREATE INDEX IF NOT EXISTS idx_pending_reg_status ON pending_registrations (status)');
+        await q('CREATE INDEX IF NOT EXISTS idx_pending_reg_device ON pending_registrations (device_id)');
+    }
+
+    // Parse helpers
+
+    function parsePeer(row) {
+        if (!row) return null;
+        let info = {};
+        if (row.info && typeof row.info === 'object') info = row.info;
+        else if (row.info && typeof row.info === 'string') { try { info = JSON.parse(row.info); } catch (_) {} }
+        return {
+            id: row.id,
+            uuid: row.uuid || '',
+            pk: row.pk || null,
+            hostname: row.note || info.hostname || '',
+            username: typeof row.user === 'string' ? row.user : '',
+            platform: info.os || info.platform || '',
+            ip: info.ip || row.ip || '',
+            note: row.note || '',
+            online: !!row.status_online,
+            banned: !!row.is_banned,
+            created_at: row.created_at,
+            last_online: row.last_online,
+            ban_reason: row.banned_reason || '',
+            folder_id: row.folder_id || null,
+            info: typeof row.info === 'object' ? JSON.stringify(row.info) : (row.info || ''),
+        };
+    }
+
+    // ========= Adapter =========
+
+    return {
+        type: 'postgres',
+
+        async init() {
+            await ensureSchema();
+            console.log('[DB] PostgreSQL adapter initialized');
+        },
+
+        async close() {
+            if (pool) { await pool.end(); pool = null; }
+        },
+
+        // ---- Peers ----
+
+        async getAllPeers(filters = {}) {
+            let where = 'WHERE NOT is_deleted';
+            const params = [];
+            let idx = 1;
+            if (filters.online !== undefined) { where += ` AND status_online = $${idx++}`; params.push(!!filters.online); }
+            if (filters.banned !== undefined) { where += ` AND is_banned = $${idx++}`; params.push(!!filters.banned); }
+            if (filters.search) { where += ` AND (id ILIKE $${idx} ESCAPE '\\' OR note ILIKE $${idx} ESCAPE '\\' OR "user" ILIKE $${idx} ESCAPE '\\')`; params.push(`%${escapeLikePattern(filters.search)}%`); idx++; }
+            if (filters.folder_id !== undefined) {
+                if (filters.folder_id === null) { where += ' AND folder_id IS NULL'; }
+                else { where += ` AND folder_id = $${idx++}`; params.push(filters.folder_id); }
+            }
+            return (await all(`SELECT * FROM peer ${where} ORDER BY id`, params)).map(parsePeer);
+        },
+
+        async getPeerById(id) {
+            return parsePeer(await one('SELECT * FROM peer WHERE id = $1 AND NOT is_deleted', [id]));
+        },
+
+        async upsertPeer({ id, uuid, pk, info, ip }) {
+            await q(`
+                INSERT INTO peer (id, uuid, pk, info, ip, status_online, created_at)
+                VALUES ($1, $2, $3, $4, $5, TRUE, NOW())
+                ON CONFLICT(id) DO UPDATE SET
+                    uuid = COALESCE(NULLIF($2, ''), peer.uuid),
+                    pk = COALESCE($3, peer.pk),
+                    info = COALESCE(NULLIF($4, ''), peer.info),
+                    ip = COALESCE(NULLIF($5, ''), peer.ip),
+                    status_online = TRUE,
+                    last_online = NOW(),
+                    is_deleted = FALSE
+            `, [id, uuid || '', pk || null, info || '{}', ip || '']);
+        },
+
+        async updatePeer(id, data) {
+            if (data.note !== undefined) await q('UPDATE peer SET note = $1 WHERE id = $2', [data.note, id]);
+            if (data.user !== undefined) await q('UPDATE peer SET "user" = $1 WHERE id = $2', [data.user, id]);
+            if (data.info !== undefined) await q('UPDATE peer SET info = $1 WHERE id = $2', [data.info, id]);
+        },
+
+        async softDeletePeer(id) {
+            await q('UPDATE peer SET is_deleted = TRUE WHERE id = $1', [id]);
+        },
+
+        async setBanStatus(id, banned, reason = '') {
+            await q(`
+                UPDATE peer SET is_banned = $1, banned_at = CASE WHEN $1 THEN NOW() ELSE NULL END, banned_reason = $2
+                WHERE id = $3
+            `, [!!banned, reason, id]);
+        },
+
+        async getPeerStats() {
+            const r = await one(`
+                SELECT
+                    COUNT(*) FILTER (WHERE NOT is_deleted) as total,
+                    COUNT(*) FILTER (WHERE NOT is_deleted AND status_online) as online,
+                    COUNT(*) FILTER (WHERE NOT is_deleted AND is_banned) as banned
+                FROM peer
+            `);
+            return { total: +r.total, online: +r.online, banned: +r.banned, offline: +r.total - +r.online };
+        },
+
+        async resetAllOnlineStatus() {
+            await q('UPDATE peer SET status_online = FALSE');
+        },
+
+        async markPeersOnline(ids) {
+            if (!ids.length) return;
+            const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+            await q(`UPDATE peer SET status_online = TRUE, last_online = NOW() WHERE id IN (${placeholders})`, ids);
+        },
+
+        // ---- Users ----
+
+        async getUserByUsername(username) { return one('SELECT * FROM users WHERE username = $1', [username]); },
+        async getUserById(id) { return one('SELECT * FROM users WHERE id = $1', [id]); },
+        async createUser(username, passwordHash, role = 'admin') {
+            const r = await one('INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING id', [username, passwordHash, role]);
+            return { id: r.id, username, role };
+        },
+        async updateUserPassword(id, passwordHash) { await q('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, id]); },
+        async touchLastLogin(id) { await q('UPDATE users SET last_login = NOW() WHERE id = $1', [id]); },
+        async hasUsers() { return +(await one('SELECT COUNT(*) as c FROM users')).c > 0; },
+        async getAllUsers() { return all('SELECT id, username, role, created_at, last_login, totp_enabled FROM users ORDER BY id'); },
+        async updateUserRole(id, role) { await q('UPDATE users SET role = $1 WHERE id = $2', [role, id]); },
+        async deleteUser(id) { await q('DELETE FROM users WHERE id = $1', [id]); },
+        async countAdmins() { return +(await one("SELECT COUNT(*) as c FROM users WHERE role = 'admin'")).c; },
+
+        // ---- TOTP ----
+
+        async saveTotpSecret(userId, secret) { await q('UPDATE users SET totp_secret = $1 WHERE id = $2', [secret, userId]); },
+        async enableTotp(userId, recoveryCodes) { await q('UPDATE users SET totp_enabled = TRUE, totp_recovery_codes = $1 WHERE id = $2', [recoveryCodes, userId]); },
+        async disableTotp(userId) { await q('UPDATE users SET totp_enabled = FALSE, totp_secret = NULL, totp_recovery_codes = NULL WHERE id = $1', [userId]); },
+        async useRecoveryCode(userId, updatedCodes) { await q('UPDATE users SET totp_recovery_codes = $1 WHERE id = $2', [updatedCodes, userId]); },
+
+        // ---- Access tokens ----
+
+        async createAccessToken({ token, userId, clientId, clientUuid, expiresAt, ipAddress }) {
+            await q('INSERT INTO access_tokens (token, user_id, client_id, client_uuid, expires_at, ip_address) VALUES ($1, $2, $3, $4, $5, $6)',
+                [token, userId, clientId || '', clientUuid || '', expiresAt, ipAddress || '']);
+        },
+        async getAccessToken(token) { return one('SELECT * FROM access_tokens WHERE token = $1 AND NOT revoked AND expires_at > NOW()', [token]); },
+        async touchAccessToken(token) { await q('UPDATE access_tokens SET last_used = NOW() WHERE token = $1', [token]); },
+        async revokeAccessToken(token) { await q('UPDATE access_tokens SET revoked = TRUE WHERE token = $1', [token]); },
+        async revokeUserClientTokens(userId, clientUuid) { await q('UPDATE access_tokens SET revoked = TRUE WHERE user_id = $1 AND client_uuid = $2', [userId, clientUuid]); },
+        async revokeAllUserTokens(userId) { await q('UPDATE access_tokens SET revoked = TRUE WHERE user_id = $1', [userId]); },
+        async cleanupExpiredTokens() { await q('DELETE FROM access_tokens WHERE expires_at < NOW() OR revoked'); },
+
+        // ---- Login tracking ----
+
+        async recordLoginAttempt(username, ipAddress, success) {
+            await q('INSERT INTO login_attempts (username, ip_address, success) VALUES ($1, $2, $3)', [username, ipAddress, !!success]);
+        },
+        async countRecentFailedAttempts(username, windowMinutes) {
+            return +(await one(`SELECT COUNT(*) as c FROM login_attempts WHERE username = $1 AND NOT success AND created_at > NOW() - INTERVAL '1 minute' * $2`, [username, windowMinutes])).c;
+        },
+        async countRecentFailedAttemptsFromIp(ipAddress, windowMinutes) {
+            return +(await one(`SELECT COUNT(*) as c FROM login_attempts WHERE ip_address = $1 AND NOT success AND created_at > NOW() - INTERVAL '1 minute' * $2`, [ipAddress, windowMinutes])).c;
+        },
+        async lockAccount(username, lockedUntil, attemptCount) {
+            await q(`INSERT INTO account_lockouts (username, locked_until, attempt_count) VALUES ($1, $2, $3)
+                ON CONFLICT(username) DO UPDATE SET locked_until = $2, attempt_count = $3`, [username, lockedUntil, attemptCount]);
+        },
+        async getAccountLockout(username) { return one('SELECT * FROM account_lockouts WHERE username = $1 AND locked_until > NOW()', [username]); },
+        async clearAccountLockout(username) { await q('DELETE FROM account_lockouts WHERE username = $1', [username]); },
+
+        // ---- Folders ----
+
+        async getAllFolders() { return all('SELECT * FROM folders ORDER BY sort_order, name'); },
+        async getFolderById(id) { return one('SELECT * FROM folders WHERE id = $1', [id]); },
+        async createFolder({ name, color, icon, sort_order }) {
+            const r = await one('INSERT INTO folders (name, color, icon, sort_order) VALUES ($1, $2, $3, $4) RETURNING id', [name, color || '#6366f1', icon || 'folder', sort_order || 0]);
+            return { id: r.id, name, color, icon, sort_order };
+        },
+        async updateFolder(id, { name, color, icon, sort_order }) {
+            const sets = []; const params = []; let idx = 1;
+            if (name !== undefined) { sets.push(`name = $${idx++}`); params.push(name); }
+            if (color !== undefined) { sets.push(`color = $${idx++}`); params.push(color); }
+            if (icon !== undefined) { sets.push(`icon = $${idx++}`); params.push(icon); }
+            if (sort_order !== undefined) { sets.push(`sort_order = $${idx++}`); params.push(sort_order); }
+            if (!sets.length) return;
+            params.push(id);
+            await q(`UPDATE folders SET ${sets.join(', ')} WHERE id = $${idx}`, params);
+        },
+        async deleteFolder(id) {
+            await q('UPDATE peer SET folder_id = NULL WHERE folder_id = $1', [id]);
+            await q('DELETE FROM folders WHERE id = $1', [id]);
+        },
+        async assignDeviceToFolder(deviceId, folderId) {
+            await q('UPDATE peer SET folder_id = $1 WHERE id = $2', [folderId, deviceId]);
+        },
+
+        // ---- Address books ----
+
+        async getAddressBook(userId, abType = 'legacy') { return one('SELECT * FROM address_books WHERE user_id = $1 AND ab_type = $2', [userId, abType]); },
+        async saveAddressBook(userId, abType, data) {
+            await q(`INSERT INTO address_books (user_id, ab_type, data, updated_at) VALUES ($1, $2, $3, NOW())
+                ON CONFLICT(user_id, ab_type) DO UPDATE SET data = $3, updated_at = NOW()`, [userId, abType, data]);
+        },
+
+        // ---- Audit ----
+
+        async logAction(userId, action, details, ipAddress) {
+            await q('INSERT INTO audit_log (user_id, action, details, ip_address) VALUES ($1, $2, $3, $4)', [userId, action, details, ipAddress]);
+        },
+        async getAuditLogs(limit = 100, offset = 0) {
+            return all(`SELECT a.*, u.username FROM audit_log a LEFT JOIN users u ON a.user_id = u.id ORDER BY a.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]);
+        },
+
+        // ---- Settings ----
+
+        async getSetting(key) {
+            const r = await one('SELECT value FROM settings WHERE key = $1', [key]);
+            return r ? r.value : null;
+        },
+        async setSetting(key, value) {
+            await q(`INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+                ON CONFLICT(key) DO UPDATE SET value = $2, updated_at = NOW()`, [key, value]);
+        },
+        async getAllSettings() {
+            const rows = await all('SELECT key, value FROM settings');
+            const result = {};
+            for (const r of rows) result[r.key] = r.value;
+            return result;
+        },
+
+        // ---- Tickets ----
+
+        async createTicket({ title, description, priority, category, deviceId, createdBy, assignedTo, slaDueAt }) {
+            const r = await one(`
+                INSERT INTO tickets (title, description, priority, category, device_id, created_by, assigned_to, sla_due_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id
+            `, [title, description || '', priority || 'medium', category || 'general', deviceId || null, createdBy, assignedTo || null, slaDueAt || null]);
+            return { id: r.id, title };
+        },
+
+        async getTicketById(id) { return one('SELECT * FROM tickets WHERE id = $1', [id]); },
+
+        async getAllTickets(filters = {}) {
+            let where = 'WHERE 1=1';
+            const params = [];
+            let idx = 1;
+            if (filters.status) { where += ` AND status = $${idx++}`; params.push(filters.status); }
+            if (filters.priority) { where += ` AND priority = $${idx++}`; params.push(filters.priority); }
+            if (filters.category) { where += ` AND category = $${idx++}`; params.push(filters.category); }
+            if (filters.assigned_to) { where += ` AND assigned_to = $${idx++}`; params.push(filters.assigned_to); }
+            if (filters.device_id) { where += ` AND device_id = $${idx++}`; params.push(filters.device_id); }
+            if (filters.created_by) { where += ` AND created_by = $${idx++}`; params.push(filters.created_by); }
+            if (filters.search) { where += ` AND (title ILIKE $${idx} ESCAPE '\\' OR description ILIKE $${idx} ESCAPE '\\')`; params.push(`%${escapeLikePattern(filters.search)}%`); idx++; }
+            return all(`SELECT * FROM tickets ${where} ORDER BY created_at DESC`, params);
+        },
+
+        async updateTicket(id, data) {
+            const sets = [];
+            const params = [];
+            let idx = 1;
+            for (const key of ['title', 'description', 'status', 'priority', 'category', 'assigned_to', 'sla_due_at']) {
+                if (data[key] !== undefined) { sets.push(`${key} = $${idx++}`); params.push(data[key]); }
+            }
+            if (data.status === 'resolved') { sets.push('resolved_at = NOW()'); }
+            if (data.status === 'closed') { sets.push('closed_at = NOW()'); }
+            sets.push('updated_at = NOW()');
+            params.push(id);
+            await q(`UPDATE tickets SET ${sets.join(', ')} WHERE id = $${idx}`, params);
+        },
+
+        async deleteTicket(id) {
+            await q('DELETE FROM ticket_comments WHERE ticket_id = $1', [id]);
+            await q('DELETE FROM ticket_attachments WHERE ticket_id = $1', [id]);
+            await q('DELETE FROM tickets WHERE id = $1', [id]);
+        },
+
+        async getTicketStats() {
+            const r = await one(`
+                SELECT COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE status = 'open') as open,
+                    COUNT(*) FILTER (WHERE status = 'in_progress') as in_progress,
+                    COUNT(*) FILTER (WHERE status = 'resolved') as resolved,
+                    COUNT(*) FILTER (WHERE status = 'closed') as closed
+                FROM tickets
+            `);
+            return { total: +r.total, open: +r.open, in_progress: +r.in_progress, resolved: +r.resolved, closed: +r.closed };
+        },
+
+        async addTicketComment(ticketId, author, body, isInternal = false) {
+            const r = await one(`INSERT INTO ticket_comments (ticket_id, author, body, is_internal) VALUES ($1, $2, $3, $4) RETURNING id`, [ticketId, author, body, !!isInternal]);
+            await q('UPDATE tickets SET updated_at = NOW() WHERE id = $1', [ticketId]);
+            return { id: r.id };
+        },
+
+        async getTicketComments(ticketId) { return all('SELECT * FROM ticket_comments WHERE ticket_id = $1 ORDER BY created_at ASC', [ticketId]); },
+
+        async addTicketAttachment(ticketId, { filename, mimetype, sizeBytes, storagePath, uploadedBy }) {
+            const r = await one(`INSERT INTO ticket_attachments (ticket_id, filename, mimetype, size_bytes, storage_path, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+                [ticketId, filename, mimetype || 'application/octet-stream', sizeBytes || 0, storagePath, uploadedBy]);
+            return { id: r.id };
+        },
+
+        async getTicketAttachments(ticketId) { return all('SELECT * FROM ticket_attachments WHERE ticket_id = $1 ORDER BY created_at ASC', [ticketId]); },
+
+        async getAttachmentById(id) { return one('SELECT * FROM ticket_attachments WHERE id = $1', [id]); },
+
+        // ---- Inventory ----
+
+        async upsertInventory(deviceId, hardware, software, collectedAt) {
+            await q(`
+                INSERT INTO device_inventory (device_id, hardware, software, collected_at, received_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT(device_id) DO UPDATE SET
+                    hardware = $2, software = $3, collected_at = $4, received_at = NOW()
+            `, [deviceId, JSON.stringify(hardware), JSON.stringify(software || {}), collectedAt || new Date().toISOString()]);
+        },
+
+        async getInventory(deviceId) {
+            const row = await one('SELECT * FROM device_inventory WHERE device_id = $1', [deviceId]);
+            if (!row) return null;
+            return {
+                device_id: row.device_id,
+                hardware: typeof row.hardware === 'object' ? row.hardware : JSON.parse(row.hardware || '{}'),
+                software: typeof row.software === 'object' ? row.software : JSON.parse(row.software || '{}'),
+                collected_at: row.collected_at,
+                received_at: row.received_at,
+            };
+        },
+
+        async getAllInventories() {
+            return (await all('SELECT * FROM device_inventory ORDER BY received_at DESC')).map(row => ({
+                device_id: row.device_id,
+                hardware: typeof row.hardware === 'object' ? row.hardware : JSON.parse(row.hardware || '{}'),
+                software: typeof row.software === 'object' ? row.software : JSON.parse(row.software || '{}'),
+                collected_at: row.collected_at,
+                received_at: row.received_at,
+            }));
+        },
+
+        async upsertTelemetry(deviceId, data) {
+            await q(`
+                INSERT INTO device_telemetry (device_id, cpu_usage_percent, memory_used_bytes, memory_total_bytes, uptime_secs, timestamp, received_at)
+                VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                ON CONFLICT(device_id) DO UPDATE SET
+                    cpu_usage_percent = $2, memory_used_bytes = $3, memory_total_bytes = $4,
+                    uptime_secs = $5, timestamp = $6, received_at = NOW()
+            `, [deviceId, data.cpu_usage_percent ?? 0, data.memory_used_bytes ?? 0, data.memory_total_bytes ?? 0, data.uptime_secs ?? 0, data.timestamp || new Date().toISOString()]);
+        },
+
+        async getTelemetry(deviceId) {
+            const row = await one('SELECT * FROM device_telemetry WHERE device_id = $1', [deviceId]);
+            if (!row) return null;
+            return {
+                device_id: row.device_id,
+                cpu_usage_percent: +row.cpu_usage_percent,
+                memory_used_bytes: +row.memory_used_bytes,
+                memory_total_bytes: +row.memory_total_bytes,
+                uptime_secs: +row.uptime_secs,
+                timestamp: row.timestamp,
+                received_at: row.received_at,
+            };
+        },
+
+        // ---- Relay sessions ----
+
+        async createSession({ id, initiatorId, targetId, initiatorPk, expiresAt }) {
+            await q(`INSERT INTO relay_sessions (id, initiator_id, target_id, initiator_pk, status, expires_at)
+                VALUES ($1, $2, $3, $4, 'pending', $5)`, [id, initiatorId, targetId, initiatorPk || null, expiresAt]);
+        },
+        async getSession(id) { return one('SELECT * FROM relay_sessions WHERE id = $1 AND expires_at > NOW()', [id]); },
+        async updateSession(id, data) {
+            const sets = []; const params = []; let idx = 1;
+            if (data.status !== undefined) { sets.push(`status = $${idx++}`); params.push(data.status); }
+            if (data.target_pk !== undefined) { sets.push(`target_pk = $${idx++}`); params.push(data.target_pk); }
+            if (!sets.length) return;
+            params.push(id);
+            await q(`UPDATE relay_sessions SET ${sets.join(', ')} WHERE id = $${idx}`, params);
+        },
+        async deleteSession(id) { await q('DELETE FROM relay_sessions WHERE id = $1', [id]); },
+        async cleanupExpiredSessions() { await q('DELETE FROM relay_sessions WHERE expires_at < NOW()'); },
+
+        // ---- Alert rules & automation ----
+
+        async getAlertRules(filters = {}) {
+            let sql = 'SELECT * FROM alert_rules WHERE 1=1';
+            const params = [];
+            let idx = 1;
+            if (filters.enabled !== undefined) { sql += ` AND enabled = $${idx++}`; params.push(!!filters.enabled); }
+            if (filters.condition_type) { sql += ` AND condition_type = $${idx++}`; params.push(filters.condition_type); }
+            sql += ' ORDER BY created_at DESC';
+            return all(sql, params);
+        },
+
+        async getAlertRuleById(id) {
+            return one('SELECT * FROM alert_rules WHERE id = $1', [id]);
+        },
+
+        async createAlertRule(rule) {
+            const row = await one(`
+                INSERT INTO alert_rules (name, description, enabled, condition_type, condition_op, condition_value,
+                    severity, scope_device_id, cooldown_secs, notify_emails, created_by)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *
+            `, [rule.name, rule.description || '', rule.enabled !== false,
+                rule.condition_type, rule.condition_op || 'gt', rule.condition_value || 0,
+                rule.severity || 'warning', rule.scope_device_id || null,
+                rule.cooldown_secs || 300, rule.notify_emails || '', rule.created_by || null]);
+            return row;
+        },
+
+        async updateAlertRule(id, data) {
+            const sets = [];
+            const params = [];
+            let idx = 1;
+            for (const key of ['name', 'description', 'condition_type', 'condition_op', 'condition_value',
+                'severity', 'scope_device_id', 'cooldown_secs', 'notify_emails']) {
+                if (data[key] !== undefined) { sets.push(`${key} = $${idx++}`); params.push(data[key]); }
+            }
+            if (data.enabled !== undefined) { sets.push(`enabled = $${idx++}`); params.push(!!data.enabled); }
+            if (!sets.length) return;
+            sets.push('updated_at = NOW()');
+            params.push(id);
+            await q(`UPDATE alert_rules SET ${sets.join(', ')} WHERE id = $${idx}`, params);
+        },
+
+        async deleteAlertRule(id) {
+            await q('DELETE FROM alert_rules WHERE id = $1', [id]);
+        },
+
+        async createAlert(alert) {
+            return one(`
+                INSERT INTO alert_history (rule_id, device_id, severity, message, triggered_at)
+                VALUES ($1, $2, $3, $4, $5) RETURNING *
+            `, [alert.rule_id, alert.device_id || null, alert.severity || 'warning',
+                alert.message || '', alert.triggered_at || new Date().toISOString()]);
+        },
+
+        async getRecentAlert(ruleId, deviceId, cooldownSecs) {
+            return one(`
+                SELECT * FROM alert_history
+                WHERE rule_id = $1 AND device_id = $2
+                  AND triggered_at > NOW() - INTERVAL '1 second' * $3
+                ORDER BY triggered_at DESC LIMIT 1
+            `, [ruleId, deviceId, cooldownSecs]);
+        },
+
+        async getAlertHistory(filters = {}) {
+            let sql = 'SELECT h.*, r.name as rule_name FROM alert_history h LEFT JOIN alert_rules r ON h.rule_id = r.id WHERE 1=1';
+            const params = [];
+            let idx = 1;
+            if (filters.device_id) { sql += ` AND h.device_id = $${idx++}`; params.push(filters.device_id); }
+            if (filters.severity) { sql += ` AND h.severity = $${idx++}`; params.push(filters.severity); }
+            if (filters.acknowledged !== undefined) { sql += ` AND h.acknowledged = $${idx++}`; params.push(!!filters.acknowledged); }
+            sql += ' ORDER BY h.triggered_at DESC';
+            if (filters.limit) { sql += ` LIMIT $${idx++}`; params.push(filters.limit); }
+            return all(sql, params);
+        },
+
+        async acknowledgeAlert(id, username) {
+            await q('UPDATE alert_history SET acknowledged = TRUE, acknowledged_by = $1, acknowledged_at = NOW() WHERE id = $2', [username, id]);
+        },
+
+        // ---- Remote commands ----
+
+        async createRemoteCommand(cmd) {
+            return one(`
+                INSERT INTO remote_commands (device_id, command_type, payload, status, created_by)
+                VALUES ($1, $2, $3, 'pending', $4) RETURNING *
+            `, [cmd.device_id, cmd.command_type || 'shell', cmd.payload || '', cmd.created_by || 'admin']);
+        },
+
+        async getPendingCommands(deviceId) {
+            return all("SELECT * FROM remote_commands WHERE device_id = $1 AND status = 'pending' ORDER BY created_at ASC", [deviceId]);
+        },
+
+        async updateRemoteCommand(id, data) {
+            const sets = [];
+            const params = [];
+            let idx = 1;
+            if (data.status) { sets.push(`status = $${idx++}`); params.push(data.status); }
+            if (data.result !== undefined) { sets.push(`result = $${idx++}`); params.push(data.result); }
+            if (data.status === 'running') { sets.push('executed_at = NOW()'); }
+            if (data.status === 'completed' || data.status === 'failed') { sets.push('completed_at = NOW()'); }
+            if (!sets.length) return;
+            params.push(id);
+            await q(`UPDATE remote_commands SET ${sets.join(', ')} WHERE id = $${idx}`, params);
+        },
+
+        async getRemoteCommands(filters = {}) {
+            let sql = 'SELECT * FROM remote_commands WHERE 1=1';
+            const params = [];
+            let idx = 1;
+            if (filters.device_id) { sql += ` AND device_id = $${idx++}`; params.push(filters.device_id); }
+            if (filters.status) { sql += ` AND status = $${idx++}`; params.push(filters.status); }
+            sql += ' ORDER BY created_at DESC';
+            if (filters.limit) { sql += ` LIMIT $${idx++}`; params.push(filters.limit); }
+            return all(sql, params);
+        },
+
+        async getRemoteCommandById(id) {
+            return one('SELECT * FROM remote_commands WHERE id = $1', [id]);
+        },
+
+        // ---- Activity monitoring ----
+
+        async insertActivitySessions(deviceId, sessions) {
+            const client = await getPool().connect();
+            try {
+                await client.query('BEGIN');
+                for (const s of sessions) {
+                    await client.query(`
+                        INSERT INTO activity_sessions (device_id, app_name, window_title, category, started_at, ended_at, duration_secs)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    `, [deviceId, s.app_name || '', s.window_title || '', s.category || 'other',
+                        s.started_at, s.ended_at, s.duration_secs || 0]);
+                }
+                await client.query('COMMIT');
+            } catch (err) {
+                await client.query('ROLLBACK');
+                throw err;
+            } finally {
+                client.release();
+            }
+        },
+
+        async upsertActivitySummary(deviceId, data) {
+            await q(`
+                INSERT INTO activity_summaries (device_id, idle_seconds, session_count, total_active_secs, reported_at, received_at)
+                VALUES ($1, $2, $3, $4, $5, NOW())
+                ON CONFLICT(device_id, reported_at) DO UPDATE SET
+                    idle_seconds = $2, session_count = $3, total_active_secs = $4, received_at = NOW()
+            `, [deviceId, data.idle_seconds ?? 0, data.session_count ?? 0,
+                data.total_active_secs ?? 0, data.reported_at || new Date().toISOString()]);
+        },
+
+        async getActivitySessions(deviceId, { from, to, limit } = {}) {
+            let sql = 'SELECT * FROM activity_sessions WHERE device_id = $1';
+            const params = [deviceId];
+            let idx = 2;
+            if (from) { sql += ` AND started_at >= $${idx++}`; params.push(from); }
+            if (to) { sql += ` AND ended_at <= $${idx++}`; params.push(to); }
+            sql += ' ORDER BY started_at DESC';
+            if (limit) { sql += ` LIMIT $${idx++}`; params.push(limit); }
+            return all(sql, params);
+        },
+
+        async getActivitySummaries(deviceId, { from, to } = {}) {
+            let sql = 'SELECT * FROM activity_summaries WHERE device_id = $1';
+            const params = [deviceId];
+            let idx = 2;
+            if (from) { sql += ` AND reported_at >= $${idx++}`; params.push(from); }
+            if (to) { sql += ` AND reported_at <= $${idx++}`; params.push(to); }
+            sql += ' ORDER BY reported_at DESC';
+            return all(sql, params);
+        },
+
+        async getAllActivitySummaries({ from, to } = {}) {
+            let sql = `SELECT s.*, (
+                SELECT COUNT(*) FROM activity_sessions a
+                WHERE a.device_id = s.device_id
+                  AND a.started_at >= s.reported_at
+            ) as detail_count
+            FROM activity_summaries s WHERE 1=1`;
+            const params = [];
+            let idx = 1;
+            if (from) { sql += ` AND s.reported_at >= $${idx++}`; params.push(from); }
+            if (to) { sql += ` AND s.reported_at <= $${idx++}`; params.push(to); }
+            sql += ' ORDER BY s.received_at DESC';
+            return all(sql, params);
+        },
+
+        async getTopApps(deviceId, { from, to, limit } = {}) {
+            let sql = `SELECT app_name, category,
+                SUM(duration_secs) as total_secs,
+                COUNT(*) as session_count
+            FROM activity_sessions WHERE device_id = $1`;
+            const params = [deviceId];
+            let idx = 2;
+            if (from) { sql += ` AND started_at >= $${idx++}`; params.push(from); }
+            if (to) { sql += ` AND ended_at <= $${idx++}`; params.push(to); }
+            sql += ' GROUP BY app_name, category ORDER BY total_secs DESC';
+            if (limit) { sql += ` LIMIT $${idx++}`; params.push(limit || 10); }
+            return all(sql, params);
+        },
+
+        // ---- Network monitoring ----
+
+        async getNetworkTargets(filters = {}) {
+            let sql = 'SELECT * FROM network_targets WHERE 1=1';
+            const params = [];
+            let idx = 1;
+            if (filters.enabled !== undefined) { sql += ` AND enabled = $${idx++}`; params.push(!!filters.enabled); }
+            if (filters.check_type) { sql += ` AND check_type = $${idx++}`; params.push(filters.check_type); }
+            sql += ' ORDER BY name';
+            return all(sql, params);
+        },
+        async getNetworkTargetById(id) {
+            return one('SELECT * FROM network_targets WHERE id = $1', [id]);
+        },
+        async createNetworkTarget(data) {
+            const r = await one(`
+                INSERT INTO network_targets (name, host, port, url, check_type, timeout_ms, interval_ms, enabled)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *
+            `, [data.name, data.host, data.port, data.url, data.check_type,
+                data.timeout_ms || 5000, data.interval_ms || 60000, data.enabled !== false]);
+            return r;
+        },
+        async updateNetworkTarget(id, data) {
+            const sets = [];
+            const params = [];
+            let idx = 1;
+            if (data.name !== undefined) { sets.push(`name = $${idx++}`); params.push(data.name); }
+            if (data.host !== undefined) { sets.push(`host = $${idx++}`); params.push(data.host); }
+            if (data.port !== undefined) { sets.push(`port = $${idx++}`); params.push(data.port); }
+            if (data.url !== undefined) { sets.push(`url = $${idx++}`); params.push(data.url); }
+            if (data.check_type !== undefined) { sets.push(`check_type = $${idx++}`); params.push(data.check_type); }
+            if (data.timeout_ms !== undefined) { sets.push(`timeout_ms = $${idx++}`); params.push(data.timeout_ms); }
+            if (data.interval_ms !== undefined) { sets.push(`interval_ms = $${idx++}`); params.push(data.interval_ms); }
+            if (data.enabled !== undefined) { sets.push(`enabled = $${idx++}`); params.push(!!data.enabled); }
+            if (data.last_status !== undefined) { sets.push(`last_status = $${idx++}`); params.push(data.last_status); }
+            if (data.last_check_at !== undefined) { sets.push(`last_check_at = $${idx++}`); params.push(data.last_check_at); }
+            if (data.last_rtt_ms !== undefined) { sets.push(`last_rtt_ms = $${idx++}`); params.push(data.last_rtt_ms); }
+            if (!sets.length) return null;
+            sets.push('updated_at = NOW()');
+            params.push(id);
+            return one(`UPDATE network_targets SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`, params);
+        },
+        async deleteNetworkTarget(id) {
+            const r = await q('DELETE FROM network_targets WHERE id = $1', [id]);
+            return r.rowCount > 0;
+        },
+        async insertNetworkCheck(data) {
+            await q(`
+                INSERT INTO network_checks (target_id, status, rtt_ms, status_code, error_msg)
+                VALUES ($1, $2, $3, $4, $5)
+            `, [data.target_id, data.status, data.rtt_ms, data.status_code, data.error_msg]);
+        },
+        async getNetworkCheckHistory(targetId, { limit, from, to } = {}) {
+            let sql = 'SELECT * FROM network_checks WHERE target_id = $1';
+            const params = [targetId];
+            let idx = 2;
+            if (from) { sql += ` AND checked_at >= $${idx++}`; params.push(from); }
+            if (to) { sql += ` AND checked_at <= $${idx++}`; params.push(to); }
+            sql += ' ORDER BY checked_at DESC';
+            if (limit) { sql += ` LIMIT $${idx++}`; params.push(limit); }
+            return all(sql, params);
+        },
+
+        // -- DataGuard / DLP -------------------------------------------------
+        async getDlpPolicies() {
+            return all('SELECT * FROM dlp_policies ORDER BY id');
+        },
+        async getDlpPolicyById(id) {
+            return one('SELECT * FROM dlp_policies WHERE id = $1', [id]);
+        },
+        async createDlpPolicy(data) {
+            const rules = typeof data.rules === 'string' ? data.rules : JSON.stringify(data.rules || []);
+            return one(`
+                INSERT INTO dlp_policies (name, description, enabled, rules)
+                VALUES ($1, $2, $3, $4)
+                RETURNING *
+            `, [
+                data.name,
+                data.description || '',
+                data.enabled !== undefined ? data.enabled : true,
+                rules
+            ]);
+        },
+        async updateDlpPolicy(id, data) {
+            const sets = [];
+            const params = [];
+            let idx = 1;
+            if (data.name !== undefined) { sets.push(`name = $${idx++}`); params.push(data.name); }
+            if (data.description !== undefined) { sets.push(`description = $${idx++}`); params.push(data.description); }
+            if (data.enabled !== undefined) { sets.push(`enabled = $${idx++}`); params.push(!!data.enabled); }
+            if (data.rules !== undefined) {
+                sets.push(`rules = $${idx++}`);
+                params.push(typeof data.rules === 'string' ? data.rules : JSON.stringify(data.rules));
+            }
+            if (!sets.length) return null;
+            sets.push(`updated_at = NOW()`);
+            params.push(id);
+            return one(`UPDATE dlp_policies SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`, params);
+        },
+        async deleteDlpPolicy(id) {
+            const { rowCount } = await q('DELETE FROM dlp_policies WHERE id = $1', [id]);
+            return rowCount > 0;
+        },
+        async insertDlpEvent(data) {
+            const details = typeof data.details === 'string' ? data.details : JSON.stringify(data.details || {});
+            return one(`
+                INSERT INTO dlp_events (device_id, event_source, event_type, policy_id, policy_name, action, details)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+            `, [
+                data.device_id,
+                data.event_source || 'unknown',
+                data.event_type || 'info',
+                data.policy_id || null,
+                data.policy_name || '',
+                data.action || 'log',
+                details
+            ]);
+        },
+        async getDlpEvents({ device_id, event_source, event_type, limit, from, to } = {}) {
+            let sql = 'SELECT * FROM dlp_events WHERE 1=1';
+            const params = [];
+            let idx = 1;
+            if (device_id) { sql += ` AND device_id = $${idx++}`; params.push(device_id); }
+            if (event_source) { sql += ` AND event_source = $${idx++}`; params.push(event_source); }
+            if (event_type) { sql += ` AND event_type = $${idx++}`; params.push(event_type); }
+            if (from) { sql += ` AND created_at >= $${idx++}`; params.push(from); }
+            if (to) { sql += ` AND created_at <= $${idx++}`; params.push(to); }
+            sql += ' ORDER BY created_at DESC';
+            if (limit) { sql += ` LIMIT $${idx++}`; params.push(limit); }
+            return all(sql, params);
+        },
+        async getDlpEventStats() {
+            return one(`
+                SELECT
+                    COUNT(*)::INTEGER AS total,
+                    COUNT(*) FILTER (WHERE action = 'block')::INTEGER AS blocked,
+                    COUNT(*) FILTER (WHERE action = 'log')::INTEGER AS logged,
+                    COUNT(*) FILTER (WHERE event_source = 'usb')::INTEGER AS usb_events,
+                    COUNT(*) FILTER (WHERE event_source = 'file')::INTEGER AS file_events
+                FROM dlp_events
+            `);
+        },
+
+        // -- Saved Reports ----------------------------------------------------
+        async getSavedReports() {
+            return all('SELECT * FROM saved_reports ORDER BY created_at DESC');
+        },
+        async getSavedReportById(id) {
+            return one('SELECT * FROM saved_reports WHERE id = $1', [id]);
+        },
+        async createSavedReport(data) {
+            return one(`
+                INSERT INTO saved_reports (title, report_type, filters, payload, created_by)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+            `, [data.title, data.report_type, data.filters || '{}', data.payload || '{}', data.created_by || 'admin']);
+        },
+        async deleteSavedReport(id) {
+            const { rowCount } = await q('DELETE FROM saved_reports WHERE id = $1', [id]);
+            return rowCount > 0;
+        },
+
+        // -- Multi-Tenancy ----------------------------------------------------
+        async getTenants() {
+            return all('SELECT * FROM tenants ORDER BY name');
+        },
+        async getTenantById(id) {
+            return one('SELECT * FROM tenants WHERE id = $1', [id]);
+        },
+        async createTenant(data) {
+            return one(`
+                INSERT INTO tenants (name, slug, contact_name, contact_email, max_devices, notes, active)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *
+            `, [
+                data.name, data.slug, data.contact_name || '', data.contact_email || '',
+                data.max_devices || 0, data.notes || '', data.active !== undefined ? data.active : true
+            ]);
+        },
+        async updateTenant(id, data) {
+            const sets = [];
+            const params = [];
+            let idx = 1;
+            if (data.name !== undefined) { sets.push(`name = $${idx++}`); params.push(data.name); }
+            if (data.slug !== undefined) { sets.push(`slug = $${idx++}`); params.push(data.slug); }
+            if (data.contact_name !== undefined) { sets.push(`contact_name = $${idx++}`); params.push(data.contact_name); }
+            if (data.contact_email !== undefined) { sets.push(`contact_email = $${idx++}`); params.push(data.contact_email); }
+            if (data.max_devices !== undefined) { sets.push(`max_devices = $${idx++}`); params.push(data.max_devices); }
+            if (data.notes !== undefined) { sets.push(`notes = $${idx++}`); params.push(data.notes); }
+            if (data.active !== undefined) { sets.push(`active = $${idx++}`); params.push(!!data.active); }
+            if (!sets.length) return this.getTenantById(id);
+            sets.push('updated_at = NOW()');
+            params.push(id);
+            return one(`UPDATE tenants SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`, params);
+        },
+        async deleteTenant(id) {
+            const { rowCount } = await q('DELETE FROM tenants WHERE id = $1', [id]);
+            return rowCount > 0;
+        },
+        async getTenantDevices(tenantId) {
+            const rows = await all(`
+                SELECT td.device_id, td.assigned_at, p.info, p.note, p.status_online, p.ip
+                FROM tenant_devices td
+                LEFT JOIN peer p ON p.id = td.device_id AND (NOT p.is_deleted OR p.is_deleted IS NULL)
+                WHERE td.tenant_id = $1
+                ORDER BY td.assigned_at DESC
+            `, [tenantId]);
+            return rows.map(r => ({
+                device_id: r.device_id,
+                assigned_at: r.assigned_at,
+                online: !!r.status_online,
+                hostname: r.note || '',
+                ip: r.ip || '',
+            }));
+        },
+        async assignDeviceToTenant(tenantId, deviceId) {
+            try {
+                await q(`
+                    INSERT INTO tenant_devices (tenant_id, device_id) VALUES ($1, $2)
+                    ON CONFLICT (tenant_id, device_id) DO NOTHING
+                `, [tenantId, deviceId]);
+                return true;
+            } catch (_) { return false; }
+        },
+        async removeDeviceFromTenant(tenantId, deviceId) {
+            const { rowCount } = await q('DELETE FROM tenant_devices WHERE tenant_id = $1 AND device_id = $2', [tenantId, deviceId]);
+            return rowCount > 0;
+        },
+        async getTenantUsers(tenantId) {
+            return all(`
+                SELECT tu.user_id, tu.assigned_at
+                FROM tenant_users tu
+                WHERE tu.tenant_id = $1
+                ORDER BY tu.assigned_at DESC
+            `, [tenantId]);
+        },
+        async assignUserToTenant(tenantId, userId) {
+            try {
+                await q(`
+                    INSERT INTO tenant_users (tenant_id, user_id) VALUES ($1, $2)
+                    ON CONFLICT (tenant_id, user_id) DO NOTHING
+                `, [tenantId, userId]);
+                return true;
+            } catch (_) { return false; }
+        },
+        async removeUserFromTenant(tenantId, userId) {
+            const { rowCount } = await q('DELETE FROM tenant_users WHERE tenant_id = $1 AND user_id = $2', [tenantId, userId]);
+            return rowCount > 0;
+        },
+
+        // ---- Pending Registrations ----
+
+        async getPendingRegistrations(filters = {}) {
+            let sql = 'SELECT * FROM pending_registrations WHERE 1=1';
+            const params = [];
+            let idx = 1;
+            if (filters.status) { sql += ` AND status = $${idx++}`; params.push(filters.status); }
+            if (filters.search) {
+                sql += ` AND (device_id ILIKE $${idx} OR hostname ILIKE $${idx} OR ip_address ILIKE $${idx})`;
+                params.push(`%${filters.search}%`);
+                idx++;
+            }
+            sql += ' ORDER BY created_at DESC';
+            return all(sql, params);
+        },
+
+        async getPendingRegistrationById(id) {
+            return one('SELECT * FROM pending_registrations WHERE id = $1', [id]);
+        },
+
+        async getPendingRegistrationByDeviceId(deviceId) {
+            return one('SELECT * FROM pending_registrations WHERE device_id = $1', [deviceId]);
+        },
+
+        async createPendingRegistration(data) {
+            // Upsert: if already approved, return existing; otherwise update/insert
+            const existing = await one('SELECT id, status FROM pending_registrations WHERE device_id = $1', [data.device_id]);
+            if (existing) {
+                if (existing.status === 'approved') {
+                    return one('SELECT * FROM pending_registrations WHERE id = $1', [existing.id]);
+                }
+                return one(`
+                    UPDATE pending_registrations
+                    SET hostname = $1, platform = $2, version = $3, ip_address = $4, public_key = $5, uuid = $6,
+                        status = 'pending', rejected_reason = '', updated_at = NOW()
+                    WHERE id = $7
+                    RETURNING *
+                `, [data.hostname || '', data.platform || '', data.version || '', data.ip_address || '', data.public_key || '', data.uuid || '', existing.id]);
+            }
+            return one(`
+                INSERT INTO pending_registrations (device_id, hostname, platform, version, ip_address, public_key, uuid)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *
+            `, [data.device_id, data.hostname || '', data.platform || '', data.version || '', data.ip_address || '', data.public_key || '', data.uuid || '']);
+        },
+
+        async approvePendingRegistration(id, approvedBy, serverConfig = {}) {
+            return one(`
+                UPDATE pending_registrations
+                SET status = 'approved', approved_by = $1, approved_at = NOW(),
+                    access_token = $2, console_url = $3, server_address = $4, server_key = $5,
+                    updated_at = NOW()
+                WHERE id = $6 AND status = 'pending'
+                RETURNING *
+            `, [approvedBy || 'admin', serverConfig.access_token || null, serverConfig.console_url || null, serverConfig.server_address || null, serverConfig.server_key || null, id]);
+        },
+
+        async rejectPendingRegistration(id, reason = '') {
+            return one(`
+                UPDATE pending_registrations
+                SET status = 'rejected', rejected_reason = $1, updated_at = NOW()
+                WHERE id = $2 AND status = 'pending'
+                RETURNING *
+            `, [reason, id]);
+        },
+
+        async deletePendingRegistration(id) {
+            const { rowCount } = await q('DELETE FROM pending_registrations WHERE id = $1', [id]);
+            return rowCount > 0;
+        },
+
+        async getPendingRegistrationCount() {
+            const row = await one("SELECT COUNT(*)::INTEGER AS count FROM pending_registrations WHERE status = 'pending'");
+            return row ? row.count : 0;
+        },
+    };
+}
+
+// =========================================================================
+//  Factory
+// =========================================================================
+
+let _adapter = null;
+
+/**
+ * Get (or create) the database adapter singleton.
+ * @param {Object} [config] - Configuration object (from config/config.js)
+ * @returns {DbAdapter}
+ */
+function getAdapter(config) {
+    if (_adapter) return _adapter;
+
+    if (DB_TYPE === 'postgres' || DB_TYPE === 'postgresql') {
+        if (!DATABASE_URL) {
+            throw new Error('[DB] DB_TYPE=postgres requires DATABASE_URL environment variable');
+        }
+        _adapter = createPostgresAdapter();
+    } else {
+        if (!config) {
+            config = require('../config/config');
+        }
+        _adapter = createSqliteAdapter(config);
+    }
+
+    return _adapter;
+}
+
+module.exports = { getAdapter, DB_TYPE };

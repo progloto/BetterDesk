@@ -23,6 +23,7 @@ const helmetMiddleware = helmet({
         directives: {
             defaultSrc: ["'self'"],
             scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // unsafe-eval required by protobuf.js codegen
+            scriptSrcAttr: ["'unsafe-inline'"], // Allow inline event handlers (onclick etc.)
             styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
             fontSrc: ["'self'", "https://fonts.gstatic.com"],
             imgSrc: ["'self'", "data:", "blob:"],

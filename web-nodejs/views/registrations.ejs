@@ -1,0 +1,88 @@
+<%- include('layouts/main', {
+    title: _('nav.registrations'),
+    pageStyles: ['registrations'],
+    pageScripts: ['registrations'],
+    currentPage: 'registrations',
+    breadcrumb: [{ label: _('nav.registrations') }],
+    body: `
+        <div class="registrations-page">
+            <!-- Header -->
+            <div class="page-header">
+                <div class="page-title">
+                    <h1>${_('registrations.title')}</h1>
+                    <span class="badge badge-info" id="pending-count">0</span>
+                </div>
+                <p class="page-subtitle">${_('registrations.subtitle')}</p>
+            </div>
+
+            <!-- Filters -->
+            <div class="registrations-filters">
+                <div class="filter-group">
+                    <div class="search-wrapper">
+                        <span class="material-icons">search</span>
+                        <input type="text" class="form-input" id="search-input"
+                            placeholder="${_('registrations.search_placeholder')}">
+                    </div>
+                    <div class="filter-buttons">
+                        <button class="btn filter-btn active" data-status="">${_('common.all')}</button>
+                        <button class="btn filter-btn" data-status="pending">${_('registrations.status_pending')}</button>
+                        <button class="btn filter-btn" data-status="approved">${_('registrations.status_approved')}</button>
+                        <button class="btn filter-btn" data-status="rejected">${_('registrations.status_rejected')}</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Registrations Table -->
+            <div class="registrations-table-wrapper">
+                <table class="registrations-table" id="registrations-table">
+                    <thead>
+                        <tr>
+                            <th>${_('registrations.col_device_id')}</th>
+                            <th>${_('registrations.col_hostname')}</th>
+                            <th>${_('registrations.col_platform')}</th>
+                            <th>${_('registrations.col_ip')}</th>
+                            <th>${_('registrations.col_version')}</th>
+                            <th>${_('registrations.col_status')}</th>
+                            <th>${_('registrations.col_requested')}</th>
+                            <th>${_('registrations.col_actions')}</th>
+                        </tr>
+                    </thead>
+                    <tbody id="registrations-body">
+                        <tr class="empty-row">
+                            <td colspan="8">
+                                <div class="empty-state">
+                                    <span class="material-icons">how_to_reg</span>
+                                    <p>${_('registrations.no_registrations')}</p>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Reject Modal -->
+            <div class="modal-overlay" id="reject-modal" style="display: none;">
+                <div class="modal">
+                    <div class="modal-header">
+                        <h3>${_('registrations.reject_title')}</h3>
+                        <button class="btn-icon modal-close" data-modal="reject-modal">
+                            <span class="material-icons">close</span>
+                        </button>
+                    </div>
+                    <div class="modal-body">
+                        <p>${_('registrations.reject_confirm')}</p>
+                        <div class="form-group" style="margin-top: 12px;">
+                            <label for="reject-reason">${_('registrations.reject_reason')}</label>
+                            <textarea id="reject-reason" class="form-input" rows="3"
+                                placeholder="${_('registrations.reject_reason_placeholder')}"></textarea>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary modal-close" data-modal="reject-modal">${_('common.cancel')}</button>
+                        <button class="btn btn-danger" id="confirm-reject-btn">${_('registrations.reject_btn')}</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `
+}) %>

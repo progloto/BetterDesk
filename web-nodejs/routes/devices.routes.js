@@ -6,6 +6,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../services/database');
 const hbbsApi = require('../services/hbbsApi');
+const serverBackend = require('../services/serverBackend');
 const { requireAuth, requireRole } = require('../middleware/auth');
 
 /**
@@ -21,17 +22,27 @@ router.get('/devices', requireAuth, (req, res) => {
 /**
  * GET /api/devices - Get devices list (JSON)
  */
-router.get('/api/devices', requireAuth, (req, res) => {
+// Allowed values for sort parameters (prevent SQL injection via sort columns)
+const ALLOWED_SORT_FIELDS = ['last_online', 'id', 'hostname', 'created_at', 'os', 'version', 'username', 'note'];
+const ALLOWED_SORT_ORDERS = ['asc', 'desc'];
+
+router.get('/api/devices', requireAuth, async (req, res) => {
     try {
+        // Validate and sanitize sort parameters
+        const sortBy = ALLOWED_SORT_FIELDS.includes(req.query.sortBy) 
+            ? req.query.sortBy : 'last_online';
+        const sortOrder = ALLOWED_SORT_ORDERS.includes(req.query.sortOrder?.toLowerCase()) 
+            ? req.query.sortOrder.toLowerCase() : 'desc';
+        
         const filters = {
             search: req.query.search || '',
             status: req.query.status || '',
             hasNotes: req.query.hasNotes === 'true',
-            sortBy: req.query.sortBy || 'last_online',
-            sortOrder: req.query.sortOrder || 'desc'
+            sortBy,
+            sortOrder
         };
         
-        const devices = db.getAllDevices(filters);
+        const devices = await serverBackend.getAllDevices(filters);
         
         res.json({
             success: true,
@@ -50,11 +61,11 @@ router.get('/api/devices', requireAuth, (req, res) => {
 });
 
 /**
- * GET /api/devices/:id - Get single device
+ * GET /api/devices/:id - Get single device with sysinfo and latest metrics
  */
-router.get('/api/devices/:id', requireAuth, (req, res) => {
+router.get('/api/devices/:id', requireAuth, async (req, res) => {
     try {
-        const device = db.getDeviceById(req.params.id);
+        const device = await serverBackend.getDeviceById(req.params.id);
         
         if (!device) {
             return res.status(404).json({
@@ -62,7 +73,57 @@ router.get('/api/devices/:id', requireAuth, (req, res) => {
                 error: req.t('devices.not_found')
             });
         }
-        
+
+        // Enrich with sysinfo data (from peer_sysinfo table)
+        try {
+            const sysinfo = db.getPeerSysinfo(req.params.id);
+            if (sysinfo) {
+                device.sysinfo = sysinfo;
+            }
+        } catch (e) {
+            // sysinfo table may not exist yet — silently skip
+        }
+
+        // Enrich with latest heartbeat metrics
+        try {
+            const latestMetric = db.getLatestPeerMetric(req.params.id);
+            if (latestMetric) {
+                device.metrics = {
+                    cpu_usage: latestMetric.cpu_usage,
+                    memory_usage: latestMetric.memory_usage,
+                    disk_usage: latestMetric.disk_usage,
+                    updated_at: latestMetric.created_at
+                };
+            }
+        } catch (e) {
+            // metrics table may not exist yet — silently skip
+        }
+
+        // Enrich with recent metrics history (last 20 data-points for charts)
+        try {
+            const metricsHistory = db.getPeerMetrics(req.params.id, 20);
+            if (metricsHistory && metricsHistory.length > 0) {
+                device.metrics_history = metricsHistory.map(m => ({
+                    cpu: m.cpu_usage,
+                    memory: m.memory_usage,
+                    disk: m.disk_usage,
+                    time: m.created_at
+                }));
+            }
+        } catch (e) {
+            // silently skip
+        }
+
+        // Enrich with device group memberships
+        try {
+            const groups = db.getDeviceGroupsForPeer(req.params.id);
+            if (groups && groups.length > 0) {
+                device.groups = groups;
+            }
+        } catch (e) {
+            // silently skip
+        }
+
         res.json({
             success: true,
             data: device
@@ -79,13 +140,13 @@ router.get('/api/devices/:id', requireAuth, (req, res) => {
 /**
  * PATCH /api/devices/:id - Update device (name, note)
  */
-router.patch('/api/devices/:id', requireAuth, requireRole('operator'), (req, res) => {
+router.patch('/api/devices/:id', requireAuth, requireRole('operator'), async (req, res) => {
     try {
         const { user, note } = req.body;
         const id = req.params.id;
         
         // Check device exists
-        const device = db.getDeviceById(id);
+        const device = await serverBackend.getDeviceById(id);
         if (!device) {
             return res.status(404).json({
                 success: false,
@@ -93,7 +154,7 @@ router.patch('/api/devices/:id', requireAuth, requireRole('operator'), (req, res
             });
         }
         
-        const result = db.updateDevice(id, { user, note });
+        const result = await serverBackend.updateDevice(id, { user, note });
         
         // Log action
         db.logAction(req.session.userId, 'device_updated', `Device ${id} updated`, req.ip);
@@ -114,11 +175,11 @@ router.patch('/api/devices/:id', requireAuth, requireRole('operator'), (req, res
 /**
  * DELETE /api/devices/:id - Delete device (soft delete)
  */
-router.delete('/api/devices/:id', requireAuth, requireRole('operator'), (req, res) => {
+router.delete('/api/devices/:id', requireAuth, requireRole('operator'), async (req, res) => {
     try {
         const id = req.params.id;
         
-        const device = db.getDeviceById(id);
+        const device = await serverBackend.getDeviceById(id);
         if (!device) {
             return res.status(404).json({
                 success: false,
@@ -126,7 +187,7 @@ router.delete('/api/devices/:id', requireAuth, requireRole('operator'), (req, re
             });
         }
         
-        db.deleteDevice(id);
+        await serverBackend.deleteDevice(id);
         
         // Log action
         db.logAction(req.session.userId, 'device_deleted', `Device ${id} deleted`, req.ip);
@@ -144,12 +205,12 @@ router.delete('/api/devices/:id', requireAuth, requireRole('operator'), (req, re
 /**
  * POST /api/devices/:id/ban - Ban device
  */
-router.post('/api/devices/:id/ban', requireAuth, requireRole('operator'), (req, res) => {
+router.post('/api/devices/:id/ban', requireAuth, requireRole('operator'), async (req, res) => {
     try {
         const id = req.params.id;
         const { reason } = req.body;
         
-        const device = db.getDeviceById(id);
+        const device = await serverBackend.getDeviceById(id);
         if (!device) {
             return res.status(404).json({
                 success: false,
@@ -157,7 +218,7 @@ router.post('/api/devices/:id/ban', requireAuth, requireRole('operator'), (req, 
             });
         }
         
-        db.setBanStatus(id, true, reason || '');
+        await serverBackend.setBanStatus(id, true, reason || '');
         
         // Log action
         db.logAction(req.session.userId, 'device_banned', `Device ${id} banned: ${reason}`, req.ip);
@@ -175,11 +236,11 @@ router.post('/api/devices/:id/ban', requireAuth, requireRole('operator'), (req, 
 /**
  * POST /api/devices/:id/unban - Unban device
  */
-router.post('/api/devices/:id/unban', requireAuth, requireRole('operator'), (req, res) => {
+router.post('/api/devices/:id/unban', requireAuth, requireRole('operator'), async (req, res) => {
     try {
         const id = req.params.id;
         
-        const device = db.getDeviceById(id);
+        const device = await serverBackend.getDeviceById(id);
         if (!device) {
             return res.status(404).json({
                 success: false,
@@ -187,7 +248,7 @@ router.post('/api/devices/:id/unban', requireAuth, requireRole('operator'), (req
             });
         }
         
-        db.setBanStatus(id, false);
+        await serverBackend.setBanStatus(id, false);
         
         // Log action
         db.logAction(req.session.userId, 'device_unbanned', `Device ${id} unbanned`, req.ip);
@@ -226,7 +287,7 @@ router.post('/api/devices/:id/change-id', requireAuth, requireRole('operator'), 
         }
         
         // Check if new ID already exists
-        const existing = db.getDeviceById(newId);
+        const existing = await serverBackend.getDeviceById(newId);
         if (existing) {
             return res.status(400).json({
                 success: false,
@@ -234,8 +295,8 @@ router.post('/api/devices/:id/change-id', requireAuth, requireRole('operator'), 
             });
         }
         
-        // Try to change via HBBS API
-        const result = await hbbsApi.changePeerId(oldId, newId);
+        // Try to change via server backend API
+        const result = await serverBackend.changePeerId(oldId, newId);
         
         if (!result || !result.success) {
             return res.status(400).json({
@@ -258,9 +319,72 @@ router.post('/api/devices/:id/change-id', requireAuth, requireRole('operator'), 
 });
 
 /**
+ * PUT /api/devices/:id/tags - Set device tags
+ */
+router.put('/api/devices/:id/tags', requireAuth, requireRole('operator'), async (req, res) => {
+    try {
+        const id = req.params.id;
+        const { tags } = req.body;
+
+        if (!Array.isArray(tags)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Tags must be an array'
+            });
+        }
+
+        // Validate tag values: non-empty strings, max 50 chars each, max 20 tags
+        const cleaned = tags
+            .filter(t => typeof t === 'string' && t.trim().length > 0)
+            .map(t => t.trim().slice(0, 50));
+
+        if (cleaned.length > 20) {
+            return res.status(400).json({
+                success: false,
+                error: 'Maximum 20 tags allowed'
+            });
+        }
+
+        const device = await serverBackend.getDeviceById(id);
+        if (!device) {
+            return res.status(404).json({
+                success: false,
+                error: req.t('devices.not_found')
+            });
+        }
+
+        // BetterDesk backend: delegate to Go server
+        if (serverBackend.isBetterDesk()) {
+            const result = await serverBackend.setPeerTags(id, cleaned);
+            if (!result || !result.success) {
+                return res.status(400).json({
+                    success: false,
+                    error: result?.error || 'Failed to set tags'
+                });
+            }
+        }
+        // Note: in rustdesk mode, tags are not supported (no-op)
+
+        // Log action
+        db.logAction(req.session.userId, 'device_tags_updated', `Device ${id} tags set to [${cleaned.join(', ')}]`, req.ip);
+
+        res.json({
+            success: true,
+            data: { tags: cleaned }
+        });
+    } catch (err) {
+        console.error('Set tags error:', err);
+        res.status(500).json({
+            success: false,
+            error: req.t('errors.server_error')
+        });
+    }
+});
+
+/**
  * POST /api/devices/bulk-delete - Delete multiple devices
  */
-router.post('/api/devices/bulk-delete', requireAuth, requireRole('operator'), (req, res) => {
+router.post('/api/devices/bulk-delete', requireAuth, requireRole('operator'), async (req, res) => {
     try {
         const { ids } = req.body;
         
@@ -273,8 +397,9 @@ router.post('/api/devices/bulk-delete', requireAuth, requireRole('operator'), (r
         
         let deleted = 0;
         for (const id of ids) {
-            const result = db.deleteDevice(id);
-            deleted += result.changes;
+            const result = await serverBackend.deleteDevice(id);
+            // In betterdesk mode, result is {success, data}; in rustdesk, result has .changes
+            if (result && (result.success || result.changes)) deleted++;
         }
         
         // Log action

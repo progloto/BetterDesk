@@ -1,20 +1,20 @@
 /**
  * BetterDesk Console - WAN API Security Middleware
  * 
- * Hardened security layer for the internet-facing RustDesk Client API (port 21114).
+ * Hardened security layer for the internet-facing RustDesk Client API (port 21121).
  * This middleware stack is applied ONLY to the dedicated API port, not the admin panel.
  * 
  * Security layers:
- *   1. Request size limit (1KB max body)
+ *   1. Request size limit (per-path body size limits)
  *   2. Strict CORS (no browser access)
  *   3. Security headers (no information leakage)
  *   4. JSON-only content type enforcement
- *   5. Path whitelist (only 4 endpoints allowed)
- *   6. Rate limiting (aggressive per-IP)
+ *   5. Path whitelist (strict endpoint list)
+ *   6. Rate limiting (aggressive per-IP + audit-specific)
  *   7. Request timeout (10s max)
  * 
  * @author UNITRONIX
- * @version 1.0.0
+ * @version 2.0.0 — expanded for sysinfo/audit/groups/strategies/server-key
  */
 
 const rateLimit = require('express-rate-limit');
@@ -24,24 +24,50 @@ const rateLimit = require('express-rate-limit');
  * Everything else returns 404 — zero attack surface.
  */
 const ALLOWED_PATHS = new Set([
+    // Phase 0: Core auth
     '/api/login',
     '/api/logout',
     '/api/currentUser',
     '/api/login-options',
+    // Phase 1: Core integration
     '/api/heartbeat',
     '/api/sysinfo',
-    '/api/ab',
-    '/api/ab/personal',
-    '/api/ab/tags',
-    '/api/audit',
-    '/api/users',
+    '/api/sysinfo_ver',
     '/api/peers',
+    // Phase 2: Audit
+    '/api/audit',
+    '/api/audit/conn',
+    '/api/audit/file',
+    '/api/audit/alarm',
+    // Phase 3: Groups & strategies
     '/api/device-group',
     '/api/device-group/accessible',
     '/api/user/group',
+    '/api/user-groups',
+    '/api/strategies',
+    // Address book
+    '/api/ab',
+    '/api/ab/personal',
+    '/api/ab/tags',
+    // Users & software
+    '/api/users',
     '/api/software',
-    '/api/software/client-download-link'
+    '/api/software/client-download-link',
+    // Security: server key distribution
+    '/api/server-key',
+    '/api/server-key/fingerprint',
+    // LAN registration
+    '/api/bd/register-request',
+    '/api/bd/register-status'
 ]);
+
+/**
+ * Dynamic path patterns (regex) for endpoints with parameters.
+ * Checked when exact match fails.
+ */
+const ALLOWED_PATH_PATTERNS = [
+    /^\/api\/peer-key\/[a-zA-Z0-9_-]{1,32}$/
+];
 
 const ALLOWED_METHODS = {
     '/api/login': 'POST',
@@ -50,21 +76,48 @@ const ALLOWED_METHODS = {
     '/api/login-options': 'GET',
     '/api/heartbeat': 'POST',
     '/api/sysinfo': 'POST',
+    '/api/sysinfo_ver': 'POST',
+    '/api/peers': 'GET',
+    '/api/audit': 'GET',
+    '/api/audit/conn': '*',
+    '/api/audit/file': '*',
+    '/api/audit/alarm': '*',
+    '/api/device-group': '*',
+    '/api/device-group/accessible': 'GET',
+    '/api/user/group': 'GET',
+    '/api/user-groups': '*',
+    '/api/strategies': '*',
     '/api/ab': '*',
     '/api/ab/personal': '*',
     '/api/ab/tags': 'GET',
-    '/api/audit': 'GET',
     '/api/users': 'GET',
-    '/api/peers': 'GET',
-    '/api/device-group': 'GET',
-    '/api/device-group/accessible': 'GET',
-    '/api/user/group': 'GET',
     '/api/software': 'GET',
-    '/api/software/client-download-link': 'GET'
+    '/api/software/client-download-link': 'GET',
+    '/api/server-key': 'GET',
+    '/api/server-key/fingerprint': 'GET',
+    '/api/bd/register-request': 'POST',
+    '/api/bd/register-status': 'GET'
 };
 
 /**
- * Maximum request body size in bytes (1KB — login payload is ~200 bytes)
+ * Per-path body size limits in bytes.
+ * Paths not listed use the default MAX_BODY_SIZE.
+ */
+const PATH_BODY_LIMITS = {
+    '/api/sysinfo': 8192,         // 8KB — sysinfo with displays/encoding data
+    '/api/sysinfo_ver': 512,      // 512B — version check (id + hash only)
+    '/api/ab': 65536,             // 64KB — address book sync
+    '/api/ab/personal': 65536,    // 64KB — personal address book
+    '/api/audit/conn': 2048,      // 2KB — connection event
+    '/api/audit/file': 4096,      // 4KB — file transfer event (file list)
+    '/api/audit/alarm': 2048,     // 2KB — alarm event
+    '/api/device-group': 2048,    // 2KB — group create/update
+    '/api/user-groups': 2048,     // 2KB — group create/update
+    '/api/strategies': 4096       // 4KB — strategy with permissions JSON
+};
+
+/**
+ * Default maximum request body size in bytes
  */
 const MAX_BODY_SIZE = 1024;
 
@@ -72,8 +125,18 @@ const MAX_BODY_SIZE = 1024;
  * Path whitelist — reject any request not matching allowed endpoints
  */
 function pathWhitelist(req, res, next) {
+    // Check exact match first
     if (!ALLOWED_PATHS.has(req.path)) {
-        return res.status(404).end();
+        // Check regex patterns for parameterized routes
+        const matched = ALLOWED_PATH_PATTERNS.some(pattern => pattern.test(req.path));
+        if (!matched) {
+            return res.status(404).end();
+        }
+        // Dynamic paths allow GET only
+        if (req.method !== 'GET' && req.method !== 'OPTIONS') {
+            return res.status(405).end();
+        }
+        return next();
     }
 
     // Enforce correct HTTP method (* allows any method)
@@ -135,11 +198,11 @@ function jsonOnly(req, res, next) {
 }
 
 /**
- * Request body size limit
+ * Request body size limit — with per-path overrides
  */
 function bodySizeLimit(req, res, next) {
     let size = 0;
-    const maxSize = MAX_BODY_SIZE;
+    const maxSize = PATH_BODY_LIMITS[req.path] || MAX_BODY_SIZE;
 
     req.on('data', (chunk) => {
         size += chunk.length;
@@ -172,12 +235,7 @@ const wanLoginLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests, please try again later' },
-    keyGenerator: (req) => {
-        return req.headers['x-forwarded-for']?.split(',')[0]?.trim()
-            || req.headers['x-real-ip']
-            || req.socket?.remoteAddress
-            || 'unknown';
-    },
+    keyGenerator: (req) => req.ip || 'unknown',
     skip: (req) => {
         // Only rate-limit login and logout, not currentUser or login-options
         return req.path !== '/api/login' && req.path !== '/api/logout';
@@ -189,15 +247,27 @@ const wanLoginLimiter = rateLimit({
  */
 const wanGlobalLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 30, // 30 requests per IP per minute total
+    max: 60, // 60 requests per IP per minute total (increased for heartbeat + sysinfo + audit)
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests' },
-    keyGenerator: (req) => {
-        return req.headers['x-forwarded-for']?.split(',')[0]?.trim()
-            || req.headers['x-real-ip']
-            || req.socket?.remoteAddress
-            || 'unknown';
+    keyGenerator: (req) => req.ip || 'unknown'
+});
+
+/**
+ * Audit-specific rate limiter — prevent log flooding attacks
+ * 20 audit events per IP per minute
+ */
+const wanAuditLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Audit rate limit exceeded' },
+    keyGenerator: (req) => req.ip || 'unknown',
+    skip: (req) => {
+        // Only apply to POST audit endpoints
+        return !req.path.startsWith('/api/audit/') || req.method !== 'POST';
     }
 });
 
@@ -236,6 +306,7 @@ function getWanMiddlewareStack() {
         requestLogger,
         pathWhitelist,
         wanGlobalLimiter,
+        wanAuditLimiter,
         wanLoginLimiter,
         bodySizeLimit,
         jsonOnly
@@ -250,6 +321,7 @@ module.exports = {
     requestTimeout,
     wanLoginLimiter,
     wanGlobalLimiter,
+    wanAuditLimiter,
     requestLogger,
     getWanMiddlewareStack
 };

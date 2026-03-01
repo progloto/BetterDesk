@@ -1,0 +1,972 @@
+package db
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// PostgresDB implements the Database interface using PostgreSQL via pgx/v5.
+// Unlike SQLite, PostgreSQL supports concurrent writes, row-level locking,
+// and LISTEN/NOTIFY for real-time event push between server instances.
+type PostgresDB struct {
+	pool *pgxpool.Pool
+	ctx  context.Context
+
+	// LISTEN/NOTIFY callback (nil = disabled). Set via OnNotify().
+	notifyFunc func(channel, payload string)
+}
+
+// OpenPostgres connects to a PostgreSQL server. The dsn must use the
+// postgres:// or postgresql:// scheme, for example:
+//
+//	postgres://user:pass@localhost:5432/betterdesk?sslmode=prefer
+//
+// Connection pooling is built-in via pgxpool. Configure max connections
+// with the pool_max_conns query parameter:
+//
+//	postgres://...?pool_max_conns=10
+func OpenPostgres(dsn string) (*PostgresDB, error) {
+	ctx := context.Background()
+
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("db: PostgreSQL parse config: %w", err)
+	}
+
+	// Sensible pool defaults if not specified in DSN
+	if config.MaxConns == 0 {
+		config.MaxConns = 10
+	}
+	config.MinConns = 1
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("db: PostgreSQL connect: %w", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("db: PostgreSQL ping: %w", err)
+	}
+
+	return &PostgresDB{pool: pool, ctx: ctx}, nil
+}
+
+// Close closes the connection pool.
+func (pg *PostgresDB) Close() error {
+	pg.pool.Close()
+	return nil
+}
+
+// Migrate creates all tables and indexes using PostgreSQL-native types.
+func (pg *PostgresDB) Migrate() error {
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS peers (
+			id            TEXT PRIMARY KEY,
+			uuid          TEXT NOT NULL DEFAULT '',
+			pk            BYTEA DEFAULT NULL,
+			ip            TEXT NOT NULL DEFAULT '',
+			"user"        TEXT NOT NULL DEFAULT '',
+			hostname      TEXT NOT NULL DEFAULT '',
+			os            TEXT NOT NULL DEFAULT '',
+			version       TEXT NOT NULL DEFAULT '',
+			status        TEXT NOT NULL DEFAULT 'OFFLINE',
+			nat_type      INTEGER NOT NULL DEFAULT 0,
+			last_online   TIMESTAMPTZ,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			disabled      BOOLEAN NOT NULL DEFAULT FALSE,
+			banned        BOOLEAN NOT NULL DEFAULT FALSE,
+			ban_reason    TEXT NOT NULL DEFAULT '',
+			banned_at     TIMESTAMPTZ,
+			soft_deleted  BOOLEAN NOT NULL DEFAULT FALSE,
+			deleted_at    TIMESTAMPTZ,
+			note          TEXT NOT NULL DEFAULT '',
+			tags          TEXT NOT NULL DEFAULT '',
+			heartbeat_seq BIGINT NOT NULL DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_uuid ON peers(uuid)`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_status ON peers(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_banned ON peers(banned) WHERE banned = TRUE`,
+
+		`CREATE TABLE IF NOT EXISTS server_config (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL DEFAULT ''
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS id_change_history (
+			id         BIGSERIAL PRIMARY KEY,
+			old_id     TEXT NOT NULL,
+			new_id     TEXT NOT NULL,
+			changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			reason     TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_id_history_old ON id_change_history(old_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_id_history_new ON id_change_history(new_id)`,
+
+		`CREATE TABLE IF NOT EXISTS users (
+			id            BIGSERIAL PRIMARY KEY,
+			username      TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			role          TEXT NOT NULL DEFAULT 'viewer',
+			totp_secret   TEXT NOT NULL DEFAULT '',
+			totp_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_login    TIMESTAMPTZ
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			id         BIGSERIAL PRIMARY KEY,
+			key_hash   TEXT UNIQUE NOT NULL,
+			key_prefix TEXT NOT NULL DEFAULT '',
+			name       TEXT NOT NULL DEFAULT '',
+			role       TEXT NOT NULL DEFAULT 'viewer',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at TIMESTAMPTZ,
+			last_used  TIMESTAMPTZ
+		)`,
+
+		// Device tokens table (Dual Key System for enhanced security)
+		`CREATE TABLE IF NOT EXISTS device_tokens (
+			id           BIGSERIAL PRIMARY KEY,
+			token_hash   TEXT UNIQUE NOT NULL,
+			token_prefix TEXT NOT NULL DEFAULT '',
+			name         TEXT NOT NULL DEFAULT '',
+			peer_id      TEXT NOT NULL DEFAULT '',
+			status       TEXT NOT NULL DEFAULT 'pending',
+			max_uses     INTEGER NOT NULL DEFAULT 1,
+			use_count    INTEGER NOT NULL DEFAULT 0,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at   TIMESTAMPTZ,
+			revoked_at   TIMESTAMPTZ,
+			last_used_at TIMESTAMPTZ,
+			created_by   TEXT NOT NULL DEFAULT '',
+			note         TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_device_tokens_peer ON device_tokens(peer_id) WHERE peer_id != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_device_tokens_status ON device_tokens(status)`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := pg.pool.Exec(pg.ctx, stmt); err != nil {
+			return fmt.Errorf("db: PostgreSQL migration failed: %w\nStatement: %s", err, stmt)
+		}
+	}
+
+	return nil
+}
+
+// ── Peer Operations ───────────────────────────────────────────────────
+
+// peerColumns is the shared SELECT list for all peer queries.
+const peerColumns = `id, uuid, pk, ip, "user", hostname, os, version,
+	status, nat_type, last_online, created_at,
+	disabled, banned, ban_reason, banned_at,
+	soft_deleted, deleted_at, note, tags, heartbeat_seq`
+
+// scanPeer scans a row into a Peer struct using nullable types.
+func scanPeer(row pgx.Row) (*Peer, error) {
+	p := &Peer{}
+	var lastOnline, bannedAt, deletedAt *time.Time
+
+	err := row.Scan(
+		&p.ID, &p.UUID, &p.PK, &p.IP, &p.User, &p.Hostname,
+		&p.OS, &p.Version, &p.Status, &p.NATType,
+		&lastOnline, &p.CreatedAt, &p.Disabled, &p.Banned,
+		&p.BanReason, &bannedAt, &p.SoftDeleted, &deletedAt,
+		&p.Note, &p.Tags, &p.HeartbeatSeq,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if lastOnline != nil {
+		p.LastOnline = *lastOnline
+	}
+	p.BannedAt = bannedAt
+	p.DeletedAt = deletedAt
+
+	return p, nil
+}
+
+// GetPeer returns a peer by ID, or nil if not found.
+func (pg *PostgresDB) GetPeer(id string) (*Peer, error) {
+	row := pg.pool.QueryRow(pg.ctx,
+		`SELECT `+peerColumns+` FROM peers WHERE id = $1`, id)
+	p, err := scanPeer(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: GetPeer(%q): %w", id, err)
+	}
+	return p, nil
+}
+
+// GetPeerByUUID returns a peer by UUID, or nil if not found.
+func (pg *PostgresDB) GetPeerByUUID(uuid string) (*Peer, error) {
+	row := pg.pool.QueryRow(pg.ctx,
+		`SELECT `+peerColumns+` FROM peers WHERE uuid = $1`, uuid)
+	p, err := scanPeer(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: GetPeerByUUID(%q): %w", uuid, err)
+	}
+	return p, nil
+}
+
+// UpsertPeer inserts or updates a peer record (PostgreSQL ON CONFLICT).
+func (pg *PostgresDB) UpsertPeer(p *Peer) error {
+	var lastOnline *time.Time
+	if !p.LastOnline.IsZero() {
+		lastOnline = &p.LastOnline
+	}
+
+	_, err := pg.pool.Exec(pg.ctx, `
+		INSERT INTO peers (id, uuid, pk, ip, "user", hostname, os, version,
+		                    status, nat_type, last_online, disabled, note, tags, heartbeat_seq)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		ON CONFLICT (id) DO UPDATE SET
+			uuid          = COALESCE(NULLIF(EXCLUDED.uuid, ''), peers.uuid),
+			pk            = COALESCE(EXCLUDED.pk, peers.pk),
+			ip            = EXCLUDED.ip,
+			"user"        = COALESCE(NULLIF(EXCLUDED."user", ''), peers."user"),
+			hostname      = COALESCE(NULLIF(EXCLUDED.hostname, ''), peers.hostname),
+			os            = COALESCE(NULLIF(EXCLUDED.os, ''), peers.os),
+			version       = COALESCE(NULLIF(EXCLUDED.version, ''), peers.version),
+			status        = EXCLUDED.status,
+			nat_type      = EXCLUDED.nat_type,
+			last_online   = EXCLUDED.last_online,
+			disabled      = EXCLUDED.disabled,
+			note          = COALESCE(NULLIF(EXCLUDED.note, ''), peers.note),
+			tags          = COALESCE(NULLIF(EXCLUDED.tags, ''), peers.tags),
+			heartbeat_seq = EXCLUDED.heartbeat_seq`,
+		p.ID, p.UUID, p.PK, p.IP, p.User, p.Hostname, p.OS, p.Version,
+		p.Status, p.NATType, lastOnline, p.Disabled, p.Note, p.Tags, p.HeartbeatSeq,
+	)
+	if err != nil {
+		return fmt.Errorf("db: UpsertPeer(%q): %w", p.ID, err)
+	}
+	return nil
+}
+
+// DeletePeer marks a peer as soft-deleted.
+func (pg *PostgresDB) DeletePeer(id string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE peers SET soft_deleted = TRUE, deleted_at = NOW() WHERE id = $1`, id)
+	return err
+}
+
+// HardDeletePeer permanently removes a peer from the database.
+func (pg *PostgresDB) HardDeletePeer(id string) error {
+	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM peers WHERE id = $1`, id)
+	return err
+}
+
+// ListPeers returns all peers, optionally including soft-deleted ones.
+func (pg *PostgresDB) ListPeers(includeDeleted bool) ([]*Peer, error) {
+	query := `SELECT ` + peerColumns + ` FROM peers`
+	if !includeDeleted {
+		query += ` WHERE soft_deleted = FALSE`
+	}
+	query += ` ORDER BY id`
+
+	rows, err := pg.pool.Query(pg.ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("db: ListPeers: %w", err)
+	}
+	defer rows.Close()
+
+	var peers []*Peer
+	for rows.Next() {
+		p, err := scanPeer(rows)
+		if err != nil {
+			return nil, fmt.Errorf("db: ListPeers scan: %w", err)
+		}
+		peers = append(peers, p)
+	}
+	return peers, rows.Err()
+}
+
+// GetPeerCount returns total and online peer counts.
+func (pg *PostgresDB) GetPeerCount() (total int, online int, err error) {
+	err = pg.pool.QueryRow(pg.ctx,
+		`SELECT COUNT(*) FROM peers WHERE soft_deleted = FALSE`).Scan(&total)
+	if err != nil {
+		return 0, 0, err
+	}
+	err = pg.pool.QueryRow(pg.ctx,
+		`SELECT COUNT(*) FROM peers WHERE soft_deleted = FALSE AND status = 'ONLINE'`).Scan(&online)
+	return total, online, err
+}
+
+// UpdatePeerStatus updates a peer's status and IP, plus last_online timestamp.
+func (pg *PostgresDB) UpdatePeerStatus(id string, status string, ip string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE peers SET status = $1, ip = $2, last_online = NOW() WHERE id = $3`,
+		status, ip, id)
+	return err
+}
+
+// SetAllOffline marks all peers as OFFLINE. Called at server startup.
+func (pg *PostgresDB) SetAllOffline() error {
+	_, err := pg.pool.Exec(pg.ctx, `UPDATE peers SET status = 'OFFLINE'`)
+	return err
+}
+
+// ── Ban System ────────────────────────────────────────────────────────
+
+// BanPeer bans a specific peer by ID.
+func (pg *PostgresDB) BanPeer(id string, reason string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE peers SET banned = TRUE, ban_reason = $1, banned_at = NOW() WHERE id = $2`,
+		reason, id)
+	return err
+}
+
+// UnbanPeer removes the ban from a peer.
+func (pg *PostgresDB) UnbanPeer(id string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE peers SET banned = FALSE, ban_reason = '', banned_at = NULL WHERE id = $1`, id)
+	return err
+}
+
+// IsPeerBanned checks if a peer is banned.
+func (pg *PostgresDB) IsPeerBanned(id string) (bool, error) {
+	var banned bool
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT banned FROM peers WHERE id = $1`, id).Scan(&banned)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	return banned, err
+}
+
+// ── ID Change ─────────────────────────────────────────────────────────
+
+// ChangePeerID changes a peer's ID and records it in history.
+// Uses a PostgreSQL transaction with row-level locking.
+func (pg *PostgresDB) ChangePeerID(oldID, newID string) error {
+	tx, err := pg.pool.Begin(pg.ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(pg.ctx)
+
+	// Check new ID doesn't exist
+	var count int
+	if err := tx.QueryRow(pg.ctx,
+		`SELECT COUNT(*) FROM peers WHERE id = $1`, newID).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("db: peer ID %q already exists", newID)
+	}
+
+	// Lock and copy the old row with FOR UPDATE
+	_, err = tx.Exec(pg.ctx, `
+		INSERT INTO peers (id, uuid, pk, ip, "user", hostname, os, version,
+		                    status, nat_type, last_online, created_at,
+		                    disabled, banned, ban_reason, banned_at,
+		                    soft_deleted, deleted_at, note, tags, heartbeat_seq)
+		SELECT $1, uuid, pk, ip, "user", hostname, os, version,
+		       status, nat_type, last_online, created_at,
+		       disabled, banned, ban_reason, banned_at,
+		       soft_deleted, deleted_at, note, tags, heartbeat_seq
+		FROM peers WHERE id = $2 FOR UPDATE`, newID, oldID)
+	if err != nil {
+		return fmt.Errorf("db: ChangePeerID insert: %w", err)
+	}
+
+	if _, err := tx.Exec(pg.ctx, `DELETE FROM peers WHERE id = $1`, oldID); err != nil {
+		return fmt.Errorf("db: ChangePeerID delete: %w", err)
+	}
+
+	if _, err := tx.Exec(pg.ctx,
+		`INSERT INTO id_change_history (old_id, new_id) VALUES ($1, $2)`,
+		oldID, newID); err != nil {
+		return fmt.Errorf("db: ChangePeerID history: %w", err)
+	}
+
+	return tx.Commit(pg.ctx)
+}
+
+// GetIDChangeHistory returns the ID change history for a peer.
+func (pg *PostgresDB) GetIDChangeHistory(id string) ([]*IDChangeHistory, error) {
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT old_id, new_id, changed_at, reason FROM id_change_history
+		 WHERE old_id = $1 OR new_id = $1 ORDER BY changed_at DESC`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []*IDChangeHistory
+	for rows.Next() {
+		h := &IDChangeHistory{}
+		if err := rows.Scan(&h.OldID, &h.NewID, &h.ChangedAt, &h.Reason); err != nil {
+			return nil, err
+		}
+		history = append(history, h)
+	}
+	return history, rows.Err()
+}
+
+// ── Tags ──────────────────────────────────────────────────────────────
+
+// UpdatePeerTags updates the tags field for a peer.
+func (pg *PostgresDB) UpdatePeerTags(id, tags string) error {
+	ct, err := pg.pool.Exec(pg.ctx,
+		`UPDATE peers SET tags = $1 WHERE id = $2`, tags, id)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return fmt.Errorf("peer %s not found", id)
+	}
+	return nil
+}
+
+// ListPeersByTag returns all non-deleted peers that have the given tag.
+// Uses LIKE with escaped wildcards to prevent SQL injection via pattern chars.
+func (pg *PostgresDB) ListPeersByTag(tag string) ([]*Peer, error) {
+	// Escape SQL LIKE wildcards (M1)
+	escaped := strings.NewReplacer("%", "\\%", "_", "\\_").Replace(tag)
+	pattern := "%" + escaped + "%"
+
+	rows, err := pg.pool.Query(pg.ctx, `
+		SELECT `+peerColumns+`
+		FROM peers
+		WHERE soft_deleted = FALSE AND tags LIKE $1 ESCAPE '\'
+		ORDER BY id`, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("db: ListPeersByTag: %w", err)
+	}
+	defer rows.Close()
+
+	var peers []*Peer
+	for rows.Next() {
+		p, err := scanPeer(rows)
+		if err != nil {
+			return nil, fmt.Errorf("db: ListPeersByTag scan: %w", err)
+		}
+		peers = append(peers, p)
+	}
+	return peers, rows.Err()
+}
+
+// ── Config ────────────────────────────────────────────────────────────
+
+// GetConfig retrieves a configuration value by key.
+func (pg *PostgresDB) GetConfig(key string) (string, error) {
+	var value string
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT value FROM server_config WHERE key = $1`, key).Scan(&value)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+// SetConfig sets a configuration key-value pair using UPSERT.
+func (pg *PostgresDB) SetConfig(key, value string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`INSERT INTO server_config (key, value) VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, key, value)
+	return err
+}
+
+// DeleteConfig removes a configuration key.
+func (pg *PostgresDB) DeleteConfig(key string) error {
+	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM server_config WHERE key = $1`, key)
+	return err
+}
+
+// ── User Operations ───────────────────────────────────────────────────
+
+// CreateUser inserts a new user and sets u.ID to the generated primary key.
+func (pg *PostgresDB) CreateUser(u *User) error {
+	err := pg.pool.QueryRow(pg.ctx,
+		`INSERT INTO users (username, password_hash, role, totp_secret, totp_enabled)
+		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		u.Username, u.PasswordHash, u.Role, u.TOTPSecret, u.TOTPEnabled,
+	).Scan(&u.ID)
+	if err != nil {
+		return fmt.Errorf("db: CreateUser: %w", err)
+	}
+	return nil
+}
+
+// scanUser scans a user row. PostgreSQL uses TIMESTAMPTZ for dates, which
+// the Node.js console stores as TEXT — we convert to string representation
+// where the interface expects strings.
+func scanUser(row pgx.Row) (*User, error) {
+	u := &User{}
+	var createdAt *time.Time
+	var lastLogin *time.Time
+
+	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role,
+		&u.TOTPSecret, &u.TOTPEnabled, &createdAt, &lastLogin)
+	if err != nil {
+		return nil, err
+	}
+
+	if createdAt != nil {
+		u.CreatedAt = createdAt.Format("2006-01-02 15:04:05")
+	}
+	if lastLogin != nil {
+		u.LastLogin = lastLogin.Format("2006-01-02 15:04:05")
+	}
+
+	return u, nil
+}
+
+// GetUser returns a user by username, or nil if not found.
+func (pg *PostgresDB) GetUser(username string) (*User, error) {
+	row := pg.pool.QueryRow(pg.ctx,
+		`SELECT id, username, password_hash, role, totp_secret, totp_enabled,
+		        created_at, last_login FROM users WHERE username = $1`, username)
+	u, err := scanUser(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return u, err
+}
+
+// GetUserByID returns a user by numeric ID, or nil if not found.
+func (pg *PostgresDB) GetUserByID(id int64) (*User, error) {
+	row := pg.pool.QueryRow(pg.ctx,
+		`SELECT id, username, password_hash, role, totp_secret, totp_enabled,
+		        created_at, last_login FROM users WHERE id = $1`, id)
+	u, err := scanUser(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return u, err
+}
+
+// ListUsers returns all users.
+func (pg *PostgresDB) ListUsers() ([]*User, error) {
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT id, username, password_hash, role, totp_secret, totp_enabled,
+		        created_at, last_login FROM users ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("db: ListUsers: %w", err)
+	}
+	defer rows.Close()
+
+	var users []*User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
+// UpdateUser updates a user's mutable fields.
+func (pg *PostgresDB) UpdateUser(u *User) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE users SET password_hash = $1, role = $2, totp_secret = $3, totp_enabled = $4
+		 WHERE id = $5`,
+		u.PasswordHash, u.Role, u.TOTPSecret, u.TOTPEnabled, u.ID)
+	return err
+}
+
+// DeleteUser removes a user by ID.
+func (pg *PostgresDB) DeleteUser(id int64) error {
+	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM users WHERE id = $1`, id)
+	return err
+}
+
+// UpdateUserLogin updates the last_login timestamp for a user.
+func (pg *PostgresDB) UpdateUserLogin(id int64) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE users SET last_login = NOW() WHERE id = $1`, id)
+	return err
+}
+
+// UserCount returns the total number of users.
+func (pg *PostgresDB) UserCount() (int, error) {
+	var count int
+	err := pg.pool.QueryRow(pg.ctx, `SELECT COUNT(*) FROM users`).Scan(&count)
+	return count, err
+}
+
+// ── API Key Operations ────────────────────────────────────────────────
+
+// CreateAPIKey inserts a new API key and sets k.ID.
+func (pg *PostgresDB) CreateAPIKey(k *APIKey) error {
+	var expiresAt *time.Time
+	if k.ExpiresAt != "" {
+		t, err := time.Parse("2006-01-02 15:04:05", k.ExpiresAt)
+		if err == nil {
+			expiresAt = &t
+		}
+	}
+
+	err := pg.pool.QueryRow(pg.ctx,
+		`INSERT INTO api_keys (key_hash, key_prefix, name, role, expires_at)
+		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		k.KeyHash, k.KeyPrefix, k.Name, k.Role, expiresAt,
+	).Scan(&k.ID)
+	if err != nil {
+		return fmt.Errorf("db: CreateAPIKey: %w", err)
+	}
+	return nil
+}
+
+// scanAPIKey scans an API key row.
+func scanAPIKey(row pgx.Row) (*APIKey, error) {
+	k := &APIKey{}
+	var createdAt *time.Time
+	var expiresAt *time.Time
+	var lastUsed *time.Time
+
+	err := row.Scan(&k.ID, &k.KeyHash, &k.KeyPrefix, &k.Name, &k.Role,
+		&createdAt, &expiresAt, &lastUsed)
+	if err != nil {
+		return nil, err
+	}
+
+	if createdAt != nil {
+		k.CreatedAt = createdAt.Format("2006-01-02 15:04:05")
+	}
+	if expiresAt != nil {
+		k.ExpiresAt = expiresAt.Format("2006-01-02 15:04:05")
+	}
+	if lastUsed != nil {
+		k.LastUsed = lastUsed.Format("2006-01-02 15:04:05")
+	}
+
+	return k, nil
+}
+
+// GetAPIKeyByHash returns an API key by its SHA-256 hash, or nil if not found.
+func (pg *PostgresDB) GetAPIKeyByHash(keyHash string) (*APIKey, error) {
+	row := pg.pool.QueryRow(pg.ctx,
+		`SELECT id, key_hash, key_prefix, name, role, created_at, expires_at, last_used
+		 FROM api_keys WHERE key_hash = $1`, keyHash)
+	k, err := scanAPIKey(row)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	return k, err
+}
+
+// ListAPIKeys returns all API keys.
+func (pg *PostgresDB) ListAPIKeys() ([]*APIKey, error) {
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT id, key_hash, key_prefix, name, role, created_at, expires_at, last_used
+		 FROM api_keys ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("db: ListAPIKeys: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []*APIKey
+	for rows.Next() {
+		k, err := scanAPIKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+// DeleteAPIKey removes an API key by ID.
+func (pg *PostgresDB) DeleteAPIKey(id int64) error {
+	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM api_keys WHERE id = $1`, id)
+	return err
+}
+
+// TouchAPIKey updates the last_used timestamp for an API key.
+func (pg *PostgresDB) TouchAPIKey(id int64) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE api_keys SET last_used = NOW() WHERE id = $1`, id)
+	return err
+}
+
+// ── Device Token Operations (Dual Key System) ─────────────────────────
+
+// CreateDeviceToken creates a new device enrollment token.
+func (pg *PostgresDB) CreateDeviceToken(t *DeviceToken) error {
+	var expiresAt *time.Time
+	if t.ExpiresAt != nil {
+		expiresAt = t.ExpiresAt
+	}
+
+	err := pg.pool.QueryRow(pg.ctx, `
+		INSERT INTO device_tokens (token_hash, token_prefix, name, peer_id, status, max_uses, use_count, expires_at, created_by, note)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id, created_at`,
+		t.TokenHash, t.Token[:8], t.Name, t.PeerID, t.Status, t.MaxUses, t.UseCount, expiresAt, t.CreatedBy, t.Note,
+	).Scan(&t.ID, &t.CreatedAt)
+	return err
+}
+
+// GetDeviceToken returns a device token by ID.
+func (pg *PostgresDB) GetDeviceToken(id int64) (*DeviceToken, error) {
+	return pg.getDeviceTokenByQuery(`SELECT id, token_hash, token_prefix, name, peer_id, status, max_uses, use_count, 
+		created_at, expires_at, revoked_at, last_used_at, created_by, note 
+		FROM device_tokens WHERE id = $1`, id)
+}
+
+// GetDeviceTokenByHash returns a device token by its hash.
+func (pg *PostgresDB) GetDeviceTokenByHash(tokenHash string) (*DeviceToken, error) {
+	return pg.getDeviceTokenByQuery(`SELECT id, token_hash, token_prefix, name, peer_id, status, max_uses, use_count, 
+		created_at, expires_at, revoked_at, last_used_at, created_by, note 
+		FROM device_tokens WHERE token_hash = $1`, tokenHash)
+}
+
+// GetDeviceTokenByPeerID returns the token bound to a peer.
+func (pg *PostgresDB) GetDeviceTokenByPeerID(peerID string) (*DeviceToken, error) {
+	return pg.getDeviceTokenByQuery(`SELECT id, token_hash, token_prefix, name, peer_id, status, max_uses, use_count, 
+		created_at, expires_at, revoked_at, last_used_at, created_by, note 
+		FROM device_tokens WHERE peer_id = $1 AND status = 'active'`, peerID)
+}
+
+// getDeviceTokenByQuery is a helper function to scan a device token row.
+func (pg *PostgresDB) getDeviceTokenByQuery(query string, args ...interface{}) (*DeviceToken, error) {
+	t := &DeviceToken{}
+	var expiresAt, revokedAt, lastUsedAt *time.Time
+
+	err := pg.pool.QueryRow(pg.ctx, query, args...).Scan(
+		&t.ID, &t.TokenHash, &t.Token, &t.Name, &t.PeerID, &t.Status, &t.MaxUses, &t.UseCount,
+		&t.CreatedAt, &expiresAt, &revokedAt, &lastUsedAt, &t.CreatedBy, &t.Note)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	t.ExpiresAt = expiresAt
+	t.RevokedAt = revokedAt
+	t.LastUsedAt = lastUsedAt
+	return t, nil
+}
+
+// ListDeviceTokens returns all device tokens.
+func (pg *PostgresDB) ListDeviceTokens(includeRevoked bool) ([]*DeviceToken, error) {
+	query := `SELECT id, token_hash, token_prefix, name, peer_id, status, max_uses, use_count, 
+		created_at, expires_at, revoked_at, last_used_at, created_by, note 
+		FROM device_tokens`
+	if !includeRevoked {
+		query += ` WHERE status != 'revoked'`
+	}
+	query += ` ORDER BY id DESC`
+
+	rows, err := pg.pool.Query(pg.ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("db: ListDeviceTokens: %w", err)
+	}
+	defer rows.Close()
+
+	var tokens []*DeviceToken
+	for rows.Next() {
+		t := &DeviceToken{}
+		var expiresAt, revokedAt, lastUsedAt *time.Time
+
+		if err := rows.Scan(&t.ID, &t.TokenHash, &t.Token, &t.Name, &t.PeerID, &t.Status,
+			&t.MaxUses, &t.UseCount, &t.CreatedAt, &expiresAt, &revokedAt, &lastUsedAt,
+			&t.CreatedBy, &t.Note); err != nil {
+			return nil, err
+		}
+
+		t.ExpiresAt = expiresAt
+		t.RevokedAt = revokedAt
+		t.LastUsedAt = lastUsedAt
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// UpdateDeviceToken updates a device token.
+func (pg *PostgresDB) UpdateDeviceToken(t *DeviceToken) error {
+	_, err := pg.pool.Exec(pg.ctx, `
+		UPDATE device_tokens SET name=$1, peer_id=$2, status=$3, max_uses=$4, expires_at=$5, note=$6
+		WHERE id=$7`, t.Name, t.PeerID, t.Status, t.MaxUses, t.ExpiresAt, t.Note, t.ID)
+	return err
+}
+
+// RevokeDeviceToken revokes a device token by ID.
+func (pg *PostgresDB) RevokeDeviceToken(id int64) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE device_tokens SET status='revoked', revoked_at=NOW() WHERE id=$1`, id)
+	return err
+}
+
+// BindTokenToPeer binds a token to a peer ID after successful enrollment.
+func (pg *PostgresDB) BindTokenToPeer(tokenHash, peerID string) error {
+	_, err := pg.pool.Exec(pg.ctx, `
+		UPDATE device_tokens SET peer_id=$1, status='active', last_used_at=NOW()
+		WHERE token_hash=$2 AND status='pending'`, peerID, tokenHash)
+	return err
+}
+
+// IncrementTokenUse increments the use count for a token.
+func (pg *PostgresDB) IncrementTokenUse(tokenHash string) error {
+	_, err := pg.pool.Exec(pg.ctx, `
+		UPDATE device_tokens SET use_count = use_count + 1, last_used_at=NOW()
+		WHERE token_hash=$1`, tokenHash)
+	return err
+}
+
+// ValidateToken checks if a token is valid for enrollment.
+// Returns the token if valid, nil if invalid/expired/revoked.
+func (pg *PostgresDB) ValidateToken(tokenHash string) (*DeviceToken, error) {
+	t, err := pg.GetDeviceTokenByHash(tokenHash)
+	if err != nil {
+		return nil, err
+	}
+	if t == nil {
+		return nil, nil // Token not found
+	}
+
+	// Check status
+	if t.Status == TokenStatusRevoked {
+		return nil, nil
+	}
+
+	// Check expiration
+	if t.ExpiresAt != nil && time.Now().After(*t.ExpiresAt) {
+		// Mark as expired if not already
+		pg.pool.Exec(pg.ctx,
+			`UPDATE device_tokens SET status='expired' WHERE id=$1 AND status NOT IN ('revoked', 'expired')`, t.ID)
+		return nil, nil
+	}
+
+	// Check max uses
+	if t.MaxUses > 0 && t.UseCount >= t.MaxUses {
+		return nil, nil // Exceeded max uses
+	}
+
+	return t, nil
+}
+
+// CleanupExpiredTokens marks expired tokens as expired.
+func (pg *PostgresDB) CleanupExpiredTokens() (int64, error) {
+	tag, err := pg.pool.Exec(pg.ctx, `
+		UPDATE device_tokens SET status='expired' 
+		WHERE status='pending' AND expires_at IS NOT NULL AND expires_at < NOW()`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ── LISTEN/NOTIFY ─────────────────────────────────────────────────────
+
+// OnNotify registers a callback for PostgreSQL LISTEN/NOTIFY events.
+// This enables real-time event push between multiple server instances
+// sharing the same database.
+func (pg *PostgresDB) OnNotify(fn func(channel, payload string)) {
+	pg.notifyFunc = fn
+}
+
+// Notify sends a NOTIFY event on the given channel with the given payload.
+// Other server instances listening on the same channel will receive it.
+func (pg *PostgresDB) Notify(channel, payload string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`SELECT pg_notify($1, $2)`, channel, payload)
+	return err
+}
+
+// ListenLoop starts listening for notifications on the given channels.
+// This blocks and should be called in a goroutine. It reconnects on error.
+// Call with context cancellation to stop.
+func (pg *PostgresDB) ListenLoop(ctx context.Context, channels ...string) {
+	for {
+		err := pg.listenOnce(ctx, channels...)
+		if ctx.Err() != nil {
+			return // context cancelled, clean exit
+		}
+		log.Printf("[db] PostgreSQL LISTEN error, reconnecting in 5s: %v", err)
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// listenOnce acquires a dedicated connection and listens until error or cancel.
+func (pg *PostgresDB) listenOnce(ctx context.Context, channels ...string) error {
+	conn, err := pg.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn for LISTEN: %w", err)
+	}
+	defer conn.Release()
+
+	for _, ch := range channels {
+		// LISTEN requires raw SQL (not parameterized).
+		// Channel names are validated to be simple identifiers.
+		if !isValidChannel(ch) {
+			return fmt.Errorf("invalid channel name: %q", ch)
+		}
+		if _, err := conn.Exec(ctx, "LISTEN "+ch); err != nil {
+			return fmt.Errorf("LISTEN %s: %w", ch, err)
+		}
+	}
+
+	log.Printf("[db] PostgreSQL LISTEN on channels: %s", strings.Join(channels, ", "))
+
+	for {
+		notification, err := conn.Conn().WaitForNotification(ctx)
+		if err != nil {
+			return err
+		}
+		if pg.notifyFunc != nil {
+			pg.notifyFunc(notification.Channel, notification.Payload)
+		}
+	}
+}
+
+// isValidChannel checks that a channel name is a safe SQL identifier.
+func isValidChannel(ch string) bool {
+	if len(ch) == 0 || len(ch) > 63 {
+		return false
+	}
+	for _, c := range ch {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// Ensure PostgresDB implements the Database interface at compile time.
+var _ Database = (*PostgresDB)(nil)
+
+// scanPeerRows is used by collectRows helper to avoid code duplication.
+// Note: We intentionally don't use pgx.CollectRows here because scanPeer
+// handles our custom nullable-to-Peer-field mapping consistently.
+func scanPeerRows(rows pgx.Rows) ([]*Peer, error) {
+	var peers []*Peer
+	for rows.Next() {
+		p, err := scanPeer(rows)
+		if err != nil {
+			return nil, err
+		}
+		peers = append(peers, p)
+	}
+	return peers, rows.Err()
+}
+
+// Pool returns the underlying pgxpool.Pool for advanced usage
+// (e.g., migration tools, raw queries). Not part of the Database interface.
+func (pg *PostgresDB) Pool() *pgxpool.Pool {
+	return pg.pool
+}

@@ -5,50 +5,54 @@
 
 ---
 
-## 📊 Stan Projektu (aktualizacja: 2026-02-22)
+## 📊 Stan Projektu (aktualizacja: 2026-03-01)
 
-### Wersja Skryptów ALL-IN-ONE (v2.3.0)
+### Wersja Skryptów ALL-IN-ONE (v2.4.0)
 
 | Plik | Wersja | Platforma | Status |
 |------|--------|-----------|--------|
-| `betterdesk.sh` | v2.3.0 | Linux | ✅ ALL-IN-ONE + Node.js only + SSL config + Auto mode |
-| `betterdesk.ps1` | v2.3.0 | Windows | ✅ ALL-IN-ONE + Node.js only + SSL config + Auto mode |
-| `betterdesk-docker.sh` | v2.1.0 | Docker | ✅ Interaktywny ALL-IN-ONE + Migration |
+| `betterdesk.sh` | v2.4.0 | Linux | ✅ ALL-IN-ONE + Node.js only + SSL config + PostgreSQL + Auto mode |
+| `betterdesk.ps1` | v2.4.0 | Windows | ✅ ALL-IN-ONE + Node.js only + SSL config + PostgreSQL + Auto mode |
+| `betterdesk-docker.sh` | v2.4.0 | Docker | ✅ Interaktywny ALL-IN-ONE + PostgreSQL + Migration |
 
 ### Konsole Webowe
 
 | Typ | Folder | Status | Opis |
 |-----|--------|--------|------|
 | **Node.js** | `web-nodejs/` | ✅ Aktywna (jedyna) | Express.js, EJS, better-sqlite3, CSRF, TOTP 2FA |
-| **Flask (deprecated)** | `web/` | ⚠️ Deprecated | Python, Jinja2, sqlite3 - nie instalowane od v2.3.0 |
+| **Flask** | `archive/web-flask/` | 📦 Archived | Python, Jinja2 - przeniesiony do archiwum |
 
-### Binarki Serwera
+### Serwer BetterDesk (Go)
 
-| Platforma | Plik | Wersja | Status | Data |
-|-----------|------|--------|--------|------|
-| Linux x86_64 | `hbbs-patch-v2/hbbs-linux-x86_64` | v2.1.3 | ✅ Przetestowana | 2026-02-23 |
-| Linux x86_64 | `hbbs-patch-v2/hbbr-linux-x86_64` | v2.1.3 | ✅ Przetestowana | 2026-02-23 |
-| Windows x86_64 | `hbbs-patch-v2/hbbs-windows-x86_64.exe` | v2.1.3 | ✅ Przetestowana | 2026-02-23 |
-| Windows x86_64 | `hbbs-patch-v2/hbbr-windows-x86_64.exe` | v2.1.3 | ✅ Przetestowana | 2026-02-23 |
+| Komponent | Folder | Status | Opis |
+|-----------|--------|--------|------|
+| **Go Server** | `betterdesk-server/` | ✅ Production-ready | Single binary replacing hbbs+hbbr, ~20K LOC Go |
+| **Rust (archived)** | `archive/hbbs-patch-v2/` | 📦 Archived | Patched Rust binaries v2.1.3 - przeniesione do archiwum |
 
-### Sumy Kontrolne SHA256
+### Serwer Go — Binaries (NIE są w repozytorium, kompilowane lokalnie)
 
-```
-Linux:
-  hbbs: E7946CDE57CEF1AB1FC3D8669AA0FBD7DC3BBCE0233B8071D981ED430B1F4328
-  hbbr: AD10925081B39A0A44C4460928935CF61D4F5335DC34A11E6942CC21E17B7B05
-
-Windows:
-  hbbs: B790FA44CAC7482A057ED322412F6D178FB33F3B05327BFA753416E9879BD62F
-  hbbr: 368C71E8D3AEF4C5C65177FBBBB99EA045661697A89CB7C2A703759C575E8E9F
-```
+| Platforma | Plik | Status |
+|-----------|------|--------|
+| Linux x86_64 | `betterdesk-server-linux-amd64` | Kompiluj lokalnie: `go build` |
+| Linux ARM64 | `betterdesk-server-linux-arm64` | Kompiluj lokalnie: `GOARCH=arm64 go build` |
+| Windows x86_64 | `betterdesk-server.exe` | Kompiluj lokalnie: `GOOS=windows go build` |
 
 ---
 
-## 🚀 Skrypty ALL-IN-ONE (v2.3.0)
+## 🚀 Skrypty ALL-IN-ONE (v2.4.0)
 
-### Nowe funkcje w v2.3.0
+### Nowe funkcje w v2.4.0
 
+- ✅ **PostgreSQL support** - full PostgreSQL database support for Go server and Node.js console
+- ✅ **SQLite → PostgreSQL migration** - built-in migration tool (menu option M/P)
+- ✅ **Database type selection** - choose SQLite or PostgreSQL during installation
+- ✅ **Docker PostgreSQL** - PostgreSQL container with health checks in docker-compose
+- ✅ **Connection pooling** - pgxpool with configurable limits via DSN params
+- ✅ **LISTEN/NOTIFY** - real-time event push between Go server instances
+
+### Previous versions
+
+#### v2.3.0
 - ✅ **Flask removed** - Flask console deprecated, Node.js is now the only option
 - ✅ **SSL certificate configuration** - new menu option C for SSL/TLS setup (Let's Encrypt, custom cert, self-signed)
 - ✅ **Security audit fixes** - CSRF protection, session fixation prevention, timing-safe auth, WebSocket auth
@@ -57,8 +61,6 @@ Windows:
 - ✅ **Address book sync** - full AB storage with address_books table
 - ✅ **Operator role** - separate admin/operator roles with different permissions
 - ✅ **Desktop connect button** - connect to devices from browser (RustDesk URI handler)
-
-### Previous versions
 
 #### v2.2.1
 - ✅ Node.js .env config fixes, admin password fixes, systemd fixes
@@ -90,6 +92,7 @@ Windows:
 9. 🗑️ **Uninstall** - full removal
 10. 🔒 **SSL config** - configure SSL/TLS certificates (NEW in v2.3.0)
 11. 🔄 **Migrate** - migrate from existing RustDesk Docker (Docker script only)
+12. 🔀 **Database migration** - migrate databases between Rust/Node.js/Go/PostgreSQL (NEW)
 
 ### Użycie
 
@@ -157,14 +160,35 @@ $env:API_PORT = "21114"
 
 ```
 Rustdesk-FreeConsole/
-├── web/                     # Flask web console (deprecated)
+├── betterdesk-server/       # Go server (replacing hbbs+hbbr) — ~20K LOC
+│   ├── main.go              # Entry point, flags, boot
+│   ├── signal/              # Signal server (UDP/TCP/WS)
+│   ├── relay/               # Relay server (TCP/WS)
+│   ├── api/                 # HTTP REST API + auth handlers
+│   ├── crypto/              # Ed25519 keys, NaCl secure TCP, addr codec
+│   ├── db/                  # Database interface + SQLite impl (future: PostgreSQL)
+│   ├── config/              # Configuration + constants
+│   ├── codec/               # Wire protocol framing
+│   ├── peer/                # Concurrent in-memory peer map
+│   ├── security/            # IP/ID/CIDR blocklist
+│   ├── auth/                # JWT, PBKDF2, roles, TOTP
+│   ├── ratelimit/           # Bandwidth + conn + IP rate limit
+│   ├── metrics/             # Prometheus exposition
+│   ├── audit/               # Ring-buffer audit log
+│   ├── events/              # Pub/sub event bus
+│   ├── logging/             # Text/JSON structured logging
+│   ├── admin/               # TCP management console
+│   ├── reload/              # Hot-reload (SIGHUP)
+│   ├── proto/               # Generated protobuf (rendezvous + message)
+│   └── tools/               # Migration utilities
 ├── web-nodejs/              # Node.js web console (active)
-├── hbbs-patch-v2/           # Enhanced server binaries (v2.1.2)
-│   ├── hbbs-linux-x86_64    # Signal server Linux
-│   ├── hbbr-linux-x86_64    # Relay server Linux  
-│   ├── hbbs-windows-x86_64.exe  # Signal server Windows
-│   ├── hbbr-windows-x86_64.exe  # Relay server Windows
-│   └── src/                 # Source code for modifications
+├── web/                     # Flask web console (deprecated)
+├── hbbs-patch-v2/           # Legacy Rust server binaries (v2.1.3)
+│   ├── hbbs-linux-x86_64    # Signal server Linux (Rust)
+│   ├── hbbr-linux-x86_64    # Relay server Linux (Rust)
+│   ├── hbbs-windows-x86_64.exe  # Signal server Windows (Rust)
+│   ├── hbbr-windows-x86_64.exe  # Relay server Windows (Rust)
+│   └── src/                 # Rust source code modifications
 ├── docs/                    # Documentation (English)
 ├── dev_modules/             # Development & testing utilities
 ├── archive/                 # Archived files (not in git)
@@ -177,12 +201,31 @@ Rustdesk-FreeConsole/
 
 | Port | Usługa | Opis |
 |------|--------|------|
-| 21114 | HTTP API | HBBS HTTP API (Rust) |
-| 21115 | TCP | NAT type test |
-| 21116 | TCP/UDP | ID Server (client registration) |
-| 21117 | TCP | Relay Server |
+| 21114 | HTTP API | BetterDesk Server REST API (Go/Rust) |
+| 21115 | TCP | NAT type test + OnlineRequest |
+| 21116 | TCP/UDP | Signal Server (client registration, punch hole) |
+| 21117 | TCP | Relay Server (bidirectional stream) |
+| 21118 | WS | WebSocket Signal (signal port + 2) |
+| 21119 | WS | WebSocket Relay (relay port + 2) |
 | 5000 | HTTP | Web Console (admin panel, LAN) |
 | 21121 | TCP | RustDesk Client API (WAN-facing, Node.js) |
+
+### Go Server — Architecture Flow
+
+```
+RustDesk Client
+  ├── UDP (:21116) → signal/serveUDP → RegisterPeer, PunchHole, RequestRelay
+  ├── TCP (:21116) → signal/serveTCP → NaCl KeyExchange → secure channel
+  ├── WS  (:21118) → signal/serveWS → websocket signal
+  ├── TCP (:21117) → relay/serveTCP → UUID pairing → io.Copy bidirectional
+  ├── WS  (:21119) → relay/serveWS → websocket relay
+  └── TCP (:21115) → signal/serveNAT → TestNatRequest, OnlineRequest
+
+Console/Admin
+  ├── HTTP (:21114) → api/server → JWT/API-key → REST handlers
+  ├── TCP  (admin)  → admin/server → CLI management
+  └── WS   (:21114) → events/bus → real-time push
+```
 
 ---
 
@@ -284,11 +327,68 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 43. [x] **Web Remote Client fixed** - 5 Critical, 2 High, 3 Low bugs fixed (video_received ack, autoplay, modifier keys, Opus audio, timestamps, O(n²) buffer, seeking, mouse, cursor, i18n)
 
 ### 🔜 Do Zrobienia (priorytety)
-1. [ ] Kompilacja binarek v3.0.0 z nowymi plikami źródłowymi
-2. [ ] WebSocket real-time push dla statusu
-3. [ ] Dodać testy jednostkowe dla HTTP API
-4. [ ] Integracja id_change.rs z rendezvous_server_core.rs
-5. [ ] Deploy v2.3.0 to production and test all new features
+
+#### Go Server — Security Fixes (Phase 1) ✅ COMPLETED 2026-02-28
+1. [x] **H1**: Walidacja `new_id` w API `POST /api/peers/{id}/change-id` — `peerIDRegexp` validation added
+2. [x] **H3**: Rate-limiting na `POST /api/auth/login/2fa` — `loginLimiter.Allow(clientIP)` + audit log
+3. [x] **H4**: Short TTL (5min) dla partial 2FA token — `GenerateWithTTL()` method added to JWTManager
+4. [x] **M1**: Escapowanie `%`/`_` w `ListPeersByTag` SQL LIKE pattern — `ESCAPE '\'` clause added
+5. [x] **M4**: Rate-limiting na TCP signal connections — `limiter.Allow(host)` in `serveTCP()`
+6. [x] **M6**: Walidacja klucza w config endpoints — `configKeyRegexp` (1-64 alnum, dots, hyphens)
+
+#### Go Server — Protocol Fixes (Phase 2) ✅ COMPLETED 2026-02-28
+7. [x] **M8**: `ConfigUpdate` w `TestNatResponse` (relay_servers, rendezvous_servers) — klienty ≥1.3.x
+8. [x] **M2**: TTL/max-size dla `tcpPunchConns` sync.Map (DDoS protection) — 2min TTL + 10K cap
+9. [x] **M3**: WebSocket origin validation (signal + relay) — `WS_ALLOWED_ORIGINS` env var
+10. [x] **M7**: Relay idle timeout (io.Copy stale sessions) — `idleTimeoutConn` wrapper
+
+#### Go Server — TLS Everywhere (Phase 3) ✅ COMPLETED 2026-02-28
+11. [x] TLS wrapper for TCP signal (:21116) via `config.DualModeListener` (auto-detect plain/TLS)
+12. [x] TLS wrapper for TCP relay (:21117) via `config.DualModeListener` (auto-detect plain/TLS)
+13. [x] WSS (WebSocket Secure) for signal (:21118) and relay (:21119) via `ListenAndServeTLS`
+14. [x] Fallback: accept both plain and TLS on same ports (first-byte 0x16 detection)
+15. [x] Config: `--tls-signal`, `--tls-relay` flags + `TLS_SIGNAL=Y`, `TLS_RELAY=Y` env vars
+
+#### Go Server — PostgreSQL Integration (Phase 4) ✅ COMPLETED 2026-02-28
+16. [x] `db/postgres.go` — full `Database` interface implementation using `pgx/v5` (pgxpool, 25+ methods)
+17. [x] `db/open.go` — detect `postgres://` DSN and dispatch to PostgreSQL driver
+18. [x] Config: `DB_URL=postgres://user:pass@host:5432/betterdesk` env var support (already in LoadEnv)
+19. [x] Connection pooling with `pgxpool` (configurable max conns via `pool_max_conns` DSN param)
+20. [x] Replace `sync.RWMutex` with PostgreSQL row-level locking (tx + FOR UPDATE in ChangePeerID)
+21. [x] `LISTEN/NOTIFY` for real-time event push between instances (ListenLoop, Notify, OnNotify)
+22. [x] PostgreSQL schema with proper types (BOOLEAN, BYTEA, TIMESTAMPTZ, BIGSERIAL)
+23. [ ] Integration tests for PostgreSQL backend (requires live PostgreSQL instance)
+
+#### Go Server — Migration Tool (Phase 5) ✅ COMPLETED 2026-03-01
+24. [x] `tools/migrate/` — SQLite → PostgreSQL migration binary (5 modes: rust2go, sqlite2pg, pg2sqlite, nodejs2go, backup)
+25. [x] Support migrating from original RustDesk `db_v2.sqlite3` schema (`peer` table → `peers`) — auto-detection
+26. [x] Support migrating from BetterDesk Go schema (full schema with users, api_keys, etc.) — sqlite2pg/pg2sqlite
+27. [x] Support migrating Node.js console tables (peer → peers, users → users) — nodejs2go mode
+28. [x] Preserve Ed25519 keys, UUIDs, ID history, bans, tags — full data preservation
+29. [x] Reverse migration: PostgreSQL → SQLite (pg2sqlite mode)
+30. [x] Integration with ALL-IN-ONE scripts (betterdesk.sh / betterdesk.ps1) — menu option M in both scripts
+
+#### Node.js Console
+31. [ ] Kompilacja binarek v3.0.0 z nowymi plikami źródłowymi (Rust legacy)
+32. [ ] WebSocket real-time push dla statusu
+33. [ ] Dodać testy jednostkowe dla HTTP API
+34. [ ] Deploy v2.3.0 to production and test all new features
+
+#### Node.js Console — Recent Changes (deployed 2026-02-28)
+35. [x] **RustDesk Client API v2.0.0** — 3 phases: heartbeat/sysinfo/peers, audit/conn/file/alarm, groups/strategies
+36. [x] **Security audit** — H-1 (rate limiter IP spoofing), H-2/H-3 (device verification), M-4/M-5/M-6 (validation)
+37. [x] **Device detail panel** — Hardware tab (sysinfo), Metrics tab (live bars + history charts)
+38. [x] **Copy ID fix** — selector `.device-id-copy` → `.copy-btn` with stopPropagation
+39. [x] **22 new i18n keys** — EN + PL translations for device_detail section
+
+#### Go Server — E2E Encryption Fix (Phase 6) ✅ COMPLETED 2026-03-01
+40. [x] **E2E handshake**: Removed spurious `RelayResponse` confirmation from `startRelay()` (was breaking `secure_connection()` handshake)
+41. [x] **SignIdPk NaCl format**: Fixed `sendRelayResponse` to use `SignIdPk()` NaCl combined format (64-byte sig + IdPk protobuf) instead of raw PK
+42. [x] **PunchHoleResponse**: Fixed UDP PunchHoleRequest to send `PunchHoleResponse` (with pk field) instead of `PunchHoleSent`
+43. [x] **TCP PunchHole fields**: Added relay_server, nat_type, socket_addr, pk, and is_local fields to TCP PunchHole forwarding
+44. [x] **Relay confirmation removed**: Removed dead `confirmRelay()` from ws.go
+45. [x] **Verified E2E**: Debug relay confirmed `Message.SignedId` + `Message.PublicKey` handshake between peers
+46. [x] **Deployment path fix**: Discovered systemd ExecStart path mismatch (`/opt/betterdesk-go/` vs `/opt/rustdesk/`), all binaries now deployed to correct path
 
 ---
 
@@ -438,6 +538,12 @@ Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
 3. **Windows API key path** - Na Windows `.api_key` jest w katalogu roboczym, nie w `/opt/rustdesk/`
 4. ~~**Urządzenia offline**~~ ✅ ROZWIĄZANE - Docker obrazy używają teraz binarek BetterDesk
 5. ~~**"no such table: peer"**~~ ✅ ROZWIĄZANE - Dockerfile.hbbs kopiuje zmodyfikowane binarki
+6. ~~**Go Server: 2FA brute-force**~~ ✅ ROZWIĄZANE - `loginLimiter.Allow(clientIP)` + audit log (H3)
+7. ~~**Go Server: Partial 2FA token TTL**~~ ✅ ROZWIĄZANE - `GenerateWithTTL()` 5min (H4)
+8. ~~**Go Server: No TLS on signal/relay**~~ ✅ ROZWIĄZANE - `DualModeListener` z auto-detekcją TLS, WSS, flagi `--tls-signal`/`--tls-relay` (Phase 3)
+9. ~~**Go Server: ConfigUpdate missing**~~ ✅ ROZWIĄZANE - `TestNatResponse.Cu` populated with relay/rendezvous servers (M8)
+10. ~~**Go Server: SQLite only**~~ ✅ ROZWIĄZANE - PostgreSQL backend implemented (`db/postgres.go`, pgx/v5, pgxpool, LISTEN/NOTIFY) — Phase 4
+11. ~~**Go Server: E2E encryption "nieszyfrowane"**~~ ✅ ROZWIĄZANE - 4 bugs fixed in signal/handler.go + relay/server.go (SignIdPk format, PunchHoleResponse, RelayResponse removal). Root cause: deployment path mismatch (`/opt/betterdesk-go/` vs `/opt/rustdesk/`) — Phase 6
 
 ---
 
@@ -458,10 +564,65 @@ Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
 7. Przy dodawaniu nowych elementów do panelu web czy innych części projektu upewnij się że są one zgodne z systemem i18n, dodaj odpowiednie klucze do plików tłumaczeń i przetestuj działanie w obu językach, pamiętaj że wszystkie teksty powinny być tłumaczalne i nie powinno się używać hardcoded stringów w kodzie, to ułatwi utrzymanie wielojęzyczności projektu i zapewni spójność w komunikacji z użytkownikami (nie stosuj tych praktyk w przypadku elementów które nie będą bezpośrednio dostępne w interfejsie i które są zwyczajnymi funkcjami w kodzie).
 8. Przy wprowadzaniu zmian projekcie upewnij się że będą one możliwe do instalacji przez obecne skrypty ALL-IN-ONE, jeśli wprowadzasz nowe funkcje lub zmieniasz istniejące, zaktualizuj skrypty instalacyjne, aby uwzględniały te zmiany, przetestuj instalację na czystym systemie, aby upewnić się że wszystko działa poprawnie, pamiętaj że skrypty ALL-IN-ONE są kluczowym elementem projektu i muszą być aktualizowane wraz z rozwojem funkcji, to zapewni użytkownikom łatwą i bezproblemową instalację najnowszych wersji projektu. Skrypty ALL-IN-ONE powinny być aktualizowane i testowane przy każdej większej zmianie, aby zapewnić kompatybilność i łatwość instalacji dla użytkowników, pamiętaj że skrypty te są często używane przez osoby bez zaawansowaną wiedzą techniczną, więc ważne jest aby były one jak najbardziej niezawodne i łatwe w użyciu, zawsze testuj skrypty po wprowadzeniu zmian, aby upewnić się że działają poprawnie i nie powodują problemów z instalacją.
 
+9. Postaraj się rozwiązywać problemy z warningami porzy kompilacji, stosować najnowsze wersje bibliotek i narzędzi, utrzymywać kod w czystości i zgodności z aktualnymi standardami, to ułatwi utrzymanie projektu i zapewni jego długoterminową stabilność, pamiętaj że regularne aktualizacje i dbanie o jakość kodu są kluczowe dla sukcesu projektu, unikaj pozostawiania warningów bez rozwiązania, jeśli pojawią się warningi podczas kompilacji, postaraj się je rozwiązać jak najszybciej, to pomoże utrzymać kod w dobrej kondycji i zapobiegnie potencjalnym problemom w przyszłości.
+10. Przy wprowadzaniu zmian w API, upewnij się że są one kompatybilne wstecz, jeśli wprowadzasz zmiany które mogą wpłynąć na istniejące funkcje lub integracje, postaraj się zachować kompatybilność wsteczną, jeśli to nie jest możliwe, odpowiednio zaktualizuj dokumentację i poinformuj użytkowników o zmianach, pamiętaj że stabilność API jest ważna dla użytkowników i deweloperów korzystających z projektu, staraj się unikać wprowadzania breaking changes bez uzasadnienia i odpowiedniej komunikacji, to pomoże utrzymać zaufanie i satysfakcję użytkowników oraz deweloperów współpracujących nad projektem.
+11. Przy wprowadzaniu zmian w systemie statusu, upewnij się że są one dobrze przemyślane i przetestowane, jeśli wprowadzasz nowe statusy lub zmieniasz istniejące, postaraj się zachować spójność z aktualnym systemem i zapewnić jasne kryteria dla każdego statusu, przetestuj działanie nowych statusów w różnych scenariuszach, to pomoże zapewnić że system statusu jest wiarygodny i użyteczny dla użytkowników, pamiętaj że system statusu jest kluczowym elementem projektu i musi być utrzymywany w dobrej kondycji, staraj się unikać wprowadzania zmian które mogą wprowadzić niejasności lub problemy z interpretacją statusów, to pomoże utrzymać zaufanie użytkowników do systemu i zapewni jego skuteczność.
+12. Stosuj wszystkie najlepsze praktyki bezpieczeństwa przy wprowadzaniu nowych funkcji, szczególnie tych związanych z autoryzacją, uwierzytelnianiem i komunikacją sieciową, jeśli wprowadzasz nowe funkcje które mogą mieć wpływ na bezpieczeństwo, upewnij się że są one dobrze zabezpieczone i przetestowane pod kątem potencjalnych luk, pamiętaj że bezpieczeństwo jest kluczowe dla projektu i jego użytkowników, staraj się unikać wprowadzania funkcji które mogą wprowadzić ryzyko bezpieczeństwa bez odpowiednich środków zaradczych, to pomoże utrzymać zaufanie użytkowników i zapewni długoterminowy sukces projektu.
+13. Przy problemach z Dockerem, zawsze sprawdzaj czy obrazy są budowane lokalnie, unikaj używania `docker compose pull` dla obrazów betterdesk-*, jeśli napotkasz problemy z Dockerem, sprawdź DOCKER_TROUBLESHOOTING.md, to pomoże szybko zidentyfikować i rozwiązać problemy związane z Dockerem, pamiętaj że Docker jest ważnym elementem projektu i musi być utrzymywany w dobrej kondycji, staraj się unikać wprowadzania zmian które mogą wpłynąć na działanie Docker, to pomoże zapewnić stabilność i niezawodność projektu dla użytkowników korzystających z tej platformy.
+14. Jeżeli napotkasz błędy kompilacji związane z innymi komponentami bądź niezgodności z bibliotekami, zawsze sprawdzaj aktualne wersje używanych bibliotek i narzędzi, upewnij się że są one kompatybilne z kodem projektu, jeśli napotkasz błędy kompilacji, postaraj się je rozwiązać jak najszybciej, to pomoże utrzymać kod w dobrej kondycji i zapobiegnie potencjalnym problemom w przyszłości, pamiętaj że regularne aktualizacje i dbanie o jakość kodu są kluczowe dla sukcesu projektu, staraj się unikać pozostawiania błędów kompilacji bez rozwiązania, to pomoże utrzymać stabilność i niezawodność projektu dla wszystkich użytkowników i deweloperów współpracujących nad projektem.
+15. Wprowadzając funkcje powiązane z większą liczbą elementów, modułów czy funkcji staraj się je dobrze zorganizować i przemyśleć, jeśli wprowadzasz funkcje które mają wpływ na wiele części projektu, postaraj się je dobrze zorganizować i przemyśleć, to pomoże zapewnić że są one łatwe do zrozumienia i utrzymania, pamiętaj że spójność i organizacja kodu są kluczowe dla jego czytelności i jakości, staraj się unikać wprowadzania funkcji które są niejasne lub trudne do zrozumienia, to pomoże utrzymać projekt w dobrej kondycji i zapewni jego długoterminowy sukces. Przykładowo dodając nowe funkcje do klienta desktop które mają być powiązane z panelem web, upewnij się że po zakończeniu tworzenia nowego kodu wprowadzisz także zmiany w innych elementach aby funkcje były bardziej kompletne.
+16. Po utworzeniu nowych funkcji postaraj zanotować sobie procedury powiązane z ich wdrażaniem i testowaniem, to pomoże ci w przyszłości szybko przypomnieć sobie jak działają i jak je utrzymywać, pamiętaj że dokumentacja jest kluczowa dla utrzymania projektu i jego zrozumienia przez innych deweloperów, staraj się unikać pozostawiania nowych funkcji bez odpowiedniej dokumentacji, to pomoże zapewnić że są one łatwe do zrozumienia i utrzymania dla wszystkich współpracujących nad projektem. Wżnym elementem całego projektu jest nie tylko dokumentacja ale także skrypty instalacyjne pozwalające szybko i łatwo zainstalować najnowsze wersje projektu, dlatego po wprowadzeniu nowych funkcji upewnij się że są one uwzględnione w skryptach ALL-IN-ONE, to pomoże zapewnić że użytkownicy mogą łatwo korzystać z nowych funkcji bez konieczności ręcznej konfiguracji czy rozwiązywania problemów z instalacją. Pamietaj że klienci często nie są technicznie obeznani i mogą mieć trudności z ręczną instalacją, dlatego ważne jest aby skrypty instalacyjne były aktualizowane i testowane przy każdej większej zmianie, to zapewni łatwą i bezproblemową instalację najnowszych wersji projektu dla wszystkich użytkowników, niezależnie od ich poziomu zaawansowania technicznego.
+
+17. Stosuj tylko sprawdzone rozwiązania, moduły czy biblioteki do implementacji nowych funkcji, unikaj eksperymentalnych lub nieprzetestowanych rozwiązań, jeśli wprowadzasz nowe funkcje, postaraj się używać sprawdzonych i stabilnych rozwiązań, to pomoże zapewnić że są one niezawodne i bezpieczne dla użytkowników, pamiętaj że stabilność i bezpieczeństwo są kluczowe dla projektu i jego użytkowników, staraj się unikać wprowadzania funkcji które mogą wprowadzić ryzyko lub problemy bez odpowiednich środków zaradczych, to pomoże utrzymać zaufanie użytkowników i zapewni długoterminowy sukces projektu. Na bierząco aktualizuj biblioteki i narzędzia używane w projekcie, to pomoże zapewnić że korzystasz z najnowszych funkcji i poprawek bezpieczeństwa, jeśli napotkasz problemy z kompatybilnością lub błędy związane z bibliotekami, postaraj się je rozwiązać jak najszybciej, to pomoże utrzymać projekt w dobrej kondycji i zapobiegnie potencjalnym problemom w przyszłości, pamiętaj że regularne aktualizacje i dbanie o jakość kodu są kluczowe dla sukcesu projektu, staraj się unikać pozostawiania problemów związanych z bibliotekami bez rozwiązania, to pomoże utrzymać stabilność i niezawodność projektu dla wszystkich użytkowników i deweloperów współpracujących nad projektem.
+
+18. Bewzględnie eliminuj wszystkie błędy bezpieczeństwa, przestrzałe biblioteki oraz inne problemy z bezpieczeństwem, jeśli napotkasz błędy bezpieczeństwa lub przestarzałe biblioteki, postaraj się je rozwiązać jak najszybciej, to pomoże utrzymać projekt bezpieczny dla użytkowników, pamiętaj że bezpieczeństwo jest kluczowe dla projektu i jego użytkowników, staraj się unikać pozostawiania problemów związanych z bezpieczeństwem bez rozwiązania, to pomoże utrzymać zaufanie użytkowników i zapewni długoterminowy sukces projektu. Regularnie przeprowadzaj audyty bezpieczeństwa i aktualizuj zależności, to pomoże zapewnić że projekt jest odporny na nowe zagrożenia i ataki, jeśli napotkasz problemy związane z bezpieczeństwem, postaraj się je rozwiązać jak najszybciej, to pomoże utrzymać projekt w dobrej kondycji i zapobiegnie potencjalnym problemom w przyszłości, pamiętaj że regularne audyty i dbanie o bezpieczeństwo są kluczowe dla sukcesu projektu, staraj się unikać pozostawiania problemów związanych z bezpieczeństwem bez rozwiązania, to pomoże utrzymać stabilność i niezawodność projektu dla wszystkich użytkowników i deweloperów współpracujących nad projektem.
+
+### Dotyczy panelu web i jego zakładek, funkcji itp.
+
+1. Zawsze zachowuj spójność z aktualnym stylem kodowania i konwencjami projektu.
+2. Używaj angielskiego dla wszystkich tekstów, komunikacji i dokumentacji ale twórz także inne wersje językowe zgodne z obecnym systemem i18n.
+3. Upewnij się że wszystkie teksty są tłumaczalne i nie używaj hardcoded stringów w kodzie.
+4. Testuj działanie nowych funkcji w obu językach (EN/PL) i upewnij się że są one zgodne z systemem i18n.
+5. Przy dodawaniu nowych elementów do panelu web, upewnij się że są one dobrze zorganizowane i przemyślane, to pomoże zapewnić że są one łatwe do zrozumienia i utrzymania.
+6. Zachowaj spójność wyglądu i stylu, stosuj optymalizację oraz najlepsze praktyki dla interfejsu użytkownika, to pomoże zapewnić że panel web jest przyjazny dla użytkowników i łatwy w obsłudze.
+7. Przy wprowadzaniu zmian w panelu web, upewnij się że są one dobrze przemyślane i przetestowane, staraj się unikać wprowadzania zmian które mogą wprowadzić niejasności lub problemy z użytecznością, to pomoże utrzymać zaufanie użytkowników do panelu web i zapewni jego skuteczność jako narzędzia do zarządzania serwerem BetterDesk dla wszystkich użytkowników, niezależnie od ich poziomu zaawansowania technicznego.
+8. Upewnij się że wszystkie elementy pokazujące statystyki urządzeń oraz ich parametry są zgodne ze sobą, korzystają z tych samych źródeł danych i są aktualizowane w czasie rzeczywistym, to pomoże zapewnić że użytkownicy mają dostęp do dokładnych i spójnych informacji o swoich urządzeniach, co jest kluczowe dla skutecznego zarządzania i monitorowania serwera BetterDesk. Nie doprowadź do sytuacji w której różne części panelu web pokazują różne informacje o statusie urządzeń, to może wprowadzić użytkowników w błąd i obniżyć zaufanie do panelu web jako narzędzia do zarządzania serwerem BetterDesk.
+9. Stosuj praktyki bezpieczeństwa.
+10. Pamiętaj aby panel web operatora zawierał odpowiednią zakładkę logowania operaji operatorów przypisanych do ich kont, domyślnie ma być on używany jednocześnie przez większą ilość operatorów i panel web wraz z jego funkcjami ma być dopasowany do tego stylu zarządzania.
+
 ### Przy problemach Docker:
 1. Sprawdź czy obrazy są budowane lokalne (`docker compose build`)
 2. Nie używaj `docker compose pull` dla obrazów betterdesk-*
 3. Sprawdź DOCKER_TROUBLESHOOTING.md
+
+---
+
+## 🤖 AI Roles & Security Policy
+
+### Copilot Roles in This Project
+
+| Role | Scope | Description |
+|------|-------|-------------|
+| **Security Auditor** | All code changes | Every modification undergoes automatic security review. Identifies vulnerabilities, insecure patterns, and outdated dependencies. |
+| **Go Backend Developer** | `betterdesk-server/` | Clean-room RustDesk-compatible server implementation. Protocol handling, crypto, database, API. |
+| **Node.js Backend Developer** | `web-nodejs/` | Express.js web console — authentication, CRUD, RustDesk Client API, WebSocket. |
+| **DevOps Engineer** | Scripts, Docker, CI/CD | ALL-IN-ONE installers (`betterdesk.sh`, `betterdesk.ps1`), Dockerfiles, GitHub Actions. |
+| **Frontend Developer** | `web-nodejs/views/`, `static/` | EJS templates, CSS, client-side JavaScript, i18n. |
+| **Documentation Maintainer** | `docs/`, `.github/` | Keep all documentation current with code changes. |
+
+### Security-First Policy (DEFAULT BEHAVIOR)
+
+All code changes MUST include a security review as part of the implementation process. This is not optional.
+
+**Mandatory checks for every change:**
+1. **Input validation** — All user-supplied data (URL params, body, headers, query strings) must be validated with strict patterns (regexps, type checks, length limits).
+2. **Rate limiting** — All public-facing endpoints and connection accept loops must have IP-based rate limiting.
+3. **SQL injection prevention** — All database queries must use parameterized queries. LIKE patterns must escape `%` and `_`.
+4. **Authentication & authorization** — Every non-public endpoint must verify credentials and enforce RBAC.
+5. **Token security** — Short-lived tokens for transient states (2FA partial tokens: 5min max). No long-lived tokens for intermediate auth states.
+6. **Dependency audit** — Flag outdated or vulnerable dependencies. Update proactively.
+7. **Error handling** — Never expose internal error details to clients. Log internally, return generic messages.
+8. **Audit logging** — Security-relevant operations (login, failed auth, config changes, bans) must be logged.
 
 ---
 
@@ -472,4 +633,4 @@ Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
 
 ---
 
-*Ostatnia aktualizacja: 2026-02-22 przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-01 (E2E encryption fix) przez GitHub Copilot*

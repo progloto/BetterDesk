@@ -11,6 +11,17 @@ let db = null;
 let authDb = null;
 
 /**
+ * Escape special characters in LIKE patterns to prevent SQL injection.
+ * Characters % and _ have special meaning in SQL LIKE clauses.
+ * @param {string} str - The string to escape
+ * @returns {string} - Escaped string safe for LIKE patterns
+ */
+function escapeLikePattern(str) {
+    if (!str) return '';
+    return str.replace(/[%_\\]/g, '\\$&');
+}
+
+/**
  * Get the main RustDesk database connection
  */
 function getDb() {
@@ -193,6 +204,16 @@ function initAuthTables(db) {
         )
     `);
 
+    // Device-to-folder assignments (stored in auth.db so it works with any backend)
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS device_folder_assignments (
+            device_id TEXT PRIMARY KEY NOT NULL,
+            folder_id INTEGER NOT NULL,
+            assigned_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
+        )
+    `);
+
     // Address books table for RustDesk client sync
     db.exec(`
         CREATE TABLE IF NOT EXISTS address_books (
@@ -204,6 +225,176 @@ function initAuthTables(db) {
             UNIQUE(user_id, ab_type),
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
         )
+    `);
+
+    // Console settings key-value store (server backend choice, etc.)
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+
+    // ==================== RustDesk Client Integration Tables ====================
+
+    // Peer sysinfo — hardware/software details reported by RustDesk client
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS peer_sysinfo (
+            peer_id TEXT PRIMARY KEY,
+            hostname TEXT DEFAULT '',
+            username TEXT DEFAULT '',
+            platform TEXT DEFAULT '',
+            version TEXT DEFAULT '',
+            cpu_name TEXT DEFAULT '',
+            cpu_cores INTEGER DEFAULT 0,
+            cpu_freq_ghz REAL DEFAULT 0,
+            memory_gb REAL DEFAULT 0,
+            os_full TEXT DEFAULT '',
+            displays TEXT DEFAULT '[]',
+            encoding TEXT DEFAULT '[]',
+            features TEXT DEFAULT '{}',
+            platform_additions TEXT DEFAULT '{}',
+            raw_json TEXT DEFAULT '{}',
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+
+    // Peer metrics — heartbeat telemetry (cpu/memory/disk usage)
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS peer_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            peer_id TEXT NOT NULL,
+            cpu_usage REAL DEFAULT 0,
+            memory_usage REAL DEFAULT 0,
+            disk_usage REAL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+    // Index for efficient time-range queries
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_peer_metrics_peer_time ON peer_metrics (peer_id, created_at)`);
+
+    // Audit: connection events — who connected where and when
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS audit_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id TEXT NOT NULL,
+            host_uuid TEXT DEFAULT '',
+            peer_id TEXT DEFAULT '',
+            peer_name TEXT DEFAULT '',
+            action TEXT NOT NULL,
+            conn_type INTEGER DEFAULT 0,
+            session_id TEXT DEFAULT '',
+            ip TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_conn_host ON audit_connections (host_id, created_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_conn_peer ON audit_connections (peer_id, created_at)`);
+
+    // Audit: file transfer events — what files were transferred
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS audit_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id TEXT NOT NULL,
+            host_uuid TEXT DEFAULT '',
+            peer_id TEXT DEFAULT '',
+            direction INTEGER DEFAULT 0,
+            path TEXT DEFAULT '',
+            is_file INTEGER DEFAULT 1,
+            num_files INTEGER DEFAULT 0,
+            files_json TEXT DEFAULT '[]',
+            ip TEXT DEFAULT '',
+            peer_name TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_files_host ON audit_files (host_id, created_at)`);
+
+    // Audit: security alarms — failed access, brute-force, IP violations
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS audit_alarms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alarm_type INTEGER NOT NULL,
+            alarm_name TEXT DEFAULT '',
+            host_id TEXT DEFAULT '',
+            peer_id TEXT DEFAULT '',
+            ip TEXT DEFAULT '',
+            details TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_alarms_type ON audit_alarms (alarm_type, created_at)`);
+
+    // User groups — RustDesk-compatible group management
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS user_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guid TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            note TEXT DEFAULT '',
+            team_id TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+
+    // Device groups — group devices by function/location/team
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS device_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guid TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            note TEXT DEFAULT '',
+            team_id TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+
+    // Device-to-group membership (many-to-many)
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS device_group_members (
+            device_group_id INTEGER NOT NULL,
+            peer_id TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (device_group_id, peer_id),
+            FOREIGN KEY (device_group_id) REFERENCES device_groups(id) ON DELETE CASCADE
+        )
+    `);
+
+    // Access strategies / policies — RustDesk-compatible permission rules
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS strategies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guid TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            user_group_guid TEXT DEFAULT '',
+            device_group_guid TEXT DEFAULT '',
+            enabled INTEGER DEFAULT 1,
+            permissions TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    `);
+
+    // Seed default groups if empty
+    const ugCount = db.prepare('SELECT COUNT(*) as c FROM user_groups').get().c;
+    if (ugCount === 0) {
+        const crypto = require('crypto');
+        db.prepare('INSERT INTO user_groups (guid, name, note) VALUES (?, ?, ?)').run(
+            crypto.randomUUID(), 'Default', 'Default user group'
+        );
+    }
+    const dgCount = db.prepare('SELECT COUNT(*) as c FROM device_groups').get().c;
+    if (dgCount === 0) {
+        const crypto = require('crypto');
+        db.prepare('INSERT INTO device_groups (guid, name, note) VALUES (?, ?, ?)').run(
+            crypto.randomUUID(), 'Default', 'Default device group'
+        );
+    }
+
+    // Cleanup old metrics (keep last 7 days) — scheduled in housekeeping
+    db.exec(`
+        DELETE FROM peer_metrics WHERE created_at < datetime('now', '-7 days')
     `);
 }
 
@@ -236,7 +427,8 @@ function parseDeviceInfo(device) {
         created_at: device.created_at,
         last_online: device.last_online,
         ban_reason: device.ban_reason || device.banned_reason || '',
-        folder_id: device.folder_id || null
+        folder_id: device.folder_id || null,
+        pk: device.pk ? Buffer.from(device.pk).toString('base64') : ''
     };
 }
 
@@ -248,10 +440,11 @@ function getAllDevices(filters = {}) {
     let sql = 'SELECT * FROM peer WHERE is_deleted = 0';
     const params = [];
     
-    // Search filter
+    // Search filter (escape % and _ to prevent LIKE injection)
     if (filters.search) {
-        sql += ' AND (id LIKE ? OR user LIKE ? OR note LIKE ?)';
-        const search = `%${filters.search}%`;
+        sql += " AND (id LIKE ? ESCAPE '\\' OR user LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\')";
+        const escaped = escapeLikePattern(filters.search);
+        const search = `%${escaped}%`;
         params.push(search, search, search);
     }
     
@@ -366,8 +559,9 @@ function countDevices(filters = {}) {
     const params = [];
     
     if (filters.search) {
-        sql += ' AND (id LIKE ? OR user LIKE ? OR note LIKE ? OR ip LIKE ?)';
-        const search = `%${filters.search}%`;
+        sql += " AND (id LIKE ? ESCAPE '\\' OR user LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\' OR ip LIKE ? ESCAPE '\\')";
+        const escaped = escapeLikePattern(filters.search);
+        const search = `%${escaped}%`;
         params.push(search, search, search, search);
     }
     
@@ -545,11 +739,10 @@ function getAllFolders() {
     const db = getAuthDb();
     const folders = db.prepare('SELECT * FROM folders ORDER BY sort_order ASC, name ASC').all();
     
-    // Get device count per folder
-    const mainDb = getDb();
+    // Get device count per folder from auth.db assignments table
     return folders.map(folder => {
-        const count = mainDb.prepare(
-            'SELECT COUNT(*) as count FROM peer WHERE is_deleted = 0 AND folder_id = ?'
+        const count = db.prepare(
+            'SELECT COUNT(*) as count FROM device_folder_assignments WHERE folder_id = ?'
         ).get(folder.id);
         return {
             ...folder,
@@ -617,18 +810,37 @@ function deleteFolder(id) {
  * Assign single device to folder
  */
 function assignDeviceToFolder(deviceId, folderId) {
-    return getDb().prepare('UPDATE peer SET folder_id = ? WHERE id = ?').run(folderId, deviceId);
+    const db = getAuthDb();
+    if (folderId === null || folderId === undefined) {
+        // Unassign: remove from assignments table
+        return db.prepare('DELETE FROM device_folder_assignments WHERE device_id = ?').run(deviceId);
+    }
+    // Upsert assignment in auth.db
+    return db.prepare(
+        'INSERT INTO device_folder_assignments (device_id, folder_id) VALUES (?, ?) ON CONFLICT(device_id) DO UPDATE SET folder_id = ?, assigned_at = datetime(\'now\')'
+    ).run(deviceId, folderId, folderId);
 }
 
 /**
  * Assign multiple devices to folder
  */
 function assignDevicesToFolder(deviceIds, folderId) {
-    const db = getDb();
-    const stmt = db.prepare('UPDATE peer SET folder_id = ? WHERE id = ?');
+    const db = getAuthDb();
+    if (folderId === null || folderId === undefined) {
+        const stmt = db.prepare('DELETE FROM device_folder_assignments WHERE device_id = ?');
+        const unassignAll = db.transaction((ids) => {
+            for (const id of ids) {
+                stmt.run(id);
+            }
+        });
+        return unassignAll(deviceIds);
+    }
+    const stmt = db.prepare(
+        'INSERT INTO device_folder_assignments (device_id, folder_id) VALUES (?, ?) ON CONFLICT(device_id) DO UPDATE SET folder_id = ?, assigned_at = datetime(\'now\')'
+    );
     const assignAll = db.transaction((ids) => {
         for (const id of ids) {
-            stmt.run(folderId, id);
+            stmt.run(id, folderId, folderId);
         }
     });
     return assignAll(deviceIds);
@@ -638,16 +850,40 @@ function assignDevicesToFolder(deviceIds, folderId) {
  * Unassign all devices from folder
  */
 function unassignDevicesFromFolder(folderId) {
-    return getDb().prepare('UPDATE peer SET folder_id = NULL WHERE folder_id = ?').run(folderId);
+    return getAuthDb().prepare('DELETE FROM device_folder_assignments WHERE folder_id = ?').run(folderId);
 }
 
 /**
  * Get unassigned device count
+ * Note: This requires total device count passed externally when using Go backend.
+ * Falls back to local peer table count when available.
  */
 function getUnassignedDeviceCount() {
-    return getDb().prepare(
-        'SELECT COUNT(*) as count FROM peer WHERE is_deleted = 0 AND folder_id IS NULL'
-    ).get().count;
+    try {
+        const mainDb = getDb();
+        const total = mainDb.prepare(
+            'SELECT COUNT(*) as count FROM peer WHERE is_deleted = 0'
+        ).get().count;
+        const assigned = getAuthDb().prepare(
+            'SELECT COUNT(*) as count FROM device_folder_assignments'
+        ).get().count;
+        return Math.max(0, total - assigned);
+    } catch {
+        // If main DB is unavailable (BetterDesk mode), return -1 to signal unknown
+        return -1;
+    }
+}
+
+/**
+ * Get all device folder assignments as a map { device_id: folder_id }
+ */
+function getAllFolderAssignments() {
+    const rows = getAuthDb().prepare('SELECT device_id, folder_id FROM device_folder_assignments').all();
+    const map = {};
+    for (const row of rows) {
+        map[row.device_id] = row.folder_id;
+    }
+    return map;
 }
 
 // ==================== Access Token Operations ====================
@@ -827,6 +1063,799 @@ function getAddressBookTags(userId) {
     }
 }
 
+// ==================== Console Settings ====================
+
+/**
+ * Get a console setting by key
+ * @param {string} key
+ * @param {string} [defaultValue] - Fallback if key not found
+ * @returns {string|null}
+ */
+function getSetting(key, defaultValue = null) {
+    const row = getAuthDb().prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    return row ? row.value : defaultValue;
+}
+
+/**
+ * Save a console setting (upsert)
+ * @param {string} key
+ * @param {string} value
+ */
+function setSetting(key, value) {
+    return getAuthDb().prepare(`
+        INSERT INTO settings (key, value, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+    `).run(key, value);
+}
+
+/**
+ * Get all console settings
+ * @returns {Object} key-value pairs
+ */
+function getAllSettings() {
+    const rows = getAuthDb().prepare('SELECT key, value FROM settings').all();
+    const result = {};
+    for (const row of rows) {
+        result[row.key] = row.value;
+    }
+    return result;
+}
+
+// ==================== Pending Registrations (LAN Discovery) ====================
+
+function ensureRegistrationTable() {
+    const mainDb = getDb();
+    mainDb.exec(`
+        CREATE TABLE IF NOT EXISTS pending_registrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            hostname TEXT DEFAULT '',
+            platform TEXT DEFAULT '',
+            version TEXT DEFAULT '',
+            ip_address TEXT DEFAULT '',
+            public_key TEXT DEFAULT '',
+            uuid TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            approved_by TEXT DEFAULT NULL,
+            approved_at TEXT DEFAULT NULL,
+            rejected_reason TEXT DEFAULT '',
+            access_token TEXT DEFAULT NULL,
+            console_url TEXT DEFAULT NULL,
+            server_address TEXT DEFAULT NULL,
+            server_key TEXT DEFAULT NULL,
+            created_at DATETIME DEFAULT (datetime('now')),
+            updated_at DATETIME DEFAULT (datetime('now')),
+            UNIQUE(device_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_reg_status ON pending_registrations (status);
+        CREATE INDEX IF NOT EXISTS idx_pending_reg_device ON pending_registrations (device_id);
+    `);
+}
+
+// Call on module load to ensure table exists
+try { ensureRegistrationTable(); } catch (_) { /* db not ready yet */ }
+
+function getPendingRegistrations(filters = {}) {
+    ensureRegistrationTable();
+    const mainDb = getDb();
+    let sql = 'SELECT * FROM pending_registrations WHERE 1=1';
+    const params = [];
+
+    if (filters.status) {
+        sql += ' AND status = ?';
+        params.push(filters.status);
+    }
+    if (filters.search) {
+        sql += " AND (device_id LIKE ? ESCAPE '\\' OR hostname LIKE ? ESCAPE '\\' OR ip_address LIKE ? ESCAPE '\\')";
+        const escaped = escapeLikePattern(filters.search);
+        const s = `%${escaped}%`;
+        params.push(s, s, s);
+    }
+
+    sql += ' ORDER BY created_at DESC';
+    return mainDb.prepare(sql).all(...params);
+}
+
+function getPendingRegistrationById(id) {
+    ensureRegistrationTable();
+    return getDb().prepare('SELECT * FROM pending_registrations WHERE id = ?').get(id);
+}
+
+function getPendingRegistrationByDeviceId(deviceId) {
+    ensureRegistrationTable();
+    return getDb().prepare('SELECT * FROM pending_registrations WHERE device_id = ?').get(deviceId);
+}
+
+function createPendingRegistration(data) {
+    ensureRegistrationTable();
+    const mainDb = getDb();
+
+    // Check if already exists
+    const existing = mainDb.prepare('SELECT * FROM pending_registrations WHERE device_id = ?').get(data.device_id);
+    if (existing) {
+        if (existing.status === 'approved') {
+            return existing; // Already approved — return as-is
+        }
+        // Update existing (reset to pending if rejected, or update fields)
+        mainDb.prepare(`
+            UPDATE pending_registrations
+            SET hostname = ?, platform = ?, version = ?, ip_address = ?,
+                public_key = ?, uuid = ?, status = 'pending',
+                rejected_reason = '', updated_at = datetime('now')
+            WHERE device_id = ?
+        `).run(
+            data.hostname || '', data.platform || '', data.version || '',
+            data.ip_address || '', data.public_key || '', data.uuid || '',
+            data.device_id
+        );
+        return mainDb.prepare('SELECT * FROM pending_registrations WHERE device_id = ?').get(data.device_id);
+    }
+
+    // Create new
+    const result = mainDb.prepare(`
+        INSERT INTO pending_registrations (device_id, hostname, platform, version, ip_address, public_key, uuid)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        data.device_id, data.hostname || '', data.platform || '',
+        data.version || '', data.ip_address || '', data.public_key || '',
+        data.uuid || ''
+    );
+
+    return mainDb.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(result.lastInsertRowid);
+}
+
+function approvePendingRegistration(id, approvedBy, serverConfig) {
+    ensureRegistrationTable();
+    const mainDb = getDb();
+    mainDb.prepare(`
+        UPDATE pending_registrations
+        SET status = 'approved', approved_by = ?, approved_at = datetime('now'),
+            access_token = ?, console_url = ?, server_address = ?, server_key = ?,
+            updated_at = datetime('now')
+        WHERE id = ?
+    `).run(
+        approvedBy,
+        serverConfig.access_token || '',
+        serverConfig.console_url || '',
+        serverConfig.server_address || '',
+        serverConfig.server_key || '',
+        id
+    );
+    return mainDb.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(id);
+}
+
+function rejectPendingRegistration(id, reason) {
+    ensureRegistrationTable();
+    const mainDb = getDb();
+    mainDb.prepare(`
+        UPDATE pending_registrations
+        SET status = 'rejected', rejected_reason = ?, updated_at = datetime('now')
+        WHERE id = ?
+    `).run(reason || '', id);
+    return mainDb.prepare('SELECT * FROM pending_registrations WHERE id = ?').get(id);
+}
+
+function deletePendingRegistration(id) {
+    ensureRegistrationTable();
+    getDb().prepare('DELETE FROM pending_registrations WHERE id = ?').run(id);
+}
+
+function getPendingRegistrationCount() {
+    ensureRegistrationTable();
+    const row = getDb().prepare("SELECT COUNT(*) as count FROM pending_registrations WHERE status = 'pending'").get();
+    return row ? row.count : 0;
+}
+
+// ==================== Peer Sysinfo Operations ====================
+
+/**
+ * Upsert peer system information (reported via POST /api/sysinfo)
+ * @param {string} peerId - RustDesk device ID
+ * @param {Object} data - Sysinfo payload from RustDesk client
+ */
+function upsertPeerSysinfo(peerId, data) {
+    return getAuthDb().prepare(`
+        INSERT INTO peer_sysinfo (peer_id, hostname, username, platform, version,
+            cpu_name, cpu_cores, cpu_freq_ghz, memory_gb, os_full,
+            displays, encoding, features, platform_additions, raw_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(peer_id) DO UPDATE SET
+            hostname = excluded.hostname, username = excluded.username,
+            platform = excluded.platform, version = excluded.version,
+            cpu_name = excluded.cpu_name, cpu_cores = excluded.cpu_cores,
+            cpu_freq_ghz = excluded.cpu_freq_ghz, memory_gb = excluded.memory_gb,
+            os_full = excluded.os_full, displays = excluded.displays,
+            encoding = excluded.encoding, features = excluded.features,
+            platform_additions = excluded.platform_additions,
+            raw_json = excluded.raw_json, updated_at = datetime('now')
+    `).run(
+        peerId,
+        data.hostname || '',
+        data.username || '',
+        data.platform || '',
+        data.version || '',
+        data.cpu_name || '',
+        data.cpu_cores || 0,
+        data.cpu_freq_ghz || 0,
+        data.memory_gb || 0,
+        data.os_full || '',
+        JSON.stringify(data.displays || []),
+        JSON.stringify(data.encoding || []),
+        JSON.stringify(data.features || {}),
+        JSON.stringify(data.platform_additions || {}),
+        JSON.stringify(data)
+    );
+}
+
+/**
+ * Get sysinfo for a single peer
+ */
+function getPeerSysinfo(peerId) {
+    const row = getAuthDb().prepare('SELECT * FROM peer_sysinfo WHERE peer_id = ?').get(peerId);
+    if (!row) return null;
+    return parseSysinfoRow(row);
+}
+
+/**
+ * Get sysinfo for all peers
+ */
+function getAllPeerSysinfo() {
+    const rows = getAuthDb().prepare('SELECT * FROM peer_sysinfo').all();
+    return rows.map(parseSysinfoRow);
+}
+
+/**
+ * Parse sysinfo row — deserialize JSON fields
+ */
+function parseSysinfoRow(row) {
+    return {
+        peer_id: row.peer_id,
+        hostname: row.hostname,
+        username: row.username,
+        platform: row.platform,
+        version: row.version,
+        cpu_name: row.cpu_name,
+        cpu_cores: row.cpu_cores,
+        cpu_freq_ghz: row.cpu_freq_ghz,
+        memory_gb: row.memory_gb,
+        os_full: row.os_full,
+        displays: safeJsonParse(row.displays, []),
+        encoding: safeJsonParse(row.encoding, []),
+        features: safeJsonParse(row.features, {}),
+        platform_additions: safeJsonParse(row.platform_additions, {}),
+        updated_at: row.updated_at
+    };
+}
+
+/**
+ * Safe JSON parse with fallback
+ */
+function safeJsonParse(str, fallback) {
+    try {
+        return JSON.parse(str);
+    } catch {
+        return fallback;
+    }
+}
+
+// ==================== Peer Metrics Operations ====================
+
+/**
+ * Update peer online status and last_online timestamp in the shared peer table.
+ * Used by heartbeat handler to mark a device as online.
+ */
+function updatePeerOnlineStatus(peerId) {
+    return getDb().prepare(
+        "UPDATE peer SET status_online = 1, last_online = datetime('now'), last_heartbeat = datetime('now'), heartbeat_count = COALESCE(heartbeat_count, 0) + 1 WHERE id = ?"
+    ).run(peerId);
+}
+
+/**
+ * Mark peers as offline if their last_heartbeat is older than the given threshold.
+ * This prevents stale "online" status when devices stop sending heartbeats.
+ * @param {number} thresholdSeconds - seconds of inactivity before marking offline
+ * @returns {{ changes: number }} number of peers marked offline
+ */
+function cleanupStaleOnlinePeers(thresholdSeconds = 90) {
+    return getDb().prepare(
+        `UPDATE peer SET status_online = 0
+         WHERE status_online = 1
+           AND last_heartbeat IS NOT NULL
+           AND last_heartbeat < datetime('now', '-' || ? || ' seconds')`
+    ).run(thresholdSeconds);
+}
+
+/**
+ * Insert a heartbeat metric data point
+ */
+function insertPeerMetric(peerId, cpuUsage, memoryUsage, diskUsage) {
+    return getAuthDb().prepare(
+        'INSERT INTO peer_metrics (peer_id, cpu_usage, memory_usage, disk_usage) VALUES (?, ?, ?, ?)'
+    ).run(peerId, cpuUsage || 0, memoryUsage || 0, diskUsage || 0);
+}
+
+/**
+ * Get recent metrics for a peer
+ * @param {string} peerId
+ * @param {number} limit - Max records to return (default 100)
+ */
+function getPeerMetrics(peerId, limit = 100) {
+    return getAuthDb().prepare(
+        'SELECT * FROM peer_metrics WHERE peer_id = ? ORDER BY created_at DESC LIMIT ?'
+    ).all(peerId, limit);
+}
+
+/**
+ * Get latest metric for a peer (most recent heartbeat)
+ */
+function getLatestPeerMetric(peerId) {
+    return getAuthDb().prepare(
+        'SELECT * FROM peer_metrics WHERE peer_id = ? ORDER BY created_at DESC LIMIT 1'
+    ).get(peerId);
+}
+
+/**
+ * Cleanup old metrics (older than N days)
+ * @param {number} days - Minimum 1, default 7
+ */
+function cleanupOldMetrics(days = 7) {
+    const safeDays = Math.max(1, parseInt(days, 10) || 7);
+    return getAuthDb().prepare(
+        "DELETE FROM peer_metrics WHERE created_at < datetime('now', ? || ' days')"
+    ).run(`-${safeDays}`);
+}
+
+// ==================== Audit Connection Operations ====================
+
+/**
+ * Insert a connection audit event
+ * @param {Object} data - { host_id, host_uuid, peer_id, peer_name, action, conn_type, session_id, ip }
+ */
+function insertAuditConnection(data) {
+    return getAuthDb().prepare(`
+        INSERT INTO audit_connections (host_id, host_uuid, peer_id, peer_name, action, conn_type, session_id, ip)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        data.host_id || '',
+        data.host_uuid || '',
+        data.peer_id || '',
+        data.peer_name || '',
+        data.action || '',
+        data.conn_type || 0,
+        data.session_id || '',
+        data.ip || ''
+    );
+}
+
+/**
+ * Query audit connections with filters
+ * @param {Object} filters - { host_id, peer_id, action, limit, offset }
+ */
+function getAuditConnections(filters = {}) {
+    let sql = 'SELECT * FROM audit_connections WHERE 1=1';
+    const params = [];
+
+    if (filters.host_id) {
+        sql += ' AND host_id = ?';
+        params.push(filters.host_id);
+    }
+    if (filters.peer_id) {
+        sql += ' AND peer_id = ?';
+        params.push(filters.peer_id);
+    }
+    if (filters.action) {
+        sql += ' AND action = ?';
+        params.push(filters.action);
+    }
+
+    sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(filters.limit || 100);
+    params.push(filters.offset || 0);
+
+    return getAuthDb().prepare(sql).all(...params);
+}
+
+/**
+ * Count audit connections (for pagination)
+ */
+function countAuditConnections(filters = {}) {
+    let sql = 'SELECT COUNT(*) as count FROM audit_connections WHERE 1=1';
+    const params = [];
+
+    if (filters.host_id) {
+        sql += ' AND host_id = ?';
+        params.push(filters.host_id);
+    }
+    if (filters.peer_id) {
+        sql += ' AND peer_id = ?';
+        params.push(filters.peer_id);
+    }
+    if (filters.action) {
+        sql += ' AND action = ?';
+        params.push(filters.action);
+    }
+
+    return getAuthDb().prepare(sql).get(...params).count;
+}
+
+// ==================== Audit File Transfer Operations ====================
+
+/**
+ * Insert a file transfer audit event
+ * @param {Object} data - { host_id, host_uuid, peer_id, direction, path, is_file, num_files, files_json, ip, peer_name }
+ */
+function insertAuditFile(data) {
+    return getAuthDb().prepare(`
+        INSERT INTO audit_files (host_id, host_uuid, peer_id, direction, path, is_file, num_files, files_json, ip, peer_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        data.host_id || '',
+        data.host_uuid || '',
+        data.peer_id || '',
+        data.direction || 0,
+        data.path || '',
+        data.is_file !== undefined ? (data.is_file ? 1 : 0) : 1,
+        data.num_files || 0,
+        JSON.stringify(data.files || []),
+        data.ip || '',
+        data.peer_name || ''
+    );
+}
+
+/**
+ * Query file transfer audit events
+ */
+function getAuditFiles(filters = {}) {
+    let sql = 'SELECT * FROM audit_files WHERE 1=1';
+    const params = [];
+
+    if (filters.host_id) {
+        sql += ' AND host_id = ?';
+        params.push(filters.host_id);
+    }
+    if (filters.peer_id) {
+        sql += ' AND peer_id = ?';
+        params.push(filters.peer_id);
+    }
+
+    sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(filters.limit || 100);
+    params.push(filters.offset || 0);
+
+    return getAuthDb().prepare(sql).all(...params);
+}
+
+/**
+ * Count file transfer audit events
+ */
+function countAuditFiles(filters = {}) {
+    let sql = 'SELECT COUNT(*) as count FROM audit_files WHERE 1=1';
+    const params = [];
+
+    if (filters.host_id) {
+        sql += ' AND host_id = ?';
+        params.push(filters.host_id);
+    }
+    if (filters.peer_id) {
+        sql += ' AND peer_id = ?';
+        params.push(filters.peer_id);
+    }
+
+    return getAuthDb().prepare(sql).get(...params).count;
+}
+
+// ==================== Audit Alarm Operations ====================
+
+/**
+ * Insert a security alarm event
+ * Alarm types: 0=AccessAttempt, 1=BruteForce, 2=IPViolation, 3=Unauthorized,
+ *              4=PortScan, 5=MaliciousFile, 6=Custom
+ * @param {Object} data - { alarm_type, alarm_name, host_id, peer_id, ip, details }
+ */
+function insertAuditAlarm(data) {
+    return getAuthDb().prepare(`
+        INSERT INTO audit_alarms (alarm_type, alarm_name, host_id, peer_id, ip, details)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+        data.alarm_type || 0,
+        data.alarm_name || '',
+        data.host_id || '',
+        data.peer_id || '',
+        data.ip || '',
+        typeof data.details === 'string' ? data.details : JSON.stringify(data.details || {})
+    );
+}
+
+/**
+ * Query security alarm events
+ */
+function getAuditAlarms(filters = {}) {
+    let sql = 'SELECT * FROM audit_alarms WHERE 1=1';
+    const params = [];
+
+    if (filters.alarm_type !== undefined) {
+        sql += ' AND alarm_type = ?';
+        params.push(filters.alarm_type);
+    }
+    if (filters.host_id) {
+        sql += ' AND host_id = ?';
+        params.push(filters.host_id);
+    }
+
+    sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+    params.push(filters.limit || 100);
+    params.push(filters.offset || 0);
+
+    return getAuthDb().prepare(sql).all(...params);
+}
+
+/**
+ * Count alarm events
+ */
+function countAuditAlarms(filters = {}) {
+    let sql = 'SELECT COUNT(*) as count FROM audit_alarms WHERE 1=1';
+    const params = [];
+
+    if (filters.alarm_type !== undefined) {
+        sql += ' AND alarm_type = ?';
+        params.push(filters.alarm_type);
+    }
+    if (filters.host_id) {
+        sql += ' AND host_id = ?';
+        params.push(filters.host_id);
+    }
+
+    return getAuthDb().prepare(sql).get(...params).count;
+}
+
+// ==================== User Group Operations ====================
+
+/**
+ * Get all user groups
+ */
+function getAllUserGroups() {
+    return getAuthDb().prepare('SELECT * FROM user_groups ORDER BY name ASC').all();
+}
+
+/**
+ * Get user group by GUID
+ */
+function getUserGroupByGuid(guid) {
+    return getAuthDb().prepare('SELECT * FROM user_groups WHERE guid = ?').get(guid);
+}
+
+/**
+ * Create a user group
+ */
+function createUserGroup(data) {
+    const crypto = require('crypto');
+    const guid = data.guid || crypto.randomUUID();
+    getAuthDb().prepare(
+        'INSERT INTO user_groups (guid, name, note, team_id) VALUES (?, ?, ?, ?)'
+    ).run(guid, data.name, data.note || '', data.team_id || '');
+    return getAuthDb().prepare('SELECT * FROM user_groups WHERE guid = ?').get(guid);
+}
+
+/**
+ * Update a user group
+ */
+function updateUserGroup(guid, data) {
+    const sets = [];
+    const params = [];
+
+    if (data.name !== undefined) { sets.push('name = ?'); params.push(data.name); }
+    if (data.note !== undefined) { sets.push('note = ?'); params.push(data.note); }
+    if (data.team_id !== undefined) { sets.push('team_id = ?'); params.push(data.team_id); }
+
+    if (sets.length === 0) return null;
+
+    params.push(guid);
+    getAuthDb().prepare(`UPDATE user_groups SET ${sets.join(', ')} WHERE guid = ?`).run(...params);
+    return getAuthDb().prepare('SELECT * FROM user_groups WHERE guid = ?').get(guid);
+}
+
+/**
+ * Delete a user group
+ */
+function deleteUserGroup(guid) {
+    return getAuthDb().prepare('DELETE FROM user_groups WHERE guid = ?').run(guid);
+}
+
+// ==================== Device Group Operations ====================
+
+/**
+ * Get all device groups with member counts
+ */
+function getAllDeviceGroups() {
+    const groups = getAuthDb().prepare('SELECT * FROM device_groups ORDER BY name ASC').all();
+    for (const g of groups) {
+        g.member_count = getAuthDb().prepare(
+            'SELECT COUNT(*) as c FROM device_group_members WHERE device_group_id = ?'
+        ).get(g.id).c;
+    }
+    return groups;
+}
+
+/**
+ * Get device group by GUID
+ */
+function getDeviceGroupByGuid(guid) {
+    return getAuthDb().prepare('SELECT * FROM device_groups WHERE guid = ?').get(guid);
+}
+
+/**
+ * Create a device group
+ */
+function createDeviceGroup(data) {
+    const crypto = require('crypto');
+    const guid = data.guid || crypto.randomUUID();
+    getAuthDb().prepare(
+        'INSERT INTO device_groups (guid, name, note, team_id) VALUES (?, ?, ?, ?)'
+    ).run(guid, data.name, data.note || '', data.team_id || '');
+    return getAuthDb().prepare('SELECT * FROM device_groups WHERE guid = ?').get(guid);
+}
+
+/**
+ * Update a device group
+ */
+function updateDeviceGroup(guid, data) {
+    const sets = [];
+    const params = [];
+
+    if (data.name !== undefined) { sets.push('name = ?'); params.push(data.name); }
+    if (data.note !== undefined) { sets.push('note = ?'); params.push(data.note); }
+    if (data.team_id !== undefined) { sets.push('team_id = ?'); params.push(data.team_id); }
+
+    if (sets.length === 0) return null;
+
+    params.push(guid);
+    getAuthDb().prepare(`UPDATE device_groups SET ${sets.join(', ')} WHERE guid = ?`).run(...params);
+    return getAuthDb().prepare('SELECT * FROM device_groups WHERE guid = ?').get(guid);
+}
+
+/**
+ * Delete a device group (cascades to memberships)
+ */
+function deleteDeviceGroup(guid) {
+    const group = getAuthDb().prepare('SELECT id FROM device_groups WHERE guid = ?').get(guid);
+    if (!group) return { changes: 0 };
+    return getAuthDb().prepare('DELETE FROM device_groups WHERE guid = ?').run(guid);
+}
+
+/**
+ * Add device to group
+ */
+function addDeviceToGroup(groupGuid, peerId) {
+    const group = getAuthDb().prepare('SELECT id FROM device_groups WHERE guid = ?').get(groupGuid);
+    if (!group) return null;
+    return getAuthDb().prepare(
+        'INSERT OR IGNORE INTO device_group_members (device_group_id, peer_id) VALUES (?, ?)'
+    ).run(group.id, peerId);
+}
+
+/**
+ * Remove device from group
+ */
+function removeDeviceFromGroup(groupGuid, peerId) {
+    const group = getAuthDb().prepare('SELECT id FROM device_groups WHERE guid = ?').get(groupGuid);
+    if (!group) return null;
+    return getAuthDb().prepare(
+        'DELETE FROM device_group_members WHERE device_group_id = ? AND peer_id = ?'
+    ).run(group.id, peerId);
+}
+
+/**
+ * Get all members of a device group
+ */
+function getDeviceGroupMembers(groupGuid) {
+    const group = getAuthDb().prepare('SELECT id FROM device_groups WHERE guid = ?').get(groupGuid);
+    if (!group) return [];
+    return getAuthDb().prepare(
+        'SELECT peer_id FROM device_group_members WHERE device_group_id = ?'
+    ).all(group.id).map(r => r.peer_id);
+}
+
+/**
+ * Get device groups for a specific peer
+ */
+function getDeviceGroupsForPeer(peerId) {
+    return getAuthDb().prepare(`
+        SELECT dg.* FROM device_groups dg
+        INNER JOIN device_group_members dgm ON dg.id = dgm.device_group_id
+        WHERE dgm.peer_id = ?
+        ORDER BY dg.name ASC
+    `).all(peerId);
+}
+
+// ==================== Strategy / Policy Operations ====================
+
+/**
+ * Get all strategies
+ */
+function getAllStrategies() {
+    const rows = getAuthDb().prepare('SELECT * FROM strategies ORDER BY name ASC').all();
+    return rows.map(r => ({
+        ...r,
+        permissions: safeJsonParse(r.permissions, {})
+    }));
+}
+
+/**
+ * Get strategy by GUID
+ */
+function getStrategyByGuid(guid) {
+    const row = getAuthDb().prepare('SELECT * FROM strategies WHERE guid = ?').get(guid);
+    if (!row) return null;
+    return { ...row, permissions: safeJsonParse(row.permissions, {}) };
+}
+
+/**
+ * Create a strategy
+ */
+function createStrategy(data) {
+    const crypto = require('crypto');
+    const guid = data.guid || crypto.randomUUID();
+    getAuthDb().prepare(`
+        INSERT INTO strategies (guid, name, user_group_guid, device_group_guid, enabled, permissions)
+        VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+        guid,
+        data.name,
+        data.user_group_guid || '',
+        data.device_group_guid || '',
+        data.enabled !== undefined ? (data.enabled ? 1 : 0) : 1,
+        JSON.stringify(data.permissions || {})
+    );
+    return getStrategyByGuid(guid);
+}
+
+/**
+ * Update a strategy
+ */
+function updateStrategy(guid, data) {
+    const sets = [];
+    const params = [];
+
+    if (data.name !== undefined) { sets.push('name = ?'); params.push(data.name); }
+    if (data.user_group_guid !== undefined) { sets.push('user_group_guid = ?'); params.push(data.user_group_guid); }
+    if (data.device_group_guid !== undefined) { sets.push('device_group_guid = ?'); params.push(data.device_group_guid); }
+    if (data.enabled !== undefined) { sets.push('enabled = ?'); params.push(data.enabled ? 1 : 0); }
+    if (data.permissions !== undefined) { sets.push('permissions = ?'); params.push(JSON.stringify(data.permissions)); }
+
+    if (sets.length === 0) return null;
+
+    sets.push("updated_at = datetime('now')");
+    params.push(guid);
+    getAuthDb().prepare(`UPDATE strategies SET ${sets.join(', ')} WHERE guid = ?`).run(...params);
+    return getStrategyByGuid(guid);
+}
+
+/**
+ * Delete a strategy
+ */
+function deleteStrategy(guid) {
+    return getAuthDb().prepare('DELETE FROM strategies WHERE guid = ?').run(guid);
+}
+
+// ==================== Housekeeping Extensions ====================
+
+/**
+ * Run extended housekeeping tasks for RustDesk integration tables
+ */
+function runIntegrationHousekeeping() {
+    const authDb = getAuthDb();
+
+    // Cleanup metrics older than 7 days
+    authDb.prepare("DELETE FROM peer_metrics WHERE created_at < datetime('now', '-7 days')").run();
+
+    // Cleanup audit events older than 90 days
+    authDb.prepare("DELETE FROM audit_connections WHERE created_at < datetime('now', '-90 days')").run();
+    authDb.prepare("DELETE FROM audit_files WHERE created_at < datetime('now', '-90 days')").run();
+    authDb.prepare("DELETE FROM audit_alarms WHERE created_at < datetime('now', '-90 days')").run();
+}
+
 // ==================== Close connections ====================
 
 function closeAll() {
@@ -846,6 +1875,7 @@ module.exports = {
     // Devices
     getAllDevices,
     getDeviceById,
+    getDevice: getDeviceById,  // Alias for compatibility
     updateDevice,
     deleteDevice,
     setBanStatus,
@@ -879,6 +1909,7 @@ module.exports = {
     assignDevicesToFolder,
     unassignDevicesFromFolder,
     getUnassignedDeviceCount,
+    getAllFolderAssignments,
     // Audit
     logAction,
     getAuditLogs,
@@ -902,6 +1933,66 @@ module.exports = {
     getAddressBook,
     saveAddressBook,
     getAddressBookTags,
+    // Console settings
+    getSetting,
+    setSetting,
+    getAllSettings,
+    // Pending Registrations (LAN Discovery)
+    getPendingRegistrations,
+    getPendingRegistrationById,
+    getPendingRegistrationByDeviceId,
+    createPendingRegistration,
+    approvePendingRegistration,
+    rejectPendingRegistration,
+    deletePendingRegistration,
+    getPendingRegistrationCount,
+    // Peer Sysinfo (RustDesk client integration)
+    upsertPeerSysinfo,
+    getPeerSysinfo,
+    getAllPeerSysinfo,
+    // Peer Metrics (heartbeat telemetry)
+    updatePeerOnlineStatus,
+    cleanupStaleOnlinePeers,
+    insertPeerMetric,
+    getPeerMetrics,
+    getLatestPeerMetric,
+    cleanupOldMetrics,
+    // Audit: connections
+    insertAuditConnection,
+    getAuditConnections,
+    countAuditConnections,
+    // Audit: file transfers
+    insertAuditFile,
+    getAuditFiles,
+    countAuditFiles,
+    // Audit: security alarms
+    insertAuditAlarm,
+    getAuditAlarms,
+    countAuditAlarms,
+    // User groups
+    getAllUserGroups,
+    getUserGroupByGuid,
+    createUserGroup,
+    updateUserGroup,
+    deleteUserGroup,
+    // Device groups
+    getAllDeviceGroups,
+    getDeviceGroupByGuid,
+    createDeviceGroup,
+    updateDeviceGroup,
+    deleteDeviceGroup,
+    addDeviceToGroup,
+    removeDeviceFromGroup,
+    getDeviceGroupMembers,
+    getDeviceGroupsForPeer,
+    // Strategies / policies
+    getAllStrategies,
+    getStrategyByGuid,
+    createStrategy,
+    updateStrategy,
+    deleteStrategy,
+    // Housekeeping extensions
+    runIntegrationHousekeeping,
     // Cleanup
     closeAll
 };

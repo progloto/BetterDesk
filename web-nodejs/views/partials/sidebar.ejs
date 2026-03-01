@@ -29,6 +29,12 @@
                 <span class="material-icons">devices</span>
                 <span class="sidebar-link-text"><%= _('nav.devices') %></span>
             </a>
+            
+            <a href="/registrations" class="sidebar-link <%= currentPage === 'registrations' ? 'active' : '' %>">
+                <span class="material-icons">how_to_reg</span>
+                <span class="sidebar-link-text"><%= _('nav.registrations') %></span>
+                <span class="badge-sidebar" id="reg-sidebar-badge" style="display: none;">0</span>
+            </a>
         </div>
         
         <!-- Tools Section -->

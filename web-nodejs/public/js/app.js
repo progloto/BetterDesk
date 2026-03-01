@@ -14,6 +14,7 @@
         initLanguageSelector();
         initUserMenu();
         initRefreshButton();
+        initRegistrationBadge();
     }
     
     /**
@@ -153,5 +154,26 @@
         }
     `;
     document.head.appendChild(style);
+
+    /**
+     * Periodically fetch pending registration count for sidebar badge.
+     */
+    function initRegistrationBadge() {
+        const badge = document.getElementById('reg-sidebar-badge');
+        if (!badge) return;
+
+        async function updateBadge() {
+            try {
+                const resp = await fetch('/api/registrations/count');
+                const data = await resp.json();
+                const count = data.count || 0;
+                badge.textContent = count;
+                badge.style.display = count > 0 ? '' : 'none';
+            } catch (_) { /* silent */ }
+        }
+
+        updateBadge();
+        setInterval(updateBadge, 30000); // every 30s
+    }
     
 })();

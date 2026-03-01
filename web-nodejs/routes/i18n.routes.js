@@ -87,8 +87,9 @@ router.post('/set/:code', (req, res) => {
         
         res.cookie('betterdesk_lang', code, {
             maxAge: 365 * 24 * 60 * 60 * 1000, // 1 year
-            httpOnly: false,
-            sameSite: 'lax'
+            httpOnly: false, // Intentionally accessible to JS for client-side i18n
+            sameSite: 'lax',
+            secure: process.env.NODE_ENV === 'production' || process.env.HTTPS_ENABLED === 'true'
         });
         
         res.json({ success: true });

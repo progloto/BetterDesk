@@ -130,6 +130,9 @@ router.post('/api/users', requireAuth, requireAdmin, passwordChangeLimiter, asyn
 router.patch('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.id, 10);
+        if (isNaN(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, error: 'Invalid user ID' });
+        }
         const { role, password } = req.body;
         
         const user = db.getUserById(userId);
@@ -194,6 +197,9 @@ router.patch('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
 router.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     try {
         const userId = parseInt(req.params.id, 10);
+        if (isNaN(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, error: 'Invalid user ID' });
+        }
         
         const user = db.getUserById(userId);
         if (!user) {
@@ -241,6 +247,9 @@ router.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
 router.post('/api/users/:id/reset-password', requireAuth, requireAdmin, passwordChangeLimiter, async (req, res) => {
     try {
         const userId = parseInt(req.params.id, 10);
+        if (isNaN(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, error: 'Invalid user ID' });
+        }
         const { newPassword } = req.body;
         
         const user = db.getUserById(userId);

@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    BetterDesk Console Manager v2.3.0 - All-in-One Interactive Tool for Windows
+    BetterDesk Console Manager v2.4.0 - All-in-One Interactive Tool for Windows
 
 .DESCRIPTION
     Features:
@@ -21,6 +21,8 @@
       - RustDesk Client API (login, address book sync)
       - TOTP Two-Factor Authentication
       - SSL/TLS certificate configuration
+      - PostgreSQL database support (new in v2.4.0)
+      - SQLite to PostgreSQL migration
 
 .PARAMETER Auto
     Run installation in automatic mode (non-interactive)
@@ -31,13 +33,23 @@
 .PARAMETER NodeJs
     Install Node.js web console (default)
 
+.PARAMETER PostgreSQL
+    Use PostgreSQL instead of SQLite
+
+.PARAMETER PgUri
+    PostgreSQL connection URI (implies -PostgreSQL)
+
 .EXAMPLE
     .\betterdesk.ps1
     Interactive mode
 
 .EXAMPLE
     .\betterdesk.ps1 -Auto
-    Automatic installation with Node.js console
+    Automatic installation with Node.js console and SQLite
+
+.EXAMPLE
+    .\betterdesk.ps1 -Auto -PostgreSQL
+    Automatic installation with PostgreSQL
 
 .EXAMPLE
     .\betterdesk.ps1 -SkipVerify
@@ -48,6 +60,8 @@ param(
     [switch]$Auto,
     [switch]$SkipVerify,
     [switch]$NodeJs,
+    [switch]$PostgreSQL,
+    [string]$PgUri = "",
     [switch]$Flask  # Deprecated, kept for backward compatibility
 )
 
@@ -55,7 +69,7 @@ param(
 # Configuration
 #===============================================================================
 
-$script:VERSION = "2.3.0"
+$script:VERSION = "2.4.0"
 $script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Auto mode flags
@@ -69,7 +83,19 @@ if ($Flask) {
     $script:PREFERRED_CONSOLE_TYPE = "nodejs" 
 }
 
-# Binary checksums (SHA256) - v2.1.3
+# Database configuration
+$script:USE_POSTGRESQL = $PostgreSQL -or ($env:USE_POSTGRESQL -eq "true")
+$script:POSTGRESQL_URI = if ($PgUri) { $PgUri } elseif ($env:POSTGRESQL_URI) { $env:POSTGRESQL_URI } else { "" }
+$script:POSTGRESQL_USER = if ($env:POSTGRESQL_USER) { $env:POSTGRESQL_USER } else { "betterdesk" }
+$script:POSTGRESQL_PASS = if ($env:POSTGRESQL_PASS) { $env:POSTGRESQL_PASS } else { "" }
+$script:POSTGRESQL_DB = if ($env:POSTGRESQL_DB) { $env:POSTGRESQL_DB } else { "betterdesk" }
+$script:POSTGRESQL_HOST = if ($env:POSTGRESQL_HOST) { $env:POSTGRESQL_HOST } else { "localhost" }
+$script:POSTGRESQL_PORT = if ($env:POSTGRESQL_PORT) { $env:POSTGRESQL_PORT } else { "5432" }
+
+# Go server configuration
+$script:GO_SERVER_SOURCE = Join-Path $script:ScriptDir "betterdesk-server"
+$script:GO_MIN_VERSION = "1.21"
+# Legacy Rust checksums (deprecated, kept for migration purposes)
 $script:HBBS_WINDOWS_X86_64_SHA256 = "B790FA44CAC7482A057ED322412F6D178FB33F3B05327BFA753416E9879BD62F"
 $script:HBBR_WINDOWS_X86_64_SHA256 = "368C71E8D3AEF4C5C65177FBBBB99EA045661697A89CB7C2A703759C575E8E9F"
 
@@ -98,18 +124,21 @@ $script:COMMON_CONSOLE_PATHS = @(
 )
 
 # Service names
-$script:HBBS_SERVICE = "BetterDeskSignal"
-$script:HBBR_SERVICE = "BetterDeskRelay"
+$script:SERVER_SERVICE = "BetterDeskServer"    # Go server (replaces HBBS + HBBR)
+$script:HBBS_SERVICE = "BetterDeskSignal"      # Legacy Rust signal
+$script:HBBR_SERVICE = "BetterDeskRelay"       # Legacy Rust relay
 $script:CONSOLE_SERVICE = "BetterDeskConsole"
 
 # Status variables
 $script:INSTALL_STATUS = "none"
-$script:HBBS_RUNNING = $false
-$script:HBBR_RUNNING = $false
+$script:SERVER_RUNNING = $false  # Go server
+$script:HBBS_RUNNING = $false    # Legacy Rust
+$script:HBBR_RUNNING = $false    # Legacy Rust
 $script:CONSOLE_RUNNING = $false
 $script:BINARIES_OK = $false
 $script:DATABASE_OK = $false
 $script:CONSOLE_TYPE = "none"  # none, nodejs
+$script:SERVER_TYPE = "none"    # none, go, rust
 
 # Logging
 $script:LOG_FILE = "$env:TEMP\betterdesk_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
@@ -142,7 +171,7 @@ function Print-Header {
 ║                    ██████╔╝███████╗███████║██║  ██╗              ║
 ║                    ╚═════╝ ╚══════╝╚══════╝╚═╝  ╚═╝              ║
 ║                                                                  ║
-║                  Console Manager v$($script:VERSION)                          ║
+║                  Console Manager v$($script:VERSION)             ║
 ╚══════════════════════════════════════════════════════════════════╝
 "@ -ForegroundColor Cyan
 }
@@ -225,18 +254,29 @@ function Generate-RandomPassword {
 
 function Detect-Installation {
     $script:INSTALL_STATUS = "none"
+    $script:SERVER_RUNNING = $false
     $script:HBBS_RUNNING = $false
     $script:HBBR_RUNNING = $false
     $script:CONSOLE_RUNNING = $false
     $script:BINARIES_OK = $false
     $script:DATABASE_OK = $false
     $script:CONSOLE_TYPE = "none"
+    $script:SERVER_TYPE = "none"
     
-    # Check paths
+    # Check paths and binary type
     if (Test-Path $script:RUSTDESK_PATH) {
-        if ((Test-Path "$script:RUSTDESK_PATH\hbbs.exe") -or (Test-Path "$script:RUSTDESK_PATH\hbbs-v8-api.exe")) {
+        # Check for Go server first
+        if (Test-Path "$script:RUSTDESK_PATH\betterdesk-server.exe") {
             $script:BINARIES_OK = $true
+            $script:SERVER_TYPE = "go"
             $script:INSTALL_STATUS = "partial"
+        }
+        # Fallback: Check for legacy Rust binaries
+        elseif ((Test-Path "$script:RUSTDESK_PATH\hbbs.exe") -or (Test-Path "$script:RUSTDESK_PATH\hbbs-v8-api.exe")) {
+            $script:BINARIES_OK = $true
+            $script:SERVER_TYPE = "rust"
+            $script:INSTALL_STATUS = "partial"
+            Print-Warning "Legacy Rust binaries detected. Consider upgrading to Go server."
         }
     }
     
@@ -258,15 +298,23 @@ function Detect-Installation {
         }
     }
     
-    # Check services
-    $hbbsService = Get-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
-    if ($hbbsService -and $hbbsService.Status -eq 'Running') {
-        $script:HBBS_RUNNING = $true
-    }
-    
-    $hbbrService = Get-Service -Name $script:HBBR_SERVICE -ErrorAction SilentlyContinue
-    if ($hbbrService -and $hbbrService.Status -eq 'Running') {
+    # Check services - Go server first
+    $serverService = Get-Service -Name $script:SERVER_SERVICE -ErrorAction SilentlyContinue
+    if ($serverService -and $serverService.Status -eq 'Running') {
+        $script:SERVER_RUNNING = $true
+        $script:HBBS_RUNNING = $true  # Go handles both
         $script:HBBR_RUNNING = $true
+    } else {
+        # Check legacy Rust services
+        $hbbsService = Get-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+        if ($hbbsService -and $hbbsService.Status -eq 'Running') {
+            $script:HBBS_RUNNING = $true
+        }
+        
+        $hbbrService = Get-Service -Name $script:HBBR_SERVICE -ErrorAction SilentlyContinue
+        if ($hbbrService -and $hbbrService.Status -eq 'Running') {
+            $script:HBBR_RUNNING = $true
+        }
     }
     
     $consoleService = Get-Service -Name $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
@@ -278,9 +326,11 @@ function Detect-Installation {
 function Auto-DetectPaths {
     $found = $false
     
-    # Check configured path first
+    # Check configured path first - Go server or legacy Rust
     if ($script:RUSTDESK_PATH -and (Test-Path $script:RUSTDESK_PATH)) {
-        if ((Test-Path "$script:RUSTDESK_PATH\hbbs.exe") -or (Test-Path "$script:RUSTDESK_PATH\hbbs-v8-api.exe")) {
+        if ((Test-Path "$script:RUSTDESK_PATH\betterdesk-server.exe") -or 
+            (Test-Path "$script:RUSTDESK_PATH\hbbs.exe") -or 
+            (Test-Path "$script:RUSTDESK_PATH\hbbs-v8-api.exe")) {
             Print-Info "Using configured RustDesk path: $script:RUSTDESK_PATH"
             $found = $true
         }
@@ -289,7 +339,10 @@ function Auto-DetectPaths {
     # Auto-detect if not found
     if (-not $found) {
         foreach ($path in $script:COMMON_RUSTDESK_PATHS) {
-            if ((Test-Path $path) -and ((Test-Path "$path\hbbs.exe") -or (Test-Path "$path\hbbs-v8-api.exe"))) {
+            if ((Test-Path $path) -and 
+                ((Test-Path "$path\betterdesk-server.exe") -or 
+                 (Test-Path "$path\hbbs.exe") -or 
+                 (Test-Path "$path\hbbs-v8-api.exe"))) {
                 $script:RUSTDESK_PATH = $path
                 Print-Success "Detected RustDesk installation: $script:RUSTDESK_PATH"
                 $found = $true
@@ -362,9 +415,10 @@ function Print-Status {
     }
     
     if ($script:BINARIES_OK) {
-        Write-Host "  Binaries:     " -NoNewline; Write-Host "[OK]" -ForegroundColor Green
+        $serverLabel = if ($script:SERVER_TYPE -eq "go") { " (Go: signal + relay + API)" } else { " (Legacy Rust)" }
+        Write-Host "  Server:       " -NoNewline; Write-Host "[OK]$serverLabel" -ForegroundColor Green
     } else {
-        Write-Host "  Binaries:     " -NoNewline; Write-Host "[X] Not found" -ForegroundColor Red
+        Write-Host "  Server:       " -NoNewline; Write-Host "[X] Not found" -ForegroundColor Red
     }
     
     if ($script:DATABASE_OK) {
@@ -387,16 +441,28 @@ function Print-Status {
     Write-Host "=== Services Status ===" -ForegroundColor White
     Write-Host ""
     
-    if ($script:HBBS_RUNNING) {
-        Write-Host "  HBBS (Signal): " -NoNewline; Write-Host "* Active" -ForegroundColor Green
+    # Check if using Go server or legacy Rust
+    if ($script:SERVER_RUNNING -or $script:SERVER_TYPE -eq "go") {
+        if ($script:SERVER_RUNNING) {
+            Write-Host "  BetterDesk Server (Go): " -NoNewline; Write-Host "* Active (Signal + Relay + API)" -ForegroundColor Green
+        } else {
+            Write-Host "  BetterDesk Server (Go): " -NoNewline; Write-Host "o Inactive" -ForegroundColor Red
+        }
     } else {
-        Write-Host "  HBBS (Signal): " -NoNewline; Write-Host "o Inactive" -ForegroundColor Red
-    }
-    
-    if ($script:HBBR_RUNNING) {
-        Write-Host "  HBBR (Relay):  " -NoNewline; Write-Host "* Active" -ForegroundColor Green
-    } else {
-        Write-Host "  HBBR (Relay):  " -NoNewline; Write-Host "o Inactive" -ForegroundColor Red
+        # Legacy Rust services
+        if ($script:HBBS_RUNNING) {
+            Write-Host "  HBBS (Signal): " -NoNewline; Write-Host "* Active " -ForegroundColor Green -NoNewline
+            Write-Host "(Legacy Rust)" -ForegroundColor Yellow
+        } else {
+            Write-Host "  HBBS (Signal): " -NoNewline; Write-Host "o Inactive" -ForegroundColor Red
+        }
+        
+        if ($script:HBBR_RUNNING) {
+            Write-Host "  HBBR (Relay):  " -NoNewline; Write-Host "* Active " -ForegroundColor Green -NoNewline
+            Write-Host "(Legacy Rust)" -ForegroundColor Yellow
+        } else {
+            Write-Host "  HBBR (Relay):  " -NoNewline; Write-Host "o Inactive" -ForegroundColor Red
+        }
     }
     
     if ($script:CONSOLE_RUNNING) {
@@ -406,6 +472,110 @@ function Print-Status {
     }
     
     Write-Host ""
+}
+
+#===============================================================================
+# Go Installation and Compilation Functions
+#===============================================================================
+
+function Test-GoInstalled {
+    $goCmd = Get-Command go -ErrorAction SilentlyContinue
+    if (-not $goCmd) {
+        return $false
+    }
+    
+    $goVersion = & go version 2>&1 | Select-String -Pattern "go(\d+\.\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
+    if (-not $goVersion) {
+        return $false
+    }
+    
+    $currentMajor = [int]($goVersion.Split('.')[0])
+    $currentMinor = [int]($goVersion.Split('.')[1])
+    $minMajor = [int]($script:GO_MIN_VERSION.Split('.')[0])
+    $minMinor = [int]($script:GO_MIN_VERSION.Split('.')[1])
+    
+    if ($currentMajor -gt $minMajor -or ($currentMajor -eq $minMajor -and $currentMinor -ge $minMinor)) {
+        return $true
+    }
+    
+    Print-Warning "Go version $goVersion is older than required $script:GO_MIN_VERSION"
+    return $false
+}
+
+function Install-Golang {
+    Print-Step "Installing Go toolchain..."
+    
+    $goVersion = "1.22.1"
+    $goUrl = "https://go.dev/dl/go$goVersion.windows-amd64.zip"
+    $goZip = Join-Path $env:TEMP "go$goVersion.zip"
+    $goRoot = "C:\Go"
+    
+    Print-Info "Downloading Go $goVersion..."
+    try {
+        Invoke-WebRequest -Uri $goUrl -OutFile $goZip -UseBasicParsing
+    } catch {
+        Print-Error "Failed to download Go: $_"
+        return $false
+    }
+    
+    Print-Info "Extracting Go..."
+    if (Test-Path $goRoot) {
+        Remove-Item -Path $goRoot -Recurse -Force
+    }
+    
+    Expand-Archive -Path $goZip -DestinationPath "C:\" -Force
+    Remove-Item -Path $goZip -Force
+    
+    # Add to PATH if not already there
+    $envPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $goPath = "$goRoot\bin"
+    if ($envPath -notlike "*$goPath*") {
+        [Environment]::SetEnvironmentVariable("Path", "$envPath;$goPath", "Machine")
+        $env:Path = "$env:Path;$goPath"
+    }
+    
+    # Verify installation
+    if (Test-GoInstalled) {
+        Print-Success "Go $goVersion installed successfully"
+        return $true
+    } else {
+        Print-Error "Go installation verification failed"
+        return $false
+    }
+}
+
+function Compile-GoServer {
+    Print-Step "Compiling BetterDesk Go Server..."
+    
+    if (-not (Test-Path $script:GO_SERVER_SOURCE)) {
+        Print-Error "Go server source not found at: $script:GO_SERVER_SOURCE"
+        return $false
+    }
+    
+    $currentDir = Get-Location
+    Set-Location $script:GO_SERVER_SOURCE
+    
+    Print-Info "Running 'go mod tidy'..."
+    & go mod tidy 2>&1 | ForEach-Object { Write-Host "  $_" }
+    
+    Print-Info "Building static binary..."
+    $env:CGO_ENABLED = "0"
+    $env:GOOS = "windows"
+    $env:GOARCH = "amd64"
+    
+    & go build -ldflags="-s -w" -o "betterdesk-server.exe" . 2>&1 | ForEach-Object { Write-Host "  $_" }
+    
+    Set-Location $currentDir
+    
+    $outputBinary = Join-Path $script:GO_SERVER_SOURCE "betterdesk-server.exe"
+    if (Test-Path $outputBinary) {
+        $size = [math]::Round((Get-Item $outputBinary).Length / 1MB, 2)
+        Print-Success "Build successful: betterdesk-server.exe ($size MB)"
+        return $true
+    } else {
+        Print-Error "Build failed - binary not created"
+        return $false
+    }
 }
 
 #===============================================================================
@@ -439,18 +609,52 @@ function Verify-BinaryChecksum {
     }
 }
 
+function Verify-GoBinary {
+    Print-Step "Verifying Go server binary..."
+    
+    $goBinary = Join-Path $script:GO_SERVER_SOURCE "betterdesk-server.exe"
+    
+    if (-not (Test-Path $goBinary)) {
+        Print-Error "Go binary not found: $goBinary"
+        return $false
+    }
+    
+    # Verify it's a valid Windows executable
+    try {
+        $peHeader = [System.IO.File]::ReadAllBytes($goBinary)[0..1]
+        if ($peHeader[0] -eq 0x4D -and $peHeader[1] -eq 0x5A) {  # MZ header
+            $size = [math]::Round((Get-Item $goBinary).Length / 1MB, 2)
+            Print-Success "Go binary valid: betterdesk-server.exe ($size MB)"
+            return $true
+        }
+    } catch {
+        Print-Error "Failed to read binary: $_"
+        return $false
+    }
+    
+    Print-Error "Invalid binary format"
+    return $false
+}
+
 function Verify-Binaries {
     Print-Step "Verifying BetterDesk binaries..."
-    
-    $binSource = Join-Path $script:ScriptDir "hbbs-patch-v2"
-    $errors = 0
     
     if ($script:SKIP_VERIFY) {
         Print-Warning "Verification skipped (-SkipVerify)"
         return $true
     }
     
-    # Verify Windows binaries
+    # Check for Go binary first
+    $goBinary = Join-Path $script:GO_SERVER_SOURCE "betterdesk-server.exe"
+    
+    if (Test-Path $goBinary) {
+        return Verify-GoBinary
+    }
+    
+    # Fallback: Check legacy Rust binaries
+    $binSource = Join-Path $script:ScriptDir "hbbs-patch-v2"
+    $errors = 0
+    
     $hbbsPath = Join-Path $binSource "hbbs-windows-x86_64.exe"
     $hbbrPath = Join-Path $binSource "hbbr-windows-x86_64.exe"
     
@@ -580,6 +784,138 @@ function Install-NodeJs {
     return $false
 }
 
+#===============================================================================
+# PostgreSQL Functions
+#===============================================================================
+
+function Choose-DatabaseType {
+    if ($script:AUTO_MODE) {
+        if ($script:USE_POSTGRESQL) {
+            Print-Info "Auto mode: Using PostgreSQL"
+        } else {
+            Print-Info "Auto mode: Using SQLite (default)"
+        }
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "Select Database Type:" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  1. SQLite (default, lightweight, no setup required)" -ForegroundColor Green
+    Write-Host "  2. PostgreSQL (recommended for production, better performance)" -ForegroundColor Green
+    Write-Host ""
+    
+    $dbChoice = Read-Host "Choose database type [1]"
+    if ([string]::IsNullOrEmpty($dbChoice)) { $dbChoice = "1" }
+    
+    switch ($dbChoice) {
+        "2" {
+            $script:USE_POSTGRESQL = $true
+            Print-Info "Selected: PostgreSQL"
+            
+            Write-Host ""
+            $pgHost = Read-Host "PostgreSQL host [$($script:POSTGRESQL_HOST)]"
+            if (![string]::IsNullOrEmpty($pgHost)) { $script:POSTGRESQL_HOST = $pgHost }
+            
+            $pgPort = Read-Host "PostgreSQL port [$($script:POSTGRESQL_PORT)]"
+            if (![string]::IsNullOrEmpty($pgPort)) { $script:POSTGRESQL_PORT = $pgPort }
+            
+            $pgDb = Read-Host "PostgreSQL database [$($script:POSTGRESQL_DB)]"
+            if (![string]::IsNullOrEmpty($pgDb)) { $script:POSTGRESQL_DB = $pgDb }
+            
+            $pgUser = Read-Host "PostgreSQL user [$($script:POSTGRESQL_USER)]"
+            if (![string]::IsNullOrEmpty($pgUser)) { $script:POSTGRESQL_USER = $pgUser }
+            
+            $pgPass = Read-Host "PostgreSQL password (leave empty to generate)" -AsSecureString
+            $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($pgPass)
+            $script:POSTGRESQL_PASS = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+        }
+        default {
+            $script:USE_POSTGRESQL = $false
+            Print-Info "Selected: SQLite"
+        }
+    }
+}
+
+function Setup-PostgreSQLDatabase {
+    Print-Step "Setting up PostgreSQL database for BetterDesk..."
+    
+    # Generate password if not set
+    if ([string]::IsNullOrEmpty($script:POSTGRESQL_PASS)) {
+        $script:POSTGRESQL_PASS = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 16 | ForEach-Object {[char]$_})
+        Print-Info "Generated PostgreSQL password"
+    }
+    
+    # Build connection URI
+    $script:POSTGRESQL_URI = "postgres://$($script:POSTGRESQL_USER):$($script:POSTGRESQL_PASS)@$($script:POSTGRESQL_HOST):$($script:POSTGRESQL_PORT)/$($script:POSTGRESQL_DB)?sslmode=disable"
+    
+    Print-Info "PostgreSQL URI configured: postgres://$($script:POSTGRESQL_USER):****@$($script:POSTGRESQL_HOST):$($script:POSTGRESQL_PORT)/$($script:POSTGRESQL_DB)"
+    Print-Warning "Note: On Windows, you must set up PostgreSQL manually before installation."
+    Print-Info "Required PostgreSQL setup:"
+    Print-Info "  1. Install PostgreSQL from https://www.postgresql.org/download/windows/"
+    Print-Info "  2. Create user: CREATE USER $($script:POSTGRESQL_USER) WITH PASSWORD '...' CREATEDB;"
+    Print-Info "  3. Create database: CREATE DATABASE $($script:POSTGRESQL_DB) OWNER $($script:POSTGRESQL_USER);"
+    
+    return $true
+}
+
+function Migrate-SQLiteToPostgreSQL {
+    Print-Step "Migrating existing SQLite data to PostgreSQL..."
+    
+    $sqliteDb = Join-Path $script:RUSTDESK_PATH "db_v2.sqlite3"
+    
+    if (-not (Test-Path $sqliteDb)) {
+        Print-Info "No existing SQLite database found, skipping migration"
+        return
+    }
+    
+    # Find migration binary
+    $migrateBin = $null
+    $migratePaths = @(
+        (Join-Path $script:ScriptDir "betterdesk-server\tools\migrate\migrate.exe"),
+        (Join-Path $script:ScriptDir "tools\migrate\migrate.exe")
+    )
+    
+    foreach ($path in $migratePaths) {
+        if (Test-Path $path) {
+            $migrateBin = $path
+            break
+        }
+    }
+    
+    if (-not $migrateBin) {
+        Print-Warning "Migration binary not found, skipping automatic migration"
+        Print-Info "You can migrate manually using: M -> 3 (SQLite -> PostgreSQL)"
+        return
+    }
+    
+    # Check if SQLite has data
+    try {
+        $peerCount = & sqlite3 $sqliteDb "SELECT COUNT(*) FROM peer;" 2>$null
+    } catch {
+        $peerCount = 0
+    }
+    
+    if ($peerCount -gt 0) {
+        Print-Info "Found $peerCount devices in SQLite database"
+        
+        if ($script:AUTO_MODE -or (Confirm-Action "Migrate existing data to PostgreSQL?")) {
+            Print-Step "Creating backup before migration..."
+            & $migrateBin -mode backup -src $sqliteDb 2>&1 | Out-Null
+            
+            Print-Step "Running SQLite -> PostgreSQL migration..."
+            $result = & $migrateBin -mode nodejs2go -src $sqliteDb -dst $script:POSTGRESQL_URI 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Print-Success "Migration completed! $peerCount devices migrated."
+            } else {
+                Print-Warning "Migration had issues: $result"
+            }
+        }
+    } else {
+        Print-Info "SQLite database is empty, no migration needed"
+    }
+}
+
 function Install-NodeJsConsole {
     Print-Step "Installing Node.js Web Console..."
     
@@ -632,6 +968,24 @@ function Install-NodeJsConsole {
         # Create .env file (always update to ensure correct paths)
         $envFile = Join-Path $script:CONSOLE_PATH ".env"
         $sessionSecret = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 64 | ForEach-Object {[char]$_})
+        
+        # Database configuration
+        $dbConfig = ""
+        if ($script:USE_POSTGRESQL -and $script:POSTGRESQL_URI) {
+            $dbConfig = @"
+# Database: PostgreSQL
+DB_TYPE=postgres
+DATABASE_URL=$($script:POSTGRESQL_URI)
+DB_PATH=$script:RUSTDESK_PATH\db_v2.sqlite3
+"@
+        } else {
+            $dbConfig = @"
+# Database: SQLite
+DB_TYPE=sqlite
+DB_PATH=$script:RUSTDESK_PATH\db_v2.sqlite3
+"@
+        }
+        
         $envContent = @"
 # BetterDesk Node.js Console Configuration
 PORT=5000
@@ -640,15 +994,19 @@ NODE_ENV=production
 # RustDesk paths (critical for key/QR code generation)
 RUSTDESK_DIR=$script:RUSTDESK_PATH
 KEYS_PATH=$script:RUSTDESK_PATH
-DB_PATH=$script:RUSTDESK_PATH\db_v2.sqlite3
 PUB_KEY_PATH=$script:RUSTDESK_PATH\id_ed25519.pub
 API_KEY_PATH=$script:RUSTDESK_PATH\.api_key
+
+$dbConfig
 
 # Auth database location
 DATA_DIR=$dataDir
 
 # HBBS API
 HBBS_API_URL=http://localhost:$script:API_PORT/api
+
+# Server backend (betterdesk = Go server, rustdesk = legacy Rust)
+SERVER_BACKEND=betterdesk
 
 # Default admin credentials (used only on first startup)
 DEFAULT_ADMIN_USERNAME=admin
@@ -660,13 +1018,22 @@ SESSION_SECRET=$sessionSecret
 # HTTPS (set to true and provide certificate paths to enable)
 HTTPS_ENABLED=false
 HTTPS_PORT=5443
-SSL_CERT_PATH=
-SSL_KEY_PATH=
+SSL_CERT_PATH=$script:RUSTDESK_PATH\ssl\betterdesk.crt
+SSL_KEY_PATH=$script:RUSTDESK_PATH\ssl\betterdesk.key
 SSL_CA_PATH=
 HTTP_REDIRECT_HTTPS=true
+
+# Go server API URL (uses HTTPS when TLS certificates are present)
+BETTERDESK_API_URL=http://localhost:$script:API_PORT/api
 "@
         Set-Content -Path $envFile -Value $envContent
         Print-Info "Created .env configuration file"
+        
+        if ($script:USE_POSTGRESQL) {
+            Print-Info "Database: PostgreSQL"
+        } else {
+            Print-Info "Database: SQLite"
+        }
         
         # Save Node.js admin credentials for display
         $credsFile = Join-Path $dataDir ".admin_credentials"
@@ -750,28 +1117,36 @@ function Install-Console {
 }
 
 function Install-Binaries {
-    Print-Step "Installing BetterDesk binaries..."
+    Print-Step "Installing BetterDesk Go Server..."
     
     # Create directory
     if (-not (Test-Path $script:RUSTDESK_PATH)) {
         New-Item -ItemType Directory -Path $script:RUSTDESK_PATH -Force | Out-Null
     }
     
-    # Check for pre-compiled binaries
-    $binSource = $null
+    # Check for Go server binary
+    $goBinaryPath = Join-Path $script:GO_SERVER_SOURCE "betterdesk-server.exe"
     
-    $hbbsPatchPath = Join-Path $script:ScriptDir "hbbs-patch-v2\hbbs-windows-x86_64.exe"
-    if (Test-Path $hbbsPatchPath) {
-        $binSource = Join-Path $script:ScriptDir "hbbs-patch-v2"
-        Print-Info "Found binaries in hbbs-patch-v2/"
-    } else {
-        Print-Error "BetterDesk binaries not found!"
-        Print-Info "Expected: $hbbsPatchPath"
-        Print-Info "Run 'Build binaries' option or download prebuilt files."
-        return $false
+    if (-not (Test-Path $goBinaryPath)) {
+        Print-Info "Pre-compiled binary not found, attempting to compile..."
+        
+        # Check if Go is installed
+        if (-not (Test-GoInstalled)) {
+            Print-Info "Installing Go toolchain..."
+            if (-not (Install-Golang)) {
+                Print-Error "Failed to install Go toolchain"
+                return $false
+            }
+        }
+        
+        # Compile Go server
+        if (-not (Compile-GoServer)) {
+            Print-Error "Failed to compile Go server"
+            return $false
+        }
     }
     
-    # Verify binaries before installation
+    # Verify binary
     if (-not (Verify-Binaries)) {
         Print-Error "Aborting installation due to verification failure"
         return $false
@@ -779,42 +1154,127 @@ function Install-Binaries {
     
     # Stop services and kill processes (prevents file locking)
     Print-Info "Stopping services before binary installation..."
+    Stop-Service -Name $script:SERVER_SERVICE -ErrorAction SilentlyContinue -Force
     Stop-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue -Force
     Stop-Service -Name $script:HBBR_SERVICE -ErrorAction SilentlyContinue -Force
+    Stop-ScheduledTask -TaskName $script:SERVER_SERVICE -ErrorAction SilentlyContinue
     Stop-ScheduledTask -TaskName $script:HBBS_SERVICE -ErrorAction SilentlyContinue
     Stop-ScheduledTask -TaskName $script:HBBR_SERVICE -ErrorAction SilentlyContinue
     
     # Kill any remaining processes
+    Get-Process -Name "betterdesk-server" -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-Process -Name "hbbs" -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-Process -Name "hbbr" -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 2
     
-    # Verify files are not locked
-    $hbbsTarget = Join-Path $script:RUSTDESK_PATH "hbbs.exe"
-    $hbbrTarget = Join-Path $script:RUSTDESK_PATH "hbbr.exe"
+    # Target path
+    $serverTarget = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
     
-    foreach ($file in @($hbbsTarget, $hbbrTarget)) {
-        if (Test-Path $file) {
-            try {
-                $stream = [System.IO.File]::Open($file, 'Open', 'ReadWrite', 'None')
-                $stream.Close()
-            } catch {
-                Print-Warning "File $file is still locked, waiting..."
-                Start-Sleep -Seconds 3
-                Get-Process -Name ($file -replace '.*\\(.*)\.exe', '$1') -ErrorAction SilentlyContinue | Stop-Process -Force
-            }
+    # Verify file is not locked
+    if (Test-Path $serverTarget) {
+        try {
+            $stream = [System.IO.File]::Open($serverTarget, 'Open', 'ReadWrite', 'None')
+            $stream.Close()
+        } catch {
+            Print-Warning "File $serverTarget is still locked, waiting..."
+            Start-Sleep -Seconds 3
+            Get-Process -Name "betterdesk-server" -ErrorAction SilentlyContinue | Stop-Process -Force
         }
     }
     
-    # Copy binaries
-    Copy-Item -Path (Join-Path $binSource "hbbs-windows-x86_64.exe") -Destination $hbbsTarget -Force
-    Print-Success "Installed hbbs.exe (signal server)"
+    # Copy binary
+    Copy-Item -Path $goBinaryPath -Destination $serverTarget -Force
+    Print-Success "Installed betterdesk-server.exe (Go: signal + relay + API)"
     
-    Copy-Item -Path (Join-Path $binSource "hbbr-windows-x86_64.exe") -Destination $hbbrTarget -Force
-    Print-Success "Installed hbbr.exe (relay server)"
-    
-    Print-Success "BetterDesk binaries v$script:VERSION installed"
+    Print-Success "BetterDesk Go Server v$script:VERSION installed"
     return $true
+}
+
+function Generate-SSLCertificates {
+    Print-Step "Generating self-signed TLS certificates..."
+    
+    $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
+    $certPath = Join-Path $sslDir "betterdesk.crt"
+    $keyPath = Join-Path $sslDir "betterdesk.key"
+    
+    # Skip if certificates already exist
+    if ((Test-Path $certPath) -and (Test-Path $keyPath)) {
+        Print-Info "TLS certificates already exist at $sslDir"
+        Print-Info "Skipping certificate generation (use SSL config menu to regenerate)"
+        return $true
+    }
+    
+    New-Item -ItemType Directory -Path $sslDir -Force | Out-Null
+    
+    # Detect server IP for SAN
+    $serverIP = Get-PublicIP
+    
+    # Try PowerShell native certificate generation first
+    try {
+        $cert = New-SelfSignedCertificate `
+            -DnsName "localhost", $serverIP `
+            -CertStoreLocation "Cert:\LocalMachine\My" `
+            -NotAfter (Get-Date).AddYears(3) `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -FriendlyName "BetterDesk Server" `
+            -TextExtension @("2.5.29.17={text}DNS=localhost&IPAddress=$serverIP&IPAddress=127.0.0.1")
+        
+        # Export certificate (public)
+        Export-Certificate -Cert $cert -FilePath "$sslDir\betterdesk.cer" -Type CERT | Out-Null
+        
+        # Export PFX then convert to PEM using openssl if available
+        $pfxPath = Join-Path $sslDir "betterdesk.pfx"
+        $securePassword = ConvertTo-SecureString -String "betterdesk-temp" -Force -AsPlainText
+        Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
+        
+        # Check if openssl is available for PEM conversion
+        $opensslCmd = Get-Command openssl -ErrorAction SilentlyContinue
+        if ($opensslCmd) {
+            & openssl pkcs12 -in $pfxPath -out $certPath -clcerts -nokeys -passin "pass:betterdesk-temp" 2>$null
+            & openssl pkcs12 -in $pfxPath -out $keyPath -nocerts -nodes -passin "pass:betterdesk-temp" 2>$null
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+        } else {
+            # Keep PFX format for Windows (Go server can use it)
+            Print-Info "OpenSSL not found - certificate stored as PFX"
+            Print-Info "PFX path: $pfxPath"
+        }
+        
+        # Clean up certificate from store
+        Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
+        
+        Print-Success "Self-signed TLS certificate generated"
+        Print-Info "Certificate: $sslDir"
+        Print-Info "SAN: DNS:localhost, IP:$serverIP, IP:127.0.0.1"
+        Print-Info "Valid for 3 years"
+        return $true
+    } catch {
+        Print-Warning "PowerShell certificate generation failed: $_"
+        
+        # Fallback: try openssl if available
+        $opensslCmd = Get-Command openssl -ErrorAction SilentlyContinue
+        if ($opensslCmd) {
+            Print-Info "Falling back to openssl..."
+            try {
+                & openssl req -x509 -nodes -days 1095 -newkey rsa:2048 `
+                    -keyout $keyPath `
+                    -out $certPath `
+                    -subj "/CN=$serverIP/O=BetterDesk/C=US" `
+                    -addext "subjectAltName=IP:$serverIP,IP:127.0.0.1,DNS:localhost" 2>$null
+                
+                if ((Test-Path $certPath) -and (Test-Path $keyPath)) {
+                    Print-Success "Self-signed TLS certificate generated (openssl)"
+                    return $true
+                }
+            } catch {
+                Print-Warning "OpenSSL fallback also failed"
+            }
+        }
+        
+        Print-Warning "Could not generate TLS certificates automatically"
+        Print-Info "Use SSL config menu (option C) to generate later"
+        return $false
+    }
 }
 
 function Setup-Services {
@@ -823,6 +1283,16 @@ function Setup-Services {
     $serverIP = Get-PublicIP
     Print-Info "Server IP: $serverIP"
     Print-Info "API Port: $script:API_PORT"
+    
+    # Build database argument
+    $dbArg = ""
+    if ($script:USE_POSTGRESQL -and $script:POSTGRESQL_URI) {
+        $dbArg = "-db `"$($script:POSTGRESQL_URI)`""
+        Print-Info "Database: PostgreSQL"
+    } else {
+        $dbArg = "-db `"$($script:DB_PATH)`""
+        Print-Info "Database: SQLite"
+    }
     
     # Check for NSSM (Non-Sucking Service Manager)
     $nssmPath = Get-Command nssm -ErrorAction SilentlyContinue
@@ -844,43 +1314,47 @@ function Setup-Services {
     
     $nssm = if ($nssmPath -is [System.Management.Automation.ApplicationInfo]) { $nssmPath.Source } else { $nssmPath }
     
-    # Remove existing services
+    # Remove legacy services
     & $nssm stop $script:HBBS_SERVICE 2>$null
     & $nssm remove $script:HBBS_SERVICE confirm 2>$null
     & $nssm stop $script:HBBR_SERVICE 2>$null
     & $nssm remove $script:HBBR_SERVICE confirm 2>$null
+    & $nssm stop $script:SERVER_SERVICE 2>$null
+    & $nssm remove $script:SERVER_SERVICE confirm 2>$null
     & $nssm stop $script:CONSOLE_SERVICE 2>$null
     & $nssm remove $script:CONSOLE_SERVICE confirm 2>$null
     
     Start-Sleep -Seconds 2
     
-    # HBBS Service (Signal Server with HTTP API)
-    $hbbsExe = Join-Path $script:RUSTDESK_PATH "hbbs.exe"
-    $hbbsArgs = "-r $serverIP -k _ --api-port $script:API_PORT"
+    # BetterDesk Go Server (single binary: signal + relay + API)
+    $serverExe = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
+    $serverArgs = "-mode all -relay $serverIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
     
-    & $nssm install $script:HBBS_SERVICE $hbbsExe $hbbsArgs
-    & $nssm set $script:HBBS_SERVICE AppDirectory $script:RUSTDESK_PATH
-    & $nssm set $script:HBBS_SERVICE DisplayName "BetterDesk Signal Server v$script:VERSION"
-    & $nssm set $script:HBBS_SERVICE Description "BetterDesk/RustDesk Signal Server with HTTP API"
-    & $nssm set $script:HBBS_SERVICE Start SERVICE_AUTO_START
-    & $nssm set $script:HBBS_SERVICE AppStdout "$script:RUSTDESK_PATH\logs\hbbs.log"
-    & $nssm set $script:HBBS_SERVICE AppStderr "$script:RUSTDESK_PATH\logs\hbbs_error.log"
+    # Add TLS flags if certificates exist
+    $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
+    $certPath = Join-Path $sslDir "betterdesk.crt"
+    $keyPath = Join-Path $sslDir "betterdesk.key"
+    $apiScheme = "http"
+    if ((Test-Path $certPath) -and (Test-Path $keyPath)) {
+        $serverArgs += " -tls-cert `"$certPath`" -tls-key `"$keyPath`" -tls-signal -tls-relay -force-https"
+        $apiScheme = "https"
+        Print-Info "TLS: Enabled (cert found at $sslDir)"
+    } else {
+        Print-Info "TLS: Disabled (no certificate found)"
+    }
     
-    # HBBR Service (Relay Server)
-    $hbbrExe = Join-Path $script:RUSTDESK_PATH "hbbr.exe"
-    $hbbrArgs = "-k _"
+    & $nssm install $script:SERVER_SERVICE $serverExe $serverArgs
+    & $nssm set $script:SERVER_SERVICE AppDirectory $script:RUSTDESK_PATH
+    & $nssm set $script:SERVER_SERVICE DisplayName "BetterDesk Go Server v$script:VERSION"
+    & $nssm set $script:SERVER_SERVICE Description "BetterDesk Go Server (Signal + Relay + API)"
+    & $nssm set $script:SERVER_SERVICE Start SERVICE_AUTO_START
+    & $nssm set $script:SERVER_SERVICE AppStdout "$script:RUSTDESK_PATH\logs\server.log"
+    & $nssm set $script:SERVER_SERVICE AppStderr "$script:RUSTDESK_PATH\logs\server_error.log"
     
-    & $nssm install $script:HBBR_SERVICE $hbbrExe $hbbrArgs
-    & $nssm set $script:HBBR_SERVICE AppDirectory $script:RUSTDESK_PATH
-    & $nssm set $script:HBBR_SERVICE DisplayName "BetterDesk Relay Server v$script:VERSION"
-    & $nssm set $script:HBBR_SERVICE Description "BetterDesk/RustDesk Relay Server"
-    & $nssm set $script:HBBR_SERVICE Start SERVICE_AUTO_START
-    & $nssm set $script:HBBR_SERVICE AppStdout "$script:RUSTDESK_PATH\logs\hbbr.log"
-    & $nssm set $script:HBBR_SERVICE AppStderr "$script:RUSTDESK_PATH\logs\hbbr_error.log"
+    Print-Success "Created BetterDesk Go Server service"
     
-    # Console Service (Web Interface) - depends on console type
+    # Console Service (Web Interface) - Node.js only
     if ($script:CONSOLE_TYPE -eq "nodejs") {
-        # Node.js console
         $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
         if (-not $nodeExe) { $nodeExe = "node.exe" }
         $serverJs = Join-Path $script:CONSOLE_PATH "server.js"
@@ -890,10 +1364,10 @@ function Setup-Services {
         & $nssm set $script:CONSOLE_SERVICE DisplayName "BetterDesk Web Console (Node.js)"
         & $nssm set $script:CONSOLE_SERVICE Description "BetterDesk Web Management Console - Node.js"
         & $nssm set $script:CONSOLE_SERVICE Start SERVICE_AUTO_START
-        & $nssm set $script:CONSOLE_SERVICE AppEnvironmentExtra "NODE_ENV=production" "RUSTDESK_DIR=$script:RUSTDESK_PATH" "RUSTDESK_PATH=$script:RUSTDESK_PATH" "KEYS_PATH=$script:RUSTDESK_PATH" "DATA_DIR=$script:CONSOLE_PATH\data" "DB_PATH=$script:RUSTDESK_PATH\db_v2.sqlite3" "API_KEY_PATH=$script:RUSTDESK_PATH\.api_key" "HBBS_API_URL=http://localhost:$($script:API_PORT)/api" "PORT=5000"
+        & $nssm set $script:CONSOLE_SERVICE AppEnvironmentExtra "NODE_ENV=production" "RUSTDESK_DIR=$script:RUSTDESK_PATH" "RUSTDESK_PATH=$script:RUSTDESK_PATH" "KEYS_PATH=$script:RUSTDESK_PATH" "DATA_DIR=$script:CONSOLE_PATH\data" "DB_PATH=$script:RUSTDESK_PATH\db_v2.sqlite3" "API_KEY_PATH=$script:RUSTDESK_PATH\.api_key" "HBBS_API_URL=${apiScheme}://localhost:$($script:API_PORT)/api" "BETTERDESK_API_URL=${apiScheme}://localhost:$($script:API_PORT)/api" "SERVER_BACKEND=betterdesk" "PORT=5000"
         & $nssm set $script:CONSOLE_SERVICE AppStdout "$script:CONSOLE_PATH\logs\console.log"
         & $nssm set $script:CONSOLE_SERVICE AppStderr "$script:CONSOLE_PATH\logs\console_error.log"
-        Print-Info "Created Node.js console service"
+        Print-Success "Created Node.js console service"
     }
     
     # Create logs directories
@@ -901,7 +1375,7 @@ function Setup-Services {
     New-Item -ItemType Directory -Path "$script:CONSOLE_PATH\logs" -Force | Out-Null
     
     Print-Success "Windows services configured"
-    Print-Info "Services: $script:HBBS_SERVICE, $script:HBBR_SERVICE, $script:CONSOLE_SERVICE"
+    Print-Info "Services: $script:SERVER_SERVICE, $script:CONSOLE_SERVICE"
 }
 
 function Setup-ScheduledTasks {
@@ -909,30 +1383,41 @@ function Setup-ScheduledTasks {
     
     Print-Step "Creating scheduled tasks as service alternative..."
     
+    # Build database argument
+    $dbArg = ""
+    if ($script:USE_POSTGRESQL -and $script:POSTGRESQL_URI) {
+        $dbArg = "-db `"$($script:POSTGRESQL_URI)`""
+    } else {
+        $dbArg = "-db `"$($script:DB_PATH)`""
+    }
+    
     # Remove existing tasks
+    Unregister-ScheduledTask -TaskName $script:SERVER_SERVICE -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $script:HBBS_SERVICE -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $script:HBBR_SERVICE -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $script:CONSOLE_SERVICE -Confirm:$false -ErrorAction SilentlyContinue
     
-    # HBBS Task
-    $hbbsExe = Join-Path $script:RUSTDESK_PATH "hbbs.exe"
-    $hbbsAction = New-ScheduledTaskAction -Execute $hbbsExe -Argument "-r $ServerIP -k _ --api-port $script:API_PORT" -WorkingDirectory $script:RUSTDESK_PATH
-    $hbbsTrigger = New-ScheduledTaskTrigger -AtStartup
-    $hbbsPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $hbbsSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    Register-ScheduledTask -TaskName $script:HBBS_SERVICE -Action $hbbsAction -Trigger $hbbsTrigger -Principal $hbbsPrincipal -Settings $hbbsSettings -Description "BetterDesk Signal Server" | Out-Null
+    # BetterDesk Go Server Task
+    $serverExe = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
+    $serverArgs = "-mode all -relay $ServerIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
     
-    # HBBR Task
-    $hbbrExe = Join-Path $script:RUSTDESK_PATH "hbbr.exe"
-    $hbbrAction = New-ScheduledTaskAction -Execute $hbbrExe -Argument "-k _" -WorkingDirectory $script:RUSTDESK_PATH
-    $hbbrTrigger = New-ScheduledTaskTrigger -AtStartup
-    $hbbrPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $hbbrSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-    Register-ScheduledTask -TaskName $script:HBBR_SERVICE -Action $hbbrAction -Trigger $hbbrTrigger -Principal $hbbrPrincipal -Settings $hbbrSettings -Description "BetterDesk Relay Server" | Out-Null
+    # Add TLS flags if certificates exist
+    $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
+    $certPath = Join-Path $sslDir "betterdesk.crt"
+    $keyPath = Join-Path $sslDir "betterdesk.key"
+    if ((Test-Path $certPath) -and (Test-Path $keyPath)) {
+        $serverArgs += " -tls-cert `"$certPath`" -tls-key `"$keyPath`" -tls-signal -tls-relay -force-https"
+        Print-Info "TLS: Enabled"
+    }
     
-    # Console Task - depends on console type
+    $serverAction = New-ScheduledTaskAction -Execute $serverExe -Argument $serverArgs -WorkingDirectory $script:RUSTDESK_PATH
+    $serverTrigger = New-ScheduledTaskTrigger -AtStartup
+    $serverPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $serverSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    Register-ScheduledTask -TaskName $script:SERVER_SERVICE -Action $serverAction -Trigger $serverTrigger -Principal $serverPrincipal -Settings $serverSettings -Description "BetterDesk Go Server (Signal + Relay + API)" | Out-Null
+    
+    # Console Task - Node.js
     if ($script:CONSOLE_TYPE -eq "nodejs") {
-        # Node.js console
         $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
         if (-not $nodeExe) { $nodeExe = "node.exe" }
         $serverJs = Join-Path $script:CONSOLE_PATH "server.js"
@@ -1326,9 +1811,30 @@ function Do-Install {
     Print-Info "Starting BetterDesk Console v$script:VERSION installation..."
     Write-Host ""
     
+    # Choose database type (SQLite or PostgreSQL)
+    Choose-DatabaseType
+    
     if (-not (Install-Dependencies)) { return }
+    
+    # Setup PostgreSQL if selected
+    if ($script:USE_POSTGRESQL) {
+        if (-not (Setup-PostgreSQLDatabase)) {
+            Print-Error "PostgreSQL setup failed"
+            return
+        }
+    }
+    
     if (-not (Install-Binaries)) { Print-Error "Binary installation failed"; return }
     if (-not (Install-Console)) { Print-Error "Console installation failed"; return }
+    
+    # Generate self-signed TLS certificates (default for fresh installs)
+    Generate-SSLCertificates
+    
+    # Migrate existing SQLite data to PostgreSQL if applicable
+    if ($script:USE_POSTGRESQL) {
+        Migrate-SQLiteToPostgreSQL
+    }
+    
     Setup-Services
     Run-Migrations
     $adminPassword = Create-AdminUser
@@ -1350,12 +1856,23 @@ function Do-Install {
         $publicKey = (Get-Content $pubKeyPath -Raw).Trim()
     }
     
+    $dbTypeInfo = "SQLite"
+    if ($script:USE_POSTGRESQL) { $dbTypeInfo = "PostgreSQL" }
+    
+    $tlsStatus = "Disabled"
+    $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
+    if ((Test-Path (Join-Path $sslDir "betterdesk.crt")) -and (Test-Path (Join-Path $sslDir "betterdesk.key"))) {
+        $tlsStatus = "Self-signed (auto-generated)"
+    }
+    
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "              INSTALLATION INFO                             " -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  Panel Web:     " -NoNewline; Write-Host "http://${serverIP}:5000" -ForegroundColor White
     Write-Host "  API Port:      " -NoNewline; Write-Host $script:API_PORT -ForegroundColor White
     Write-Host "  Server ID:     " -NoNewline; Write-Host $serverIP -ForegroundColor White
+    Write-Host "  Database:      " -NoNewline; Write-Host $dbTypeInfo -ForegroundColor White
+    Write-Host "  TLS:           " -NoNewline; Write-Host $tlsStatus -ForegroundColor White
     if ($publicKey) {
         Write-Host "  Key:           " -NoNewline; Write-Host "$($publicKey.Substring(0, [Math]::Min(20, $publicKey.Length)))..." -ForegroundColor White
     }
@@ -2627,6 +3144,225 @@ function Do-ConfigureSSL {
 }
 
 #===============================================================================
+# Database Migration Functions
+#===============================================================================
+
+function Do-MigrateDatabase {
+    Print-Header
+    Write-Host "========== DATABASE MIGRATION ==========" -ForegroundColor White
+    Write-Host ""
+
+    # Locate migration binary
+    $migrateBin = $null
+    $searchPaths = @(
+        (Join-Path $script:ScriptDir "betterdesk-server\tools\migrate\migrate.exe"),
+        (Join-Path $script:ScriptDir "tools\migrate\migrate.exe"),
+        (Join-Path $script:RUSTDESK_PATH "migrate.exe"),
+        "C:\BetterDesk\migrate.exe"
+    )
+
+    foreach ($p in $searchPaths) {
+        if (Test-Path $p) {
+            $migrateBin = $p
+            break
+        }
+    }
+
+    if (-not $migrateBin) {
+        Print-Error "Migration binary not found!"
+        Print-Info "Expected at: $(Join-Path $script:ScriptDir 'betterdesk-server\tools\migrate\migrate.exe')"
+        Print-Info "Build it with: cd betterdesk-server; go build -o tools\migrate\migrate.exe ./tools/migrate/"
+        Press-Enter
+        return
+    }
+
+    Print-Info "Migration binary: $migrateBin"
+    Write-Host ""
+    Write-Host "  Migrate databases between different BetterDesk components." -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Migration Modes:" -ForegroundColor Yellow
+    Write-Host "  1. Rust -> Go          Migrate from legacy Rust hbbs database to Go server" -ForegroundColor Green
+    Write-Host "  2. Node.js -> Go       Migrate from Node.js web console to Go server" -ForegroundColor Green
+    Write-Host "  3. SQLite -> PostgreSQL Migrate BetterDesk Go SQLite to PostgreSQL" -ForegroundColor Green
+    Write-Host "  4. PostgreSQL -> SQLite Migrate PostgreSQL back to SQLite" -ForegroundColor Green
+    Write-Host "  5. Backup              Create timestamped backup of SQLite database" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  0. Back to main menu" -ForegroundColor Red
+    Write-Host ""
+
+    $migChoice = Read-Host "Select migration mode"
+
+    switch ($migChoice) {
+        "1" {
+            # Rust -> Go
+            Write-Host ""
+            $defaultSrc = Join-Path $script:RUSTDESK_PATH "db_v2.sqlite3"
+            $srcDb = Read-Host "Source Rust database [$defaultSrc]"
+            if ([string]::IsNullOrEmpty($srcDb)) { $srcDb = $defaultSrc }
+
+            if (-not (Test-Path $srcDb)) {
+                Print-Error "Source database not found: $srcDb"
+                Press-Enter
+                return
+            }
+
+            $dstDb = Read-Host "Destination (SQLite path or postgres:// URI) [new file next to source]"
+
+            Print-Step "Creating backup before migration..."
+            & $migrateBin -mode backup -src $srcDb 2>&1 | ForEach-Object { Write-Host $_ }
+
+            Print-Step "Running Rust -> Go migration..."
+            if ([string]::IsNullOrEmpty($dstDb)) {
+                & $migrateBin -mode rust2go -src $srcDb 2>&1 | ForEach-Object { Write-Host $_ }
+            } else {
+                & $migrateBin -mode rust2go -src $srcDb -dst $dstDb 2>&1 | ForEach-Object { Write-Host $_ }
+            }
+
+            if ($LASTEXITCODE -eq 0) {
+                Print-Success "Rust -> Go migration completed successfully!"
+            } else {
+                Print-Error "Migration failed. Check the output above for details."
+            }
+        }
+        "2" {
+            # Node.js -> Go
+            Write-Host ""
+            $defaultSrc = Join-Path $script:RUSTDESK_PATH "db_v2.sqlite3"
+            $defaultAuth = Join-Path $script:CONSOLE_PATH "data\auth.db"
+
+            $srcDb = Read-Host "Source Node.js peer database [$defaultSrc]"
+            if ([string]::IsNullOrEmpty($srcDb)) { $srcDb = $defaultSrc }
+
+            if (-not (Test-Path $srcDb)) {
+                Print-Error "Source peer database not found: $srcDb"
+                Press-Enter
+                return
+            }
+
+            $authDb = Read-Host "Node.js auth database [$defaultAuth]"
+            if ([string]::IsNullOrEmpty($authDb)) { $authDb = $defaultAuth }
+
+            $dstDb = Read-Host "Destination (SQLite path or postgres:// URI) [new file next to source]"
+
+            Print-Step "Creating backup before migration..."
+            & $migrateBin -mode backup -src $srcDb 2>&1 | ForEach-Object { Write-Host $_ }
+            if (Test-Path $authDb) {
+                & $migrateBin -mode backup -src $authDb 2>&1 | ForEach-Object { Write-Host $_ }
+            }
+
+            Print-Step "Running Node.js -> Go migration..."
+            $args = @("-mode", "nodejs2go", "-src", $srcDb)
+            if (Test-Path $authDb) {
+                $args += @("-node-auth", $authDb)
+            }
+            if (-not [string]::IsNullOrEmpty($dstDb)) {
+                $args += @("-dst", $dstDb)
+            }
+            & $migrateBin @args 2>&1 | ForEach-Object { Write-Host $_ }
+
+            if ($LASTEXITCODE -eq 0) {
+                Print-Success "Node.js -> Go migration completed successfully!"
+            } else {
+                Print-Error "Migration failed. Check the output above for details."
+            }
+        }
+        "3" {
+            # SQLite -> PostgreSQL
+            Write-Host ""
+            $defaultSrc = Join-Path $script:RUSTDESK_PATH "db_v2.sqlite3"
+            $srcDb = Read-Host "Source SQLite database [$defaultSrc]"
+            if ([string]::IsNullOrEmpty($srcDb)) { $srcDb = $defaultSrc }
+
+            if (-not (Test-Path $srcDb)) {
+                Print-Error "Source database not found: $srcDb"
+                Press-Enter
+                return
+            }
+
+            $pgUri = Read-Host "PostgreSQL connection URI (postgres://user:pass@host:5432/dbname)"
+            if ([string]::IsNullOrEmpty($pgUri)) {
+                Print-Error "PostgreSQL URI is required"
+                Press-Enter
+                return
+            }
+
+            Print-Step "Creating backup before migration..."
+            & $migrateBin -mode backup -src $srcDb 2>&1 | ForEach-Object { Write-Host $_ }
+
+            Print-Step "Running SQLite -> PostgreSQL migration..."
+            & $migrateBin -mode sqlite2pg -src $srcDb -dst $pgUri 2>&1 | ForEach-Object { Write-Host $_ }
+
+            if ($LASTEXITCODE -eq 0) {
+                Print-Success "SQLite -> PostgreSQL migration completed successfully!"
+                Print-Info "Update your BetterDesk Go server config: DB_URL=$pgUri"
+            } else {
+                Print-Error "Migration failed. Check the output above for details."
+            }
+        }
+        "4" {
+            # PostgreSQL -> SQLite
+            Write-Host ""
+            $pgUri = Read-Host "PostgreSQL connection URI (postgres://user:pass@host:5432/dbname)"
+            if ([string]::IsNullOrEmpty($pgUri)) {
+                Print-Error "PostgreSQL URI is required"
+                Press-Enter
+                return
+            }
+
+            $defaultDst = Join-Path $script:RUSTDESK_PATH "db_v2.sqlite3"
+            $dstDb = Read-Host "Destination SQLite file [$defaultDst]"
+            if ([string]::IsNullOrEmpty($dstDb)) { $dstDb = $defaultDst }
+
+            if (Test-Path $dstDb) {
+                Print-Warning "Destination file exists: $dstDb"
+                if (-not (Confirm-Action "Overwrite (backup will be created first)?")) {
+                    Press-Enter
+                    return
+                }
+                & $migrateBin -mode backup -src $dstDb 2>&1 | ForEach-Object { Write-Host $_ }
+            }
+
+            Print-Step "Running PostgreSQL -> SQLite migration..."
+            & $migrateBin -mode pg2sqlite -src $pgUri -dst $dstDb 2>&1 | ForEach-Object { Write-Host $_ }
+
+            if ($LASTEXITCODE -eq 0) {
+                Print-Success "PostgreSQL -> SQLite migration completed successfully!"
+            } else {
+                Print-Error "Migration failed. Check the output above for details."
+            }
+        }
+        "5" {
+            # Backup
+            Write-Host ""
+            $defaultSrc = Join-Path $script:RUSTDESK_PATH "db_v2.sqlite3"
+            $srcDb = Read-Host "SQLite database to backup [$defaultSrc]"
+            if ([string]::IsNullOrEmpty($srcDb)) { $srcDb = $defaultSrc }
+
+            if (-not (Test-Path $srcDb)) {
+                Print-Error "Database not found: $srcDb"
+                Press-Enter
+                return
+            }
+
+            Print-Step "Creating backup..."
+            & $migrateBin -mode backup -src $srcDb 2>&1 | ForEach-Object { Write-Host $_ }
+
+            if ($LASTEXITCODE -eq 0) {
+                Print-Success "Backup created successfully!"
+            } else {
+                Print-Error "Backup failed."
+            }
+        }
+        "0" { return }
+        default {
+            Print-Warning "Invalid option"
+        }
+    }
+
+    Press-Enter
+}
+
+#===============================================================================
 # Main Menu
 #===============================================================================
 
@@ -2647,6 +3383,7 @@ function Show-Menu {
     Write-Host "  9. UNINSTALL"
     Write-Host ""
     Write-Host "  C. Configure SSL certificates"
+    Write-Host "  M. Database migration"
     Write-Host "  S. Settings (paths)"
     Write-Host "  0. Exit"
     Write-Host ""
@@ -2682,6 +3419,8 @@ function Main {
             "9" { Do-Uninstall }
             "C" { Do-ConfigureSSL }
             "c" { Do-ConfigureSSL }
+            "M" { Do-MigrateDatabase }
+            "m" { Do-MigrateDatabase }
             "S" { Configure-Paths }
             "s" { Configure-Paths }
             "0" {

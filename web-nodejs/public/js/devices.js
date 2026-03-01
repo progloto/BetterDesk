@@ -50,6 +50,12 @@
             loadFolders();
             loadDevices();
         });
+
+        // Listen for changes from DeviceDetail panel
+        document.addEventListener('deviceDetail:changed', () => {
+            loadFolders();
+            loadDevices();
+        });
     }
     
     /**
@@ -226,8 +232,9 @@
      */
     function attachRowEventListeners() {
         // Copy ID
-        tableBody.querySelectorAll('.device-id-copy').forEach(btn => {
-            btn.addEventListener('click', async () => {
+        tableBody.querySelectorAll('.copy-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
                 const id = btn.dataset.copy;
                 await Utils.copyToClipboard(id);
                 btn.classList.add('copied');
@@ -253,6 +260,18 @@
         tableBody.querySelectorAll('.action-btn').forEach(btn => {
             btn.addEventListener('click', () => handleAction(btn.dataset.action, btn.dataset.id, btn.dataset));
         });
+
+        // Double-click row to open device detail panel
+        tableBody.querySelectorAll('tr[data-id]').forEach(row => {
+            row.addEventListener('dblclick', (e) => {
+                // Ignore double-click on action buttons and drag handle
+                if (e.target.closest('.action-btn') || e.target.closest('.drag-handle') || e.target.closest('.copy-btn')) return;
+                const deviceId = row.dataset.id;
+                if (deviceId && typeof DeviceDetail !== 'undefined') {
+                    DeviceDetail.open(deviceId);
+                }
+            });
+        });
     }
     
     /**
@@ -269,7 +288,11 @@
                 break;
                 
             case 'details':
-                showDeviceDetails(deviceId);
+                if (typeof DeviceDetail !== 'undefined') {
+                    DeviceDetail.open(deviceId);
+                } else {
+                    showDeviceDetails(deviceId);
+                }
                 break;
                 
             case 'edit':
@@ -759,6 +782,8 @@
         try {
             const response = await Utils.api('/api/folders');
             folders = response.folders || [];
+            // Expose folders globally for DeviceDetail panel
+            window._betterdesk_folders = folders;
             renderFolders();
             updateFolderCounts();
             updateBulkMoveSelect();
@@ -780,11 +805,13 @@
             return;
         }
         
-        container.innerHTML = folders.map(folder => `
+        container.innerHTML = folders.map(folder => {
+            const safeColor = Utils.sanitizeColor(folder.color);
+            return `
             <div class="folder-item ${currentFolder == folder.id ? 'active' : ''}" 
                  data-folder="${folder.id}" 
-                 style="--folder-color: ${folder.color}">
-                <span class="material-icons folder-icon" style="color: ${folder.color}">folder</span>
+                 style="--folder-color: ${safeColor}">
+                <span class="material-icons folder-icon" style="color: ${safeColor}">folder</span>
                 <span class="folder-name">${Utils.escapeHtml(folder.name)}</span>
                 <span class="folder-count">${folder.device_count || 0}</span>
                 <div class="folder-actions">
@@ -796,7 +823,7 @@
                     </button>
                 </div>
             </div>
-        `).join('');
+        `}).join('');
         
         // Attach folder event listeners
         container.querySelectorAll('.folder-item').forEach(el => {
