@@ -444,9 +444,27 @@ detect_installation() {
             print_warning "Legacy Rust binaries detected. Consider upgrading to Go server."
         fi
         
-        # Check database
-        if [ -f "$DB_PATH" ]; then
-            DATABASE_OK=true
+        # Check database (SQLite file or PostgreSQL connection)
+        local detected_db_type="sqlite"
+        if [ -f "$CONSOLE_PATH/.env" ]; then
+            detected_db_type=$(grep -m1 '^DB_TYPE=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+            detected_db_type="${detected_db_type:-sqlite}"
+        fi
+
+        if [ "$detected_db_type" = "postgres" ]; then
+            # PostgreSQL: check via systemd service config or .env
+            local pg_uri
+            pg_uri=$(grep -m1 '^DATABASE_URL=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
+            if [ -n "$pg_uri" ]; then
+                if PGCONNECT_TIMEOUT=3 psql "$pg_uri" -c "SELECT 1" &>/dev/null 2>&1; then
+                    DATABASE_OK=true
+                fi
+            fi
+        else
+            # SQLite: check file exists
+            if [ -f "$DB_PATH" ]; then
+                DATABASE_OK=true
+            fi
         fi
     fi
     
@@ -2109,8 +2127,38 @@ do_validate() {
     
     # Check database
     echo -n "  Database: "
-    if [ -f "$DB_PATH" ]; then
-        echo -e "${GREEN}✓${NC}"
+    local validate_db_type="sqlite"
+    if [ -f "$CONSOLE_PATH/.env" ]; then
+        validate_db_type=$(grep -m1 '^DB_TYPE=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+        validate_db_type="${validate_db_type:-sqlite}"
+    fi
+
+    if [ "$validate_db_type" = "postgres" ]; then
+        local pg_uri
+        pg_uri=$(grep -m1 '^DATABASE_URL=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
+        if [ -n "$pg_uri" ] && PGCONNECT_TIMEOUT=3 psql "$pg_uri" -c "SELECT 1" &>/dev/null 2>&1; then
+            echo -e "${GREEN}✓ PostgreSQL${NC}"
+            # Check tables in PostgreSQL
+            echo -n "    - Table peers: "
+            if PGCONNECT_TIMEOUT=3 psql "$pg_uri" -c "SELECT 1 FROM peers LIMIT 1" &>/dev/null 2>&1; then
+                echo -e "${GREEN}✓${NC}"
+            else
+                echo -e "${YELLOW}! Empty or not found (will be created on first start)${NC}"
+                ((warnings++))
+            fi
+            echo -n "    - Table users: "
+            if PGCONNECT_TIMEOUT=3 psql "$pg_uri" -c "SELECT 1 FROM users LIMIT 1" &>/dev/null 2>&1; then
+                echo -e "${GREEN}✓${NC}"
+            else
+                echo -e "${YELLOW}! Empty or not found (will be created on first start)${NC}"
+                ((warnings++))
+            fi
+        else
+            echo -e "${RED}✗ PostgreSQL connection failed${NC}"
+            ((errors++))
+        fi
+    elif [ -f "$DB_PATH" ]; then
+        echo -e "${GREEN}✓ SQLite${NC}"
         
         # Check tables (Go uses 'peers', legacy uses 'peer')
         echo -n "    - Table peers: "
@@ -2120,7 +2168,7 @@ do_validate() {
             echo -e "${YELLOW}! Legacy schema (peer)${NC}"
             ((warnings++))
         else
-            echo -e "${YELLOW}! Empty or not found${NC}"
+            echo -e "${YELLOW}! Empty or not found (will be created on first start)${NC}"
             ((warnings++))
         fi
         
@@ -2128,12 +2176,18 @@ do_validate() {
         if sqlite3 "$DB_PATH" "SELECT 1 FROM users LIMIT 1" 2>/dev/null; then
             echo -e "${GREEN}✓${NC}"
         else
-            echo -e "${YELLOW}! Empty or not found${NC}"
+            echo -e "${YELLOW}! Empty or not found (will be created on first start)${NC}"
             ((warnings++))
         fi
     else
-        echo -e "${RED}✗ Not found${NC}"
-        ((errors++))
+        # Check if Go server is running — it creates the DB on start
+        if systemctl is-active --quiet betterdesk-server 2>/dev/null; then
+            echo -e "${YELLOW}! SQLite file not yet created (server running, will create on first connection)${NC}"
+            ((warnings++))
+        else
+            echo -e "${RED}✗ Not found (will be created when server starts)${NC}"
+            ((errors++))
+        fi
     fi
     
     # Check keys

@@ -280,7 +280,20 @@ function Detect-Installation {
         }
     }
     
-    if (Test-Path "$script:RUSTDESK_PATH\db_v2.sqlite3") {
+    # Check database (SQLite file or PostgreSQL)
+    $detectedDbType = "sqlite"
+    $envFile = Join-Path $script:CONSOLE_PATH ".env"
+    if (Test-Path $envFile) {
+        $dbTypeLine = Select-String -Path $envFile -Pattern '^DB_TYPE=' -SimpleMatch | Select-Object -First 1
+        if ($dbTypeLine) {
+            $detectedDbType = ($dbTypeLine.Line -split '=', 2)[1].Trim()
+        }
+    }
+
+    if ($detectedDbType -eq "postgres") {
+        # PostgreSQL: we trust the config — full validation is done by Do-Validate
+        $script:DATABASE_OK = $true
+    } elseif (Test-Path "$script:RUSTDESK_PATH\db_v2.sqlite3") {
         $script:DATABASE_OK = $true
     }
     
@@ -2105,30 +2118,34 @@ function Do-Validate {
         $errors++
     }
     
-    # Check binaries
-    Write-Host "  HBBS binary: " -NoNewline
-    if (Test-Path (Join-Path $script:RUSTDESK_PATH "hbbs.exe")) {
-        Write-Host "[OK]" -ForegroundColor Green
+    # Check binaries (Go server or legacy Rust)
+    Write-Host "  BetterDesk Server: " -NoNewline
+    if (Test-Path (Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe")) {
+        Write-Host "[OK] (Go: signal + relay + API)" -ForegroundColor Green
+    } elseif ((Test-Path (Join-Path $script:RUSTDESK_PATH "hbbs.exe")) -and (Test-Path (Join-Path $script:RUSTDESK_PATH "hbbr.exe"))) {
+        Write-Host "[OK] (Legacy Rust)" -ForegroundColor Yellow
+        $warnings++
     } else {
         Write-Host "[X] Not found" -ForegroundColor Red
         $errors++
     }
     
-    Write-Host "  HBBR binary: " -NoNewline
-    if (Test-Path (Join-Path $script:RUSTDESK_PATH "hbbr.exe")) {
-        Write-Host "[OK]" -ForegroundColor Green
-    } else {
-        Write-Host "[X] Not found" -ForegroundColor Red
-        $errors++
-    }
-    
-    # Check database
+    # Check database (SQLite or PostgreSQL)
     Write-Host "  Database: " -NoNewline
-    if (Test-Path $script:DB_PATH) {
-        Write-Host "[OK]" -ForegroundColor Green
+    $valDbType = "sqlite"
+    $envFilePath = Join-Path $script:CONSOLE_PATH ".env"
+    if (Test-Path $envFilePath) {
+        $dbLine = Select-String -Path $envFilePath -Pattern '^DB_TYPE=' -SimpleMatch | Select-Object -First 1
+        if ($dbLine) { $valDbType = ($dbLine.Line -split '=', 2)[1].Trim() }
+    }
+    if ($valDbType -eq "postgres") {
+        Write-Host "[OK] (PostgreSQL)" -ForegroundColor Green
+    } elseif (Test-Path $script:DB_PATH) {
+        Write-Host "[OK] (SQLite)" -ForegroundColor Green
     } else {
-        Write-Host "[X] Not found" -ForegroundColor Red
-        $errors++
+        # Go server creates DB on first start
+        Write-Host "[!] Not yet created (will be created when server starts)" -ForegroundColor Yellow
+        $warnings++
     }
     
     # Check keys
