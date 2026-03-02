@@ -37,6 +37,7 @@ LABEL version="2.4.0"
 RUN apk add --no-cache \
     ca-certificates \
     curl \
+    sqlite \
     tini \
     && addgroup -S betterdesk \
     && adduser -S -G betterdesk betterdesk
@@ -65,4 +66,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
 USER betterdesk
 
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["/usr/local/bin/betterdesk-server", "-dir", "/opt/rustdesk"]
+CMD ["/usr/local/bin/betterdesk-server", "-mode", "all", "-db", "/opt/rustdesk/db_v2.sqlite3", "-key-file", "/opt/rustdesk/id_ed25519"]

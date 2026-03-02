@@ -115,7 +115,7 @@ CONSOLE_TYPE="none"  # none, nodejs
 BACKUP_DIR="${BACKUP_DIR:-/opt/rustdesk-backups}"
 
 # API configuration
-API_PORT="${API_PORT:-21120}"
+API_PORT="${API_PORT:-21114}"
 
 # Database configuration
 USE_POSTGRESQL="${USE_POSTGRESQL:-false}"  # true = PostgreSQL, false = SQLite
@@ -395,6 +395,20 @@ start_services_with_verification() {
         return 1
     fi
     print_success "betterdesk-server started and healthy"
+    
+    # Inject shared API key into Go server database for Node.js ↔ Go communication
+    local api_key_file="$RUSTDESK_PATH/.api_key"
+    if [ -f "$api_key_file" ]; then
+        local api_key
+        api_key=$(cat "$api_key_file")
+        local go_db="$RUSTDESK_PATH/db_v2.sqlite3"
+        if [ -f "$go_db" ] && command -v sqlite3 &>/dev/null; then
+            sqlite3 "$go_db" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key');" 2>/dev/null
+            if [ $? -eq 0 ]; then
+                print_info "API key synced to Go server database"
+            fi
+        fi
+    fi
     
     # Verify relay port is also listening
     if ! verify_service_health "betterdesk-server" "21117" 5; then
@@ -1290,16 +1304,15 @@ install_nodejs_console() {
     mkdir -p "$CONSOLE_PATH/data"
     
     # Generate admin password for Node.js console
-    local nodejs_admin_password
-    nodejs_admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+    ADMIN_PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+    local nodejs_admin_password="$ADMIN_PASSWORD"
     
     # Determine database configuration
     local db_config=""
     if [ "$USE_POSTGRESQL" = "true" ] && [ -n "$POSTGRESQL_URI" ]; then
         db_config="# Database: PostgreSQL
 DB_TYPE=postgres
-DATABASE_URL=$POSTGRESQL_URI
-DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3"
+DATABASE_URL=$POSTGRESQL_URI"
     else
         db_config="# Database: SQLite
 DB_TYPE=sqlite
@@ -1573,6 +1586,19 @@ setup_services() {
     fi
     
     # BetterDesk Go Server (single binary replacing hbbs+hbbr)
+    # Generate shared API key for Node.js ↔ Go server communication
+    local api_key
+    api_key=$(openssl rand -hex 32)
+    echo "$api_key" > "$RUSTDESK_PATH/.api_key"
+    chmod 600 "$RUSTDESK_PATH/.api_key"
+    print_info "Generated API key for console ↔ server communication"
+    
+    # Read admin password from install step (for syncing Go server admin)
+    local init_admin_arg=""
+    if [ -n "$ADMIN_PASSWORD" ]; then
+        init_admin_arg="-init-admin-pass $ADMIN_PASSWORD"
+    fi
+    
     cat > /etc/systemd/system/betterdesk-server.service << EOF
 [Unit]
 Description=BetterDesk Go Server v$VERSION (Signal + Relay + API)
@@ -1583,7 +1609,7 @@ After=network.target postgresql.service
 Type=simple
 User=root
 WorkingDirectory=$RUSTDESK_PATH
-ExecStart=$RUSTDESK_PATH/betterdesk-server -mode all -relay-servers $server_ip $db_arg -key-file $RUSTDESK_PATH/id_ed25519 -api-port $API_PORT $tls_arg
+ExecStart=$RUSTDESK_PATH/betterdesk-server -mode all -relay-servers $server_ip $db_arg -key-file $RUSTDESK_PATH/id_ed25519 -api-port $API_PORT $init_admin_arg $tls_arg
 Restart=always
 RestartSec=5
 LimitNOFILE=1000000

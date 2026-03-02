@@ -505,6 +505,22 @@ EOF
 EOF
     fi
 
+    # Generate shared API key for Node.js <-> Go server communication
+    local api_key
+    api_key=$(openssl rand -hex 32)
+    echo "$api_key" > "$DATA_DIR/.api_key"
+    chmod 600 "$DATA_DIR/.api_key"
+    print_info "Generated API key for console <-> server communication"
+    
+    # Generate admin password (shared between Go server and Node.js console)
+    local admin_password
+    admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+    DOCKER_ADMIN_PASSWORD="$admin_password"
+    
+    # Get server public IP for relay-servers
+    local server_ip
+    server_ip=$(curl -s ifconfig.me 2>/dev/null || curl -s icanhazip.com 2>/dev/null || echo "127.0.0.1")
+    
     # Add BetterDesk server (Go single binary — signal + relay + API)
     cat >> "$COMPOSE_FILE" << EOF
   server:
@@ -524,7 +540,8 @@ EOF
     volumes:
       - $DATA_DIR:/opt/rustdesk
     environment:
-      - ENCRYPTED_ONLY=1
+      - RELAY_SERVERS=$server_ip
+      - INIT_ADMIN_PASS=$admin_password
 EOF
 
     if [ "$DB_TYPE" = "postgresql" ]; then
@@ -570,6 +587,8 @@ EOF
       - DB_PATH=/opt/rustdesk/db_v2.sqlite3
       - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
       - API_KEY_PATH=/opt/rustdesk/.api_key
+      - KEYS_PATH=/opt/rustdesk
+      - DEFAULT_ADMIN_PASSWORD=$admin_password
       - WS_HBBS_HOST=$SERVER_CONTAINER
       - WS_HBBS_PORT=21116
       - WS_HBBR_HOST=$SERVER_CONTAINER
@@ -649,6 +668,24 @@ start_containers() {
     
     sleep 5
     
+    # Inject shared API key into Go server database for Node.js <-> Go communication
+    local api_key_file="$DATA_DIR/.api_key"
+    if [ -f "$api_key_file" ]; then
+        local api_key
+        api_key=$(cat "$api_key_file")
+        # Use sqlite3 inside the server container to insert the API key
+        docker exec "$SERVER_CONTAINER" sh -c "
+            if command -v sqlite3 >/dev/null 2>&1; then
+                sqlite3 /opt/rustdesk/db_v2.sqlite3 \"INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key');\" 2>/dev/null
+            fi
+        " 2>/dev/null || true
+        # Also try from host if sqlite3 is available
+        if [ -f "$DATA_DIR/db_v2.sqlite3" ] && command -v sqlite3 &>/dev/null; then
+            sqlite3 "$DATA_DIR/db_v2.sqlite3" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key');" 2>/dev/null || true
+        fi
+        print_info "API key synced to Go server database"
+    fi
+    
     detect_installation
     
     if [ "$SERVER_RUNNING" = true ] && [ "$CONSOLE_RUNNING" = true ]; then
@@ -671,8 +708,11 @@ stop_containers() {
 create_admin_user() {
     print_step "Creating admin user..."
     
-    local admin_password
-    admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+    # Use the password generated during compose file creation
+    local admin_password="${DOCKER_ADMIN_PASSWORD}"
+    if [ -z "$admin_password" ]; then
+        admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+    fi
     
     # Wait for database to be created
     sleep 3

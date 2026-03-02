@@ -1339,9 +1339,29 @@ function Setup-Services {
     
     Start-Sleep -Seconds 2
     
+    # Generate shared API key for Node.js <-> Go server communication
+    $apiKeyPath = Join-Path $script:RUSTDESK_PATH ".api_key"
+    if (-not (Test-Path $apiKeyPath)) {
+        $apiKeyBytes = New-Object byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill($apiKeyBytes)
+        $apiKey = [System.BitConverter]::ToString($apiKeyBytes) -replace '-', '' | ForEach-Object { $_.ToLower() }
+        Set-Content -Path $apiKeyPath -Value $apiKey -NoNewline
+        Print-Info "Generated API key for console-server communication"
+    }
+    
     # BetterDesk Go Server (single binary: signal + relay + API)
     $serverExe = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
     $serverArgs = "-mode all -relay-servers $serverIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
+    
+    # Add -init-admin-pass to sync admin password with Node.js console
+    $credsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
+    if (Test-Path $credsFile) {
+        $credsContent = Get-Content $credsFile -Raw
+        if ($credsContent -match ':(.+)') {
+            $adminPass = $Matches[1].Trim()
+            $serverArgs += " -init-admin-pass $adminPass"
+        }
+    }
     
     # Add TLS flags if certificates exist
     $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
@@ -1413,6 +1433,16 @@ function Setup-ScheduledTasks {
     # BetterDesk Go Server Task
     $serverExe = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
     $serverArgs = "-mode all -relay-servers $ServerIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
+    
+    # Add -init-admin-pass to sync admin password with Node.js console
+    $credsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
+    if (Test-Path $credsFile) {
+        $credsContent = Get-Content $credsFile -Raw
+        if ($credsContent -match ':(.+)') {
+            $adminPass = $Matches[1].Trim()
+            $serverArgs += " -init-admin-pass $adminPass"
+        }
+    }
     
     # Add TLS flags if certificates exist
     $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
@@ -1629,17 +1659,28 @@ function Create-AdminUser {
 function Start-Services {
     Print-Step "Starting services..."
     
-    # Try to start as Windows services first
-    $serviceExists = Get-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+    # Try Go server service first, then legacy
+    $goServiceExists = Get-Service -Name $script:SERVER_SERVICE -ErrorAction SilentlyContinue
+    $legacyServiceExists = Get-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
     
-    if ($serviceExists) {
+    if ($goServiceExists) {
+        # New Go single-binary architecture
+        Start-Service -Name $script:SERVER_SERVICE -ErrorAction SilentlyContinue
+        Start-Service -Name $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
+    } elseif ($legacyServiceExists) {
+        # Legacy Rust architecture (hbbs + hbbr)
         Start-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
         Start-Service -Name $script:HBBR_SERVICE -ErrorAction SilentlyContinue
         Start-Service -Name $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
     } else {
-        # Start scheduled tasks
-        Start-ScheduledTask -TaskName $script:HBBS_SERVICE -ErrorAction SilentlyContinue
-        Start-ScheduledTask -TaskName $script:HBBR_SERVICE -ErrorAction SilentlyContinue
+        # Try scheduled tasks (Go first, then legacy)
+        $goTaskExists = Get-ScheduledTask -TaskName $script:SERVER_SERVICE -ErrorAction SilentlyContinue
+        if ($goTaskExists) {
+            Start-ScheduledTask -TaskName $script:SERVER_SERVICE -ErrorAction SilentlyContinue
+        } else {
+            Start-ScheduledTask -TaskName $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+            Start-ScheduledTask -TaskName $script:HBBR_SERVICE -ErrorAction SilentlyContinue
+        }
         Start-ScheduledTask -TaskName $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
     }
     
@@ -1647,7 +1688,7 @@ function Start-Services {
     
     Detect-Installation
     
-    if ($script:HBBS_RUNNING -and $script:HBBR_RUNNING) {
+    if ($script:SERVER_RUNNING -or ($script:HBBS_RUNNING -and $script:HBBR_RUNNING)) {
         Print-Success "All services started"
     } else {
         Print-Warning "Some services may not be working properly"
@@ -1658,19 +1699,25 @@ function Start-Services {
 function Stop-AllServices {
     Print-Step "Stopping services..."
     
-    # Stop Windows services
+    # Stop Windows services (Go server + legacy)
+    Stop-Service -Name $script:SERVER_SERVICE -ErrorAction SilentlyContinue -Force
     Stop-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue -Force
     Stop-Service -Name $script:HBBR_SERVICE -ErrorAction SilentlyContinue -Force
     Stop-Service -Name $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue -Force
     
     # Stop scheduled tasks
+    Stop-ScheduledTask -TaskName $script:SERVER_SERVICE -ErrorAction SilentlyContinue
     Stop-ScheduledTask -TaskName $script:HBBS_SERVICE -ErrorAction SilentlyContinue
     Stop-ScheduledTask -TaskName $script:HBBR_SERVICE -ErrorAction SilentlyContinue
     Stop-ScheduledTask -TaskName $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
     
-    # Kill processes directly
+    # Kill processes directly (Go server + legacy)
+    Get-Process -Name "betterdesk-server" -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-Process -Name "hbbs" -ErrorAction SilentlyContinue | Stop-Process -Force
     Get-Process -Name "hbbr" -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object {
+        $_.MainModule.FileName -like "*betterdesk*" -or $_.CommandLine -like "*server.js*"
+    } | Stop-Process -Force -ErrorAction SilentlyContinue
     
     Start-Sleep -Seconds 2
 }
@@ -1699,10 +1746,12 @@ function Test-ServiceHealth {
         [int]$TimeoutSeconds = 10
     )
     
-    # Check if process is running  
-    $processName = if ($ServiceName -match "Signal") { "hbbs" } 
+    # Check if process is running
+    $processName = if ($ServiceName -eq $script:SERVER_SERVICE) { "betterdesk-server" }
+                   elseif ($ServiceName -match "Signal") { "hbbs" }
                    elseif ($ServiceName -match "Relay") { "hbbr" }
-                   else { "python" }
+                   elseif ($ServiceName -eq $script:CONSOLE_SERVICE) { "node" }
+                   else { "betterdesk-server" }
     
     $process = Get-Process -Name $processName -ErrorAction SilentlyContinue
     
@@ -1735,12 +1784,12 @@ function Start-ServicesWithVerification {
     $hasErrors = $false
     
     # Check ports first
-    if (-not (Test-PortAvailable -Port 21116 -ServiceName "hbbs")) {
+    if (-not (Test-PortAvailable -Port 21116 -ServiceName "betterdesk-server")) {
         Print-Error "Port 21116 (ID server) not available"
         $hasErrors = $true
     }
     
-    if (-not (Test-PortAvailable -Port 21117 -ServiceName "hbbr")) {
+    if (-not (Test-PortAvailable -Port 21117 -ServiceName "betterdesk-server")) {
         Print-Error "Port 21117 (relay) not available"  
         $hasErrors = $true
     }
@@ -1751,43 +1800,60 @@ function Start-ServicesWithVerification {
         return $false
     }
     
-    # Start HBBS
-    Print-Info "Starting $($script:HBBS_SERVICE)..."
-    $serviceExists = Get-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+    # Start Go Server (single binary: signal + relay + API)
+    Print-Info "Starting $($script:SERVER_SERVICE) (Go server)..."
+    $goServiceExists = Get-Service -Name $script:SERVER_SERVICE -ErrorAction SilentlyContinue
     
-    if ($serviceExists) {
-        Start-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+    if ($goServiceExists) {
+        Start-Service -Name $script:SERVER_SERVICE -ErrorAction SilentlyContinue
     } else {
-        Start-ScheduledTask -TaskName $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+        # Try scheduled task
+        $goTaskExists = Get-ScheduledTask -TaskName $script:SERVER_SERVICE -ErrorAction SilentlyContinue
+        if ($goTaskExists) {
+            Start-ScheduledTask -TaskName $script:SERVER_SERVICE -ErrorAction SilentlyContinue
+        } else {
+            # Legacy fallback: start hbbs + hbbr separately
+            Print-Warning "Go server service not found, trying legacy hbbs/hbbr..."
+            $legacyService = Get-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+            if ($legacyService) {
+                Start-Service -Name $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+                Start-Service -Name $script:HBBR_SERVICE -ErrorAction SilentlyContinue
+            } else {
+                Start-ScheduledTask -TaskName $script:HBBS_SERVICE -ErrorAction SilentlyContinue
+                Start-ScheduledTask -TaskName $script:HBBR_SERVICE -ErrorAction SilentlyContinue
+            }
+        }
     }
     
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 3
     
-    if (-not (Test-ServiceHealth -ServiceName $script:HBBS_SERVICE -ExpectedPort 21116 -TimeoutSeconds 10)) {
-        Print-Error "Failed to start hbbs"
+    if (-not (Test-ServiceHealth -ServiceName $script:SERVER_SERVICE -ExpectedPort 21116 -TimeoutSeconds 10)) {
+        Print-Error "Failed to start BetterDesk server"
         return $false
     }
-    Print-Success "hbbs started and healthy"
+    Print-Success "BetterDesk server started and healthy (signal + relay + API)"
     
-    # Start HBBR
-    Print-Info "Starting $($script:HBBR_SERVICE)..."
-    if ($serviceExists) {
-        Start-Service -Name $script:HBBR_SERVICE -ErrorAction SilentlyContinue
-    } else {
-        Start-ScheduledTask -TaskName $script:HBBR_SERVICE -ErrorAction SilentlyContinue
+    # Inject shared API key into Go server database for Node.js <-> Go communication
+    $apiKeyPath = Join-Path $script:RUSTDESK_PATH ".api_key"
+    $goDbPath = Join-Path $script:RUSTDESK_PATH "db_v2.sqlite3"
+    if ((Test-Path $apiKeyPath) -and (Test-Path $goDbPath)) {
+        $apiKey = Get-Content $apiKeyPath -Raw
+        $apiKey = $apiKey.Trim()
+        try {
+            $pythonScript = "import sqlite3; conn = sqlite3.connect(r'$goDbPath'); conn.execute('INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)', ('api_key', '$apiKey')); conn.commit(); conn.close()"
+            python -c $pythonScript 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Print-Info "API key synced to Go server database"
+            }
+        } catch {
+            # Non-critical: API key sync failed, Node.js will still work with JWT auth
+        }
     }
-    
-    Start-Sleep -Seconds 2
-    
-    if (-not (Test-ServiceHealth -ServiceName $script:HBBR_SERVICE -ExpectedPort 21117 -TimeoutSeconds 10)) {
-        Print-Error "Failed to start hbbr"
-        return $false
-    }
-    Print-Success "hbbr started and healthy"
     
     # Start Console
     Print-Info "Starting $($script:CONSOLE_SERVICE)..."
-    if ($serviceExists) {
+    $consoleService = Get-Service -Name $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
+    if ($consoleService) {
         Start-Service -Name $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
     } else {
         Start-ScheduledTask -TaskName $script:CONSOLE_SERVICE -ErrorAction SilentlyContinue
