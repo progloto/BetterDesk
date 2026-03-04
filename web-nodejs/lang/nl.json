@@ -54,6 +54,7 @@
     "password_placeholder": "Voer wachtwoord in",
     "remember_me": "Onthoud mij",
     "login_failed": "Inloggen mislukt. Controleer uw inloggegevens.",
+    "invalid_credentials": "Ongeldige gebruikersnaam of wachtwoord.",
     "fill_all_fields": "Vul alle velden in",
     "logout_confirm": "Weet u zeker dat u wilt uitloggen?",
     "change_password": "Wachtwoord wijzigen",

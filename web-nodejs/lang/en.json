@@ -54,6 +54,7 @@
     "password_placeholder": "Enter password",
     "remember_me": "Remember me",
     "login_failed": "Login failed. Please check your credentials.",
+    "invalid_credentials": "Invalid username or password.",
     "fill_all_fields": "Please fill in all fields",
     "logout_confirm": "Are you sure you want to logout?",
     "change_password": "Change Password",

@@ -54,6 +54,7 @@
     "password_placeholder": "请输入密码",
     "remember_me": "记住我",
     "login_failed": "登录失败，请检查您的凭据。",
+    "invalid_credentials": "用户名或密码无效。",
     "fill_all_fields": "请填写所有字段",
     "logout_confirm": "确定要退出登录吗？",
     "change_password": "修改密码",

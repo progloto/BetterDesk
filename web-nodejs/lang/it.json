@@ -54,6 +54,7 @@
     "password_placeholder": "Inserisci la password",
     "remember_me": "Ricordami",
     "login_failed": "Accesso fallito. Verifica le tue credenziali.",
+    "invalid_credentials": "Nome utente o password non validi.",
     "fill_all_fields": "Compila tutti i campi",
     "logout_confirm": "Sei sicuro di voler uscire?",
     "change_password": "Cambia password",

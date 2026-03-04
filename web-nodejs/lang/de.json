@@ -54,6 +54,7 @@
     "password_placeholder": "Passwort eingeben",
     "remember_me": "Angemeldet bleiben",
     "login_failed": "Anmeldung fehlgeschlagen. Bitte überprüfen Sie Ihre Anmeldedaten.",
+    "invalid_credentials": "Ungültiger Benutzername oder Passwort.",
     "fill_all_fields": "Bitte füllen Sie alle Felder aus",
     "logout_confirm": "Sind Sie sicher, dass Sie sich abmelden möchten?",
     "change_password": "Passwort ändern",

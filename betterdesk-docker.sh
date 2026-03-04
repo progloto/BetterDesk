@@ -719,7 +719,8 @@ create_admin_user() {
     
     # Node.js console auto-creates admin user on startup if no users exist
     # We use the reset-password script to set a secure password
-    docker exec "$CONSOLE_CONTAINER" node /app/scripts/reset-password.js admin "$admin_password" 2>/dev/null || {
+    # Arguments: <password> [username] — password first, then optional username
+    docker exec "$CONSOLE_CONTAINER" node /app/scripts/reset-password.js "$admin_password" admin 2>/dev/null || {
         # If script fails, try via environment variable approach
         print_info "Setting admin password via API..."
         
@@ -731,7 +732,7 @@ create_admin_user() {
         # If this fails, admin will use default password which must be changed
         docker exec "$CONSOLE_CONTAINER" sh -c "
             if [ -f /app/scripts/reset-password.js ]; then
-                node /app/scripts/reset-password.js admin '$admin_password' 2>/dev/null
+                node /app/scripts/reset-password.js '$admin_password' admin 2>/dev/null
             fi
         " 2>/dev/null || true
     }
@@ -1166,7 +1167,9 @@ do_reset_password() {
     esac
     
     # Update password using reset-password.js (supports both SQLite and PostgreSQL)
-    docker exec "$CONSOLE_CONTAINER" node /app/scripts/reset-password.js admin "$new_password" 2>/dev/null || {
+    # Update password using reset-password.js (supports both SQLite and PostgreSQL)
+    # Arguments: <password> [username] — password first, then optional username
+    docker exec "$CONSOLE_CONTAINER" node /app/scripts/reset-password.js "$new_password" admin 2>/dev/null || {
         print_warning "reset-password.js failed, trying inline fallback..."
         docker exec "$CONSOLE_CONTAINER" node -e "
 const bcrypt = require('bcrypt');

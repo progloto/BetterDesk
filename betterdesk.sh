@@ -2639,6 +2639,21 @@ EOF
 
     echo ""
     if [ "$success" = "true" ]; then
+        # Update DEFAULT_ADMIN_PASSWORD in .env so ensureDefaultAdmin() does not
+        # overwrite the new hash on next Node.js restart
+        if [ -f "$CONSOLE_PATH/.env" ]; then
+            if grep -q '^DEFAULT_ADMIN_PASSWORD=' "$CONSOLE_PATH/.env" 2>/dev/null; then
+                sed -i "s|^DEFAULT_ADMIN_PASSWORD=.*|DEFAULT_ADMIN_PASSWORD=$new_password|" "$CONSOLE_PATH/.env"
+            fi
+        fi
+        
+        # Restart console so it picks up the new .env value
+        if systemctl is-active betterdesk-console &>/dev/null; then
+            print_info "Restarting betterdesk-console..."
+            systemctl restart betterdesk-console 2>/dev/null || true
+            sleep 2
+        fi
+        
         echo -e "${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║              NEW LOGIN CREDENTIALS                       ║${NC}"
         echo -e "${GREEN}╠════════════════════════════════════════════════════════╣${NC}"

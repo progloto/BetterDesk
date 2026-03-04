@@ -54,6 +54,7 @@
     "password_placeholder": "Introduzca la contraseña",
     "remember_me": "Recordarme",
     "login_failed": "Error de inicio de sesión. Verifique sus credenciales.",
+    "invalid_credentials": "Nombre de usuario o contraseña inválidos.",
     "fill_all_fields": "Por favor, rellene todos los campos",
     "logout_confirm": "¿Está seguro de que desea cerrar sesión?",
     "change_password": "Cambiar contraseña",

@@ -54,6 +54,7 @@
     "password_placeholder": "Insira a palavra-passe",
     "remember_me": "Lembrar-me",
     "login_failed": "Falha no início de sessão. Verifique as suas credenciais.",
+    "invalid_credentials": "Nome de utilizador ou palavra-passe inválidos.",
     "fill_all_fields": "Preencha todos os campos",
     "logout_confirm": "Tem a certeza que deseja sair?",
     "change_password": "Alterar palavra-passe",

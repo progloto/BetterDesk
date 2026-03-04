@@ -85,14 +85,24 @@ async function authenticate(username, password) {
     if (!user) {
         // Timing-safe: do a real hash comparison to prevent user enumeration
         await bcrypt.compare(password, DUMMY_HASH);
+        console.log(`[AUTH] Login failed: user '${username}' not found in database`);
         return null;
     }
     
+    // Diagnostic: log hash format to help debug password issues
+    const hashType = isPBKDF2Hash(user.password_hash) ? 'PBKDF2'
+        : (user.password_hash && user.password_hash.startsWith('$2')) ? 'bcrypt'
+        : 'unknown';
+    console.log(`[AUTH] Verifying password for '${username}' (hash type: ${hashType}, length: ${(user.password_hash || '').length})`);
+    
     const { valid, needsMigration } = await verifyPasswordEx(password, user.password_hash);
     if (!valid) {
+        console.log(`[AUTH] Login failed: password mismatch for '${username}' (hash type: ${hashType})`);
         return null;
     }
 
+    console.log(`[AUTH] Login successful for '${username}'`);
+    
     // Auto-migrate PBKDF2 hash to bcrypt for future logins
     if (needsMigration) {
         try {
@@ -135,6 +145,8 @@ async function ensureDefaultAdmin() {
     const defaultUsername = process.env.DEFAULT_ADMIN_USERNAME || 'admin';
     const defaultPassword = process.env.DEFAULT_ADMIN_PASSWORD || '';
 
+    console.log(`[AUTH] ensureDefaultAdmin: checking for existing users...`);
+
     if (await db.hasUsers()) {
         // Users exist — check if the admin's hash needs migration from PBKDF2 to bcrypt.
         // This handles the case where the Go server created the user first (PostgreSQL shared DB).
@@ -149,7 +161,28 @@ async function ensureDefaultAdmin() {
                 } else {
                     console.warn(`[AUTH] DEFAULT_ADMIN_PASSWORD does not match existing PBKDF2 hash — skipping migration`);
                 }
+            } else if (admin) {
+                // Admin exists with bcrypt hash — check if password matches
+                // ONLY fix the hash if the admin has never logged in (fresh install).
+                // If they have logged in, they may have changed password via the UI;
+                // overwriting it would lock them out.
+                const hashType = (admin.password_hash || '').startsWith('$2') ? 'bcrypt' : 'unknown';
+                if (!admin.last_login) {
+                    const matches = await verifyPassword(defaultPassword, admin.password_hash);
+                    if (!matches) {
+                        console.warn(`[AUTH] DEFAULT_ADMIN_PASSWORD does not match stored ${hashType} hash for '${defaultUsername}' (never logged in). Updating hash...`);
+                        const bcryptHash = await hashPassword(defaultPassword);
+                        await db.updateUserPassword(admin.id, bcryptHash);
+                        console.log(`[AUTH] Admin password hash updated to match DEFAULT_ADMIN_PASSWORD`);
+                    } else {
+                        console.log(`[AUTH] Admin user '${defaultUsername}' exists (${hashType}), password matches, never logged in`);
+                    }
+                } else {
+                    console.log(`[AUTH] Admin user '${defaultUsername}' exists (${hashType}), has logged in before — not touching password`);
+                }
             }
+        } else {
+            console.log(`[AUTH] Users exist, no DEFAULT_ADMIN_PASSWORD set — skipping admin check`);
         }
         return false;
     }
@@ -160,7 +193,23 @@ async function ensureDefaultAdmin() {
     const hash = await hashPassword(password);
     await db.createUser(defaultUsername, hash, 'admin');
     
-    console.log(`Created default admin user: ${defaultUsername}`);
+    // Verify the hash was stored correctly (self-test)
+    const created = await db.getUserByUsername(defaultUsername);
+    if (created) {
+        const selfTest = await bcrypt.compare(password, created.password_hash);
+        if (selfTest) {
+            console.log(`[AUTH] Admin user '${defaultUsername}' created and verified successfully`);
+        } else {
+            console.error(`[AUTH] CRITICAL: Admin password self-test FAILED! Hash may be corrupted. Re-hashing...`);
+            const retryHash = await hashPassword(password);
+            await db.updateUserPassword(created.id, retryHash);
+            const retryTest = await bcrypt.compare(password, retryHash);
+            console.log(`[AUTH] Re-hash result: ${retryTest ? 'OK' : 'STILL FAILING — bcrypt may be broken'}`);
+        }
+    } else {
+        console.error(`[AUTH] CRITICAL: createUser succeeded but getUserByUsername returned null for '${defaultUsername}'`);
+    }
+    
     if (!defaultPassword) {
         console.log(`Generated admin password: ${password}`);
     }

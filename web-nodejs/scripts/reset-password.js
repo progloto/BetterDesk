@@ -142,6 +142,14 @@ async function main() {
         // Hash password with bcrypt
         const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
         
+        // Self-test: verify the hash we just created is valid
+        const selfTest = await bcrypt.compare(newPassword, passwordHash);
+        if (!selfTest) {
+            console.error('CRITICAL: bcrypt self-test failed! The generated hash cannot verify the password.');
+            console.error('This may indicate a broken bcrypt native module. Try: npm rebuild bcrypt');
+            process.exit(1);
+        }
+        
         // Check if user exists
         const existingUser = await store.getUser(username);
         
@@ -152,6 +160,8 @@ async function main() {
             await store.createUser(username, passwordHash, 'admin');
             console.log(`Created admin user: ${username}`);
         }
+        
+        console.log(`Hash type: bcrypt, length: ${passwordHash.length}`);
     } finally {
         await store.close();
     }
@@ -163,6 +173,11 @@ async function main() {
 function findDataDir() {
     const possiblePaths = [
         process.env.RUSTDESK_DATA,
+        // BetterDesk Console standard data directories
+        '/opt/BetterDeskConsole/data',
+        'C:\\BetterDesk\\BetterDeskConsole\\data',
+        'C:\\BetterDesk\\data',
+        // Legacy paths
         '/opt/rustdesk',
         '/var/lib/rustdesk',
         'C:\\RustDesk',

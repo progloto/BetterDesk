@@ -54,6 +54,7 @@
     "password_placeholder": "Wprowadź hasło",
     "remember_me": "Zapamiętaj mnie",
     "login_failed": "Logowanie nie powiodło się. Sprawdź dane logowania.",
+    "invalid_credentials": "Nieprawidłowa nazwa użytkownika lub hasło.",
     "fill_all_fields": "Wypełnij wszystkie pola",
     "logout_confirm": "Czy na pewno chcesz się wylogować?",
     "change_password": "Zmień hasło",
