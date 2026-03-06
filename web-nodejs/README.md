@@ -157,4 +157,4 @@ web-nodejs/
 
 ## License
 
-AGPL-3.0 License - see LICENSE file for details.
+Apache-2.0 License - see LICENSE file for details.

@@ -15,7 +15,7 @@ services:
   server:
     build:
       context: .
-      dockerfile: Dockerfile.hbbs
+      dockerfile: Dockerfile.server
     image: betterdesk-server:local
     pull_policy: never
     container_name: betterdesk-server

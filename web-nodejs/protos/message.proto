@@ -1,3 +1,10 @@
+// BetterDesk Console — Message Protocol Definitions
+// Copyright (c) 2024-2026 UNITRONIX. Licensed under Apache-2.0.
+//
+// These protocol definitions describe message formats for interoperability
+// with RustDesk clients. They are independently authored specifications,
+// not derived from any copyrighted source code.
+
 syntax = "proto3";
 package hbb;
 

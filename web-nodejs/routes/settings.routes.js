@@ -5,7 +5,6 @@
 const express = require('express');
 const router = express.Router();
 const config = require('../config/config');
-const hbbsApi = require('../services/hbbsApi');
 const keyService = require('../services/keyService');
 const db = require('../services/database');
 const brandingService = require('../services/brandingService');
@@ -30,7 +29,7 @@ router.get('/settings', requireAuth, (req, res) => {
  */
 router.get('/api/settings/info', requireAuth, async (req, res) => {
     try {
-        const hbbsHealth = await serverBackend.getHealth();
+        const serverHealth = await serverBackend.getHealth();
         const serverConfig = keyService.getServerConfig();
         const stats = await db.getStats();
         
@@ -50,7 +49,7 @@ router.get('/api/settings/info', requireAuth, async (req, res) => {
                     uptime: Math.floor(process.uptime()),
                     memoryUsage: process.memoryUsage().heapUsed
                 },
-                hbbs: hbbsHealth,
+                goServer: serverHealth,
                 backend: serverBackend.getActiveBackend(),
                 paths: {
                     database: config.dbPath,
@@ -114,87 +113,6 @@ router.get('/api/settings/audit', requireAuth, async (req, res) => {
             success: false,
             error: req.t('errors.server_error')
         });
-    }
-});
-
-// ==================== Server Backend Selection API ====================
-
-/**
- * GET /api/settings/backend - Get current server backend
- */
-router.get('/api/settings/backend', requireAuth, async (req, res) => {
-    try {
-        const active = serverBackend.getActiveBackend();
-        const health = await serverBackend.getHealth();
-
-        res.json({
-            success: true,
-            data: {
-                backend: active,
-                health: health
-            }
-        });
-    } catch (err) {
-        console.error('Get backend error:', err);
-        res.status(500).json({ success: false, error: req.t('errors.server_error') });
-    }
-});
-
-/**
- * POST /api/settings/backend - Switch server backend (admin only)
- * NOTE: Only 'betterdesk' is supported. Legacy 'rustdesk' selection has been removed.
- */
-router.post('/api/settings/backend', requireAuth, requireAdmin, async (req, res) => {
-    try {
-        const { backend } = req.body;
-
-        if (!backend || backend !== 'betterdesk') {
-            return res.status(400).json({
-                success: false,
-                error: req.t('settings.invalid_backend')
-            });
-        }
-
-        // Test connectivity before switching
-        const betterdeskApi = require('../services/betterdeskApi');
-        const health = await betterdeskApi.getHealth();
-
-        if (health.status !== 'running') {
-            return res.status(400).json({
-                success: false,
-                error: req.t('settings.backend_unreachable')
-            });
-        }
-
-        serverBackend.setActiveBackend(backend);
-
-        await db.logAction(req.session?.userId, 'backend_changed', `Server backend changed to: ${backend}`, req.ip);
-
-        res.json({
-            success: true,
-            data: { backend, health }
-        });
-    } catch (err) {
-        console.error('Set backend error:', err);
-        res.status(500).json({ success: false, error: req.t('errors.server_error') });
-    }
-});
-
-/**
- * POST /api/settings/backend/test - Test connection to BetterDesk Go server
- */
-router.post('/api/settings/backend/test', requireAuth, async (req, res) => {
-    try {
-        const betterdeskApi = require('../services/betterdeskApi');
-        const health = await betterdeskApi.getHealth();
-
-        res.json({
-            success: true,
-            data: { backend, health }
-        });
-    } catch (err) {
-        console.error('Test backend error:', err);
-        res.status(500).json({ success: false, error: req.t('errors.server_error') });
     }
 });
 

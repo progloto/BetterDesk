@@ -537,7 +537,7 @@ EOF
     container_name: $SERVER_CONTAINER
     build:
       context: .
-      dockerfile: Dockerfile.hbbs
+      dockerfile: Dockerfile.server
     pull_policy: never
     ports:
       - "21114:21114"

@@ -338,7 +338,7 @@ Any other information, mockups, examples
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License (for web console) or AGPL-3.0 (for HBBS patches).
+By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
 
 ---
 

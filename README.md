@@ -6,7 +6,7 @@
 
 <br><br>
 
-![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)
 ![Node.js](https://img.shields.io/badge/Node.js-18+-339933.svg)
 ![Version](https://img.shields.io/badge/version-2.4.0-brightgreen.svg)
@@ -1379,9 +1379,9 @@ Contributions are welcome! See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guide
 
 ## 📄 License
 
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [LICENSE](LICENSE).
+This project is licensed under the **Apache License 2.0** — see [LICENSE](LICENSE).
 
-The Go server is a clean-room implementation. The web console and installation scripts are also AGPL-3.0 for license consistency.
+The Go server and Node.js console are independent, clean-room implementations with no RustDesk-derived code. Commercial licensing is available for organizations requiring extended support, white-label rights, or custom integrations — contact UNITRONIX for details.
 
 ---
 

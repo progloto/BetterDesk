@@ -16,10 +16,6 @@
                 <span class="material-icons">tune</span>
                 ${_('settings.tab_general')}
             </button>
-            <button class="settings-tab" data-tab="server">
-                <span class="material-icons">dns</span>
-                ${_('settings.tab_server')}
-            </button>
             <button class="settings-tab" data-tab="branding">
                 <span class="material-icons">palette</span>
                 ${_('settings.tab_branding')}
@@ -157,69 +153,6 @@
                                 </tr>
                             </tbody>
                         </table>
-                    </div>
-                </div>
-            </div>
-        </div>
-        </div>
-        
-        <!-- Server Backend Tab -->
-        <div class="settings-tab-content" id="tab-server">
-        <div class="settings-sections">
-            <!-- Server Backend Info (BetterDesk Go Server only) -->
-            <div class="settings-section">
-                <div class="settings-section-header">
-                    <h2 class="settings-section-title">
-                        <span class="material-icons">dns</span>
-                        ${_('settings.backend_title')}
-                    </h2>
-                    <p class="settings-section-desc">${_('settings.backend_desc')}</p>
-                </div>
-                <div class="settings-section-body">
-                    <div class="backend-selector">
-                        <div class="backend-option active" id="backend-opt-betterdesk">
-                            <div class="backend-card">
-                                <div class="backend-card-header">
-                                    <span class="material-icons backend-icon">rocket_launch</span>
-                                    <div>
-                                        <h3 class="backend-name">BetterDesk (Go Server)</h3>
-                                        <span class="backend-badge badge-new">${_('settings.backend_enhanced')}</span>
-                                    </div>
-                                </div>
-                                <p class="backend-desc">${_('settings.backend_betterdesk_desc')}</p>
-                                <ul class="backend-features">
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_signal')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_relay')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_full_api')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_jwt')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_blocklist')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_tags')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_audit')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_websocket')}</li>
-                                </ul>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- Connection Status -->
-                    <div class="backend-status-box" id="backend-status-box">
-                        <div class="backend-status-row">
-                            <span class="material-icons">cloud</span>
-                            <span>${_('settings.backend_connection')}:</span>
-                            <span id="backend-health-status" class="backend-health">-</span>
-                        </div>
-                        <div class="backend-status-row">
-                            <span class="material-icons">link</span>
-                            <span>${_('settings.backend_api_url')}:</span>
-                            <span id="backend-api-url" class="text-muted">-</span>
-                        </div>
-                    </div>
-                    
-                    <div class="backend-actions">
-                        <button type="button" class="btn btn-secondary" id="backend-test-btn">
-                            <span class="material-icons">wifi_tethering</span>
-                            ${_('settings.backend_test')}
-                        </button>
                     </div>
                 </div>
             </div>

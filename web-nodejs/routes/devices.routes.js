@@ -5,7 +5,6 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../services/database');
-const hbbsApi = require('../services/hbbsApi');
 const serverBackend = require('../services/serverBackend');
 const { requireAuth, requireRole } = require('../middleware/auth');
 

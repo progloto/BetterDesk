@@ -87,7 +87,7 @@ func rustdeskUserPayload(username, role string) map[string]any {
 		"note":     "",
 		"status":   1, // kNormal
 		"grp":      "",
-		"is_admin":  role == auth.RoleAdmin,
+		"is_admin": role == auth.RoleAdmin,
 	}
 }
 

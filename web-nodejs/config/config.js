@@ -57,10 +57,10 @@ const PUB_KEY_PATH = process.env.PUB_KEY_PATH || path.join(KEYS_PATH, 'id_ed2551
 const API_KEY_PATH = process.env.API_KEY_PATH || path.join(KEYS_PATH, '.api_key');
 
 // Read API key from file if exists
-let hbbsApiKey = process.env.HBBS_API_KEY || '';
-if (!hbbsApiKey && fs.existsSync(API_KEY_PATH)) {
+let apiKey = process.env.BETTERDESK_API_KEY || process.env.HBBS_API_KEY || '';
+if (!apiKey && fs.existsSync(API_KEY_PATH)) {
     try {
-        hbbsApiKey = fs.readFileSync(API_KEY_PATH, 'utf8').trim();
+        apiKey = fs.readFileSync(API_KEY_PATH, 'utf8').trim();
     } catch (err) {
         console.warn('Warning: Could not read API key file:', err.message);
     }
@@ -113,18 +113,17 @@ module.exports = {
     pubKeyPath: PUB_KEY_PATH,
     apiKeyPath: API_KEY_PATH,
     
-    // Server backend selection: 'rustdesk' (hbbs/hbbr) or 'betterdesk' (Go server)
-    // Can be overridden at runtime via Settings UI (stored in auth.db)
-    serverBackend: process.env.SERVER_BACKEND || 'betterdesk',
+    // Server backend (BetterDesk Go server)
+    serverBackend: 'betterdesk',
     
-    // HBBS API (used in 'rustdesk' mode)
-    hbbsApiUrl: process.env.HBBS_API_URL || 'http://localhost:21114/api',
-    hbbsApiKey: hbbsApiKey,
-    hbbsApiTimeout: parseInt(process.env.HBBS_API_TIMEOUT, 10) || 3000,
+    // BetterDesk Go Server API
+    hbbsApiUrl: process.env.BETTERDESK_API_URL || process.env.HBBS_API_URL || 'http://localhost:21114/api',
+    hbbsApiKey: apiKey,
+    hbbsApiTimeout: parseInt(process.env.BETTERDESK_API_TIMEOUT || process.env.HBBS_API_TIMEOUT, 10) || 3000,
     
-    // BetterDesk Go Server API (used in 'betterdesk' mode)
-    betterdeskApiUrl: process.env.BETTERDESK_API_URL || 'http://localhost:21114/api',
-    betterdeskApiKey: process.env.BETTERDESK_API_KEY || hbbsApiKey,
+    // BetterDesk Go Server API (preferred names)
+    betterdeskApiUrl: process.env.BETTERDESK_API_URL || process.env.HBBS_API_URL || 'http://localhost:21114/api',
+    betterdeskApiKey: process.env.BETTERDESK_API_KEY || apiKey,
     betterdeskApiTimeout: parseInt(process.env.BETTERDESK_API_TIMEOUT, 10) || 5000,
     
     // Session

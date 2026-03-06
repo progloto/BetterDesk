@@ -12,7 +12,6 @@
         initPasswordForm();
         initTotpSection();
         initBrandingSection();
-        initBackendSection();
         initBackupSection();
         loadAuditLog();
         loadServerInfo();
@@ -784,73 +783,7 @@
         });
     }
     
-    // ==================== Server Backend Status ====================
-    
-    function initBackendSection() {
-        const testBtn = document.getElementById('backend-test-btn');
-        
-        // Load current backend status
-        loadBackendStatus();
-        
-        // Test connection button
-        testBtn?.addEventListener('click', async () => {
-            testBtn.disabled = true;
-            testBtn.innerHTML = '<span class="material-icons spin">sync</span> ' + _('settings.backend_testing');
-            
-            try {
-                const result = await Utils.api('/api/settings/backend/test', {
-                    method: 'POST',
-                    body: { backend: 'betterdesk' }
-                });
-                
-                const health = result.health || {};
-                updateBackendHealth(health);
-                
-                if (health.status === 'running') {
-                    Notifications.success(_('settings.backend_test_success'));
-                } else {
-                    Notifications.warning(_('settings.backend_test_failed'));
-                }
-            } catch (error) {
-                Notifications.error(error.message || _('settings.backend_test_failed'));
-                updateBackendHealth({ status: 'error' });
-            } finally {
-                testBtn.disabled = false;
-                testBtn.innerHTML = '<span class="material-icons">wifi_tethering</span> ' + _('settings.backend_test');
-    }
-    
-    async function loadBackendStatus() {
-        try {
-            const result = await Utils.api('/api/settings/backend');
-            updateBackendHealth(result.health || {});
-        } catch (error) {
-            console.error('Failed to load backend status:', error);
-        }
-    }
-    
-    function updateBackendHealth(health) {
-        const el = document.getElementById('backend-health-status');
-        if (!el) return;
-        
-        const status = health.status || 'unknown';
-        el.className = 'backend-health backend-health-' + status;
-        
-        const labels = {
-            'running': _('settings.backend_status_running'),
-            'unreachable': _('settings.backend_status_unreachable'),
-            'error': _('settings.backend_status_error'),
-            'unknown': _('settings.backend_status_unknown')
-        };
-        el.textContent = labels[status] || status;
-        
-        // Update API URL display
-        const urlEl = document.getElementById('backend-api-url');
-        if (urlEl) {
-            urlEl.textContent = health.api_url || 'BetterDesk Go API';
-        }
-    }
-    
-    // ==================== Backup & Restore ====================
+    // ==================== Backup & Restore ======================================
     
     function initBackupSection() {
         loadBackupStats();

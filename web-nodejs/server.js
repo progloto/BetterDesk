@@ -4,7 +4,7 @@
  * 
  * @author UNITRONIX
  * @version 2.1.0
- * @license AGPL-3.0
+ * @license Apache-2.0
  */
 
 const express = require('express');
@@ -21,7 +21,6 @@ const { initI18n } = require('./middleware/i18n');
 const { apiLimiter } = require('./middleware/rateLimiter');
 const { csrfTokenProvider, doubleCsrfProtection } = require('./middleware/csrf');
 const authService = require('./services/authService');
-const hbbsApi = require('./services/hbbsApi');
 const serverBackend = require('./services/serverBackend');
 const db = require('./services/database');
 const { initWsProxy } = require('./services/wsRelay');

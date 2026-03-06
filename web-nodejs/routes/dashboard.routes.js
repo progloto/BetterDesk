@@ -5,7 +5,6 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../services/database');
-const hbbsApi = require('../services/hbbsApi');
 const keyService = require('../services/keyService');
 const config = require('../config/config');
 const serverBackend = require('../services/serverBackend');

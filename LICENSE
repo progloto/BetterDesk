@@ -1,97 +1,118 @@
-GNU AFFERO GENERAL PUBLIC LICENSE
-Version 3, 19 November 2007
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
 
-Copyright (c) 2026 BetterDesk Console Contributors
-Copyright (c) 2020-2024 RustDesk (for HBBS modifications)
+Copyright (c) 2025-2026 UNITRONIX (Krzysztof Nienartowicz). All rights reserved.
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU Affero General Public License for more details.
+    http://www.apache.org/licenses/LICENSE-2.0
 
-You should have received a copy of the GNU Affero General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
 ---
 
-## Additional Terms for Network Use
+## Licensing
 
-As this project modifies RustDesk Server (HBBS) which is licensed under AGPL-3.0,
-the following additional terms apply:
+This project is available under a dual-licensing model:
 
-If you run a modified version of this software on a server and let users 
-interact with it remotely through a network, you must make the complete 
-source code of your modified version available to those users.
+### Open Source License (Apache 2.0)
 
-The modifications to RustDesk HBBS are located in the `hbbs-patch-v2/` directory
-and must remain open source under AGPL-3.0.
+The BetterDesk Server and Console are licensed under the Apache License 2.0.
+You may use, modify, and distribute this software freely under the terms
+of Apache 2.0. See above for the full license text.
 
-Full AGPL-3.0 license text: https://www.gnu.org/licenses/agpl-3.0.html
+### Commercial License
+
+For organizations requiring:
+- Extended support and SLA guarantees
+- Custom features and integrations
+- White-label / OEM redistribution rights
+- Priority bug fixes and security patches
+
+Contact: UNITRONIX (Krzysztof Nienartowicz) (via GitHub Issues or email)
+
+---
+
+## Clean-Room Implementation Notice
+
+BetterDesk Server (`betterdesk-server/`) is an independent, clean-room
+implementation of the RustDesk rendezvous and relay protocol. It contains
+**no code derived from the RustDesk project**. The server implements published
+protocol specifications for client compatibility, similar to how any HTTP
+server implements the HTTP protocol without being derived from Apache or Nginx.
+
+BetterDesk Console (`web-nodejs/`) is an entirely original Node.js/Express
+web application. It has no code-level dependency on RustDesk.
+
+Protocol definitions (`.proto` files) describe message formats for
+interoperability and are not derived from any copyrighted source code.
+
+---
+
+## Archive Directory Exclusion
+
+The `archive/` directory (excluded from distribution via `.gitignore`) contains
+deprecated code from earlier development phases, including legacy Rust-based
+server binaries and source code licensed under AGPL-3.0. These files are
+**NOT covered by this Apache 2.0 license** and retain their original AGPL-3.0
+licensing. They are preserved locally for historical reference and migration
+tooling only and are never included in releases, packages, or Docker images.
+
+Earlier commits in this repository's git history may contain AGPL-3.0 licensed
+files that were part of the project when it was originally released under
+AGPL-3.0. The license change to Apache 2.0 applies to the current and all
+future versions of the active codebase (`betterdesk-server/` and `web-nodejs/`).
+
+---
+
+## Trademark Notice
+
+"RustDesk" is a trademark of the RustDesk Team. BetterDesk is an independent
+project that implements the RustDesk protocol for client compatibility. Use of
+the name "RustDesk" in this project is purely descriptive (indicating protocol
+compatibility) and does not imply affiliation with or endorsement by the
+RustDesk Team.
 
 ---
 
 ## Component Licenses
 
-### BetterDesk Console (Web Interface & API)
-License: GNU Affero General Public License v3.0
-Copyright: 2026 BetterDesk Console Contributors
+### BetterDesk Server (Go)
+License: Apache License 2.0
+Copyright: 2025-2026 UNITRONIX (Krzysztof Nienartowicz)
+Location: betterdesk-server/
 
-### RustDesk Server (HBBS) - Original
-License: GNU Affero General Public License v3.0
-Copyright: 2020-2024 RustDesk
-Source: https://github.com/rustdesk/rustdesk-server
-
-### RustDesk Server (HBBS) - Modifications
-License: GNU Affero General Public License v3.0 (inherited from original)
-Copyright: 2026 BetterDesk Console Contributors
-Location: hbbs-patch-v2/ directory
-
-Modified files in RustDesk Server:
-- src/database.rs: Added is_device_banned() method with rusqlite integration
-- src/peer.rs: Added ban checks in update_pk(), get(), and get_id_by_addr() method
-- src/rendezvous_server.rs: Added ban enforcement in RequestRelay and PunchHoleRequest
-- Cargo.toml: Added rusqlite = "0.27" dependency
-
-Build system:
-- build.sh: Automated patch application and compilation script
-
-Modifications implement:
-- Bidirectional ban enforcement (blocks connections FROM and TO banned devices)
-- Synchronous database queries using rusqlite to avoid Tokio runtime conflicts
-- Memory-based device tracking via get_id_by_addr() for initiator identification
-- Comprehensive logging of ban enforcement actions
-
-Source availability:
-All modifications are available in the hbbs-patch-v2/ directory and must be
-provided to any user accessing the modified server over a network, as
-required by AGPL-3.0 Section 13.
-
-Original RustDesk source: https://github.com/rustdesk/rustdesk-server
-Modified version source: This repository (hbbs-patch-v2/ directory)
+### BetterDesk Console (Node.js)
+License: Apache License 2.0
+Copyright: 2025-2026 UNITRONIX (Krzysztof Nienartowicz)
+Location: web-nodejs/
 
 ### Third-Party Dependencies
 
-### Material Icons
-License: Apache License 2.0
-Copyright: Google Inc.
-Source: https://github.com/google/material-design-icons
+#### Go Server Dependencies
+- coder/websocket — ISC License
+- jackc/pgx/v5 — MIT License
+- golang.org/x/crypto — BSD-3-Clause (Google)
+- google.golang.org/protobuf — BSD-3-Clause (Google)
+- modernc.org/sqlite — BSD-3-Clause
 
-### Flask
-License: BSD-3-Clause
-Copyright: 2010 Pallets
-Source: https://github.com/pallets/flask
+#### Node.js Console Dependencies
+- express — MIT License
+- bcrypt — MIT License
+- better-sqlite3 — MIT License
+- ejs — Apache-2.0 License
+- helmet — MIT License
+- tweetnacl — Unlicense
+- ws — MIT License
+- otplib — MIT License
+- pg — MIT License
 
-### Axum
-License: MIT
-Copyright: 2021 Tower Contributors
-Source: https://github.com/tokio-rs/axum
-
-### Tokio
-License: MIT
-Copyright: 2019 Tokio Contributors
-Source: https://github.com/tokio-rs/tokio
+#### Frontend
+- Material Icons — Apache License 2.0 (Google Inc.)
