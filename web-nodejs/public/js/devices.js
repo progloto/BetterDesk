@@ -5,6 +5,13 @@
 (function() {
     'use strict';
     
+    // Fallback if Utils.sanitizeColor is missing (old utils.js on server)
+    function _sanitizeColorFallback(c) {
+        if (!c || typeof c !== 'string') return '#808080';
+        if (/^#[0-9A-Fa-f]{3,6}$/.test(c)) return c;
+        return '#808080';
+    }
+    
     document.addEventListener('DOMContentLoaded', init);
     
     // State
@@ -808,7 +815,7 @@
         }
         
         container.innerHTML = folders.map(folder => {
-            const safeColor = Utils.sanitizeColor(folder.color);
+            const safeColor = (Utils.sanitizeColor || _sanitizeColorFallback)(folder.color);
             return `
             <div class="folder-item ${currentFolder == folder.id ? 'active' : ''}" 
                  data-folder="${folder.id}" 
