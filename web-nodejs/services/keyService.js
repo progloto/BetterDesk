@@ -74,8 +74,8 @@ async function getServerConfigQR(serverHost) {
             width: 256,
             margin: 2,
             color: {
-                dark: '#e6edf3',
-                light: '#0d1117'
+                dark: '#000000',
+                light: '#ffffff'
             }
         });
         return qrDataUrl;
@@ -101,8 +101,8 @@ async function getPublicKeyQR() {
             width: 256,
             margin: 2,
             color: {
-                dark: '#e6edf3',
-                light: '#0d1117'
+                dark: '#000000',
+                light: '#ffffff'
             }
         });
         return qrDataUrl;

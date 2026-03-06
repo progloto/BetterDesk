@@ -384,6 +384,22 @@ func (s *SQLiteDB) UpdatePeerStatus(id string, status string, ip string) error {
 	return err
 }
 
+// UpdatePeerSysinfo updates hostname, os, and version for a peer.
+// Only non-empty values overwrite existing data.
+func (s *SQLiteDB) UpdatePeerSysinfo(id, hostname, os, version string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		UPDATE peers SET
+			hostname = CASE WHEN ? != '' THEN ? ELSE hostname END,
+			os = CASE WHEN ? != '' THEN ? ELSE os END,
+			version = CASE WHEN ? != '' THEN ? ELSE version END
+		WHERE id = ?`,
+		hostname, hostname, os, os, version, version, id)
+	return err
+}
+
 // SetAllOffline marks all peers as OFFLINE. Called at server startup.
 func (s *SQLiteDB) SetAllOffline() error {
 	s.mu.Lock()

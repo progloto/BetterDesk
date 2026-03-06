@@ -42,8 +42,21 @@ function getPgDriver() {
 //  Configuration
 // ---------------------------------------------------------------------------
 
-const DB_TYPE = (process.env.DB_TYPE || 'sqlite').toLowerCase();
 const DATABASE_URL = process.env.DATABASE_URL || '';
+
+// Auto-detect: if DATABASE_URL starts with postgres://, use postgres mode
+// even if DB_TYPE is not explicitly set.
+const DB_TYPE = (() => {
+    const explicit = (process.env.DB_TYPE || '').toLowerCase();
+    if (explicit === 'postgres' || explicit === 'postgresql') return 'postgres';
+    if (explicit === 'sqlite') return 'sqlite';
+    // Auto-detect from DATABASE_URL when DB_TYPE is not set
+    if (!explicit && DATABASE_URL && /^postgres(ql)?:\/\//i.test(DATABASE_URL)) {
+        console.log('[DB] Auto-detected PostgreSQL from DATABASE_URL');
+        return 'postgres';
+    }
+    return 'sqlite';
+})();
 
 // ---------------------------------------------------------------------------
 //  Security Helpers

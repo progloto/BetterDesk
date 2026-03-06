@@ -397,6 +397,27 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 50. [x] **WebSocket RequestRelay fix**: ws.go now uses `handleRequestRelayTCP` instead of UDP handler (`handleRequestRelay`) which was sending the response via UDP — unreachable by WebSocket clients.
 51. [x] **Root cause**: RustDesk client uses TCP (not UDP) for signal messages when logged in (reliable token delivery). TCP handlers returned nil for online targets, forcing clients to wait for target responses that may never arrive (strict NAT, firewall, slow network). UDP handlers always sent immediate responses.
 
+#### GitHub Issues Triage & Fixes (Phase 8) ✅ COMPLETED 2026-03-05
+52. [x] **QR code fix (Issue #38)**: Inverted QR code colors in `keyService.js` — `dark: '#e6edf3'` → `'#000000'`, `light: '#0d1117'` → `'#ffffff'` for both `getServerConfigQR()` and `getPublicKeyQR()`
+53. [x] **403 error page (Issue #38)**: Created `views/errors/403.ejs` — `requireAdmin` middleware was rendering non-existent template, causing crash → redirect to dashboard for operators
+54. [x] **RustDesk Client API on Go server (Issue #38)**: Added `client_api_handlers.go` with RustDesk-compatible endpoints: `POST /api/login`, `GET /api/login-options`, `POST /api/logout`, `GET /api/currentUser`, `GET/POST /api/ab`. Fixes `_Map<String, dynamic>` Dart client error caused by sending login to Go server port 21114 which lacked `/api/login`
+55. [x] **GetPeer live status (Issue #16)**: `handleGetPeer` now enriches response with `live_online` and `live_status` from in-memory peer map, matching `handleListPeers` behavior. Previously returned raw DB data without live status overlay
+56. [x] **i18n: forbidden keys**: Added `errors.forbidden_title` and `errors.forbidden_message` to EN/PL/ZH translations
+57. [x] **Chinese i18n verified (Issue #28)**: `zh.json` has 100% key coverage — no missing translations
+58. [x] **Old Rust server removed from UI**: Settings page, serverBackend.js, settings.routes.js — all hbbsApi branching removed, hardcoded to BetterDesk Go server
+59. [x] **Docker single-container**: New `Dockerfile` (multi-stage Go+Node.js+supervisord), `docker-compose.single.yml`, `docker/entrypoint.sh`, `docker/supervisord.conf`
+60. [x] **DB auto-detection**: `dbAdapter.js` and `config.js` auto-detect PostgreSQL from `DATABASE_URL` prefix
+61. [x] **Windows experimental labels**: Tier system in README, `.github/labels.yml`, PS1 banner
+
+#### Go Server — Sysinfo/Heartbeat Endpoints (Phase 9) ✅ COMPLETED 2026-03-05
+62. [x] **Hostname/Platform display (Issue #37)**: RustDesk client sends hostname/os/version via `POST /api/sysinfo` to signal_port-2 (21114). Go server was missing these endpoints — hostname/platform columns stayed empty.
+63. [x] **UpdatePeerSysinfo DB method**: Added `UpdatePeerSysinfo(id, hostname, os, version)` to Database interface + SQLite + PostgreSQL implementations. Uses CASE WHEN to only overwrite with non-empty values.
+64. [x] **POST /api/heartbeat**: Accepts `{id, cpu, memory, disk}`, verifies peer exists & not banned, updates status to ONLINE, requests sysinfo if hostname is empty. Response: `{modified_at, sysinfo: true/false}`.
+65. [x] **POST /api/sysinfo**: Accepts full sysinfo payload, extracts hostname/platform/version, calls `UpdatePeerSysinfo()`. Response: plain text `"SYSINFO_UPDATED"` (activates PRO mode in client).
+66. [x] **POST /api/sysinfo_ver**: Version check endpoint — returns SHA256 hash of stored sysinfo fields. Empty response triggers full sysinfo upload from client.
+67. [x] **Auth middleware updated**: `/api/heartbeat`, `/api/sysinfo`, `/api/sysinfo_ver` added to public endpoint list (no auth required — client may not be logged in).
+68. [x] **Audit logging**: Added `ActionSysinfoUpdated` and `ActionSysinfoError` audit actions with full details (hostname, os, version).
+
 ---
 
 ## 🔄 System Statusu v3.0
@@ -552,6 +573,11 @@ Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
 10. ~~**Go Server: SQLite only**~~ ✅ ROZWIĄZANE - PostgreSQL backend implemented (`db/postgres.go`, pgx/v5, pgxpool, LISTEN/NOTIFY) — Phase 4
 11. ~~**Go Server: E2E encryption "nieszyfrowane"**~~ ✅ ROZWIĄZANE - 4 bugs fixed in signal/handler.go + relay/server.go (SignIdPk format, PunchHoleResponse, RelayResponse removal). Root cause: deployment path mismatch (`/opt/betterdesk-go/` vs `/opt/rustdesk/`) — Phase 6
 12. ~~**Go Server: "Failed to secure tcp" when logged in**~~ ✅ ROZWIĄZANE - TCP/WS signal handlers returned nil for online targets, forcing logged-in clients (which use TCP) to wait for target responses that may never arrive. Fixed: immediate PunchHoleResponse/RelayResponse with signed PK matching UDP behavior — Phase 7
+13. ~~**QR code invalid on Windows**~~ ✅ ROZWIĄZANE - Inverted QR colors fixed (`dark:'#e6edf3'` → `'#000000'`, `light:'#0d1117'` → `'#ffffff'`) — Phase 8
+14. ~~**Users tab redirect for operators**~~ ✅ ROZWIĄZANE - Created `views/errors/403.ejs` (missing template caused crash → redirect) — Phase 8
+15. ~~**Client login `_Map<String, dynamic>` error**~~ ✅ ROZWIĄZANE - Added RustDesk-compatible `/api/login` endpoint to Go server `client_api_handlers.go` — Phase 8
+16. ~~**GetPeer missing live status**~~ ✅ ROZWIĄZANE - `handleGetPeer` now returns `live_online` + `live_status` from memory map — Phase 8
+17. ~~**Hostname/Platform columns empty (Issue #37)**~~ ✅ ROZWIĄZANE - Go server was missing `/api/heartbeat`, `/api/sysinfo`, `/api/sysinfo_ver` endpoints. RustDesk client sends hostname/os/version via HTTP API to signal_port-2 (21114), but Go server had no handlers. Added all 3 endpoints + `UpdatePeerSysinfo` DB method — Phase 9
 
 ---
 
@@ -641,4 +667,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-04 (TCP signaling fix — Phase 7) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-05 (Sysinfo/Heartbeat Endpoints — Phase 9) przez GitHub Copilot*

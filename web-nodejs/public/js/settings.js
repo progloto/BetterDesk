@@ -784,40 +784,23 @@
         });
     }
     
-    // ==================== Server Backend Selection ====================
-    
-    let _currentBackend = null;
+    // ==================== Server Backend Status ====================
     
     function initBackendSection() {
-        const radios = document.querySelectorAll('input[name="server-backend"]');
         const testBtn = document.getElementById('backend-test-btn');
-        const saveBtn = document.getElementById('backend-save-btn');
         
-        if (!radios.length) return;
-        
-        // Load current backend
+        // Load current backend status
         loadBackendStatus();
-        
-        // Radio change — enable save button when different from current
-        radios.forEach(radio => {
-            radio.addEventListener('change', () => {
-                const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
-                saveBtn.disabled = (selected === _currentBackend);
-            });
-        });
         
         // Test connection button
         testBtn?.addEventListener('click', async () => {
-            const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
-            if (!selected) return;
-            
             testBtn.disabled = true;
             testBtn.innerHTML = '<span class="material-icons spin">sync</span> ' + _('settings.backend_testing');
             
             try {
                 const result = await Utils.api('/api/settings/backend/test', {
                     method: 'POST',
-                    body: { backend: selected }
+                    body: { backend: 'betterdesk' }
                 });
                 
                 const health = result.health || {};
@@ -834,60 +817,15 @@
             } finally {
                 testBtn.disabled = false;
                 testBtn.innerHTML = '<span class="material-icons">wifi_tethering</span> ' + _('settings.backend_test');
-            }
-        });
-        
-        // Save button
-        saveBtn?.addEventListener('click', async () => {
-            const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
-            if (!selected || selected === _currentBackend) return;
-            
-            if (!confirm(_('settings.backend_confirm_switch'))) return;
-            
-            saveBtn.disabled = true;
-            
-            try {
-                const result = await Utils.api('/api/settings/backend', {
-                    method: 'POST',
-                    body: { backend: selected }
-                });
-                
-                _currentBackend = selected;
-                highlightActiveBackend(selected);
-                updateBackendHealth(result.health || {});
-                Notifications.success(_('settings.backend_saved'));
-                saveBtn.disabled = true;
-                
-            } catch (error) {
-                Notifications.error(error.message || _('settings.backend_save_failed'));
-                saveBtn.disabled = false;
-            }
-        });
     }
     
     async function loadBackendStatus() {
         try {
             const result = await Utils.api('/api/settings/backend');
-            _currentBackend = result.backend || 'rustdesk';
-            
-            // Select the radio
-            const radio = document.querySelector(`input[name="server-backend"][value="${_currentBackend}"]`);
-            if (radio) radio.checked = true;
-            
-            highlightActiveBackend(_currentBackend);
             updateBackendHealth(result.health || {});
-            
         } catch (error) {
             console.error('Failed to load backend status:', error);
         }
-    }
-    
-    function highlightActiveBackend(name) {
-        document.querySelectorAll('.backend-option').forEach(opt => {
-            opt.classList.remove('active');
-        });
-        const activeOpt = document.getElementById('backend-opt-' + name);
-        if (activeOpt) activeOpt.classList.add('active');
     }
     
     function updateBackendHealth(health) {
@@ -908,10 +846,7 @@
         // Update API URL display
         const urlEl = document.getElementById('backend-api-url');
         if (urlEl) {
-            const selected = document.querySelector('input[name="server-backend"]:checked')?.value;
-            urlEl.textContent = health.backend === 'betterdesk' || selected === 'betterdesk'
-                ? (health.api_url || 'BetterDesk Go API')
-                : 'HBBS REST API';
+            urlEl.textContent = health.api_url || 'BetterDesk Go API';
         }
     }
     

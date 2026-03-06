@@ -339,6 +339,19 @@ func (pg *PostgresDB) UpdatePeerStatus(id string, status string, ip string) erro
 	return err
 }
 
+// UpdatePeerSysinfo updates hostname, os, and version for a peer.
+// Only non-empty values overwrite existing data.
+func (pg *PostgresDB) UpdatePeerSysinfo(id, hostname, os, version string) error {
+	_, err := pg.pool.Exec(pg.ctx, `
+		UPDATE peers SET
+			hostname = CASE WHEN $1 != '' THEN $1 ELSE hostname END,
+			os = CASE WHEN $2 != '' THEN $2 ELSE os END,
+			version = CASE WHEN $3 != '' THEN $3 ELSE version END
+		WHERE id = $4`,
+		hostname, os, version, id)
+	return err
+}
+
 // SetAllOffline marks all peers as OFFLINE. Called at server startup.
 func (pg *PostgresDB) SetAllOffline() error {
 	_, err := pg.pool.Exec(pg.ctx, `UPDATE peers SET status = 'OFFLINE'`)

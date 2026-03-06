@@ -36,6 +36,8 @@ const (
 	ActionUserDeleted      Action = "user_deleted"
 	ActionAPIKeyCreated    Action = "apikey_created"
 	ActionAPIKeyRevoked    Action = "apikey_revoked"
+	ActionSysinfoUpdated   Action = "sysinfo_updated"
+	ActionSysinfoError     Action = "sysinfo_error"
 )
 
 // Event represents a single audit log entry.

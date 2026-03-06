@@ -382,6 +382,8 @@
     "toggle_sidebar": "Toggle sidebar"
   },
   "errors": {
+    "forbidden_title": "Access Denied",
+    "forbidden_message": "You do not have permission to access this resource.",
     "not_found_title": "Page Not Found",
     "not_found_message": "The page you're looking for doesn't exist or has been moved.",
     "server_error_title": "Server Error",

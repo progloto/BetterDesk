@@ -440,7 +440,24 @@ Allows RustDesk desktop clients to:
 
 ---
 
-## 📦 Installation
+## �️ Platform Support
+
+| Platform | Tier | Status | Notes |
+|----------|------|--------|-------|
+| **Linux x86_64** (bare-metal) | Tier 1 | ✅ Primary | Full support, all features, recommended |
+| **Linux ARM64** (bare-metal) | Tier 2 | ✅ Supported | Raspberry Pi 4+, Oracle ARM |
+| **Docker** (single-container) | Tier 2 | ✅ Supported | All-in-one image with supervisord |
+| **PostgreSQL** backend | Tier 2 | ✅ Supported | Enterprise deployments |
+| **Windows** x86_64 | Tier 3 | ⚠️ Experimental | Community-tested, limited support |
+| **Synology DSM** (Docker) | Tier 3 | ⚠️ Experimental | Community-tested |
+
+> **Tier 1** = Fully tested by maintainers, highest priority for bug fixes.
+> **Tier 2** = Supported and tested, fixes provided.
+> **Tier 3** = Community-tested, best-effort support. Contributions welcome!
+
+---
+
+## �📦 Installation
 
 ### Prerequisites
 
@@ -502,21 +519,31 @@ The script installs Go, compiles the server, sets up NSSM services (`BetterDeskS
 
 ### Docker
 
+**Single-container (recommended):**
+
 ```bash
 git clone https://github.com/UNITRONIX/Rustdesk-FreeConsole.git
 cd Rustdesk-FreeConsole
+
+# Build and start (all-in-one: Go server + Node.js console in one container)
+docker compose -f docker-compose.single.yml build
+docker compose -f docker-compose.single.yml up -d
+```
+
+**With PostgreSQL:**
+
+```bash
+docker compose -f docker-compose.single.yml --profile postgres up -d
+```
+
+**Legacy multi-container** (via interactive script):
+
+```bash
 chmod +x betterdesk-docker.sh
 ./betterdesk-docker.sh
 ```
 
-Or manually with Docker Compose:
-
-```bash
-docker compose build
-docker compose up -d
-```
-
-> **Note**: Docker images are built locally — they are **not** available on Docker Hub. Always use `docker compose build` first.
+> **Note**: Docker images are built locally — they are **not** available on Docker Hub. Always run `build` first.
 
 ### Menu Options
 

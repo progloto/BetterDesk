@@ -126,6 +126,7 @@ config.local.*
 htmlcov/
 .pytest_cache/
 test_*.sh
+TESTING.local.md
 
 # Dev scripts (removed — old Flask/Rust-era utilities, not needed for production)
 dev_modules/

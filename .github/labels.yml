@@ -1,0 +1,92 @@
+# GitHub Labels for BetterDesk
+# Apply with: gh label create <name> --color <color> --description "<desc>"
+# Or use a tool like github-label-sync
+
+# Platform tiers
+- name: "tier-1: linux"
+  color: "0e8a16"
+  description: "Primary platform — full support (Linux bare-metal)"
+
+- name: "tier-2: docker"
+  color: "1d76db"
+  description: "Supported platform — Docker deployments"
+
+- name: "tier-2: postgresql"
+  color: "336791"
+  description: "Supported — PostgreSQL database backend"
+
+- name: "tier-3: windows"
+  color: "fbca04"
+  description: "Experimental — Windows (community-tested)"
+
+- name: "tier-3: synology"
+  color: "fbca04"
+  description: "Experimental — Synology DSM Docker"
+
+# Community testing
+- name: "community-tested"
+  color: "bfd4f2"
+  description: "Verified by community members"
+
+- name: "needs-testing"
+  color: "d93f0b"
+  description: "Needs testing on specific platform"
+
+- name: "confirmed"
+  color: "0e8a16"
+  description: "Bug confirmed and reproducible"
+
+# Component labels
+- name: "component: go-server"
+  color: "00ADD8"
+  description: "BetterDesk Go server (signal/relay/API)"
+
+- name: "component: web-console"
+  color: "f1e05a"
+  description: "Node.js web console"
+
+- name: "component: docker"
+  color: "0db7ed"
+  description: "Docker/docker-compose setup"
+
+- name: "component: installer"
+  color: "c5def5"
+  description: "ALL-IN-ONE install scripts (sh/ps1)"
+
+- name: "component: database"
+  color: "d4c5f9"
+  description: "Database layer (SQLite/PostgreSQL)"
+
+# Issue type
+- name: "type: bug"
+  color: "d73a4a"
+  description: "Something isn't working"
+
+- name: "type: feature"
+  color: "a2eeef"
+  description: "New feature request"
+
+- name: "type: docs"
+  color: "0075ca"
+  description: "Documentation improvement"
+
+- name: "type: security"
+  color: "e11d48"
+  description: "Security vulnerability or hardening"
+
+# Status
+- name: "status: fixed-in-dev"
+  color: "0e8a16"
+  description: "Fixed in development branch, not yet released"
+
+- name: "status: wontfix"
+  color: "ffffff"
+  description: "Not planned — out of scope or by design"
+
+- name: "status: duplicate"
+  color: "cfd3d7"
+  description: "Duplicate of another issue"
+
+- name: "status: stale"
+  color: "ededed"
+  description: "No activity for 60+ days"

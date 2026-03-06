@@ -420,3 +420,50 @@ func TestMigrateUpgradesLegacySchema(t *testing.T) {
 		t.Fatalf("Migrate (idempotent): %v", err)
 	}
 }
+
+func TestUpdatePeerSysinfo(t *testing.T) {
+	db := newTestDB(t)
+
+	// Insert a peer with empty hostname/os/version
+	db.UpsertPeer(&Peer{ID: "SYSINFO1", UUID: "uuid-sys", Status: "ONLINE"})
+
+	// Update sysinfo
+	if err := db.UpdatePeerSysinfo("SYSINFO1", "my-desktop", "Windows 11", "1.3.2"); err != nil {
+		t.Fatalf("UpdatePeerSysinfo: %v", err)
+	}
+
+	got, err := db.GetPeer("SYSINFO1")
+	if err != nil {
+		t.Fatalf("GetPeer: %v", err)
+	}
+	if got.Hostname != "my-desktop" {
+		t.Errorf("Hostname: got %q, want %q", got.Hostname, "my-desktop")
+	}
+	if got.OS != "Windows 11" {
+		t.Errorf("OS: got %q, want %q", got.OS, "Windows 11")
+	}
+	if got.Version != "1.3.2" {
+		t.Errorf("Version: got %q, want %q", got.Version, "1.3.2")
+	}
+
+	// Partial update — empty fields should NOT overwrite existing values
+	if err := db.UpdatePeerSysinfo("SYSINFO1", "", "Ubuntu 22.04", ""); err != nil {
+		t.Fatalf("UpdatePeerSysinfo partial: %v", err)
+	}
+
+	got2, _ := db.GetPeer("SYSINFO1")
+	if got2.Hostname != "my-desktop" {
+		t.Errorf("Hostname after partial update: got %q, want %q (unchanged)", got2.Hostname, "my-desktop")
+	}
+	if got2.OS != "Ubuntu 22.04" {
+		t.Errorf("OS after partial update: got %q, want %q", got2.OS, "Ubuntu 22.04")
+	}
+	if got2.Version != "1.3.2" {
+		t.Errorf("Version after partial update: got %q, want %q (unchanged)", got2.Version, "1.3.2")
+	}
+
+	// Non-existent peer — should not error (0 rows affected)
+	if err := db.UpdatePeerSysinfo("NOSUCHPEER", "host", "os", "ver"); err != nil {
+		t.Fatalf("UpdatePeerSysinfo non-existent: %v", err)
+	}
+}

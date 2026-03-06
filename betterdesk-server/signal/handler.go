@@ -1229,7 +1229,8 @@ func registerPkResponse(result pb.RegisterPkResponse_Result) *pb.RendezvousMessa
 // the same NAT. Used for LAN detection to enable direct local connections.
 //
 // Matches the original Rust hbbs logic:
-//   is_local = (both private IPv4 && same /24 subnet) || (same IP)
+//
+//	is_local = (both private IPv4 && same /24 subnet) || (same IP)
 func isSameNetwork(a, b *net.UDPAddr) bool {
 	if a == nil || b == nil {
 		return false

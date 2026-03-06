@@ -148,8 +148,14 @@ module.exports = {
         hbbrPort: parseInt(process.env.WS_HBBR_PORT, 10) || 21117
     },
     
-    // Database type: 'sqlite' (default) or 'postgres'
-    dbType: (process.env.DB_TYPE || 'sqlite').toLowerCase(),
+    // Database type: 'sqlite' (default) or 'postgres' (auto-detected from DATABASE_URL)
+    dbType: (() => {
+        const explicit = (process.env.DB_TYPE || '').toLowerCase();
+        if (explicit === 'postgres' || explicit === 'postgresql') return 'postgres';
+        if (explicit === 'sqlite') return 'sqlite';
+        if (!explicit && process.env.DATABASE_URL && /^postgres(ql)?:\/\//i.test(process.env.DATABASE_URL)) return 'postgres';
+        return 'sqlite';
+    })(),
     databaseUrl: process.env.DATABASE_URL || '',
     
     // App info

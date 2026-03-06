@@ -166,7 +166,7 @@
         <!-- Server Backend Tab -->
         <div class="settings-tab-content" id="tab-server">
         <div class="settings-sections">
-            <!-- Server Backend Selection -->
+            <!-- Server Backend Info (BetterDesk Go Server only) -->
             <div class="settings-section">
                 <div class="settings-section-header">
                     <h2 class="settings-section-title">
@@ -177,26 +177,7 @@
                 </div>
                 <div class="settings-section-body">
                     <div class="backend-selector">
-                        <label class="backend-option" id="backend-opt-rustdesk">
-                            <input type="radio" name="server-backend" value="rustdesk">
-                            <div class="backend-card">
-                                <div class="backend-card-header">
-                                    <span class="material-icons backend-icon">memory</span>
-                                    <div>
-                                        <h3 class="backend-name">RustDesk (hbbs/hbbr)</h3>
-                                        <span class="backend-badge badge-default">${_('settings.backend_original')}</span>
-                                    </div>
-                                </div>
-                                <p class="backend-desc">${_('settings.backend_rustdesk_desc')}</p>
-                                <ul class="backend-features">
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_signal')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_relay')}</li>
-                                    <li><span class="material-icons">check</span> ${_('settings.backend_feature_basic_api')}</li>
-                                </ul>
-                            </div>
-                        </label>
-                        <label class="backend-option" id="backend-opt-betterdesk">
-                            <input type="radio" name="server-backend" value="betterdesk">
+                        <div class="backend-option active" id="backend-opt-betterdesk">
                             <div class="backend-card">
                                 <div class="backend-card-header">
                                     <span class="material-icons backend-icon">rocket_launch</span>
@@ -217,7 +198,7 @@
                                     <li><span class="material-icons">check</span> ${_('settings.backend_feature_websocket')}</li>
                                 </ul>
                             </div>
-                        </label>
+                        </div>
                     </div>
                     
                     <!-- Connection Status -->
@@ -238,10 +219,6 @@
                         <button type="button" class="btn btn-secondary" id="backend-test-btn">
                             <span class="material-icons">wifi_tethering</span>
                             ${_('settings.backend_test')}
-                        </button>
-                        <button type="button" class="btn btn-primary" id="backend-save-btn" disabled>
-                            <span class="material-icons">save</span>
-                            ${_('settings.backend_save')}
                         </button>
                     </div>
                 </div>

@@ -113,6 +113,7 @@ type Database interface {
 
 	// Status tracking
 	UpdatePeerStatus(id string, status string, ip string) error
+	UpdatePeerSysinfo(id, hostname, os, version string) error
 	SetAllOffline() error
 
 	// Ban system

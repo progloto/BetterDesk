@@ -1,0 +1,116 @@
+# BetterDesk — Simplified Docker Compose (Single Container)
+# ===========================================================
+#
+# All-in-one: Go server + Node.js console in a single container.
+# Optional PostgreSQL via profile: docker compose --profile postgres up -d
+#
+# Quick start:
+#   docker compose build
+#   docker compose up -d
+#
+# With PostgreSQL:
+#   docker compose --profile postgres up -d
+#
+# With Nginx reverse proxy:
+#   docker compose --profile nginx up -d
+#
+# Access:
+#   Web Console: http://localhost:5000
+#   Default login: admin / admin
+
+version: '3.8'
+
+services:
+  # BetterDesk All-in-One (Go server + Node.js console)
+  betterdesk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: betterdesk:local
+    pull_policy: never
+    container_name: betterdesk
+    hostname: betterdesk
+    ports:
+      - "5000:5000"             # Web Console
+      - "21114:21114"           # HTTP API
+      - "21115:21115"           # NAT type test
+      - "21116:21116/tcp"       # Signal TCP
+      - "21116:21116/udp"       # Signal UDP
+      - "21117:21117"           # Relay TCP
+      - "21118:21118"           # WebSocket Signal
+      - "21119:21119"           # WebSocket Relay
+      - "21121:21121"           # RustDesk Client API (WAN)
+    volumes:
+      - betterdesk-data:/opt/rustdesk
+      - console-data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - ENCRYPTED_ONLY=1
+      - SERVER_BACKEND=betterdesk
+      - HBBS_API_URL=http://127.0.0.1:21114/api
+      - BETTERDESK_API_URL=http://127.0.0.1:21114/api
+      - RUSTDESK_PATH=/opt/rustdesk
+      - DATA_DIR=/app/data
+      - DB_PATH=/opt/rustdesk/db_v2.sqlite3
+      - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
+      - API_KEY_PATH=/opt/rustdesk/.api_key
+      - SESSION_SECRET=${SESSION_SECRET:-}
+      - DOCKER=true
+      # PostgreSQL (uncomment or use --profile postgres):
+      # - DB_TYPE=postgres
+      # - DATABASE_URL=postgres://betterdesk:${PG_PASSWORD:-betterdesk}@postgres:5432/betterdesk
+      # Admin credentials (first run only):
+      # - ADMIN_USERNAME=admin
+      # - ADMIN_PASSWORD=YourSecurePassword123
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:21114/api/health && curl -sf http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+
+  # PostgreSQL (optional — use with --profile postgres)
+  postgres:
+    image: postgres:16-alpine
+    container_name: betterdesk-postgres
+    environment:
+      - POSTGRES_USER=betterdesk
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-betterdesk}
+      - POSTGRES_DB=betterdesk
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U betterdesk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - postgres
+
+  # Nginx Reverse Proxy (optional — use with --profile nginx)
+  nginx:
+    image: nginx:alpine
+    container_name: betterdesk-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    restart: unless-stopped
+    depends_on:
+      - betterdesk
+    profiles:
+      - nginx
+
+volumes:
+  betterdesk-data:
+  console-data:
+  postgres-data:
+
+networks:
+  default:
+    name: betterdesk-net

@@ -41,32 +41,34 @@ var configKeyRegexp = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,64}$`)
 
 // Server is the HTTP API server.
 type Server struct {
-	cfg          *config.Config
-	db           db.Database
-	peers        *peer.Map
-	relay        *relay.Server
-	blocklist    *security.Blocklist
-	bwLimiter    *ratelimit.BandwidthLimiter
-	auditLog     *audit.Logger
-	eventBus     *eventsModule.Bus
-	metrics      *metrics.Collector
-	jwtManager   *auth.JWTManager
-	loginLimiter *ratelimit.IPLimiter
-	keyPair      *crypto.KeyPair // Ed25519 keypair for signing
-	httpSrv      *http.Server
-	wg           sync.WaitGroup
-	version      string
+	cfg               *config.Config
+	db                db.Database
+	peers             *peer.Map
+	relay             *relay.Server
+	blocklist         *security.Blocklist
+	bwLimiter         *ratelimit.BandwidthLimiter
+	auditLog          *audit.Logger
+	eventBus          *eventsModule.Bus
+	metrics           *metrics.Collector
+	jwtManager        *auth.JWTManager
+	loginLimiter      *ratelimit.IPLimiter
+	keyPair           *crypto.KeyPair // Ed25519 keypair for signing
+	clientTFASessions *tfaSessionStore
+	httpSrv           *http.Server
+	wg                sync.WaitGroup
+	version           string
 }
 
 // New creates a new API server.
 func New(cfg *config.Config, database db.Database, peerMap *peer.Map, relaySrv *relay.Server, version string) *Server {
 	return &Server{
-		cfg:          cfg,
-		db:           database,
-		peers:        peerMap,
-		relay:        relaySrv,
-		version:      version,
-		loginLimiter: ratelimit.NewIPLimiter(5, 5*time.Minute, 10*time.Minute),
+		cfg:               cfg,
+		db:                database,
+		peers:             peerMap,
+		relay:             relaySrv,
+		version:           version,
+		loginLimiter:      ratelimit.NewIPLimiter(5, 5*time.Minute, 10*time.Minute),
+		clientTFASessions: newTFASessionStore(),
 	}
 }
 
@@ -150,6 +152,18 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.HandleFunc("POST /api/auth/login/2fa", s.handleLogin2FA)
 	mux.HandleFunc("GET /api/auth/me", s.handleAuthMe)
+
+	// RustDesk Client API (compatible with RustDesk desktop client)
+	// The client calculates API port as signal_port - 2 (21116-2=21114).
+	mux.HandleFunc("POST /api/login", s.handleClientLogin)
+	mux.HandleFunc("GET /api/login-options", s.handleClientLoginOptions)
+	mux.HandleFunc("POST /api/logout", s.handleClientLogout)
+	mux.HandleFunc("GET /api/currentUser", s.handleClientCurrentUser)
+	mux.HandleFunc("GET /api/ab", s.handleClientAddressBook)
+	mux.HandleFunc("POST /api/ab", s.handleClientAddressBook)
+	mux.HandleFunc("POST /api/heartbeat", s.handleClientHeartbeat)
+	mux.HandleFunc("POST /api/sysinfo", s.handleClientSysinfo)
+	mux.HandleFunc("POST /api/sysinfo_ver", s.handleClientSysinfoVer)
 
 	// User management (admin only)
 	mux.HandleFunc("GET /api/users", s.requireRole(auth.RoleAdmin, s.handleListUsers))
@@ -363,7 +377,25 @@ func (s *Server) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Peer not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, p)
+
+	// Enrich with live status from memory map (same as handleListPeers)
+	liveOnline := s.peers.IsOnline(p.ID, config.RegTimeout)
+	liveStatus := peer.StatusOffline
+	if snap, ok := s.peers.GetSnapshot(p.ID, config.DegradedThreshold, config.CriticalThreshold); ok {
+		liveStatus = snap.Status
+	}
+
+	type singlePeerResponse struct {
+		*db.Peer
+		LiveOnline bool        `json:"live_online"`
+		LiveStatus peer.Status `json:"live_status"`
+	}
+
+	writeJSON(w, http.StatusOK, singlePeerResponse{
+		Peer:       p,
+		LiveOnline: liveOnline,
+		LiveStatus: liveStatus,
+	})
 }
 
 func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {

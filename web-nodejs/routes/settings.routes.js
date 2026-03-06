@@ -142,12 +142,13 @@ router.get('/api/settings/backend', requireAuth, async (req, res) => {
 
 /**
  * POST /api/settings/backend - Switch server backend (admin only)
+ * NOTE: Only 'betterdesk' is supported. Legacy 'rustdesk' selection has been removed.
  */
 router.post('/api/settings/backend', requireAuth, requireAdmin, async (req, res) => {
     try {
         const { backend } = req.body;
 
-        if (!backend || !['rustdesk', 'betterdesk'].includes(backend)) {
+        if (!backend || backend !== 'betterdesk') {
             return res.status(400).json({
                 success: false,
                 error: req.t('settings.invalid_backend')
@@ -156,9 +157,7 @@ router.post('/api/settings/backend', requireAuth, requireAdmin, async (req, res)
 
         // Test connectivity before switching
         const betterdeskApi = require('../services/betterdeskApi');
-        const hbbsApiClient = require('../services/hbbsApi');
-        const testApi = backend === 'betterdesk' ? betterdeskApi : hbbsApiClient;
-        const health = await testApi.getHealth();
+        const health = await betterdeskApi.getHealth();
 
         if (health.status !== 'running') {
             return res.status(400).json({
@@ -182,20 +181,12 @@ router.post('/api/settings/backend', requireAuth, requireAdmin, async (req, res)
 });
 
 /**
- * POST /api/settings/backend/test - Test connection to a backend server
+ * POST /api/settings/backend/test - Test connection to BetterDesk Go server
  */
 router.post('/api/settings/backend/test', requireAuth, async (req, res) => {
     try {
-        const { backend } = req.body;
-
-        if (!backend || !['rustdesk', 'betterdesk'].includes(backend)) {
-            return res.status(400).json({ success: false, error: 'Invalid backend' });
-        }
-
         const betterdeskApi = require('../services/betterdeskApi');
-        const hbbsApiClient = require('../services/hbbsApi');
-        const testApi = backend === 'betterdesk' ? betterdeskApi : hbbsApiClient;
-        const health = await testApi.getHealth();
+        const health = await betterdeskApi.getHealth();
 
         res.json({
             success: true,

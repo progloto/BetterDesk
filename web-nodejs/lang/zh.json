@@ -382,6 +382,8 @@
     "toggle_sidebar": "切换侧边栏"
   },
   "errors": {
+    "forbidden_title": "访问被拒绝",
+    "forbidden_message": "您没有权限访问此资源。",
     "not_found_title": "页面未找到",
     "not_found_message": "您要查找的页面不存在或已被移动。",
     "server_error_title": "服务器错误",

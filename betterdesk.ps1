@@ -174,6 +174,10 @@ function Print-Header {
 ║                  Console Manager v$($script:VERSION)             ║
 ╚══════════════════════════════════════════════════════════════════╝
 "@ -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  ⚠  WINDOWS SUPPORT: EXPERIMENTAL (Tier 3)" -ForegroundColor Yellow
+    Write-Host "     Primary platform: Linux. Report issues at GitHub." -ForegroundColor DarkYellow
+    Write-Host ""
 }
 
 function Print-Success {
