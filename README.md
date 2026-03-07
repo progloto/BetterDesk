@@ -1420,6 +1420,12 @@ Commercial licensing is available for organizations requiring extended support, 
 
 ---
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=star-history/star-history&type=Date&theme=dark" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=star-history/star-history&type=Date" />
+  <img alt="Star History Chart" src="https://api.star-history.com/image?repos=star-history/star-history&type=Date" />
+</picture>
+
 ## 🙏 Credits
 
 - **[RustDesk](https://github.com/rustdesk/rustdesk)** — The open-source remote desktop solution
