@@ -171,12 +171,16 @@ async function main() {
 }
 
 function findDataDir() {
+    const isWindows = process.platform === 'win32';
     const possiblePaths = [
         process.env.RUSTDESK_DATA,
-        // BetterDesk Console standard data directories
-        '/opt/BetterDeskConsole/data',
+        process.env.DATA_DIR,
+        // BetterDesk Console standard data directories (Windows)
+        'C:\\BetterDeskConsole\\data',
         'C:\\BetterDesk\\BetterDeskConsole\\data',
         'C:\\BetterDesk\\data',
+        // BetterDesk Console standard data directories (Linux)
+        '/opt/BetterDeskConsole/data',
         // Legacy paths
         '/opt/rustdesk',
         '/var/lib/rustdesk',
@@ -190,8 +194,8 @@ function findDataDir() {
         }
     }
     
-    // Default to current directory
-    return process.cwd();
+    // Default to data subdirectory of current working directory
+    return path.join(process.cwd(), 'data');
 }
 
 main().catch(err => {

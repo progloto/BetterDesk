@@ -803,7 +803,7 @@ router.post('/api/login', async (req, res) => {
 
         // No 2FA — issue token directly
         authService.recordAttempt(username, ip, true);
-        const token = authService.generateAccessToken(user.id, clientId, clientUuid, ip);
+        const token = await authService.generateAccessToken(user.id, clientId, clientUuid, ip);
         await db.updateLastLogin(user.id);
         await db.logAction(user.id, 'api_login_success', `Client: ${clientId || 'unknown'}`, ip);
 
@@ -854,7 +854,7 @@ async function handleTfaVerification(req, res, ip, totpCode) {
         sessions.delete(tfaSecret);
 
         authService.recordAttempt(session.username, ip, true);
-        const token = authService.generateAccessToken(
+        const token = await authService.generateAccessToken(
             session.userId,
             clientId || session.clientId,
             clientUuid || session.clientUuid,

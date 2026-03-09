@@ -2494,10 +2494,14 @@ function Do-BackupSilent {
         Print-Info "  - API key"
     }
     
-    # Backup credentials
-    $credPath = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
-    if (Test-Path $credPath) {
-        Copy-Item -Path $credPath -Destination $backupPath
+    # Backup credentials (check both locations)
+    $consoleCredPath = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
+    $rustdeskCredPath = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
+    if (Test-Path $consoleCredPath) {
+        Copy-Item -Path $consoleCredPath -Destination $backupPath
+        Print-Info "  - Login credentials"
+    } elseif (Test-Path $rustdeskCredPath) {
+        Copy-Item -Path $rustdeskCredPath -Destination $backupPath
         Print-Info "  - Login credentials"
     }
     
@@ -2665,9 +2669,20 @@ print("Password updated successfully")
         Write-Host "  Password: " -NoNewline; Write-Host $newPassword -ForegroundColor White
         Write-Host "============================================================" -ForegroundColor Green
         
-        # Save credentials
-        $credentialsFile = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
-        "admin:$newPassword" | Out-File -FilePath $credentialsFile -Encoding UTF8
+        # Save credentials to BOTH locations for consistency
+        $consoleCredsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
+        $rustdeskCredsFile = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
+        
+        # Create console data directory if it doesn't exist
+        $consoleDataDir = Join-Path $script:CONSOLE_PATH "data"
+        if (-not (Test-Path $consoleDataDir)) {
+            New-Item -ItemType Directory -Path $consoleDataDir -Force | Out-Null
+        }
+        
+        "admin:$newPassword" | Out-File -FilePath $consoleCredsFile -Encoding UTF8
+        "admin:$newPassword" | Out-File -FilePath $rustdeskCredsFile -Encoding UTF8
+        
+        Print-Info "Credentials saved to: $consoleCredsFile"
     } else {
         Print-Error "Failed to reset password!"
         Print-Info "Make sure Node.js is installed and the console is set up correctly"

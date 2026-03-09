@@ -1111,7 +1111,19 @@ function createSqliteAdapter(config) {
             openAuth().prepare('DELETE FROM folders WHERE id = ?').run(id);
         },
         async assignDeviceToFolder(deviceId, folderId) {
+            // First update peer table for direct lookups
             openMain().prepare('UPDATE peer SET folder_id = ? WHERE id = ?').run(folderId, deviceId);
+            
+            // Then update assignment tracking table (used by getAllFolderAssignments)
+            if (folderId === null || folderId === undefined) {
+                openAuth().prepare('DELETE FROM device_folder_assignments WHERE device_id = ?').run(deviceId);
+            } else {
+                openAuth().prepare(`
+                    INSERT INTO device_folder_assignments (device_id, folder_id)
+                    VALUES (?, ?)
+                    ON CONFLICT(device_id) DO UPDATE SET folder_id = ?, assigned_at = datetime('now')
+                `).run(deviceId, folderId, folderId);
+            }
         },
 
         // ---- Address books ----
@@ -3030,7 +3042,7 @@ function createPostgresAdapter() {
                         'os',       COALESCE(p.os, ''),
                         'platform', COALESCE(p.os, ''),
                         'version',  COALESCE(p.version, '')
-                    )::text,
+                    )::jsonb,
                     COALESCE(p.ip, ''),
                     COALESCE(p."user", ''),
                     (p.status = 'ONLINE'),
@@ -3272,10 +3284,23 @@ function createPostgresAdapter() {
         },
         async deleteFolder(id) {
             await q('UPDATE peer SET folder_id = NULL WHERE folder_id = $1', [id]);
+            await q('DELETE FROM device_folder_assignments WHERE folder_id = $1', [id]);
             await q('DELETE FROM folders WHERE id = $1', [id]);
         },
         async assignDeviceToFolder(deviceId, folderId) {
+            // First update peer table for direct lookups
             await q('UPDATE peer SET folder_id = $1 WHERE id = $2', [folderId, deviceId]);
+            
+            // Then update assignment tracking table (used by getAllFolderAssignments)
+            if (folderId === null || folderId === undefined) {
+                await q('DELETE FROM device_folder_assignments WHERE device_id = $1', [deviceId]);
+            } else {
+                await q(`
+                    INSERT INTO device_folder_assignments (device_id, folder_id)
+                    VALUES ($1, $2)
+                    ON CONFLICT(device_id) DO UPDATE SET folder_id = $2, assigned_at = NOW()
+                `, [deviceId, folderId]);
+            }
         },
 
         // ---- Address books ----
