@@ -20,8 +20,6 @@
 #   Web Console: http://localhost:5000
 #   Default login: admin / admin
 
-version: '3.8'
-
 services:
   # BetterDesk All-in-One (Go server + Node.js console)
   betterdesk:

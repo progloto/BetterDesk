@@ -7,8 +7,6 @@
 # The Go server replaces separate hbbs/hbbr — it handles signal, relay,
 # and HTTP API in a single process.
 
-version: '3.8'
-
 services:
   # BetterDesk Server (Go) — replaces hbbs + hbbr
   # Single binary: signal (21116), relay (21117), API (21114), NAT test (21115)

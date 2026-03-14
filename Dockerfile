@@ -36,12 +36,12 @@ FROM node:20-alpine AS node-builder
 
 WORKDIR /app
 
-# Install build dependencies for native modules (better-sqlite3, bcrypt)
-RUN apk add --no-cache python3 make g++ sqlite-dev
+# Build dependencies for native modules (better-sqlite3, bcrypt)
+# Note: sqlite-dev is NOT needed — better-sqlite3 bundles its own SQLite
+RUN apk add --no-cache python3 make g++
 
 COPY web-nodejs/package.json web-nodejs/package-lock.json* ./
-RUN npm install --production --ignore-scripts && \
-    npm rebuild bcrypt better-sqlite3
+RUN npm install --production
 
 # ============= Stage 3: Production runtime =============
 # Note: supervisord requires root to manage child processes with user= directive.
@@ -74,8 +74,11 @@ RUN chmod +x /usr/local/bin/betterdesk-server
 
 # ---- Node.js console ----
 WORKDIR /app
-COPY --from=node-builder /app/node_modules ./node_modules
+# IMPORTANT: Copy app code FIRST, then overlay compiled node_modules.
+# This prevents local node_modules (if any) from overwriting the
+# properly compiled Alpine/musl native modules from the builder.
 COPY web-nodejs/ .
+COPY --from=node-builder /app/node_modules ./node_modules/
 
 # ---- Supervisord config ----
 COPY docker/supervisord.conf /etc/supervisor/conf.d/betterdesk.conf

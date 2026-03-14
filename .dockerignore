@@ -1,0 +1,74 @@
+# =============================================================
+# .dockerignore — Reduce Docker build context and prevent
+# local development artifacts from leaking into images.
+# =============================================================
+
+# Node.js — CRITICAL: local node_modules contain platform-specific
+# native binaries (e.g. Windows x64) that will break Linux/Alpine
+# containers.  The Dockerfile builds its own node_modules.
+**/node_modules/
+web-nodejs/data/
+web-nodejs/uploads/
+
+# Package lock is rebuilt in Docker
+# (remove this line if you commit package-lock.json)
+web-nodejs/package-lock.json
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Go build artifacts (binary is built inside Docker)
+betterdesk-server/betterdesk-server
+betterdesk-server/betterdesk-server-*
+betterdesk-server/*.exe
+betterdesk-server/db_v2.sqlite3
+betterdesk-server/id_ed25519
+betterdesk-server/id_ed25519.pub
+betterdesk-server/test_*.go
+betterdesk-server/_test_*
+
+# Archive (old/deprecated files)
+archive/
+
+# Documentation (not needed in image)
+docs/
+screenshots/
+*.md
+!web-nodejs/**/*.md
+!docker/*.md
+
+# Development & testing
+dev_modules/
+TESTING.local.md
+betterdesk-client/
+
+# Sensitive files
+*.key
+*.pem
+*.pub
+.env
+.env.*
+*credentials*
+*secret*.key
+
+# OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Databases (created at runtime)
+*.sqlite3
+*.db
+
+# Logs
+*.log
+logs/
+
+# Backups
+*.backup
+*.bak
+rustdesk-backup-*/

@@ -170,6 +170,7 @@ function createSqliteAdapter(config) {
     function openMain() {
         if (mainDb) return mainDb;
         mainDb = new Database(config.dbPath, { readonly: false, fileMustExist: false });
+        mainDb.pragma('busy_timeout = 5000');
         mainDb.pragma('journal_mode = WAL');
         mainDb.pragma('foreign_keys = ON');
         return mainDb;
@@ -179,6 +180,7 @@ function createSqliteAdapter(config) {
         if (authDb) return authDb;
         const authDbPath = path.join(config.dataDir, 'auth.db');
         authDb = new Database(authDbPath, { readonly: false, fileMustExist: false });
+        authDb.pragma('busy_timeout = 5000');
         authDb.pragma('journal_mode = WAL');
         authDb.pragma('foreign_keys = ON');
         return authDb;
