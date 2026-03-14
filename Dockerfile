@@ -44,6 +44,9 @@ RUN npm install --production --ignore-scripts && \
     npm rebuild bcrypt better-sqlite3
 
 # ============= Stage 3: Production runtime =============
+# Note: supervisord requires root to manage child processes with user= directive.
+# Both betterdesk-server and betterdesk-console run as non-root 'betterdesk' user
+# via supervisord configuration (user=betterdesk).
 FROM node:20-alpine
 
 LABEL maintainer="UNITRONIX"

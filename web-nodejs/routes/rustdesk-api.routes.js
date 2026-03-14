@@ -254,8 +254,19 @@ router.post('/api/sysinfo', async (req, res) => {
         let cpuCores = 0;
         let cpuFreqGhz = 0;
         if (cpuRaw) {
-            // Pattern: "Intel Core i7-12700K, 5.2GHz, 24/16 cores"
-            const cpuMatch = cpuRaw.match(/^([^,]+?)(?:,\s*(\d+\.?\d*)GHz)?(?:,\s*)?(\d+)?\/?(\d+)?\s*cores?$/i);
+            // Parse comma-separated parts: "Intel Core i7-12700K, 5.2GHz, 24/16 cores"
+            // Uses split instead of complex regex to avoid ReDoS backtracking.
+            const cpuParts = cpuRaw.split(',').map(s => s.trim());
+            const cpuMatch = cpuParts.length >= 1 ? [null, cpuParts[0]] : null;
+            if (cpuMatch) {
+                const ghzPart = cpuParts.find(p => /^\d+\.?\d*GHz$/i.test(p));
+                const coresPart = cpuParts.find(p => /^\d+\/?\d*\s*cores?$/i.test(p));
+                if (ghzPart) cpuMatch[2] = ghzPart.replace(/GHz$/i, '');
+                if (coresPart) {
+                    const cm = coresPart.match(/^(\d+)\/?(\d+)?/);
+                    if (cm) { cpuMatch[3] = cm[1]; cpuMatch[4] = cm[2]; }
+                }
+            }
             if (cpuMatch) {
                 cpuName = cpuMatch[1]?.trim() || cpuRaw;
                 cpuFreqGhz = parseFloat(cpuMatch[2]) || 0;

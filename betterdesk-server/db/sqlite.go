@@ -187,8 +187,24 @@ func (s *SQLiteDB) Migrate() error {
 	return nil
 }
 
+// safeIdentifier validates that a string is a safe SQL identifier (letters, digits, underscores).
+func safeIdentifier(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // hasColumn checks if a column exists in a table using PRAGMA table_info.
 func (s *SQLiteDB) hasColumn(table, column string) bool {
+	if !safeIdentifier(table) {
+		return false
+	}
 	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
 		return false

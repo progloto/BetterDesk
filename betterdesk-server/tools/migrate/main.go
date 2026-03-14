@@ -1613,8 +1613,24 @@ func tableExists(db *sql.DB, name string) bool {
 	return err == nil
 }
 
+// safeIdentifier validates that a string is a safe SQL identifier (letters, digits, underscores).
+func safeIdentifier(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 // getColumns returns column names for a table.
 func getColumns(db *sql.DB, table string) []string {
+	if !safeIdentifier(table) {
+		return nil
+	}
 	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
 	if err != nil {
 		return nil
