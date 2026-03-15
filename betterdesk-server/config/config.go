@@ -99,7 +99,14 @@ func DefaultConfig() *Config {
 // LoadEnv overrides config values from environment variables.
 // Environment variables take precedence over CLI flags.
 func (c *Config) LoadEnv() {
-	if v := os.Getenv("PORT"); v != "" {
+	// SIGNAL_PORT takes precedence over PORT.
+	// This avoids conflicts in Docker single-container setups where PORT=5000
+	// is intended for the Node.js console, not the Go signal server.
+	if v := os.Getenv("SIGNAL_PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.SignalPort = n
+		}
+	} else if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.SignalPort = n
 		}

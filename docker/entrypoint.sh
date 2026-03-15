@@ -63,6 +63,9 @@ if [ "${DB_TYPE}" = "postgres" ] || [ "${DB_TYPE}" = "postgresql" ]; then
     fi
 fi
 
+# Ensure Go server uses correct signal port (not NODE.js PORT)
+export SIGNAL_PORT="${SIGNAL_PORT:-21116}"
+
 echo ""
 echo "Starting services via supervisord..."
 echo "  Web Console:  http://localhost:${PORT:-5000}"

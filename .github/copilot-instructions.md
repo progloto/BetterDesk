@@ -428,6 +428,14 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 73. [x] **betterdesk.ps1 fix**: Added `Preserve-DatabaseConfig` PowerShell function with same logic. Called in `Do-Update` and `Do-Repair` before any reinstallation.
 74. [x] **Root cause**: `install_nodejs_console()` always created new `.env` based on `USE_POSTGRESQL` var which defaults to `false`. During UPDATE, this var was never set from existing config.
 
+#### Docker Single-Container — Port 5000 Conflict Fix (Phase 13) ✅ COMPLETED 2026-03-15
+75. [x] **Root cause (Issue #56)**: Go server `config.LoadEnv()` reads generic `PORT` env var for signal port. In Docker single-container, `PORT=5000` is intended for Node.js console but leaks into Go server, setting signal to :5000. Both processes fight for port 5000 → EADDRINUSE race condition.
+76. [x] **config.go fix**: Added `SIGNAL_PORT` env var with higher priority than `PORT` — `SIGNAL_PORT` takes precedence, `PORT` only used as fallback.
+77. [x] **supervisord.conf fix**: Added `SIGNAL_PORT="21116"` to Go server environment section.
+78. [x] **entrypoint.sh fix**: Exports `SIGNAL_PORT=${SIGNAL_PORT:-21116}` before starting supervisord.
+79. [x] **Dockerfile fix**: Added `ENV SIGNAL_PORT=21116` as default alongside `ENV PORT=5000`.
+80. [x] **Multi-container NOT affected**: `docker-compose.yml` uses separate containers, no port conflict.
+
 ---
 
 ## 🔄 System Statusu v3.0
@@ -593,6 +601,7 @@ Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
 20. ~~**Folders not working with PostgreSQL (Issue #48)**~~ ✅ ROZWIĄZANE - `folders.routes.js` and `users.routes.js` used SQLite-specific `result.lastInsertRowid` instead of `result.id`. Fixed for PostgreSQL compatibility — Phase 12
 21. ~~**TOTP column missing on upgrade (Issue #38)**~~ ✅ ROZWIĄZANE - Added automatic migration of `totp_secret`, `totp_enabled`, `totp_recovery_codes` columns to existing `users` table for both SQLite and PostgreSQL — Phase 12
 22. ~~**SELinux volume mount issues (Issue #31)**~~ ✅ ROZWIĄZANE - Added SELinux documentation to DOCKER_TROUBLESHOOTING.md with 4 solutions (named volumes, `:z` flag, chcon, setenforce) — Phase 12
+23. ~~**Docker single-container port 5000 conflict (Issue #56)**~~ ✅ ROZWIĄZANE - Go server `config.LoadEnv()` read generic `PORT=5000` (meant for Node.js console) and set signal port to 5000 instead of 21116, causing EADDRINUSE race condition. Fixed by adding `SIGNAL_PORT` env var with priority over `PORT` in `config.go`, setting `SIGNAL_PORT=21116` in `supervisord.conf` and `entrypoint.sh`, adding `ENV SIGNAL_PORT=21116` to `Dockerfile` — Phase 13
 
 ---
 
@@ -682,4 +691,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-13 (PostgreSQL config preservation fix — Phase 11) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-15 (Docker single-container port 5000 conflict fix — Phase 13) przez GitHub Copilot*

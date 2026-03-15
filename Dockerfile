@@ -90,6 +90,7 @@ RUN chmod +x /entrypoint.sh
 # Environment variables (defaults)
 ENV NODE_ENV=production
 ENV PORT=5000
+ENV SIGNAL_PORT=21116
 ENV HOST=0.0.0.0
 ENV DATA_DIR=/app/data
 ENV RUSTDESK_PATH=/opt/rustdesk
