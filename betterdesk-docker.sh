@@ -34,12 +34,14 @@ COMPOSE_FILE="${COMPOSE_FILE:-$SCRIPT_DIR/docker-compose.yml}"
 
 # Database configuration
 USE_POSTGRESQL="${USE_POSTGRESQL:-false}"
+DB_TYPE="${DB_TYPE:-sqlite}"
 POSTGRESQL_URI="${POSTGRESQL_URI:-}"
 POSTGRESQL_USER="${POSTGRESQL_USER:-betterdesk}"
 POSTGRESQL_PASS="${POSTGRESQL_PASS:-}"
 POSTGRESQL_DB="${POSTGRESQL_DB:-betterdesk}"
 POSTGRESQL_HOST="${POSTGRESQL_HOST:-postgres}"  # Container name as host
 POSTGRESQL_PORT="${POSTGRESQL_PORT:-5432}"
+STORE_ADMIN_CREDENTIALS="${STORE_ADMIN_CREDENTIALS:-false}"
 
 # Common data directory paths to search
 COMMON_DATA_PATHS=(
@@ -159,6 +161,11 @@ get_public_ip() {
     ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     ip=$(curl -s --max-time 5 icanhazip.com 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     echo "127.0.0.1"
+}
+
+sql_escape_literal() {
+    local value="$1"
+    printf "%s" "${value//\'/\'\'}"
 }
 
 #===============================================================================
@@ -508,196 +515,226 @@ choose_database_type() {
     esac
 }
 
+preserve_compose_database_config() {
+    # Keep existing database mode/credentials when regenerating compose file
+    # during update/repair so we do not accidentally switch backends.
+    DB_TYPE="sqlite"
+
+    if [ -f "$COMPOSE_FILE" ]; then
+        if grep -qE '^\s*-\s*DB_TYPE=postgresql|^\s*POSTGRES_USER:' "$COMPOSE_FILE"; then
+            DB_TYPE="postgresql"
+
+            local detected_user detected_pass detected_db detected_uri
+            detected_user=$(grep -E '^\s*POSTGRES_USER:' "$COMPOSE_FILE" | head -1 | sed -E 's/^\s*POSTGRES_USER:\s*//')
+            detected_pass=$(grep -E '^\s*POSTGRES_PASSWORD:' "$COMPOSE_FILE" | head -1 | sed -E 's/^\s*POSTGRES_PASSWORD:\s*//')
+            detected_db=$(grep -E '^\s*POSTGRES_DB:' "$COMPOSE_FILE" | head -1 | sed -E 's/^\s*POSTGRES_DB:\s*//')
+            detected_uri=$(grep -E '^\s*-\s*DATABASE_URL=postgres' "$COMPOSE_FILE" | head -1 | sed -E 's/^\s*-\s*DATABASE_URL=//')
+
+            [ -n "$detected_user" ] && POSTGRESQL_USER="$detected_user"
+            [ -n "$detected_pass" ] && POSTGRESQL_PASS="$detected_pass"
+            [ -n "$detected_db" ] && POSTGRESQL_DB="$detected_db"
+            [ -n "$detected_uri" ] && POSTGRESQL_URI="$detected_uri"
+        fi
+    elif [ "$USE_POSTGRESQL" = "true" ]; then
+        DB_TYPE="postgresql"
+    fi
+
+    if [ "$DB_TYPE" = "postgresql" ]; then
+        print_info "Preserved database mode: PostgreSQL"
+    else
+        print_info "Preserved database mode: SQLite"
+    fi
+}
+
 create_compose_file() {
-    print_step "Creating docker-compose.yml..."
-    
-    local server_ip
-    server_ip=$(get_public_ip)
-    
-    # Start composing docker-compose.yml
-    cat > "$COMPOSE_FILE" << EOF
+        print_step "Creating docker-compose.yml..."
+
+        # Start composing docker-compose.yml
+        cat > "$COMPOSE_FILE" << EOF
 version: '3.8'
 
 services:
 EOF
 
-    # Add PostgreSQL service if selected
-    if [ "$DB_TYPE" = "postgresql" ]; then
+        # Add PostgreSQL service if selected
+        if [ "$DB_TYPE" = "postgresql" ]; then
+                cat >> "$COMPOSE_FILE" << EOF
+    postgres:
+        container_name: betterdesk-postgres
+        image: postgres:16-alpine
+        environment:
+            POSTGRES_USER: $POSTGRESQL_USER
+            POSTGRES_PASSWORD: $POSTGRESQL_PASS
+            POSTGRES_DB: $POSTGRESQL_DB
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U $POSTGRESQL_USER -d $POSTGRESQL_DB"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        restart: unless-stopped
+        networks:
+            - betterdesk
+
+EOF
+        fi
+
+        # Generate shared API key for Node.js <-> Go server communication
+        local api_key
+        api_key=$(openssl rand -hex 32)
+        echo "$api_key" > "$DATA_DIR/.api_key"
+        chmod 600 "$DATA_DIR/.api_key"
+        print_info "Generated API key for console <-> server communication"
+
+        # Generate admin password (shared between Go server and Node.js console)
+        local admin_password
+        admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+        DOCKER_ADMIN_PASSWORD="$admin_password"
+
+        # Clean old auth database from console_data volume to ensure the newly
+        # generated password is used. Without this, a reinstall would keep the
+        # old auth.db with a stale password hash while the env var gets a new
+        # password - making login impossible.
+        if docker volume inspect "${PROJECT_NAME:-betterdesk}_console_data" >/dev/null 2>&1; then
+                print_info "Cleaning old auth database from console_data volume..."
+                docker run --rm -v "${PROJECT_NAME:-betterdesk}_console_data:/data" alpine \
+                        sh -c "rm -f /data/auth.db /data/auth.db-wal /data/auth.db-shm" 2>/dev/null || true
+        fi
+
+        # Get server public IP for relay-servers
+        local server_ip
+        server_ip=$(get_public_ip)
+
+        # Add BetterDesk server (Go single binary - signal + relay + API)
         cat >> "$COMPOSE_FILE" << EOF
-  postgres:
-    container_name: betterdesk-postgres
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: $POSTGRESQL_USER
-      POSTGRES_PASSWORD: $POSTGRESQL_PASS
-      POSTGRES_DB: $POSTGRESQL_DB
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $POSTGRESQL_USER -d $POSTGRESQL_DB"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-    networks:
-      - betterdesk
-
-EOF
-    fi
-
-    # Generate shared API key for Node.js <-> Go server communication
-    local api_key
-    api_key=$(openssl rand -hex 32)
-    echo "$api_key" > "$DATA_DIR/.api_key"
-    chmod 600 "$DATA_DIR/.api_key"
-    print_info "Generated API key for console <-> server communication"
-    
-    # Generate admin password (shared between Go server and Node.js console)
-    local admin_password
-    admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
-    DOCKER_ADMIN_PASSWORD="$admin_password"
-    
-    # Clean old auth database from console_data volume to ensure the newly
-    # generated password is used. Without this, a reinstall would keep the
-    # old auth.db with a stale password hash while the env var gets a new
-    # password — making login impossible.
-    if docker volume inspect "${PROJECT_NAME:-betterdesk}_console_data" >/dev/null 2>&1; then
-        print_info "Cleaning old auth database from console_data volume..."
-        docker run --rm -v "${PROJECT_NAME:-betterdesk}_console_data:/data" alpine \
-            sh -c "rm -f /data/auth.db /data/auth.db-wal /data/auth.db-shm" 2>/dev/null || true
-    fi
-    
-    # Get server public IP for relay-servers
-    local server_ip
-    server_ip=$(get_public_ip)
-    
-    # Add BetterDesk server (Go single binary — signal + relay + API)
-    cat >> "$COMPOSE_FILE" << EOF
-  server:
-    container_name: $SERVER_CONTAINER
-    build:
-      context: .
-      dockerfile: Dockerfile.server
-    pull_policy: never
-    ports:
-      - "21114:21114"
-      - "21115:21115"
-      - "21116:21116"
-      - "21116:21116/udp"
-      - "21117:21117"
-      - "21118:21118"
-      - "21119:21119"
-    volumes:
-      - $DATA_DIR:/opt/rustdesk
-    environment:
-      - RELAY_SERVERS=$server_ip
-      - INIT_ADMIN_PASS=$admin_password
+    server:
+        container_name: $SERVER_CONTAINER
+        build:
+            context: .
+            dockerfile: Dockerfile.server
+        pull_policy: never
+        ports:
+            - "21114:21114"
+            - "21115:21115"
+            - "21116:21116"
+            - "21116:21116/udp"
+            - "21117:21117"
+            - "21118:21118"
+            - "21119:21119"
+        volumes:
+            - $DATA_DIR:/opt/rustdesk
+        environment:
+            - RELAY_SERVERS=$server_ip
+            - INIT_ADMIN_PASS=$admin_password
 EOF
 
-    if [ "$DB_TYPE" = "postgresql" ]; then
+        if [ "$DB_TYPE" = "postgresql" ]; then
+                cat >> "$COMPOSE_FILE" << EOF
+            - DB_URL=postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@postgres:5432/$POSTGRESQL_DB?sslmode=disable
+        depends_on:
+            postgres:
+                condition: service_healthy
+EOF
+        fi
+
         cat >> "$COMPOSE_FILE" << EOF
-      - DB_URL=postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@postgres:5432/$POSTGRESQL_DB?sslmode=disable
-    depends_on:
-      postgres:
-        condition: service_healthy
-EOF
-    fi
+        healthcheck:
+            test: ["CMD", "curl", "-sf", "http://localhost:21114/api/health"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 15s
+        restart: unless-stopped
+        networks:
+            - betterdesk
 
-    cat >> "$COMPOSE_FILE" << EOF
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:21114/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - betterdesk
-
-  console:
-    container_name: $CONSOLE_CONTAINER
-    build:
-      context: .
-      dockerfile: Dockerfile.console
-    pull_policy: never
-    ports:
-      - "5000:5000"
-      - "21121:21121"
-    volumes:
-      - $DATA_DIR:/opt/rustdesk:ro
-      - console_data:/app/data
-    environment:
-      - NODE_ENV=production
-      - PORT=5000
-      - RUSTDESK_PATH=/opt/rustdesk
-      - HBBS_API_URL=http://$SERVER_CONTAINER:21114/api
-      - BETTERDESK_API_URL=http://$SERVER_CONTAINER:21114/api
-      - SERVER_BACKEND=betterdesk
-      - DATA_DIR=/app/data
-      - DB_PATH=/opt/rustdesk/db_v2.sqlite3
-      - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
-      - API_KEY_PATH=/opt/rustdesk/.api_key
-      - KEYS_PATH=/opt/rustdesk
-      - DEFAULT_ADMIN_PASSWORD=$admin_password
-      - FORCE_PASSWORD_UPDATE=true
-      - WS_HBBS_HOST=$SERVER_CONTAINER
-      - WS_HBBS_PORT=21116
-      - WS_HBBR_HOST=$SERVER_CONTAINER
-      - WS_HBBR_PORT=21117
-      - DOCKER=true
+    console:
+        container_name: $CONSOLE_CONTAINER
+        build:
+            context: .
+            dockerfile: Dockerfile.console
+        pull_policy: never
+        ports:
+            - "5000:5000"
+            - "21121:21121"
+        volumes:
+            - $DATA_DIR:/opt/rustdesk:ro
+            - console_data:/app/data
+        environment:
+            - NODE_ENV=production
+            - PORT=5000
+            - HOST=0.0.0.0
+            - API_HOST=0.0.0.0
+            - RUSTDESK_PATH=/opt/rustdesk
+            - HBBS_API_URL=http://$SERVER_CONTAINER:21114/api
+            - BETTERDESK_API_URL=http://$SERVER_CONTAINER:21114/api
+            - SERVER_BACKEND=betterdesk
+            - DATA_DIR=/app/data
+            - DB_PATH=/opt/rustdesk/db_v2.sqlite3
+            - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
+            - API_KEY_PATH=/opt/rustdesk/.api_key
+            - KEYS_PATH=/opt/rustdesk
+            - DEFAULT_ADMIN_PASSWORD=$admin_password
+            - FORCE_PASSWORD_UPDATE=true
+            - WS_HBBS_HOST=$SERVER_CONTAINER
+            - WS_HBBS_PORT=21116
+            - WS_HBBR_HOST=$SERVER_CONTAINER
+            - WS_HBBR_PORT=21117
+            - DOCKER=true
 EOF
 
-    if [ "$DB_TYPE" = "postgresql" ]; then
+        if [ "$DB_TYPE" = "postgresql" ]; then
+                cat >> "$COMPOSE_FILE" << EOF
+            - DB_TYPE=postgresql
+            - DATABASE_URL=postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@postgres:5432/$POSTGRESQL_DB?sslmode=disable
+        depends_on:
+            postgres:
+                condition: service_healthy
+            server:
+                condition: service_healthy
+EOF
+        else
+                cat >> "$COMPOSE_FILE" << EOF
+        depends_on:
+            server:
+                condition: service_healthy
+EOF
+        fi
+
         cat >> "$COMPOSE_FILE" << EOF
-      - DB_TYPE=postgresql
-      - DATABASE_URL=postgres://$POSTGRESQL_USER:$POSTGRESQL_PASS@postgres:5432/$POSTGRESQL_DB?sslmode=disable
-    depends_on:
-      postgres:
-        condition: service_healthy
-      server:
-        condition: service_healthy
-EOF
-    else
-        cat >> "$COMPOSE_FILE" << EOF
-    depends_on:
-      server:
-        condition: service_healthy
-EOF
-    fi
-
-    cat >> "$COMPOSE_FILE" << EOF
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - betterdesk
+        healthcheck:
+            test: ["CMD", "curl", "-sf", "http://localhost:5000/health"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 30s
+        restart: unless-stopped
+        networks:
+            - betterdesk
 
 networks:
-  betterdesk:
-    driver: bridge
+    betterdesk:
+        driver: bridge
 EOF
 
-    # Add volumes
-    if [ "$DB_TYPE" = "postgresql" ]; then
-        cat >> "$COMPOSE_FILE" << EOF
+        # Add volumes
+        if [ "$DB_TYPE" = "postgresql" ]; then
+                cat >> "$COMPOSE_FILE" << EOF
 
 volumes:
-  console_data:
-  postgres_data:
+    console_data:
+    postgres_data:
 EOF
-    else
-        cat >> "$COMPOSE_FILE" << EOF
+        else
+                cat >> "$COMPOSE_FILE" << EOF
 
 volumes:
-  console_data:
+    console_data:
 EOF
-    fi
+        fi
 
-    print_success "docker-compose.yml created"
+        print_success "docker-compose.yml created"
 }
 
 build_images() {
@@ -724,15 +761,17 @@ start_containers() {
     if [ -f "$api_key_file" ]; then
         local api_key
         api_key=$(cat "$api_key_file")
+        local api_key_sql
+        api_key_sql=$(sql_escape_literal "$api_key")
         # Use sqlite3 inside the server container to insert the API key
         docker exec "$SERVER_CONTAINER" sh -c "
             if command -v sqlite3 >/dev/null 2>&1; then
-                sqlite3 /opt/rustdesk/db_v2.sqlite3 \"INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key');\" 2>/dev/null
+                sqlite3 /opt/rustdesk/db_v2.sqlite3 \"INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key_sql');\" 2>/dev/null
             fi
         " 2>/dev/null || true
         # Also try from host if sqlite3 is available
         if [ -f "$DATA_DIR/db_v2.sqlite3" ] && command -v sqlite3 &>/dev/null; then
-            sqlite3 "$DATA_DIR/db_v2.sqlite3" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key');" 2>/dev/null || true
+            sqlite3 "$DATA_DIR/db_v2.sqlite3" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key_sql');" 2>/dev/null || true
         fi
         print_info "API key synced to Go server database"
     fi
@@ -799,10 +838,13 @@ create_admin_user() {
     
     # Save credentials
     mkdir -p "$DATA_DIR"
-    echo "admin:$admin_password" > "$DATA_DIR/.admin_credentials"
-    chmod 600 "$DATA_DIR/.admin_credentials"
-    
-    print_info "Credentials saved in: $DATA_DIR/.admin_credentials"
+    if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
+        echo "admin:$admin_password" > "$DATA_DIR/.admin_credentials"
+        chmod 600 "$DATA_DIR/.admin_credentials"
+        print_info "Credentials saved in: $DATA_DIR/.admin_credentials"
+    else
+        print_warning "Credentials are not persisted by default (security hardening)."
+    fi
 }
 
 do_install() {
@@ -922,6 +964,10 @@ do_update() {
     
     print_info "Creating backup before update..."
     do_backup_silent
+
+    preserve_compose_database_config
+    print_info "Regenerating docker-compose.yml with latest template..."
+    create_compose_file
     
     stop_containers
     build_images
@@ -958,6 +1004,8 @@ do_repair() {
     
     case $repair_choice in
         1) 
+            preserve_compose_database_config
+            create_compose_file
             stop_containers
             build_images
             start_containers
@@ -976,6 +1024,8 @@ do_repair() {
             fi
             ;;
         5)
+            preserve_compose_database_config
+            create_compose_file
             stop_containers
             docker system prune -f
             build_images
@@ -1230,16 +1280,17 @@ do_reset_password() {
     # Arguments: <password> [username] — password first, then optional username
     docker exec "$CONSOLE_CONTAINER" node /app/scripts/reset-password.js "$new_password" admin 2>/dev/null || {
         print_warning "reset-password.js failed, trying inline fallback..."
-        docker exec "$CONSOLE_CONTAINER" node -e "
+        docker exec -e RESET_ADMIN_PASSWORD="$new_password" "$CONSOLE_CONTAINER" node -e "
 const bcrypt = require('bcrypt');
 const Database = require('better-sqlite3');
 const path = require('path');
 
 const dataDir = process.env.DATA_DIR || '/app/data';
 const dbPath = path.join(dataDir, 'auth.db');
+const resetPassword = process.env.RESET_ADMIN_PASSWORD || '';
 
 const db = new Database(dbPath);
-const hash = bcrypt.hashSync('$new_password', 10);
+const hash = bcrypt.hashSync(resetPassword, 10);
 
 const update = db.prepare('UPDATE users SET password_hash = ? WHERE username = ?');
 const result = update.run(hash, 'admin');
@@ -1264,8 +1315,10 @@ db.close();
     echo -e "${GREEN}╚════════════════════════════════════════════════════════╝${NC}"
     
     # Save credentials
-    echo "admin:$new_password" > "$DATA_DIR/.admin_credentials"
-    chmod 600 "$DATA_DIR/.admin_credentials"
+    if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
+        echo "admin:$new_password" > "$DATA_DIR/.admin_credentials"
+        chmod 600 "$DATA_DIR/.admin_credentials"
+    fi
     
     press_enter
 }

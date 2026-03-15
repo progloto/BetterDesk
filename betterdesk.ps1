@@ -107,6 +107,7 @@ $script:DB_PATH = "$script:RUSTDESK_PATH\db_v2.sqlite3"
 
 # API configuration
 $script:API_PORT = if ($env:API_PORT) { $env:API_PORT } else { "21114" }
+$script:STORE_ADMIN_CREDENTIALS = ($env:STORE_ADMIN_CREDENTIALS -eq "true")
 
 # Common installation paths to search
 $script:COMMON_RUSTDESK_PATHS = @(
@@ -541,13 +542,22 @@ function Test-GoInstalled {
         return $false
     }
     
-    $goVersion = & go version 2>&1 | Select-String -Pattern "go(\d+\.\d+)" | ForEach-Object { $_.Matches.Groups[1].Value }
-    if (-not $goVersion) {
+    $goVersionOutput = & go version 2>&1
+    $goMatch = [regex]::Match($goVersionOutput, 'go(\d+)\.(\d+)(?:\.(\d+))?')
+    if (-not $goMatch.Success) {
         return $false
     }
-    
-    $currentMajor = [int]($goVersion.Split('.')[0])
-    $currentMinor = [int]($goVersion.Split('.')[1])
+
+    $goVersion = $goMatch.Groups[0].Value.Replace('go', '')
+    $currentMajor = [int]$goMatch.Groups[1].Value
+    $currentMinor = [int]$goMatch.Groups[2].Value
+    $currentPatch = if ($goMatch.Groups[3].Success) { [int]$goMatch.Groups[3].Value } else { 0 }
+
+    # Security hardening: reject vulnerable Go 1.26.0 stdlib.
+    if ($currentMajor -eq 1 -and $currentMinor -eq 26 -and $currentPatch -eq 0) {
+        Print-Warning "Detected vulnerable Go version $goVersion (known stdlib CVEs)."
+        return $false
+    }
     $minMajor = [int]($script:GO_MIN_VERSION.Split('.')[0])
     $minMinor = [int]($script:GO_MIN_VERSION.Split('.')[1])
     
@@ -562,7 +572,7 @@ function Test-GoInstalled {
 function Install-Golang {
     Print-Step "Installing Go toolchain..."
     
-    $goVersion = "1.25.0"
+    $goVersion = "1.26.1"
     $goUrl = "https://go.dev/dl/go$goVersion.windows-amd64.zip"
     $goZip = Join-Path $env:TEMP "go$goVersion.zip"
     $goRoot = "C:\Go"
@@ -1076,6 +1086,7 @@ DB_PATH=$script:RUSTDESK_PATH\db_v2.sqlite3
         $envContent = @"
 # BetterDesk Node.js Console Configuration
 PORT=5000
+HOST=0.0.0.0
 NODE_ENV=production
 
 # RustDesk paths (critical for key/QR code generation)
@@ -1091,6 +1102,9 @@ DATA_DIR=$dataDir
 
 # HBBS API
 HBBS_API_URL=http://localhost:$script:API_PORT/api
+
+# RustDesk Client API listener
+API_HOST=0.0.0.0
 
 # Server backend (betterdesk = Go server, rustdesk = legacy Rust)
 SERVER_BACKEND=betterdesk
@@ -1122,9 +1136,11 @@ BETTERDESK_API_URL=http://localhost:$script:API_PORT/api
             Print-Info "Database: SQLite"
         }
         
-        # Save Node.js admin credentials for display
-        $credsFile = Join-Path $dataDir ".admin_credentials"
-        "admin:$nodejsAdminPassword" | Out-File -FilePath $credsFile -Encoding UTF8
+        # Persist credentials only when explicitly requested.
+        if ($script:STORE_ADMIN_CREDENTIALS) {
+            $credsFile = Join-Path $dataDir ".admin_credentials"
+            "admin:$nodejsAdminPassword" | Out-File -FilePath $credsFile -Encoding UTF8
+        }
         
         $script:CONSOLE_TYPE = "nodejs"
         Print-Success "Node.js Web Console installed"
@@ -1491,13 +1507,25 @@ function Setup-Services {
     $serverArgs = "-mode all -relay-servers $serverIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
     
     # Add -init-admin-pass to sync admin password with Node.js console
+    $adminPass = $null
     $credsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
     if (Test-Path $credsFile) {
         $credsContent = Get-Content $credsFile -Raw
         if ($credsContent -match ':(.+)') {
             $adminPass = $Matches[1].Trim()
-            $serverArgs += " -init-admin-pass $adminPass"
         }
+    }
+    if (-not $adminPass) {
+        $envFile = Join-Path $script:CONSOLE_PATH ".env"
+        if (Test-Path $envFile) {
+            $line = Get-Content $envFile | Where-Object { $_ -like 'DEFAULT_ADMIN_PASSWORD=*' } | Select-Object -First 1
+            if ($line) {
+                $adminPass = ($line -split '=', 2)[1].Trim()
+            }
+        }
+    }
+    if ($adminPass) {
+        $serverArgs += " -init-admin-pass $adminPass"
     }
     
     # Add TLS flags if certificates exist
@@ -1563,7 +1591,9 @@ function Setup-Services {
             "HBBS_API_URL=${apiScheme}://localhost:$($script:API_PORT)/api",
             "BETTERDESK_API_URL=${apiScheme}://localhost:$($script:API_PORT)/api",
             "SERVER_BACKEND=betterdesk",
-            "PORT=5000"
+            "PORT=5000",
+            "HOST=0.0.0.0",
+            "API_HOST=0.0.0.0"
         )
         # Enable HTTPS on Node.js console when TLS certs are available
         if ($apiScheme -eq "https" -and (Test-Path $certPath) -and (Test-Path $keyPath)) {
@@ -1613,13 +1643,25 @@ function Setup-ScheduledTasks {
     $serverArgs = "-mode all -relay-servers $ServerIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
     
     # Add -init-admin-pass to sync admin password with Node.js console
+    $adminPass = $null
     $credsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
     if (Test-Path $credsFile) {
         $credsContent = Get-Content $credsFile -Raw
         if ($credsContent -match ':(.+)') {
             $adminPass = $Matches[1].Trim()
-            $serverArgs += " -init-admin-pass $adminPass"
         }
+    }
+    if (-not $adminPass) {
+        $envFile = Join-Path $script:CONSOLE_PATH ".env"
+        if (Test-Path $envFile) {
+            $line = Get-Content $envFile | Where-Object { $_ -like 'DEFAULT_ADMIN_PASSWORD=*' } | Select-Object -First 1
+            if ($line) {
+                $adminPass = ($line -split '=', 2)[1].Trim()
+            }
+        }
+    }
+    if ($adminPass) {
+        $serverArgs += " -init-admin-pass $adminPass"
     }
     
     # Add TLS flags if certificates exist
@@ -1816,14 +1858,26 @@ function Create-AdminUser {
         return $null
     }
     
-    # Node.js console - admin is created automatically on startup
-    # Read the password saved during Install-NodeJsConsole
+    # Node.js console - admin is created automatically on startup.
+    # Prefer plaintext credentials file (legacy), then .env fallback.
+    $adminPassword = $null
     $dataDir = Join-Path $script:CONSOLE_PATH "data"
     $credsFile = Join-Path $dataDir ".admin_credentials"
-    
     if (Test-Path $credsFile) {
         $creds = Get-Content $credsFile -Raw
         $adminPassword = ($creds -split ':')[1].Trim()
+    }
+    if (-not $adminPassword) {
+        $envFile = Join-Path $script:CONSOLE_PATH ".env"
+        if (Test-Path $envFile) {
+            $line = Get-Content $envFile | Where-Object { $_ -like 'DEFAULT_ADMIN_PASSWORD=*' } | Select-Object -First 1
+            if ($line) {
+                $adminPassword = ($line -split '=', 2)[1].Trim()
+            }
+        }
+    }
+
+    if ($adminPassword) {
         
         Write-Host ""
         Write-Host "============================================================" -ForegroundColor Green
@@ -1834,17 +1888,19 @@ function Create-AdminUser {
         Write-Host "============================================================" -ForegroundColor Green
         Write-Host ""
         
-        # Also save to main RustDesk path for consistency
-        $mainCredsFile = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
-        "admin:$adminPassword" | Out-File -FilePath $mainCredsFile -Encoding UTF8
-        
-        Print-Info "Credentials saved in: $mainCredsFile"
+        if ($script:STORE_ADMIN_CREDENTIALS) {
+            # Legacy behavior (opt-in): persist plaintext credentials file
+            $mainCredsFile = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
+            "admin:$adminPassword" | Out-File -FilePath $mainCredsFile -Encoding UTF8
+            Print-Info "Credentials saved in: $mainCredsFile"
+        } else {
+            Print-Warning "Credentials are not persisted by default (security hardening)."
+        }
         return $adminPassword
     } else {
         Print-Warning "No Node.js admin credentials found"
-        Print-Info "Default credentials: admin / admin"
-        Print-Info "Please change password after first login!"
-        return "admin"
+        Print-Info "Use password reset option to set a new admin password"
+        return $null
     }
 }
 
@@ -2032,8 +2088,12 @@ function Start-ServicesWithVerification {
         $apiKey = Get-Content $apiKeyPath -Raw
         $apiKey = $apiKey.Trim()
         try {
-            $pythonScript = "import sqlite3; conn = sqlite3.connect(r'$goDbPath'); conn.execute('INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)', ('api_key', '$apiKey')); conn.commit(); conn.close()"
+            $env:BETTERDESK_GO_DB_PATH = $goDbPath
+            $env:BETTERDESK_API_KEY_TMP = $apiKey
+            $pythonScript = "import os, sqlite3; conn = sqlite3.connect(os.environ['BETTERDESK_GO_DB_PATH']); conn.execute('INSERT OR REPLACE INTO server_config (key, value) VALUES (?, ?)', ('api_key', os.environ['BETTERDESK_API_KEY_TMP'])); conn.commit(); conn.close()"
             python -c $pythonScript 2>$null
+            Remove-Item Env:BETTERDESK_GO_DB_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:BETTERDESK_API_KEY_TMP -ErrorAction SilentlyContinue
             if ($LASTEXITCODE -eq 0) {
                 Print-Info "API key synced to Go server database"
             }
@@ -2719,12 +2779,14 @@ function Do-ResetPassword {
                 }
                 Print-Info "Auth database: $authDbPath"
                 
+                $env:BETTERDESK_AUTH_DB_PATH = $authDbPath
+                $env:BETTERDESK_RESET_PASSWORD = $newPassword
                 $pythonScript = @"
 import sqlite3
 import bcrypt
 import os
 
-auth_db_path = r'$authDbPath'
+auth_db_path = os.environ.get('BETTERDESK_AUTH_DB_PATH', '')
 
 # Create parent directory if needed
 os.makedirs(os.path.dirname(auth_db_path), exist_ok=True)
@@ -2742,7 +2804,7 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS users (
     last_login TEXT
 )''')
 
-new_password = '$newPassword'
+new_password = os.environ.get('BETTERDESK_RESET_PASSWORD', '')
 password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(12)).decode()
 
 cursor.execute("UPDATE users SET password_hash = ? WHERE username = 'admin'", (password_hash,))
@@ -2756,6 +2818,8 @@ conn.close()
 print("Password updated successfully")
 "@
                 $output = $pythonScript | python 2>&1
+                Remove-Item Env:BETTERDESK_AUTH_DB_PATH -ErrorAction SilentlyContinue
+                Remove-Item Env:BETTERDESK_RESET_PASSWORD -ErrorAction SilentlyContinue
                 if ($output -match "successfully") {
                     $success = $true
                 } else {
@@ -2774,20 +2838,23 @@ print("Password updated successfully")
         Write-Host "  Password: " -NoNewline; Write-Host $newPassword -ForegroundColor White
         Write-Host "============================================================" -ForegroundColor Green
         
-        # Save credentials to BOTH locations for consistency
-        $consoleCredsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
-        $rustdeskCredsFile = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
-        
-        # Create console data directory if it doesn't exist
-        $consoleDataDir = Join-Path $script:CONSOLE_PATH "data"
-        if (-not (Test-Path $consoleDataDir)) {
-            New-Item -ItemType Directory -Path $consoleDataDir -Force | Out-Null
+        if ($script:STORE_ADMIN_CREDENTIALS) {
+            # Legacy behavior (opt-in): persist plaintext credentials
+            $consoleCredsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
+            $rustdeskCredsFile = Join-Path $script:RUSTDESK_PATH ".admin_credentials"
+
+            # Create console data directory if it doesn't exist
+            $consoleDataDir = Join-Path $script:CONSOLE_PATH "data"
+            if (-not (Test-Path $consoleDataDir)) {
+                New-Item -ItemType Directory -Path $consoleDataDir -Force | Out-Null
+            }
+
+            "admin:$newPassword" | Out-File -FilePath $consoleCredsFile -Encoding UTF8
+            "admin:$newPassword" | Out-File -FilePath $rustdeskCredsFile -Encoding UTF8
+            Print-Info "Credentials saved to: $consoleCredsFile"
+        } else {
+            Print-Warning "Credentials are not persisted by default (security hardening)."
         }
-        
-        "admin:$newPassword" | Out-File -FilePath $consoleCredsFile -Encoding UTF8
-        "admin:$newPassword" | Out-File -FilePath $rustdeskCredsFile -Encoding UTF8
-        
-        Print-Info "Credentials saved to: $consoleCredsFile"
     } else {
         Print-Error "Failed to reset password!"
         Print-Info "Make sure Node.js is installed and the console is set up correctly"

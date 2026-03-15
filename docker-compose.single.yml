@@ -31,7 +31,7 @@ services:
     container_name: betterdesk
     hostname: betterdesk
     ports:
-      - "5000:5000"             # Web Console
+      - "5000:5000"             # Web Console (LAN)
       - "21114:21114"           # HTTP API
       - "21115:21115"           # NAT type test
       - "21116:21116/tcp"       # Signal TCP
@@ -46,6 +46,8 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=5000
+      - HOST=0.0.0.0
+      - API_HOST=0.0.0.0
       - ENCRYPTED_ONLY=1
       - SERVER_BACKEND=betterdesk
       - HBBS_API_URL=http://127.0.0.1:21114/api

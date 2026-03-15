@@ -910,7 +910,9 @@ You can **upgrade to Let's Encrypt** or a custom certificate at any time using m
 
 ```bash
 PORT=5000              # Web console port
+HOST=0.0.0.0           # Web console bind address (LAN)
 API_PORT=21121         # RustDesk Client API port
+API_HOST=0.0.0.0       # RustDesk Client API bind address
 API_ENABLED=true       # Enable/disable Client API
 HTTPS_ENABLED=false    # Enable HTTPS on console
 SSL_CERT_PATH=         # SSL certificate path
@@ -920,6 +922,8 @@ DB_PATH=               # Path to SQLite database
 BETTERDESK_API_URL=    # Go server API URL (http://localhost:21114)
 BETTERDESK_API_KEY=    # API key for Go server (env: BETTERDESK_API_KEY or HBBS_API_KEY)
 ```
+
+> Keep port `5000` LAN-only via firewall. Do not expose the Web Console directly to the internet.
 
 ---
 

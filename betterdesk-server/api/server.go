@@ -893,9 +893,12 @@ func (s *Server) handleWSEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // Allow cross-origin for admin tools
-	})
+	acceptOpts := &websocket.AcceptOptions{}
+	if origins := s.cfg.GetAPIAllowedWSOrigins(); len(origins) > 0 {
+		acceptOpts.OriginPatterns = origins
+	}
+
+	conn, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
 		log.Printf("[api] WebSocket upgrade failed: %v", err)
 		return

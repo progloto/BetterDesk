@@ -443,6 +443,13 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 84. [x] **`RELAY_SERVERS` env var override**: Both scripts now support `RELAY_SERVERS=YOUR.PUBLIC.IP sudo ./betterdesk.sh` to override auto-detected IP. Critical for servers behind NAT or with broken external IP detection.
 85. [x] **Go server relay port normalization**: `GetRelayServers()` in `config/config.go` now auto-appends default relay port (21117) when `-relay-servers IP` is passed without port. Uses `net.SplitHostPort`/`net.JoinHostPort` for correct IPv6 handling.
 
+#### Security Hardening — API + Installers (Phase 15) ✅ COMPLETED 2026-03-15
+86. [x] **Go API WebSocket origin hardening**: Removed `InsecureSkipVerify: true` from `api/server.go` events WS endpoint and switched to safe defaults with optional `API_WS_ALLOWED_ORIGINS` allowlist in `config/config.go`.
+87. [x] **Local-only Web panel by default**: Node.js config now binds panel to `127.0.0.1` by default (`HOST`), while keeping separate `API_HOST` for RustDesk client API exposure.
+88. [x] **Install script SQL/interpolation hardening**: Added SQL literal escaping + PostgreSQL identifier validation in `betterdesk.sh`; replaced dangerous shell interpolation in Python/Node fallback password reset paths with environment-variable passing.
+89. [x] **Credentials persistence hardening**: Plaintext `.admin_credentials` persistence is now opt-in via `STORE_ADMIN_CREDENTIALS=true` (default secure behavior: do not persist credentials files).
+90. [x] **Dependency vulnerability fixes**: Updated Node override for `tar` in `web-nodejs/package.json`; `npm audit --omit=dev` now reports 0 vulnerabilities. Added Go toolchain hardening (`go.mod` toolchain + installer checks) to avoid vulnerable Go 1.26.0 stdlib.
+
 ---
 
 ## 🔄 System Statusu v3.0
@@ -699,4 +706,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-15 (IP detection & relay fix — Phase 14) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-15 (Security hardening API + installers — Phase 15) przez GitHub Copilot*

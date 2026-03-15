@@ -93,6 +93,7 @@ while [[ $# -gt 0 ]]; do
             echo "  POSTGRESQL_DB=...       PostgreSQL database (default: betterdesk)"
             echo "  POSTGRESQL_HOST=...     PostgreSQL host (default: localhost)"
             echo "  POSTGRESQL_PORT=...     PostgreSQL port (default: 5432)"
+            echo "  STORE_ADMIN_CREDENTIALS=true  Persist admin password to .admin_credentials (not recommended)"
             exit 0
             ;;
         *)
@@ -116,6 +117,7 @@ BACKUP_DIR="${BACKUP_DIR:-/opt/rustdesk-backups}"
 
 # API configuration
 API_PORT="${API_PORT:-21114}"
+STORE_ADMIN_CREDENTIALS="${STORE_ADMIN_CREDENTIALS:-false}"
 
 # Database configuration
 USE_POSTGRESQL="${USE_POSTGRESQL:-false}"  # true = PostgreSQL, false = SQLite
@@ -214,6 +216,19 @@ get_public_ip() {
     ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     ip=$(curl -s --max-time 5 icanhazip.com 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     echo "127.0.0.1"
+}
+
+sql_escape_literal() {
+    # Escape single quotes for SQL string literals: ' -> ''
+    local value="$1"
+    printf "%s" "${value//\'/\'\'}"
+}
+
+is_valid_pg_identifier() {
+    # PostgreSQL unquoted identifier compatible pattern.
+    # Keeps installation scripts safe from SQL injection in CREATE/ALTER statements.
+    local ident="$1"
+    [[ "$ident" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]]
 }
 
 #===============================================================================
@@ -413,9 +428,11 @@ start_services_with_verification() {
     if [ -f "$api_key_file" ]; then
         local api_key
         api_key=$(cat "$api_key_file")
+        local api_key_sql
+        api_key_sql=$(sql_escape_literal "$api_key")
         local go_db="$RUSTDESK_PATH/db_v2.sqlite3"
         if [ -f "$go_db" ] && command -v sqlite3 &>/dev/null; then
-            sqlite3 "$go_db" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key');" 2>/dev/null
+            sqlite3 "$go_db" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key_sql');" 2>/dev/null
             if [ $? -eq 0 ]; then
                 print_info "API key synced to Go server database"
             fi
@@ -897,8 +914,16 @@ check_go_installed() {
         go_version=$(go version | awk '{print $3}' | sed 's/go//')
         local go_major=$(echo "$go_version" | cut -d'.' -f1)
         local go_minor=$(echo "$go_version" | cut -d'.' -f2)
+        local go_patch=$(echo "$go_version" | cut -d'.' -f3)
+        [ -z "$go_patch" ] && go_patch=0
         local min_major=$(echo "$GO_MIN_VERSION" | cut -d'.' -f1)
         local min_minor=$(echo "$GO_MIN_VERSION" | cut -d'.' -f2)
+
+        # Security hardening: reject vulnerable Go 1.26.0 stdlib.
+        if [ "$go_major" -eq 1 ] && [ "$go_minor" -eq 26 ] && [ "$go_patch" -eq 0 ]; then
+            print_warning "Detected vulnerable Go version $go_version (known stdlib CVEs)."
+            return 1
+        fi
         
         if [ "$go_major" -gt "$min_major" ] || ([ "$go_major" -eq "$min_major" ] && [ "$go_minor" -ge "$min_minor" ]); then
             return 0
@@ -921,7 +946,7 @@ install_golang() {
         return 0
     fi
     
-    local go_version="1.25.0"
+    local go_version="1.26.1"
     local go_arch=""
     
     case "$ARCH_NAME" in
@@ -1147,6 +1172,17 @@ install_postgresql() {
 
 setup_postgresql_database() {
     print_step "Setting up PostgreSQL database for BetterDesk..."
+
+    if ! is_valid_pg_identifier "$POSTGRESQL_USER"; then
+        print_error "Invalid PostgreSQL username: $POSTGRESQL_USER"
+        print_info "Allowed pattern: ^[A-Za-z_][A-Za-z0-9_]{0,62}$"
+        return 1
+    fi
+    if ! is_valid_pg_identifier "$POSTGRESQL_DB"; then
+        print_error "Invalid PostgreSQL database name: $POSTGRESQL_DB"
+        print_info "Allowed pattern: ^[A-Za-z_][A-Za-z0-9_]{0,62}$"
+        return 1
+    fi
     
     # Generate password if not set
     if [ -z "$POSTGRESQL_PASS" ]; then
@@ -1161,14 +1197,17 @@ setup_postgresql_database() {
     fi
     
     # Create user and database
+    local pg_pass_sql
+    pg_pass_sql=$(sql_escape_literal "$POSTGRESQL_PASS")
+
     print_step "Creating PostgreSQL user '$POSTGRESQL_USER'..."
-    sudo -u postgres psql -c "CREATE USER $POSTGRESQL_USER WITH PASSWORD '$POSTGRESQL_PASS' CREATEDB;" 2>/dev/null || {
+    sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE USER \"$POSTGRESQL_USER\" WITH PASSWORD '$pg_pass_sql' CREATEDB;" 2>/dev/null || {
         print_warning "User might already exist, trying to update password..."
-        sudo -u postgres psql -c "ALTER USER $POSTGRESQL_USER WITH PASSWORD '$POSTGRESQL_PASS';" 2>/dev/null || true
+        sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER \"$POSTGRESQL_USER\" WITH PASSWORD '$pg_pass_sql';" 2>/dev/null || true
     }
     
     print_step "Creating PostgreSQL database '$POSTGRESQL_DB'..."
-    sudo -u postgres psql -c "CREATE DATABASE $POSTGRESQL_DB OWNER $POSTGRESQL_USER;" 2>/dev/null || {
+    sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$POSTGRESQL_DB\" OWNER \"$POSTGRESQL_USER\";" 2>/dev/null || {
         print_warning "Database might already exist"
     }
     
@@ -1432,6 +1471,7 @@ DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3"
     cat > "$CONSOLE_PATH/.env" << EOF
 # BetterDesk Node.js Console Configuration
 PORT=5000
+HOST=0.0.0.0
 NODE_ENV=production
 
 # RustDesk paths (critical for key/QR code generation)
@@ -1447,6 +1487,9 @@ DATA_DIR=$CONSOLE_PATH/data
 
 # HBBS API
 HBBS_API_URL=http://localhost:$API_PORT/api
+
+# RustDesk Client API listener
+API_HOST=0.0.0.0
 
 # Server backend (betterdesk = Go server, rustdesk = legacy Rust)
 SERVER_BACKEND=betterdesk
@@ -1471,9 +1514,11 @@ BETTERDESK_API_URL=http://localhost:$API_PORT/api
 EOF
     print_info "Created .env configuration file"
     
-    # Save Node.js admin credentials for display
-    echo "admin:$nodejs_admin_password" > "$CONSOLE_PATH/data/.admin_credentials"
-    chmod 600 "$CONSOLE_PATH/data/.admin_credentials"
+    # Persist credentials only when explicitly requested.
+    if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
+        echo "admin:$nodejs_admin_password" > "$CONSOLE_PATH/data/.admin_credentials"
+        chmod 600 "$CONSOLE_PATH/data/.admin_credentials"
+    fi
     
     # Set permissions
     chown -R root:root "$CONSOLE_PATH"
@@ -1841,6 +1886,8 @@ Environment=HBBS_API_URL=$api_scheme://localhost:$API_PORT/api
 Environment=BETTERDESK_API_URL=$api_scheme://localhost:$API_PORT/api
 Environment=SERVER_BACKEND=betterdesk
 Environment=PORT=5000
+Environment=HOST=0.0.0.0
+Environment=API_HOST=0.0.0.0
 $tls_env
 $([ "$tls_is_selfsigned" = true ] && echo "Environment=NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt" || true)
 Restart=always
@@ -1902,14 +1949,14 @@ create_admin_user() {
         return
     fi
     
-    # Node.js console - admin is created automatically on startup
-    # Read the password saved during install_nodejs_console
-    local creds_file="$CONSOLE_PATH/data/.admin_credentials"
-    
-    if [ -f "$creds_file" ]; then
-        local admin_password
-        admin_password=$(cat "$creds_file" | cut -d':' -f2)
-        
+    # Node.js console - admin is created automatically on startup.
+    # Prefer in-memory password from installer, then .env fallback.
+    local admin_password="${ADMIN_PASSWORD:-}"
+    if [ -z "$admin_password" ] && [ -f "$CONSOLE_PATH/.env" ]; then
+        admin_password=$(grep -E '^DEFAULT_ADMIN_PASSWORD=' "$CONSOLE_PATH/.env" | head -1 | cut -d= -f2-)
+    fi
+
+    if [ -n "$admin_password" ]; then
         echo ""
         echo -e "${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║            PANEL LOGIN CREDENTIALS                    ║${NC}"
@@ -1918,16 +1965,18 @@ create_admin_user() {
         echo -e "${GREEN}║  Password: ${WHITE}${admin_password}${GREEN}                         ║${NC}"
         echo -e "${GREEN}╚════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        
-        # Also save to main RustDesk path for consistency
-        echo "admin:$admin_password" > "$RUSTDESK_PATH/.admin_credentials"
-        chmod 600 "$RUSTDESK_PATH/.admin_credentials"
-        
-        print_info "Credentials saved in: $RUSTDESK_PATH/.admin_credentials"
+
+        if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
+            echo "admin:$admin_password" > "$RUSTDESK_PATH/.admin_credentials"
+            chmod 600 "$RUSTDESK_PATH/.admin_credentials"
+            print_info "Credentials saved in: $RUSTDESK_PATH/.admin_credentials"
+        else
+            print_warning "Credentials are not persisted by default (security hardening)."
+            print_info "Set STORE_ADMIN_CREDENTIALS=true to restore legacy behavior."
+        fi
     else
-        print_warning "No Node.js admin credentials found"
-        print_info "Default credentials: admin / admin"
-        print_info "Please change password after first login!"
+        print_warning "No admin password available for display"
+        print_info "Use option 6 (Password reset) if needed"
     fi
 }
 
@@ -2653,8 +2702,9 @@ do_reset_password() {
                 
                 if [ -n "$pg_url" ] && command -v python3 &> /dev/null; then
                     print_info "Using Python to update PostgreSQL..."
-                    python3 << EOF
+                    PG_URL="$pg_url" RESET_ADMIN_PASSWORD="$new_password" python3 << 'PYEOF'
 import bcrypt
+import os
 try:
     import psycopg2
 except ImportError:
@@ -2662,8 +2712,8 @@ except ImportError:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'psycopg2-binary', '-q'])
     import psycopg2
 
-pg_url = '$pg_url'
-new_password = '$new_password'
+pg_url = os.environ.get('PG_URL', '')
+new_password = os.environ.get('RESET_ADMIN_PASSWORD', '')
 password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(12)).decode()
 
 conn = psycopg2.connect(pg_url)
@@ -2687,7 +2737,7 @@ if cursor.rowcount == 0:
 conn.commit()
 conn.close()
 print("Password updated successfully (PostgreSQL)")
-EOF
+PYEOF
                     if [ $? -eq 0 ]; then
                         success=true
                     fi
@@ -2700,12 +2750,12 @@ EOF
                 fi
                 print_info "Auth database: $auth_db_path"
                 
-                python3 << EOF
+                AUTH_DB_PATH="$auth_db_path" RESET_ADMIN_PASSWORD="$new_password" python3 << 'PYEOF'
 import sqlite3
 import bcrypt
 import os
 
-auth_db_path = '$auth_db_path'
+auth_db_path = os.environ.get('AUTH_DB_PATH', '')
 
 # Create parent directory if needed
 os.makedirs(os.path.dirname(auth_db_path), exist_ok=True)
@@ -2723,7 +2773,7 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS users (
     last_login TEXT
 )''')
 
-new_password = '$new_password'
+new_password = os.environ.get('RESET_ADMIN_PASSWORD', '')
 password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(12)).decode()
 
 cursor.execute("UPDATE users SET password_hash = ? WHERE username = 'admin'", (password_hash,))
@@ -2735,7 +2785,7 @@ if cursor.rowcount == 0:
 conn.commit()
 conn.close()
 print("Password updated successfully")
-EOF
+PYEOF
                 if [ $? -eq 0 ]; then
                     success=true
                 fi
@@ -2767,9 +2817,11 @@ EOF
         echo -e "${GREEN}║  Password: ${WHITE}${new_password}${GREEN}                         ║${NC}"
         echo -e "${GREEN}╚════════════════════════════════════════════════════════╝${NC}"
         
-        # Save credentials
-        echo "admin:$new_password" > "$RUSTDESK_PATH/.admin_credentials"
-        chmod 600 "$RUSTDESK_PATH/.admin_credentials"
+        # Persist credentials only when explicitly requested.
+        if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
+            echo "admin:$new_password" > "$RUSTDESK_PATH/.admin_credentials"
+            chmod 600 "$RUSTDESK_PATH/.admin_credentials"
+        fi
     else
         print_error "Failed to reset password!"
         print_info "Make sure Python with bcrypt is installed, or Node.js for Node.js console"

@@ -70,6 +70,7 @@ type Config struct {
 
 	// WebSocket security (M3)
 	AllowedWSOrigins string // Comma-separated allowed WebSocket origins (empty = allow all)
+	APIAllowedWSOrigins string // Comma-separated allowed WebSocket origins for HTTP API events endpoint
 
 	// TLS for signal/relay (Phase 3)
 	TLSSignal bool // Enable TLS on TCP signal (:21116) and WS signal (:21118)
@@ -194,6 +195,9 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("WS_ALLOWED_ORIGINS"); v != "" {
 		c.AllowedWSOrigins = v
 	}
+	if v := os.Getenv("API_WS_ALLOWED_ORIGINS"); v != "" {
+		c.APIAllowedWSOrigins = v
+	}
 	if strings.ToUpper(os.Getenv("TLS_SIGNAL")) == "Y" {
 		c.TLSSignal = true
 	}
@@ -257,6 +261,24 @@ func (c *Config) GetAllowedWSOrigins() []string {
 		return nil
 	}
 	origins := strings.Split(c.AllowedWSOrigins, ",")
+	result := make([]string, 0, len(origins))
+	for _, o := range origins {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			result = append(result, o)
+		}
+	}
+	return result
+}
+
+// GetAPIAllowedWSOrigins parses the comma-separated list of allowed WebSocket origins
+// for the HTTP API events endpoint. Returns nil if empty (defaults to safe same-origin
+// behavior enforced by the WebSocket library).
+func (c *Config) GetAPIAllowedWSOrigins() []string {
+	if c.APIAllowedWSOrigins == "" {
+		return nil
+	}
+	origins := strings.Split(c.APIAllowedWSOrigins, ",")
 	result := make([]string, 0, len(origins))
 	for _, o := range origins {
 		o = strings.TrimSpace(o)

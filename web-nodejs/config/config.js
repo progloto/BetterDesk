@@ -95,6 +95,7 @@ module.exports = {
     
     // RustDesk Client API (dedicated WAN-facing port)
     apiPort: parseInt(process.env.API_PORT, 10) || 21121,
+    apiHost: process.env.API_HOST || '0.0.0.0',
     apiEnabled: (process.env.API_ENABLED || 'true').toLowerCase() !== 'false',
     
     // HTTPS / SSL

@@ -454,7 +454,7 @@ function startRustDeskApiServer() {
         throw err;
     });
     
-    apiServerInstance.listen(config.apiPort, config.host, () => {
+    apiServerInstance.listen(config.apiPort, config.apiHost, () => {
         console.log(`  ║   API Port:  ${config.apiPort} (RustDesk Client)`.padEnd(53) + '║');
         console.log('  ║                                                  ║');
     });
