@@ -162,11 +162,13 @@
 
         case 'streaming':
             hideOverlays();
+            viewerContainer.classList.add('streaming');
             setToolbarAutoHide(true);
             break;
 
         case 'disconnected':
         case 'error':
+            viewerContainer.classList.remove('streaming');
             showConnectionOverlay();
             setStatus(state === 'error' ? 'error' : 'info', label);
             showOverlayActions();
@@ -212,11 +214,16 @@
 
     function handleLoginSuccess() {
         passwordOverlay.style.display = 'none';
+        // Remove focus from password input so keyboard events reach the canvas
+        passwordInput.blur();
     }
 
     function handleSessionStart() {
         hideOverlays();
         client.renderer.resize();
+
+        // Explicitly focus canvas so mouse/keyboard events are captured
+        canvas.focus();
 
         // Wire up autoplay-blocked callback from video decoder (JMuxer fallback)
         if (client.video) {

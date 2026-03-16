@@ -524,7 +524,9 @@ class RDClient {
 
         // Cursor data (cursor image)
         if (msg.cursorData) {
-            this.renderer.updateCursor(msg.cursorData);
+            this.renderer.updateCursor(msg.cursorData).catch(() => {
+                // Handled inside updateCursor — ignore unhandled promise rejection
+            });
             return;
         }
 
@@ -829,6 +831,10 @@ class RDClient {
                 this._emit('log', 'Audio init failed');
             });
         }
+
+        // Tell peer our desired FPS to avoid unnecessary throttling
+        const fps = this.opts.fps || 30;
+        this._sendPeerMessage(this.proto.buildOptionMisc({ customFps: fps }));
 
         // Start ping interval
         this._pingInterval = setInterval(() => {

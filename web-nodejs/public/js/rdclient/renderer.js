@@ -271,25 +271,52 @@ class RDRenderer {
      * @param {Object} cursorData - { data: Uint8Array, hotx: number, hoty: number, width: number, height: number, id: number }
      */
     async updateCursor(cursorData) {
-        // Proto field is 'colors' (RGBA pixel data), support both for compatibility
-        const pixelData = cursorData.colors || cursorData.data;
-        if (!pixelData || !cursorData.width || !cursorData.height) return;
+        try {
+            // Proto field is 'colors' (RGBA pixel data), support both for compatibility
+            const pixelData = cursorData.colors || cursorData.data;
+            if (!pixelData || !cursorData.width || !cursorData.height) return;
 
-        this.cursorHotspot.x = cursorData.hotx || 0;
-        this.cursorHotspot.y = cursorData.hoty || 0;
+            const w = cursorData.width;
+            const h = cursorData.height;
+            const expectedLen = w * h * 4;
 
-        // Create ImageData from RGBA bytes
-        const imgData = new ImageData(
-            new Uint8ClampedArray(pixelData),
-            cursorData.width,
-            cursorData.height
-        );
+            // Normalize protobuf bytes to Uint8Array
+            let bytes = (pixelData instanceof Uint8Array)
+                ? pixelData
+                : new Uint8Array(pixelData);
 
-        // Convert to ImageBitmap for efficient drawing
-        if (this.cursorImage) {
-            this.cursorImage.close();
+            // Skip zstd-compressed cursor data (magic: 28 b5 2f fd)
+            if (bytes.length >= 4 && bytes[0] === 0x28 && bytes[1] === 0xb5
+                && bytes[2] === 0x2f && bytes[3] === 0xfd) {
+                return;
+            }
+
+            // Validate RGBA buffer size — must be exactly width * height * 4
+            if (bytes.length < expectedLen) {
+                return;
+            }
+            if (bytes.length > expectedLen) {
+                bytes = bytes.subarray(0, expectedLen);
+            }
+
+            this.cursorHotspot.x = cursorData.hotx || 0;
+            this.cursorHotspot.y = cursorData.hoty || 0;
+
+            // Create ImageData from RGBA bytes (copy to avoid protobuf buffer issues)
+            const imgData = new ImageData(
+                new Uint8ClampedArray(bytes),
+                w,
+                h
+            );
+
+            // Convert to ImageBitmap for efficient drawing
+            if (this.cursorImage) {
+                this.cursorImage.close();
+            }
+            this.cursorImage = await createImageBitmap(imgData);
+        } catch (err) {
+            // Silently skip invalid cursor data to prevent crash
         }
-        this.cursorImage = await createImageBitmap(imgData);
     }
 
     /**

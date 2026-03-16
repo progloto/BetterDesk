@@ -183,6 +183,10 @@ class RDProtocol {
      * @param {Object} opts
      */
     buildLoginRequest(passwordHash, opts = {}) {
+        // Dynamically detect codec support
+        const hasWebCodecs = typeof VideoDecoder !== 'undefined';
+        const hasJMuxer = typeof JMuxer !== 'undefined';
+
         return {
             loginRequest: {
                 username: opts.username || '',
@@ -195,13 +199,13 @@ class RDProtocol {
                 option: {
                     imageQuality: this.enums.ImageQuality.values.Balanced,
                     supportedDecoding: {
-                        abilityVp9: 0,
-                        abilityH264: 1,
-                        abilityAv1: 0,
-                        abilityVp8: 0,
-                        prefer: 2 // PreferCodec.H264
+                        abilityVp9: hasWebCodecs ? 1 : 0,
+                        abilityH264: (hasWebCodecs || hasJMuxer) ? 1 : 0,
+                        abilityAv1: hasWebCodecs ? 1 : 0,
+                        abilityVp8: hasWebCodecs ? 1 : 0,
+                        prefer: hasWebCodecs ? 0 : 2 // Auto when WebCodecs, H264 when fallback
                     },
-                    customFps: opts.fps || 60,
+                    customFps: opts.fps || 30,
                     showRemoteCursor: 2, // Yes
                     disableAudio: opts.disableAudio ? 2 : 1,
                     disableClipboard: 1, // No

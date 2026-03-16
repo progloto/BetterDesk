@@ -494,6 +494,16 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 121. [x] **Migration tool auto-compilation**: `migrate_sqlite_to_postgresql()` now tries to compile migration tool from source when Go is available and binary is not found. Also validates binary supports `-mode` flag (detects outdated binaries).
 122. [x] **Migration tool rebuilt**: `tools/migrate/migrate-linux-amd64` rebuilt with current source code supporting `-mode`, `-src`, `-dst`, `-node-auth` flags.
 
+#### Web Remote Client — Cursor, Video & Input Fix (Phase 22) ✅ COMPLETED 2026-03-18
+123. [x] **Cursor ImageData crash (Critical)**: `renderer.js` `updateCursor()` called `new ImageData(new Uint8ClampedArray(pixelData), w, h)` without validating `pixelData.length === w * h * 4`. Protobuf cursor data can be zstd-compressed (magic `28 b5 2f fd`), truncated, or have padding. Added: zstd detection + skip, length validation (skip if too short, truncate if too long), full try/catch wrapper. Prevents `InvalidStateError: input data length is not a multiple of 4` crash.
+124. [x] **Unhandled cursor promise rejection**: `_dispatchMessage()` in `client.js` called async `renderer.updateCursor()` without `.catch()` — unhandled promise rejections from ImageData errors polluted console. Added `.catch(() => {})` wrapper.
+125. [x] **JMuxer per-frame seek stutter**: `_decodeFallback()` in `video.js` seeked to live edge (`currentTime = end - 0.01`) on every frame when buffer latency exceeded 0.15s. Constant micro-seeks caused playback stutter. Increased threshold from 0.15s to 0.5s and seek offset to 0.02s — lets MSE play naturally, only intervenes when significantly behind.
+126. [x] **Health check too slow**: `_startHealthCheck()` interval reduced from 2000ms to 1000ms. Hard-seek threshold from 1.5s to 0.8s. Speed-up threshold from 0.3s to 0.15s. Playback rate from 1.05 to 1.15 for faster catch-up. `_recoverVideo()` threshold from 0.3s to 0.2s.
+127. [x] **Focus management after login**: `handleLoginSuccess()` in `remote.js` now calls `passwordInput.blur()` to remove focus from hidden password input. `handleSessionStart()` explicitly calls `canvas.focus()`. Prevents `_isInputFocused()` guard in `input.js` from blocking keyboard events when hidden password input retains focus.
+128. [x] **`.streaming` CSS class**: `handleStateChange()` in `remote.js` adds/removes `.streaming` class on `viewerContainer`. Enables CSS rule `.viewer-container:not(.streaming) #remote-canvas { cursor: default }` — shows system cursor when not streaming, hides when streaming.
+129. [x] **Dynamic codec negotiation**: `buildLoginRequest()` in `protocol.js` now detects `VideoDecoder` (WebCodecs) and `JMuxer` availability. HTTPS: reports VP9+H264+AV1+VP8 with Auto preference. HTTP: reports H264-only with H264 preference. Gives peer more encoding options on HTTPS.
+130. [x] **FPS option after login**: `_startSession()` in `client.js` sends `customFps` option as Misc message after login. Default reduced from 60 to 30 fps for stability. Helps peer establish target framerate without relying solely on `video_received` ack timing.
+
 ---
 
 ## 🔄 System Statusu v3.0

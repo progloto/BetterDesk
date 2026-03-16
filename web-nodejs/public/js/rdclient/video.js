@@ -367,9 +367,9 @@ class RDVideo {
         const end = v.buffered.end(v.buffered.length - 1);
         const start = v.buffered.start(0);
 
-        // If currentTime is outside buffered range, or far behind, seek to live edge
-        if (v.currentTime < start || v.currentTime > end + 0.5 || (end - v.currentTime) > 0.3) {
-            v.currentTime = Math.max(start, end - 0.01);
+        // If currentTime is outside buffered range, or behind, seek to live edge
+        if (v.currentTime < start || v.currentTime > end + 0.5 || (end - v.currentTime) > 0.2) {
+            v.currentTime = Math.max(start, end - 0.02);
         }
 
         // Ensure video is playing
@@ -409,18 +409,18 @@ class RDVideo {
                     + ' dropped=' + this.droppedFrames);
             }
 
-            // Recovery: gently catch up to live edge if fallen behind
+            // Recovery: catch up to live edge if fallen behind
             if (v.buffered && v.buffered.length > 0) {
                 const end = v.buffered.end(v.buffered.length - 1);
                 const latency = end - v.currentTime;
 
-                if (latency > 1.5) {
-                    // Very far behind — hard seek as last resort
-                    v.currentTime = end - 0.05;
+                if (latency > 0.8) {
+                    // Far behind — hard seek to live edge
+                    v.currentTime = end - 0.02;
                     v.playbackRate = 1.0;
-                } else if (latency > 0.3) {
-                    // Slightly behind — speed up gently to catch up
-                    v.playbackRate = 1.05;
+                } else if (latency > 0.15) {
+                    // Slightly behind — speed up to catch up
+                    v.playbackRate = 1.15;
                 } else {
                     // At live edge — normal speed
                     v.playbackRate = 1.0;
@@ -437,7 +437,7 @@ class RDVideo {
                     this._tryPlay();
                 }
             }
-        }, 2000);
+        }, 1000);
     }
 
     /**
@@ -532,11 +532,11 @@ class RDVideo {
                 if (this._videoEl.paused) {
                     this._tryPlay();
                 }
-                // Nudge to live edge after new data (only if behind)
+                // Nudge to live edge only when significantly behind (avoid stutter from constant seeks)
                 if (this._videoEl.buffered && this._videoEl.buffered.length > 0) {
                     const end = this._videoEl.buffered.end(this._videoEl.buffered.length - 1);
-                    if (end - this._videoEl.currentTime > 0.15) {
-                        this._videoEl.currentTime = end - 0.01;
+                    if (end - this._videoEl.currentTime > 0.5) {
+                        this._videoEl.currentTime = end - 0.02;
                     }
                 }
             }
