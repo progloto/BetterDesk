@@ -1439,21 +1439,42 @@ install_nodejs_console() {
     # Create data directory for databases
     mkdir -p "$CONSOLE_PATH/data"
     
-    # Remove old auth database to ensure the newly generated password is used.
-    # Without this, a reinstall would keep the old auth.db with a stale password
-    # hash while .env gets a new password — making login impossible.
-    if [ -f "$CONSOLE_PATH/data/auth.db" ]; then
-        print_info "Removing old auth database (will be recreated with new credentials)..."
-        rm -f "$CONSOLE_PATH/data/auth.db" "$CONSOLE_PATH/data/auth.db-wal" "$CONSOLE_PATH/data/auth.db-shm"
+    # Preserve existing authentication and session data during UPDATE.
+    # Only wipe auth.db and generate new credentials on FRESH install.
+    local existing_session_secret=""
+    local existing_admin_password=""
+    local is_update=false
+    
+    if [ -f "$CONSOLE_PATH/.env" ]; then
+        is_update=true
+        existing_session_secret=$(grep -m1 '^SESSION_SECRET=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
+        existing_admin_password=$(grep -m1 '^DEFAULT_ADMIN_PASSWORD=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
     fi
     
-    # Generate admin password for Node.js console
-    ADMIN_PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
-    local nodejs_admin_password="$ADMIN_PASSWORD"
+    if [ "$is_update" = true ] && [ -n "$existing_session_secret" ]; then
+        # UPDATE: preserve existing auth database, session secret, and admin password
+        print_info "Preserving existing auth database and session configuration"
+        local nodejs_admin_password="$existing_admin_password"
+        ADMIN_PASSWORD="${ADMIN_PASSWORD:-$existing_admin_password}"
+    else
+        # FRESH INSTALL: remove old auth.db and generate new credentials
+        if [ -f "$CONSOLE_PATH/data/auth.db" ]; then
+            print_info "Removing old auth database (will be recreated with new credentials)..."
+            rm -f "$CONSOLE_PATH/data/auth.db" "$CONSOLE_PATH/data/auth.db-wal" "$CONSOLE_PATH/data/auth.db-shm"
+        fi
+        
+        # Generate admin password for Node.js console
+        ADMIN_PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+        local nodejs_admin_password="$ADMIN_PASSWORD"
+        
+        # Create sentinel file so ensureDefaultAdmin() force-updates the password
+        # even if auth.db was somehow preserved (e.g. shared volume, manual copy)
+        touch "$CONSOLE_PATH/data/.force_password_update"
+        existing_session_secret=""
+    fi
     
-    # Create sentinel file so ensureDefaultAdmin() force-updates the password
-    # even if auth.db was somehow preserved (e.g. shared volume, manual copy)
-    touch "$CONSOLE_PATH/data/.force_password_update"
+    # Use preserved or newly generated session secret
+    local session_secret="${existing_session_secret:-$(openssl rand -hex 32)}"
     
     # Determine database configuration
     local db_config=""
@@ -1499,7 +1520,7 @@ DEFAULT_ADMIN_USERNAME=admin
 DEFAULT_ADMIN_PASSWORD=$nodejs_admin_password
 
 # Session
-SESSION_SECRET=$(openssl rand -hex 32)
+SESSION_SECRET=$session_secret
 
 # HTTPS (set to true and provide certificate paths to enable)
 HTTPS_ENABLED=false
@@ -1742,6 +1763,21 @@ generate_ssl_certificates() {
 setup_services() {
     print_step "Configuring systemd services..."
     
+    # SAFETY NET: Re-read database config from .env if shell vars are empty.
+    # This prevents PostgreSQL → SQLite regression during UPDATE/REPAIR
+    # if preserve_database_config() was not called or vars were lost.
+    if [ "$USE_POSTGRESQL" != "true" ] && [ -f "$CONSOLE_PATH/.env" ]; then
+        local _env_db_type
+        _env_db_type=$(grep -m1 '^DB_TYPE=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+        if [ "$_env_db_type" = "postgres" ]; then
+            POSTGRESQL_URI=$(grep -m1 '^DATABASE_URL=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
+            if [ -n "$POSTGRESQL_URI" ]; then
+                USE_POSTGRESQL="true"
+                print_info "Recovered PostgreSQL config from existing .env"
+            fi
+        fi
+    fi
+    
     # Get server IP (prefers IPv4 for relay compatibility)
     local server_ip
     server_ip=$(get_public_ip)
@@ -1854,6 +1890,14 @@ EOF
         rm -f /etc/systemd/system/rustdeskrelay.service
         print_info "Removed legacy rustdeskrelay.service"
     fi
+    
+    # Remove legacy Flask betterdesk-api.service (deprecated in v2.3.0)
+    if [ -f /etc/systemd/system/betterdesk-api.service ]; then
+        systemctl stop betterdesk-api 2>/dev/null || true
+        systemctl disable betterdesk-api 2>/dev/null || true
+        rm -f /etc/systemd/system/betterdesk-api.service
+        print_info "Removed legacy betterdesk-api.service (Flask)"
+    fi
 
     # Console service (Web Interface) - Node.js only
     if [ "$CONSOLE_TYPE" = "nodejs" ]; then
@@ -1879,6 +1923,13 @@ Environment=SSL_CERT_PATH=$ssl_dir/betterdesk.crt
 Environment=SSL_KEY_PATH=$ssl_dir/betterdesk.key"
         fi
         
+        # Detect node binary path dynamically (NodeSource, nvm, system, etc.)
+        local node_path
+        node_path=$(command -v node 2>/dev/null || which node 2>/dev/null || echo "/usr/bin/node")
+        if [ ! -x "$node_path" ]; then
+            print_warning "Node.js binary not found at $node_path — service may fail to start"
+        fi
+        
         cat > /etc/systemd/system/betterdesk-console.service << EOF
 [Unit]
 Description=BetterDesk Web Console (Node.js)
@@ -1890,7 +1941,10 @@ Type=simple
 User=root
 WorkingDirectory=$CONSOLE_PATH
 EnvironmentFile=-$CONSOLE_PATH/.env
-ExecStart=/usr/bin/node server.js
+ExecStart=$node_path server.js
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=betterdesk-console
 Environment=NODE_ENV=production
 Environment=RUSTDESK_DIR=$RUSTDESK_PATH
 Environment=KEYS_PATH=$RUSTDESK_PATH

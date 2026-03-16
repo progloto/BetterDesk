@@ -473,6 +473,16 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 104. [x] **Relay server address validation**: `GetRelayServers()` in `config/config.go` now rejects entries with host < 2 characters (prevents `relay=a:21117` from invalid config).
 105. [x] **Docker DNS resilience (Issue #62)**: Added retry logic (`|| { sleep 2 && apk add ...; }`) to all `apk add --no-cache` commands in `Dockerfile`, `Dockerfile.server`, and `Dockerfile.console` for transient DNS failures on AlmaLinux/CentOS.
 
+#### ALL-IN-ONE Scripts — Installer Stability Fix (Phase 20) ✅ COMPLETED 2026-03-18
+106. [x] **PostgreSQL→SQLite regression on UPDATE (CRITICAL)**: `setup_services()` in `betterdesk.sh` relied solely on ephemeral shell variables (`$USE_POSTGRESQL`, `$POSTGRESQL_URI`) for database config. If vars were lost between function calls, service files defaulted to SQLite. Added safety-net re-read from `.env` at start of `setup_services()`. Same fix applied to `Setup-Services` in `betterdesk.ps1`.
+107. [x] **Hard-coded `/usr/bin/node` in systemd service**: `betterdesk-console.service` template used `ExecStart=/usr/bin/node server.js`. On systems with NodeSource/nvm/snap, node is at different path. Changed to dynamic detection via `command -v node`. Added `StandardOutput=journal`, `StandardError=journal`, `SyslogIdentifier=betterdesk-console` for visible error logs.
+108. [x] **Auth.db + admin password destroyed on every UPDATE (CRITICAL)**: `install_nodejs_console()` unconditionally deleted `auth.db`, generated new admin password, new SESSION_SECRET, and created `.force_password_update` sentinel — destroying all user accounts, sessions, and TOTP configs on every update. Fixed: detect existing `.env` as UPDATE indicator; preserve auth.db, SESSION_SECRET, and admin password. Only generate fresh credentials on FRESH install. Same fix applied to `Install-NodeJsConsole` in `betterdesk.ps1` and `create_compose_file` in `betterdesk-docker.sh`.
+109. [x] **Legacy betterdesk-api.service not cleaned up**: Script removed `rustdesksignal.service` and `rustdeskrelay.service` but not the old Flask `betterdesk-api.service`. Added cleanup in `setup_services()` (Linux) and NSSM `BetterDeskAPI` removal in `Setup-Services` (Windows). Fixes "Failed to determine user credentials: No such process" error.
+110. [x] **PS1 `Do-Update` called `Setup-ScheduledTasks` instead of `Setup-Services`**: Windows update path used scheduled tasks fallback instead of NSSM services, inconsistent with `Do-Install` which correctly calls `Setup-Services`. Fixed to call `Setup-Services`.
+111. [x] **PS1 `Repair-Binaries` checked `hbbs.exe` instead of `betterdesk-server.exe`**: Binary lock check referenced legacy Rust binaries. Updated to check `betterdesk-server.exe` with `hbbs.exe` fallback.
+112. [x] **PS1 NSSM env missing DB_TYPE/DATABASE_URL**: NSSM `AppEnvironmentExtra` for console service did not include database type variables. Added `DB_TYPE` and `DATABASE_URL` propagation for PostgreSQL mode.
+113. [x] **Docker: API key + auth.db regenerated on every update**: `create_compose_file()` unconditionally generated new API key, new admin password, and deleted auth.db from volume. Changed to preserve existing `.api_key` and `.admin_credentials` files; only wipe auth.db on fresh install.
+
 ---
 
 ## 🔄 System Statusu v3.0
@@ -738,4 +748,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-18 (Go Server Empty UUID & Relay Fix — Phase 19) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-18 (ALL-IN-ONE Scripts — Installer Stability Fix — Phase 20) przez GitHub Copilot*

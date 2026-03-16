@@ -580,27 +580,35 @@ EOF
 EOF
         fi
 
-        # Generate shared API key for Node.js <-> Go server communication
+        # Generate or preserve shared API key for Node.js <-> Go server communication
         local api_key
-        api_key=$(openssl rand -hex 32)
-        echo "$api_key" > "$DATA_DIR/.api_key"
-        chmod 600 "$DATA_DIR/.api_key"
-        print_info "Generated API key for console <-> server communication"
+        if [ -f "$DATA_DIR/.api_key" ] && [ -s "$DATA_DIR/.api_key" ]; then
+            api_key=$(cat "$DATA_DIR/.api_key")
+            print_info "Preserved existing API key"
+        else
+            api_key=$(openssl rand -hex 32)
+            echo "$api_key" > "$DATA_DIR/.api_key"
+            chmod 600 "$DATA_DIR/.api_key"
+            print_info "Generated API key for console <-> server communication"
+        fi
 
-        # Generate admin password (shared between Go server and Node.js console)
+        # Generate or preserve admin password (shared between Go server and Node.js console)
         local admin_password
-        admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
-        DOCKER_ADMIN_PASSWORD="$admin_password"
-
-        # Clean old auth database from console_data volume to ensure the newly
-        # generated password is used. Without this, a reinstall would keep the
-        # old auth.db with a stale password hash while the env var gets a new
-        # password - making login impossible.
-        if docker volume inspect "${PROJECT_NAME:-betterdesk}_console_data" >/dev/null 2>&1; then
+        if [ -f "$DATA_DIR/.admin_credentials" ] && [ -s "$DATA_DIR/.admin_credentials" ]; then
+            admin_password=$(cut -d: -f2 "$DATA_DIR/.admin_credentials" 2>/dev/null)
+        fi
+        if [ -z "$admin_password" ]; then
+            admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+            # Only clean auth.db on FRESH install (no existing credentials)
+            if docker volume inspect "${PROJECT_NAME:-betterdesk}_console_data" >/dev/null 2>&1; then
                 print_info "Cleaning old auth database from console_data volume..."
                 docker run --rm -v "${PROJECT_NAME:-betterdesk}_console_data:/data" alpine \
                         sh -c "rm -f /data/auth.db /data/auth.db-wal /data/auth.db-shm" 2>/dev/null || true
+            fi
+        else
+            print_info "Preserved existing admin password"
         fi
+        DOCKER_ADMIN_PASSWORD="$admin_password"
 
         # Get server public IP for relay-servers
         local server_ip

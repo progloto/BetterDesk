@@ -1044,27 +1044,45 @@ function Install-NodeJsConsole {
             New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
         }
         
-        # Remove old auth database to ensure the newly generated password is used.
-        # Without this, a reinstall would keep the old auth.db with a stale password
-        # hash while .env gets a new password — making login impossible.
-        $authDbPath = Join-Path $dataDir "auth.db"
-        if (Test-Path $authDbPath) {
-            Print-Info "Removing old auth database (will be recreated with new credentials)..."
-            Remove-Item -Force -Path $authDbPath -ErrorAction SilentlyContinue
-            Remove-Item -Force -Path "$authDbPath-wal" -ErrorAction SilentlyContinue
-            Remove-Item -Force -Path "$authDbPath-shm" -ErrorAction SilentlyContinue
+        # Preserve existing authentication and session data during UPDATE.
+        # Only wipe auth.db and generate new credentials on FRESH install.
+        $envFile = Join-Path $script:CONSOLE_PATH ".env"
+        $existingSessionSecret = ""
+        $existingAdminPassword = ""
+        $isUpdate = $false
+        
+        if (Test-Path $envFile) {
+            $isUpdate = $true
+            $ssLine = Select-String -Path $envFile -Pattern '^SESSION_SECRET=' -SimpleMatch | Select-Object -First 1
+            $existingSessionSecret = if ($ssLine) { ($ssLine.Line -split '=', 2)[1].Trim() } else { "" }
+            $apLine = Select-String -Path $envFile -Pattern '^DEFAULT_ADMIN_PASSWORD=' -SimpleMatch | Select-Object -First 1
+            $existingAdminPassword = if ($apLine) { ($apLine.Line -split '=', 2)[1].Trim() } else { "" }
         }
         
-        # Generate admin password for Node.js console
-        $nodejsAdminPassword = Generate-RandomPassword
-        
-        # Create sentinel file so ensureDefaultAdmin() force-updates the password
-        # even if auth.db was somehow preserved (e.g. shared volume, manual copy)
-        New-Item -ItemType File -Path (Join-Path $dataDir ".force_password_update") -Force | Out-Null
-        
-        # Create .env file (always update to ensure correct paths)
-        $envFile = Join-Path $script:CONSOLE_PATH ".env"
-        $sessionSecret = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 64 | ForEach-Object {[char]$_})
+        if ($isUpdate -and $existingSessionSecret) {
+            # UPDATE: preserve existing auth database, session secret, and admin password
+            Print-Info "Preserving existing auth database and session configuration"
+            $nodejsAdminPassword = $existingAdminPassword
+            $sessionSecret = $existingSessionSecret
+        } else {
+            # FRESH INSTALL: remove old auth.db and generate new credentials
+            $authDbPath = Join-Path $dataDir "auth.db"
+            if (Test-Path $authDbPath) {
+                Print-Info "Removing old auth database (will be recreated with new credentials)..."
+                Remove-Item -Force -Path $authDbPath -ErrorAction SilentlyContinue
+                Remove-Item -Force -Path "$authDbPath-wal" -ErrorAction SilentlyContinue
+                Remove-Item -Force -Path "$authDbPath-shm" -ErrorAction SilentlyContinue
+            }
+            
+            # Generate admin password for Node.js console
+            $nodejsAdminPassword = Generate-RandomPassword
+            
+            # Create sentinel file so ensureDefaultAdmin() force-updates the password
+            # even if auth.db was somehow preserved (e.g. shared volume, manual copy)
+            New-Item -ItemType File -Path (Join-Path $dataDir ".force_password_update") -Force | Out-Null
+            
+            $sessionSecret = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 64 | ForEach-Object {[char]$_})
+        }
         
         # Database configuration
         $dbConfig = ""
@@ -1432,6 +1450,26 @@ function Generate-SSLCertificates {
 function Setup-Services {
     Print-Step "Configuring Windows services..."
     
+    # SAFETY NET: Re-read database config from .env if script vars are empty.
+    # This prevents PostgreSQL → SQLite regression during UPDATE/REPAIR
+    # if Preserve-DatabaseConfig was not called or vars were lost.
+    if (-not $script:USE_POSTGRESQL) {
+        $envFile = Join-Path $script:CONSOLE_PATH ".env"
+        if (Test-Path $envFile) {
+            $dtLine = Select-String -Path $envFile -Pattern '^DB_TYPE=' -SimpleMatch | Select-Object -First 1
+            $_envDbType = if ($dtLine) { ($dtLine.Line -split '=', 2)[1].Trim() } else { "" }
+            if ($_envDbType -eq "postgres") {
+                $duLine = Select-String -Path $envFile -Pattern '^DATABASE_URL=' -SimpleMatch | Select-Object -First 1
+                $_envDbUrl = if ($duLine) { ($duLine.Line -split '=', 2)[1].Trim() } else { "" }
+                if ($_envDbUrl) {
+                    $script:USE_POSTGRESQL = $true
+                    $script:POSTGRESQL_URI = $_envDbUrl
+                    Print-Info "Recovered PostgreSQL config from existing .env"
+                }
+            }
+        }
+    }
+    
     $serverIP = Get-PublicIP
     
     # IPv6-only relay detection: many RustDesk clients cannot connect via IPv6-only relay.
@@ -1511,6 +1549,10 @@ function Setup-Services {
     & $nssm remove $script:SERVER_SERVICE confirm 2>$null
     & $nssm stop $script:CONSOLE_SERVICE 2>$null
     & $nssm remove $script:CONSOLE_SERVICE confirm 2>$null
+    
+    # Remove legacy Flask API service (deprecated in v2.3.0)
+    & $nssm stop "BetterDeskAPI" 2>$null
+    & $nssm remove "BetterDeskAPI" confirm 2>$null
     
     Start-Sleep -Seconds 2
     
@@ -1617,6 +1659,13 @@ function Setup-Services {
             "HOST=0.0.0.0",
             "API_HOST=0.0.0.0"
         )
+        # Propagate database type to NSSM environment
+        if ($script:USE_POSTGRESQL -and $script:POSTGRESQL_URI) {
+            $envExtra += "DB_TYPE=postgres"
+            $envExtra += "DATABASE_URL=$($script:POSTGRESQL_URI)"
+        } else {
+            $envExtra += "DB_TYPE=sqlite"
+        }
         # Enable HTTPS on Node.js console when TLS certs are available
         if ($apiScheme -eq "https" -and (Test-Path $certPath) -and (Test-Path $keyPath)) {
             $envExtra += "HTTPS_ENABLED=true"
@@ -2288,8 +2337,8 @@ function Do-Update {
     if (-not (Install-Console)) { Print-Error "Console update failed"; return }
     Run-Migrations
     
-    # Update scheduled tasks/services with latest configuration
-    Setup-ScheduledTasks
+    # Update services with latest configuration
+    Setup-Services
     
     # Ensure admin user exists (especially for Node.js console migration)
     Create-AdminUser | Out-Null
@@ -2376,18 +2425,23 @@ function Repair-Binaries {
     $hbbrLocked = $false
     
     try {
-        if (Test-Path "$script:RUSTDESK_PATH\hbbs.exe") {
+        if (Test-Path "$script:RUSTDESK_PATH\betterdesk-server.exe") {
+            $stream = [System.IO.File]::Open("$script:RUSTDESK_PATH\betterdesk-server.exe", 'Open', 'ReadWrite', 'None')
+            $stream.Close()
+        } elseif (Test-Path "$script:RUSTDESK_PATH\hbbs.exe") {
             $stream = [System.IO.File]::Open("$script:RUSTDESK_PATH\hbbs.exe", 'Open', 'ReadWrite', 'None')
             $stream.Close()
         }
     } catch {
         $hbbsLocked = $true
-        Print-Warning "hbbs.exe is still locked, killing stale processes..."
+        Print-Warning "Server binary is still locked, killing stale processes..."
+        Get-Process -Name "betterdesk-server" -ErrorAction SilentlyContinue | Stop-Process -Force
         Get-Process -Name "hbbs" -ErrorAction SilentlyContinue | Stop-Process -Force
         Start-Sleep -Seconds 2
     }
     
     try {
+        # Legacy hbbr check (Go server no longer uses separate relay binary)
         if (Test-Path "$script:RUSTDESK_PATH\hbbr.exe") {
             $stream = [System.IO.File]::Open("$script:RUSTDESK_PATH\hbbr.exe", 'Open', 'ReadWrite', 'None')
             $stream.Close()
