@@ -163,4 +163,8 @@ type Database interface {
 	IncrementTokenUse(tokenHash string) error
 	ValidateToken(tokenHash string) (*DeviceToken, error) // Returns token if valid, nil if invalid/expired/revoked
 	CleanupExpiredTokens() (int64, error)
+
+	// Address Book
+	GetAddressBook(username, abType string) (string, error) // Returns JSON data string; abType: "legacy" or "personal"
+	SaveAddressBook(username, abType, data string) error
 }

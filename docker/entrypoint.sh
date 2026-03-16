@@ -66,6 +66,38 @@ fi
 # Ensure Go server uses correct signal port (not NODE.js PORT)
 export SIGNAL_PORT="${SIGNAL_PORT:-21116}"
 
+# Relay server address: if not explicitly set, try to auto-detect public IP.
+# Inside Docker, the Go server's own detection may return the container's
+# internal IP (172.x.x.x) which is unreachable by remote clients.
+if [ -z "${RELAY_SERVERS:-}" ]; then
+    DETECTED_IP=""
+    if command -v curl >/dev/null 2>&1; then
+        DETECTED_IP=$(curl -4 -sf --max-time 5 https://checkip.amazonaws.com 2>/dev/null \
+            || curl -4 -sf --max-time 5 https://api.ipify.org 2>/dev/null \
+            || curl -4 -sf --max-time 5 https://ifconfig.me/ip 2>/dev/null || true)
+        DETECTED_IP=$(echo "$DETECTED_IP" | tr -d '[:space:]')
+    fi
+    if [ -n "$DETECTED_IP" ]; then
+        # Verify it's not a private/Docker IP
+        case "$DETECTED_IP" in
+            10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*|127.*)
+                echo "WARNING: Auto-detected IP ($DETECTED_IP) is private — relay may fail for remote clients."
+                echo "         Set RELAY_SERVERS=YOUR.PUBLIC.IP in docker-compose.single.yml"
+                ;;
+            *)
+                export RELAY_SERVERS="$DETECTED_IP"
+                echo "Relay IP:     $DETECTED_IP (auto-detected)"
+                ;;
+        esac
+    else
+        echo "WARNING: Could not auto-detect public IP for relay."
+        echo "         Set RELAY_SERVERS=YOUR.PUBLIC.IP in docker-compose.single.yml"
+    fi
+else
+    echo "Relay IP:     $RELAY_SERVERS (from env)"
+fi
+export RELAY_SERVERS="${RELAY_SERVERS:-}"
+
 # Ensure API key exists (shared between Go server and Node.js console)
 API_KEY_FILE="/opt/rustdesk/.api_key"
 if [ -z "${API_KEY:-}" ] && [ ! -f "$API_KEY_FILE" ]; then

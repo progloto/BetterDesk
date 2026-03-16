@@ -140,7 +140,14 @@
     "bulk_delete_confirm": "Czy na pewno chcesz usunąć {count} urządzeń?",
     "bulk_delete_success": "Usunięto {count} urządzeń",
     "columns": "Kolumny",
-    "toggle_columns": "Przełącz widoczność kolumn"
+    "toggle_columns": "Przełącz widoczność kolumn",
+    "not_found": "Nie znaleziono urządzenia",
+    "delete_failed": "Nie udało się usunąć urządzenia",
+    "change_id_failed": "Nie udało się zmienić ID urządzenia",
+    "invalid_id": "Nieprawidłowe ID urządzenia (wymagane 6-16 znaków)",
+    "invalid_id_format": "Nieprawidłowy format ID (tylko litery, cyfry, myślniki i podkreślenia)",
+    "id_exists": "Urządzenie o tym ID już istnieje",
+    "no_selection": "Nie wybrano żadnych urządzeń"
   },
   "keys": {
     "title": "Klucze serwera",

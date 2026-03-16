@@ -133,6 +133,15 @@ func (s *SQLiteDB) Migrate() error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_device_tokens_hash ON device_tokens(token_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_tokens_peer ON device_tokens(peer_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_tokens_status ON device_tokens(status)`,
+
+		// Address books table (RustDesk client AB sync)
+		`CREATE TABLE IF NOT EXISTS address_books (
+			username TEXT NOT NULL,
+			ab_type TEXT NOT NULL DEFAULT 'legacy',
+			data TEXT DEFAULT '{}',
+			updated_at TEXT DEFAULT (datetime('now')),
+			PRIMARY KEY (username, ab_type)
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -1069,4 +1078,34 @@ func (s *SQLiteDB) CleanupExpiredTokens() (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ── Address Book ──────────────────────────────────────────────────────
+
+// GetAddressBook retrieves the address book data for a user.
+func (s *SQLiteDB) GetAddressBook(username, abType string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var data string
+	err := s.db.QueryRow(
+		`SELECT data FROM address_books WHERE username = ? AND ab_type = ?`,
+		username, abType).Scan(&data)
+	if err == sql.ErrNoRows {
+		return "{}", nil
+	}
+	return data, err
+}
+
+// SaveAddressBook stores the address book data for a user (upsert).
+func (s *SQLiteDB) SaveAddressBook(username, abType, data string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`INSERT INTO address_books (username, ab_type, data, updated_at)
+		 VALUES (?, ?, ?, datetime('now'))
+		 ON CONFLICT(username, ab_type) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
+		username, abType, data)
+	return err
 }

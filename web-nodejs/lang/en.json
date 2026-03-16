@@ -140,7 +140,14 @@
     "bulk_delete_confirm": "Are you sure you want to delete {count} devices?",
     "bulk_delete_success": "{count} devices deleted successfully",
     "columns": "Columns",
-    "toggle_columns": "Toggle visible columns"
+    "toggle_columns": "Toggle visible columns",
+    "not_found": "Device not found",
+    "delete_failed": "Failed to delete device",
+    "change_id_failed": "Failed to change device ID",
+    "invalid_id": "Invalid device ID (6-16 characters required)",
+    "invalid_id_format": "Invalid ID format (letters, numbers, dashes, underscores only)",
+    "id_exists": "Device ID already exists",
+    "no_selection": "No devices selected"
   },
   "keys": {
     "title": "Server Keys",

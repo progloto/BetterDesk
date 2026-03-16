@@ -461,6 +461,12 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 96. [x] **`/api/audit/conn` returns 400 for numeric IDs**: RustDesk client sends `host_id` as numeric (e.g., `1340238749`). Validation `typeof body.host_id !== 'string'` rejected it. Changed to `String()` coercion for `host_id`, `host_uuid`, and `peer_id` — accepts both string and numeric IDs.
 97. [x] **Stale sysinfo log spam**: Heartbeat handler logged "Requesting sysinfo refresh from {id} (stale)" every ~15 seconds per device with no throttling. Added `shouldLogSysinfoRequest()` with Map-based 5-minute cooldown per device (auto-prune at 1000 entries). Sysinfo request to client still happens every heartbeat (functional behavior unchanged), only log message is throttled.
 
+#### Go Server — Address Book & Issue Fixes (Phase 18) ✅ COMPLETED 2026-03-17
+98. [x] **Address Book storage in Go server (Issue #57)**: Replaced stub `/api/ab` handlers with real implementation. Added `address_books` table (SQLite + PostgreSQL), `GetAddressBook`/`SaveAddressBook` methods to Database interface, full GET/POST handlers for `/api/ab`, `/api/ab/personal`, `/api/ab/tags`. RustDesk clients send AB to signal_port-2 (21114=Go), not Node.js (21121).
+99. [x] **Settings password "password is required" (Issue #60)**: `settings.js` sent snake_case (`current_password`, `new_password`) but `auth.routes.js` expected camelCase (`currentPassword`, `newPassword`, `confirmPassword`). Fixed field names + added missing `confirmPassword`.
+100. [x] **Password modal plaintext (Issue #60)**: `modal.js` `prompt()` only checked `options.type`, but `users.js` passed `inputType: 'password'`. Fixed modal to check both `options.type` and `options.inputType`.
+101. [x] **Closed 12 resolved GitHub issues**: #59, #56, #52, #28, #54, #58, #19, #53, #61, #60, #57, #48 — all verified and closed with detailed resolution comments.
+
 ---
 
 ## 🔄 System Statusu v3.0
@@ -632,6 +638,9 @@ Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
 26. ~~**Relay fails when initial public IP detection fails**~~ ✅ ROZWIĄZANE - `startIPDetectionRetry()` goroutine was defined but never called from `Start()` in `signal/server.go`. If boot-time `detectPublicIP()` failed, no retry ever happened, causing `getRelayServer()` to return LAN IP. Fixed by calling `s.startIPDetectionRetry(s.ctx)` in `Start()` — Phase 17
 27. ~~**`/api/audit/conn` returns 400 for numeric device IDs**~~ ✅ ROZWIĄZANE - RustDesk client sends `host_id` as number. Validation rejected non-string. Changed to `String()` coercion — Phase 17
 28. ~~**Stale sysinfo log spam every 15 seconds**~~ ✅ ROZWIĄZANE - Added 5-minute per-device throttle for sysinfo log messages in heartbeat handler — Phase 17
+29. ~~**Address Book sync fails (Issue #57)**~~ ✅ ROZWIĄZANE - Go server `/api/ab` endpoints were stubs returning empty data. Added `address_books` table + full GET/POST handlers for `/api/ab`, `/api/ab/personal`, `/api/ab/tags` with SQLite + PostgreSQL support — Phase 18
+30. ~~**Settings password "password is required" (Issue #60)**~~ ✅ ROZWIĄZANE - `settings.js` sent snake_case fields, `auth.routes.js` expected camelCase. Fixed field names + added missing `confirmPassword` — Phase 18
+31. ~~**Password modal plaintext (Issue #60)**~~ ✅ ROZWIĄZANE - `modal.js` prompt checked `options.type` but `users.js` passed `inputType`. Fixed to check both — Phase 18
 
 ---
 
@@ -721,4 +730,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-16 (Go Server Relay & Diagnostics Fixes — Phase 17) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-17 (Go Server Address Book & Issue Fixes — Phase 18) przez GitHub Copilot*

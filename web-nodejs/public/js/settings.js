@@ -87,8 +87,9 @@
                 await Utils.api('/api/auth/password', {
                     method: 'POST',
                     body: {
-                        current_password: currentPassword,
-                        new_password: newPass
+                        currentPassword: currentPassword,
+                        newPassword: newPass,
+                        confirmPassword: confirmPass
                     }
                 });
                 

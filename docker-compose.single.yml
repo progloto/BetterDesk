@@ -63,6 +63,10 @@ services:
       - DB_TYPE=${DB_TYPE:-sqlite}
       - DATABASE_URL=${DATABASE_URL:-}
       - DB_URL=${DATABASE_URL:-}
+      # Relay server address (public IP or domain).
+      # Auto-detected if not set. MUST be set if auto-detection returns
+      # Docker internal IP (172.x.x.x) — remote relay connections will fail otherwise.
+      - RELAY_SERVERS=${RELAY_SERVERS:-}
       # Admin credentials (first run only):
       # - ADMIN_USERNAME=admin
       # - ADMIN_PASSWORD=YourSecurePassword123

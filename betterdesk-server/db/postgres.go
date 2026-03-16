@@ -151,6 +151,15 @@ func (pg *PostgresDB) Migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_device_tokens_peer ON device_tokens(peer_id) WHERE peer_id != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_device_tokens_status ON device_tokens(status)`,
+
+		// Address books table (RustDesk client AB sync)
+		`CREATE TABLE IF NOT EXISTS address_books (
+			username   TEXT NOT NULL,
+			ab_type    TEXT NOT NULL DEFAULT 'legacy',
+			data       TEXT NOT NULL DEFAULT '{}',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (username, ab_type)
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -901,6 +910,30 @@ func (pg *PostgresDB) CleanupExpiredTokens() (int64, error) {
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// ── Address Book ──────────────────────────────────────────────────────
+
+// GetAddressBook retrieves the address book data for a user.
+func (pg *PostgresDB) GetAddressBook(username, abType string) (string, error) {
+	var data string
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT data FROM address_books WHERE username = $1 AND ab_type = $2`,
+		username, abType).Scan(&data)
+	if err == pgx.ErrNoRows {
+		return "{}", nil
+	}
+	return data, err
+}
+
+// SaveAddressBook stores the address book data for a user (upsert).
+func (pg *PostgresDB) SaveAddressBook(username, abType, data string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`INSERT INTO address_books (username, ab_type, data, updated_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (username, ab_type) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+		username, abType, data)
+	return err
 }
 
 // ── LISTEN/NOTIFY ─────────────────────────────────────────────────────

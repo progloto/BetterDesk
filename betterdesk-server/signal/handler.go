@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/unitronix/betterdesk-server/config"
 	"github.com/unitronix/betterdesk-server/crypto"
 	"github.com/unitronix/betterdesk-server/db"
@@ -561,10 +562,13 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	log.Printf("[signal] PunchHole (TCP): target %s found (addr=%s, status=%s), relay=%s",
 		targetID, target.UDPAddr, target.StatusTier, relayServer)
 
-	// ForceRelay or AlwaysUseRelay: send relay-only response immediately,
-	// matching the UDP path's sendRelayResponse behavior.
+	// ForceRelay or AlwaysUseRelay: send RelayResponse (NOT PunchHoleResponse)
+	// with a generated UUID, matching the UDP path's sendRelayResponse behavior.
+	// RelayResponse contains the uuid field required by hbbr for session pairing.
 	if msg.ForceRelay || s.cfg.AlwaysUseRelay {
 		log.Printf("[signal] PunchHole (TCP): force relay for %s", targetID)
+
+		relayUUID := uuid.New().String()
 
 		var signedPk []byte
 		if len(target.PK) > 0 {
@@ -576,11 +580,30 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 			}
 		}
 
-		return &pb.RendezvousMessage{
-			Union: &pb.RendezvousMessage_PunchHoleResponse{
-				PunchHoleResponse: &pb.PunchHoleResponse{
-					Pk:          signedPk,
+		// Forward RequestRelay to target so it connects to hbbr with the same UUID.
+		reqRelay := &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_RequestRelay{
+				RequestRelay: &pb.RequestRelay{
+					Id:          msg.Id,
+					Uuid:        relayUUID,
+					SocketAddr:  crypto.EncodeAddr(raddr),
 					RelayServer: relayServer,
+					Secure:      false,
+					ConnType:    msg.ConnType,
+				},
+			},
+		}
+		if target.UDPAddr != nil {
+			s.sendUDP(reqRelay, target.UDPAddr)
+			log.Printf("[signal] PunchHole (TCP): forwarded RequestRelay to target %s (uuid=%s)", targetID, relayUUID[:8])
+		}
+
+		return &pb.RendezvousMessage{
+			Union: &pb.RendezvousMessage_RelayResponse{
+				RelayResponse: &pb.RelayResponse{
+					Uuid:        relayUUID,
+					RelayServer: relayServer,
+					Union:       &pb.RelayResponse_Pk{Pk: signedPk},
 				},
 			},
 		}
@@ -1156,6 +1179,9 @@ func (s *Server) handleOnlineRequest(msg *pb.OnlineRequest) *pb.RendezvousMessag
 // The target's public key is signed with the server's Ed25519 key (NaCl combined format)
 // so the initiator can verify the target's identity for E2E encryption.
 func (s *Server) sendRelayResponse(target *peer.Entry, raddr *net.UDPAddr, msg *pb.PunchHoleRequest, relay string) {
+	// Generate a relay session UUID for pairing both peers at hbbr.
+	relayUUID := uuid.New().String()
+
 	// Sign the target's PK with server's Ed25519 key for E2E verification.
 	// Format: [64-byte Ed25519 signature][serialized IdPk protobuf] — NaCl combined mode.
 	// Without signing, clients cannot verify target identity and E2E will fail.
@@ -1170,15 +1196,38 @@ func (s *Server) sendRelayResponse(target *peer.Entry, raddr *net.UDPAddr, msg *
 		}
 	}
 
+	// Send RelayResponse (NOT PunchHoleResponse) to the initiator.
+	// RelayResponse contains the UUID field required by hbbr for session pairing.
+	// PunchHoleResponse does not have a uuid field, so clients would send
+	// RequestRelay with an empty UUID, causing hbbr to reject the connection.
 	resp := &pb.RendezvousMessage{
-		Union: &pb.RendezvousMessage_PunchHoleResponse{
-			PunchHoleResponse: &pb.PunchHoleResponse{
-				Pk:          signedPk,
+		Union: &pb.RendezvousMessage_RelayResponse{
+			RelayResponse: &pb.RelayResponse{
+				Uuid:        relayUUID,
 				RelayServer: relay,
+				Union:       &pb.RelayResponse_Pk{Pk: signedPk},
 			},
 		},
 	}
 	s.sendUDP(resp, raddr)
+
+	// Forward RequestRelay to the target so it connects to hbbr with the same UUID.
+	reqRelay := &pb.RendezvousMessage{
+		Union: &pb.RendezvousMessage_RequestRelay{
+			RequestRelay: &pb.RequestRelay{
+				Id:          msg.Id,
+				Uuid:        relayUUID,
+				SocketAddr:  crypto.EncodeAddr(raddr),
+				RelayServer: relay,
+				Secure:      false,
+				ConnType:    msg.ConnType,
+			},
+		},
+	}
+	if target.UDPAddr != nil {
+		s.sendUDP(reqRelay, target.UDPAddr)
+		log.Printf("[signal] sendRelayResponse: forwarded RequestRelay to target %s at %s (uuid=%s)", target.ID, target.UDPAddr, relayUUID[:8])
+	}
 }
 
 // getRelayServer returns the relay server address to advertise to clients.

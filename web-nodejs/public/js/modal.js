@@ -228,7 +228,7 @@ const Modal = (function() {
                 content: `
                     <div class="form-group">
                         ${options.label ? `<label class="form-label" for="${inputId}">${Utils.escapeHtml(options.label)}</label>` : ''}
-                        <input type="${options.type || 'text'}" id="${inputId}" class="form-input" 
+                        <input type="${options.type || options.inputType || 'text'}" id="${inputId}" class="form-input" 
                             value="${Utils.escapeHtml(options.value || '')}"
                             placeholder="${Utils.escapeHtml(options.placeholder || '')}">
                         ${options.hint ? `<p class="form-hint">${Utils.escapeHtml(options.hint)}</p>` : ''}

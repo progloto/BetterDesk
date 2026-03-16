@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -293,9 +294,8 @@ func (s *Server) handleClientCurrentUser(w http.ResponseWriter, r *http.Request)
 }
 
 // handleClientAddressBook handles address book get/set for RustDesk clients.
-// GET /api/ab — get address book
-// POST /api/ab — update address book
-// TODO: Implement when address book table is added to the Go server DB.
+// GET /api/ab — get legacy address book
+// POST /api/ab — update legacy address book
 func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request) {
 	username := getUsernameFromCtx(r)
 	if username == "" {
@@ -305,16 +305,132 @@ func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request)
 
 	switch r.Method {
 	case http.MethodGet:
-		// Return empty address book until DB support is added
-		writeJSON(w, http.StatusOK, map[string]any{"data": "{}"})
+		data, err := s.db.GetAddressBook(username, "legacy")
+		if err != nil {
+			log.Printf("[api] GetAddressBook error for %s: %v", username, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": data, "licensed_devices": 0})
 
 	case http.MethodPost:
-		// Accept but silently discard until DB support is added
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		var body struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+			return
+		}
+		// RustDesk sends data as a JSON string or as an object; normalize to string
+		dataStr := string(body.Data)
+		if len(dataStr) > 0 && dataStr[0] == '"' {
+			// JSON-encoded string — unquote it
+			var s2 string
+			if err := json.Unmarshal(body.Data, &s2); err == nil {
+				dataStr = s2
+			}
+		}
+		if dataStr == "" || dataStr == "null" {
+			dataStr = "{}"
+		}
+		// Limit AB size to 512 KB
+		if len(dataStr) > 512*1024 {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "Address book too large"})
+			return
+		}
+		if err := s.db.SaveAddressBook(username, "legacy", dataStr); err != nil {
+			log.Printf("[api] SaveAddressBook error for %s: %v", username, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
+			return
+		}
+		log.Printf("[api] Saved legacy address book for %s (%d bytes)", username, len(dataStr))
+		writeJSON(w, http.StatusOK, map[string]any{})
 
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
 	}
+}
+
+// handleClientAddressBookPersonal handles personal address book get/set.
+// GET /api/ab/personal — get personal address book
+// POST /api/ab/personal — update personal address book
+func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.Request) {
+	username := getUsernameFromCtx(r)
+	if username == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		data, err := s.db.GetAddressBook(username, "personal")
+		if err != nil {
+			log.Printf("[api] GetAddressBook(personal) error for %s: %v", username, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": data})
+
+	case http.MethodPost:
+		var body struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+			return
+		}
+		dataStr := string(body.Data)
+		if len(dataStr) > 0 && dataStr[0] == '"' {
+			var s2 string
+			if err := json.Unmarshal(body.Data, &s2); err == nil {
+				dataStr = s2
+			}
+		}
+		if dataStr == "" || dataStr == "null" {
+			dataStr = "{}"
+		}
+		if len(dataStr) > 512*1024 {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "Address book too large"})
+			return
+		}
+		if err := s.db.SaveAddressBook(username, "personal", dataStr); err != nil {
+			log.Printf("[api] SaveAddressBook(personal) error for %s: %v", username, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
+			return
+		}
+		log.Printf("[api] Saved personal address book for %s (%d bytes)", username, len(dataStr))
+		writeJSON(w, http.StatusOK, map[string]any{})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+	}
+}
+
+// handleClientAddressBookTags returns tags from the legacy address book.
+// GET /api/ab/tags
+func (s *Server) handleClientAddressBookTags(w http.ResponseWriter, r *http.Request) {
+	username := getUsernameFromCtx(r)
+	if username == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	data, err := s.db.GetAddressBook(username, "legacy")
+	if err != nil {
+		log.Printf("[api] GetAddressBook(tags) error for %s: %v", username, err)
+		writeJSON(w, http.StatusOK, map[string]any{"data": []string{}})
+		return
+	}
+
+	// Extract tags from the address book JSON
+	var ab struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.Unmarshal([]byte(data), &ab); err != nil || ab.Tags == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"data": []string{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": ab.Tags})
 }
 
 // handleClientHeartbeat accepts heartbeat pings from RustDesk clients.

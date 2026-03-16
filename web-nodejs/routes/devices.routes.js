@@ -186,7 +186,14 @@ router.delete('/api/devices/:id', requireAuth, requireRole('operator'), async (r
             });
         }
         
-        await serverBackend.deleteDevice(id);
+        const result = await serverBackend.deleteDevice(id);
+        
+        if (!result || !result.success) {
+            return res.status(500).json({
+                success: false,
+                error: result?.error || req.t('devices.delete_failed')
+            });
+        }
         
         // Log action
         await db.logAction(req.session.userId, 'device_deleted', `Device ${id} deleted`, req.ip);
