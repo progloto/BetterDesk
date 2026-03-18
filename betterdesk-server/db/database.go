@@ -67,6 +67,16 @@ type IDChangeHistory struct {
 	Reason    string    `json:"reason,omitempty"`
 }
 
+// PeerMetric represents a single heartbeat metric data point.
+type PeerMetric struct {
+	ID        int64     `json:"id"`
+	PeerID    string    `json:"peer_id"`
+	CPU       float64   `json:"cpu_usage"`
+	Memory    float64   `json:"memory_usage"`
+	Disk      float64   `json:"disk_usage"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // DeviceToken represents a unique enrollment token for device registration.
 // Dual Key System: supports both global server key (backward compatible) and
 // per-device tokens for enhanced security.
@@ -116,10 +126,14 @@ type Database interface {
 	UpdatePeerSysinfo(id, hostname, os, version string) error
 	SetAllOffline() error
 
+	// Peer field updates
+	UpdatePeerFields(id string, fields map[string]string) error
+
 	// Ban system
 	BanPeer(id string, reason string) error
 	UnbanPeer(id string) error
 	IsPeerBanned(id string) (bool, error)
+	IsPeerSoftDeleted(id string) (bool, error)
 
 	// ID change
 	ChangePeerID(oldID, newID string) error
@@ -167,4 +181,10 @@ type Database interface {
 	// Address Book
 	GetAddressBook(username, abType string) (string, error) // Returns JSON data string; abType: "legacy" or "personal"
 	SaveAddressBook(username, abType, data string) error
+
+	// Peer Metrics (heartbeat CPU/memory/disk)
+	SavePeerMetric(peerID string, cpu, memory, disk float64) error
+	GetPeerMetrics(peerID string, limit int) ([]*PeerMetric, error)
+	GetLatestPeerMetric(peerID string) (*PeerMetric, error)
+	CleanupOldMetrics(maxAge time.Duration) (int64, error) // Delete metrics older than maxAge
 }

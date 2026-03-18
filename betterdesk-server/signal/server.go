@@ -38,6 +38,15 @@ type tcpPunchConn struct {
 	createdAt time.Time // M2: track creation time for TTL eviction
 }
 
+// pendingUUID tracks a relay UUID that was sent to a target device.
+// Some RustDesk clients don't echo the UUID back in RelayResponse, causing
+// relay pairing to fail. We store the UUID so we can recover it when the
+// target responds with an empty UUID.
+type pendingUUID struct {
+	uuid      string
+	createdAt time.Time
+}
+
 // writeProto sends a protobuf message, using encryption if the connection is secure.
 func (pc *tcpPunchConn) writeProto(msg *pb.RendezvousMessage) error {
 	pc.writeMu.Lock()
@@ -70,6 +79,12 @@ type Server struct {
 	// When a target sends a RelayResponse, we decode socket_addr to find the
 	// initiator's addr key and forward the message over their TCP connection.
 	tcpPunchConns sync.Map // map[string]*tcpPunchConn
+
+	// pendingRelayUUIDs tracks the UUID we send to each target when forwarding
+	// RequestRelay or PunchHole (force-relay). Some RustDesk clients respond with
+	// an empty UUID in RelayResponse — this map lets us recover the original UUID
+	// so relay pairing succeeds. Key=targetID, Value=*pendingUUID.
+	pendingRelayUUIDs sync.Map // map[string]*pendingUUID
 
 	// localIP is the server's detected public IP address (via external service).
 	// Used to build the relay server address when -relay-servers is not set.
@@ -755,6 +770,20 @@ func (s *Server) cleanupTCPPunchConns() {
 			if evicted > 0 {
 				log.Printf("[signal] TCP punch conns cleanup: evicted %d stale entries (remaining ~%d)", evicted, count-evicted)
 			}
+
+			// Also cleanup stale pendingRelayUUIDs (same TTL as punch conns)
+			uuidEvicted := 0
+			s.pendingRelayUUIDs.Range(func(key, value any) bool {
+				pu := value.(*pendingUUID)
+				if now.Sub(pu.createdAt) > maxTTL {
+					s.pendingRelayUUIDs.Delete(key)
+					uuidEvicted++
+				}
+				return true
+			})
+			if uuidEvicted > 0 {
+				log.Printf("[signal] Pending relay UUIDs cleanup: evicted %d stale entries", uuidEvicted)
+			}
 		}
 	}
 }
@@ -769,6 +798,26 @@ func (s *Server) sendUDP(msg *pb.RendezvousMessage, addr *net.UDPAddr) {
 	if _, err := s.udpConn.WriteToUDP(data, addr); err != nil {
 		log.Printf("[signal] UDP send to %s: %v", addr, err)
 	}
+}
+
+// storePendingUUID stores a relay UUID that we sent/are sending to a target.
+// When the target responds with RelayResponse containing empty UUID, we can
+// look up this stored UUID to maintain relay pairing.
+func (s *Server) storePendingUUID(targetID, uuid string) {
+	s.pendingRelayUUIDs.Store(targetID, &pendingUUID{
+		uuid:      uuid,
+		createdAt: time.Now(),
+	})
+}
+
+// getPendingUUID retrieves the pending UUID for a target device (without removing it).
+// The UUID remains available for subsequent retry attempts; cleanup happens via ticker.
+// Returns empty string if no pending UUID exists for this target.
+func (s *Server) getPendingUUID(targetID string) string {
+	if val, ok := s.pendingRelayUUIDs.Load(targetID); ok {
+		return val.(*pendingUUID).uuid
+	}
+	return ""
 }
 
 // isNormalClose returns true if the error represents a normal connection close

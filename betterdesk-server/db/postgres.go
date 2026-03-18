@@ -160,6 +160,18 @@ func (pg *PostgresDB) Migrate() error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			PRIMARY KEY (username, ab_type)
 		)`,
+
+		// Peer metrics table (heartbeat CPU/memory/disk history)
+		`CREATE TABLE IF NOT EXISTS peer_metrics (
+			id         BIGSERIAL PRIMARY KEY,
+			peer_id    TEXT NOT NULL,
+			cpu_usage  REAL NOT NULL DEFAULT 0,
+			memory_usage REAL NOT NULL DEFAULT 0,
+			disk_usage REAL NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_peer_id ON peer_metrics(peer_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_created_at ON peer_metrics(created_at)`,
 	}
 
 	for _, stmt := range statements {
@@ -393,6 +405,44 @@ func (pg *PostgresDB) IsPeerBanned(id string) (bool, error) {
 		return false, nil
 	}
 	return banned, err
+}
+
+// IsPeerSoftDeleted checks if a peer is soft-deleted.
+func (pg *PostgresDB) IsPeerSoftDeleted(id string) (bool, error) {
+	var deleted bool
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT soft_deleted FROM peers WHERE id = $1`, id).Scan(&deleted)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	return deleted, err
+}
+
+// UpdatePeerFields updates specific peer fields (note, user, tags).
+// Only provided keys are updated; others are left unchanged.
+// Allowed keys: "note", "user", "tags".
+func (pg *PostgresDB) UpdatePeerFields(id string, fields map[string]string) error {
+	allowed := map[string]string{"note": "note", "user": `"user"`, "tags": "tags"}
+	setClauses := []string{}
+	args := []interface{}{}
+	idx := 1
+	for k, v := range fields {
+		col, ok := allowed[k]
+		if !ok {
+			continue
+		}
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col, idx))
+		args = append(args, v)
+		idx++
+	}
+	if len(setClauses) == 0 {
+		return nil
+	}
+	args = append(args, id)
+	query := fmt.Sprintf("UPDATE peers SET %s WHERE id = $%d AND soft_deleted = FALSE",
+		strings.Join(setClauses, ", "), idx)
+	_, err := pg.pool.Exec(pg.ctx, query, args...)
+	return err
 }
 
 // ── ID Change ─────────────────────────────────────────────────────────
@@ -934,6 +984,64 @@ func (pg *PostgresDB) SaveAddressBook(username, abType, data string) error {
 		 ON CONFLICT (username, ab_type) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
 		username, abType, data)
 	return err
+}
+
+// ── Peer Metrics ──────────────────────────────────────────────────────
+
+// SavePeerMetric inserts a new metric record for a peer.
+func (pg *PostgresDB) SavePeerMetric(peerID string, cpu, memory, disk float64) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`INSERT INTO peer_metrics (peer_id, cpu_usage, memory_usage, disk_usage) VALUES ($1, $2, $3, $4)`,
+		peerID, cpu, memory, disk)
+	return err
+}
+
+// GetPeerMetrics retrieves the most recent N metric records for a peer.
+func (pg *PostgresDB) GetPeerMetrics(peerID string, limit int) ([]*PeerMetric, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT id, peer_id, cpu_usage, memory_usage, disk_usage, created_at
+		 FROM peer_metrics WHERE peer_id = $1 ORDER BY created_at DESC LIMIT $2`,
+		peerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*PeerMetric
+	for rows.Next() {
+		m := &PeerMetric{}
+		if err := rows.Scan(&m.ID, &m.PeerID, &m.CPU, &m.Memory, &m.Disk, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		metrics = append(metrics, m)
+	}
+	return metrics, rows.Err()
+}
+
+// GetLatestPeerMetric returns the single most recent metric for a peer.
+func (pg *PostgresDB) GetLatestPeerMetric(peerID string) (*PeerMetric, error) {
+	metrics, err := pg.GetPeerMetrics(peerID, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(metrics) == 0 {
+		return nil, nil
+	}
+	return metrics[0], nil
+}
+
+// CleanupOldMetrics deletes metrics older than maxAge. Returns deleted count.
+func (pg *PostgresDB) CleanupOldMetrics(maxAge time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-maxAge)
+	result, err := pg.pool.Exec(pg.ctx,
+		`DELETE FROM peer_metrics WHERE created_at < $1`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 // ── LISTEN/NOTIFY ─────────────────────────────────────────────────────

@@ -164,9 +164,24 @@ async function setBanStatus(id, banned, reason = '') {
 }
 
 async function updateDevice(id, data) {
-    // BetterDesk Go server does not expose a peer-update endpoint for user/note,
-    // so we keep writing to the local SQLite in both modes for now.
-    return await db.updateDevice(id, data);
+    // Route through Go API PATCH /api/peers/:id for note/user fields
+    const fields = {};
+    if (data.note !== undefined) fields.note = String(data.note);
+    if (data.user !== undefined) fields.user = String(data.user);
+
+    if (Object.keys(fields).length > 0) {
+        const result = await betterdeskApi.updatePeer(id, fields);
+        if (!result || !result.success) {
+            return { changes: 0, error: result?.error || 'Failed to update peer' };
+        }
+    }
+
+    // Also update local auth.db as fallback for overlaid fields
+    try {
+        await db.updateDevice(id, data);
+    } catch { /* non-critical: auth.db is secondary storage */ }
+
+    return { changes: 1 };
 }
 
 async function changePeerId(oldId, newId) {

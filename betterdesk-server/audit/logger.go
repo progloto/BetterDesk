@@ -19,6 +19,7 @@ const (
 	ActionPeerBanned       Action = "peer_banned"
 	ActionPeerUnbanned     Action = "peer_unbanned"
 	ActionPeerDeleted      Action = "peer_deleted"
+	ActionPeerUpdated      Action = "peer_updated"
 	ActionPeerIDChanged    Action = "peer_id_changed"
 	ActionPeerTagsUpdated  Action = "peer_tags_updated"
 	ActionBlocklistAdd     Action = "blocklist_add"

@@ -252,7 +252,22 @@ async function removeBlocklistEntry(entry) {
  */
 async function setPeerTags(id, tags) {
     try {
-        const { data } = await apiClient.put(`/peers/${encodeURIComponent(id)}/tags`, { tags });
+        // Ensure tags is sent as an array (Go server now accepts both string and array)
+        const payload = Array.isArray(tags) ? tags : (typeof tags === 'string' ? tags.split(',').map(t => t.trim()).filter(Boolean) : []);
+        const { data } = await apiClient.put(`/peers/${encodeURIComponent(id)}/tags`, { tags: payload });
+        return wrap(data);
+    } catch (err) {
+        if (err.response?.data) return wrap(err.response.data);
+        return { success: false, error: err.message };
+    }
+}
+
+/**
+ * PATCH /api/peers/:id - Update peer fields (note, user, tags)
+ */
+async function updatePeer(id, fields) {
+    try {
+        const { data } = await apiClient.patch(`/peers/${encodeURIComponent(id)}`, fields);
         return wrap(data);
     } catch (err) {
         if (err.response?.data) return wrap(err.response.data);
@@ -423,6 +438,8 @@ module.exports = {
     // Tags
     setPeerTags,
     getPeersByTag,
+    // Peer update
+    updatePeer,
     // Audit
     getAuditEvents,
     // Config

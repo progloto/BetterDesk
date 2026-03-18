@@ -142,6 +142,18 @@ func (s *SQLiteDB) Migrate() error {
 			updated_at TEXT DEFAULT (datetime('now')),
 			PRIMARY KEY (username, ab_type)
 		)`,
+
+		// Peer metrics table (heartbeat CPU/memory/disk data)
+		`CREATE TABLE IF NOT EXISTS peer_metrics (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			peer_id TEXT NOT NULL,
+			cpu_usage REAL DEFAULT 0,
+			memory_usage REAL DEFAULT 0,
+			disk_usage REAL DEFAULT 0,
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_peer ON peer_metrics(peer_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_created ON peer_metrics(created_at)`,
 	}
 
 	for _, stmt := range statements {
@@ -466,6 +478,45 @@ func (s *SQLiteDB) IsPeerBanned(id string) (bool, error) {
 		return false, nil
 	}
 	return banned, err
+}
+
+// IsPeerSoftDeleted checks if a peer is soft-deleted.
+func (s *SQLiteDB) IsPeerSoftDeleted(id string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var deleted bool
+	err := s.db.QueryRow(`SELECT soft_deleted FROM peers WHERE id = ?`, id).Scan(&deleted)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return deleted, err
+}
+
+// UpdatePeerFields updates specific peer fields (note, user, tags).
+// Only provided keys are updated; others are left unchanged.
+// Allowed keys: "note", "user", "tags".
+func (s *SQLiteDB) UpdatePeerFields(id string, fields map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	allowed := map[string]bool{"note": true, "user": true, "tags": true}
+	setClauses := []string{}
+	args := []interface{}{}
+	for k, v := range fields {
+		if !allowed[k] {
+			continue
+		}
+		setClauses = append(setClauses, k+" = ?")
+		args = append(args, v)
+	}
+	if len(setClauses) == 0 {
+		return nil
+	}
+	args = append(args, id)
+	query := "UPDATE peers SET " + strings.Join(setClauses, ", ") + " WHERE id = ? AND soft_deleted = 0"
+	_, err := s.db.Exec(query, args...)
+	return err
 }
 
 // ChangePeerID changes a peer's ID and records it in history.
@@ -1108,4 +1159,72 @@ func (s *SQLiteDB) SaveAddressBook(username, abType, data string) error {
 		 ON CONFLICT(username, ab_type) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`,
 		username, abType, data)
 	return err
+}
+
+// ── Peer Metrics ──────────────────────────────────────────────────────
+
+// SavePeerMetric inserts a new heartbeat metric data point for a peer.
+func (s *SQLiteDB) SavePeerMetric(peerID string, cpu, memory, disk float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`INSERT INTO peer_metrics (peer_id, cpu_usage, memory_usage, disk_usage, created_at)
+		 VALUES (?, ?, ?, ?, datetime('now'))`,
+		peerID, cpu, memory, disk)
+	return err
+}
+
+// GetPeerMetrics returns the most recent metric data points for a peer.
+func (s *SQLiteDB) GetPeerMetrics(peerID string, limit int) ([]*PeerMetric, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		`SELECT id, peer_id, cpu_usage, memory_usage, disk_usage, created_at
+		 FROM peer_metrics WHERE peer_id = ? ORDER BY created_at DESC LIMIT ?`,
+		peerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var metrics []*PeerMetric
+	for rows.Next() {
+		var m PeerMetric
+		var createdAt string
+		if err := rows.Scan(&m.ID, &m.PeerID, &m.CPU, &m.Memory, &m.Disk, &createdAt); err != nil {
+			return nil, err
+		}
+		m.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		metrics = append(metrics, &m)
+	}
+	return metrics, nil
+}
+
+// GetLatestPeerMetric returns the most recent metric for a peer.
+func (s *SQLiteDB) GetLatestPeerMetric(peerID string) (*PeerMetric, error) {
+	metrics, err := s.GetPeerMetrics(peerID, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(metrics) == 0 {
+		return nil, nil
+	}
+	return metrics[0], nil
+}
+
+// CleanupOldMetrics deletes metric records older than maxAge.
+// Returns the number of deleted rows.
+func (s *SQLiteDB) CleanupOldMetrics(maxAge time.Duration) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-maxAge).UTC().Format("2006-01-02 15:04:05")
+	result, err := s.db.Exec(
+		`DELETE FROM peer_metrics WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

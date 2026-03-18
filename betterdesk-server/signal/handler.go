@@ -185,6 +185,12 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 		return
 	}
 
+	// Check if this peer was soft-deleted — do not allow re-registration
+	if deleted, _ := s.db.IsPeerSoftDeleted(id); deleted {
+		log.Printf("[signal] Rejected soft-deleted peer registration: %s from %s", id, raddr.IP)
+		return
+	}
+
 	// New peer — add to memory map
 	// Try to load existing PK from database first (peer may have registered PK before server restart)
 	now := time.Now()
@@ -283,6 +289,12 @@ func (s *Server) processRegisterPk(msg *pb.RegisterPk, addrStr string) *pb.Rende
 	banned, _ := s.db.IsPeerBanned(id)
 	if banned {
 		log.Printf("[signal] Rejected banned peer: %s", id)
+		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+	}
+
+	// Check soft-deleted status — do not allow re-registration
+	if deleted, _ := s.db.IsPeerSoftDeleted(id); deleted {
+		log.Printf("[signal] Rejected soft-deleted peer PK registration: %s", id)
 		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
 	}
 
@@ -594,6 +606,8 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 			},
 		}
 		if target.UDPAddr != nil {
+			// Store the UUID so we can recover it if target responds with empty UUID.
+			s.storePendingUUID(targetID, relayUUID)
 			s.sendUDP(reqRelay, target.UDPAddr)
 			log.Printf("[signal] PunchHole (TCP): forwarded RequestRelay to target %s (uuid=%s)", targetID, relayUUID[:8])
 		}
@@ -860,6 +874,8 @@ func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
 	}
 
 	if target.UDPAddr != nil {
+		// Store the UUID so we can recover it if target responds with empty UUID.
+		s.storePendingUUID(targetID, relayUUID)
 		s.sendUDP(relayResp, target.UDPAddr)
 	}
 
@@ -962,6 +978,8 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr)
 				},
 			},
 		}
+		// Store the UUID so we can recover it if target responds with empty UUID.
+		s.storePendingUUID(targetID, relayUUID)
 		s.sendUDP(reqRelay, target.UDPAddr)
 		log.Printf("[signal] RequestRelay (TCP): forwarded to %s secure=%v connType=%v", targetID, msg.Secure, msg.ConnType)
 	}
@@ -1012,15 +1030,6 @@ func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage, senderAdd
 		return
 	}
 
-	// If the target sent a RelayResponse with an empty UUID, both peers will fail
-	// to connect through relay. Generate a UUID as a last resort — the target may
-	// have already connected to relay with "" which won't pair, but at least this
-	// gives useful diagnostics and prevents silent failures.
-	if rr.Uuid == "" {
-		rr.Uuid = uuid.New().String()
-		log.Printf("[signal] WARNING: RelayResponse from %s has empty UUID — generated %s (target may have connected with empty UUID, relay pairing may fail)", senderAddr, rr.Uuid[:8])
-	}
-
 	initiatorAddr, err := crypto.DecodeAddr(rr.SocketAddr)
 	if err != nil {
 		log.Printf("[signal] RelayResponse forward: cannot decode socket_addr: %v", err)
@@ -1038,6 +1047,22 @@ func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage, senderAdd
 		if entry := s.peers.FindByIP(senderAddr.IP); entry != nil {
 			targetID = entry.ID
 			log.Printf("[signal] RelayResponse forward: resolved sender %s to peer %s via IP lookup", senderAddr, targetID)
+		}
+	}
+
+	// If the target sent a RelayResponse with an empty UUID, try to recover the
+	// original UUID that we sent to the target in RequestRelay/PunchHole. This
+	// is critical for relay pairing — the target may have connected to relay with
+	// that UUID, but the old RustDesk client doesn't echo it back.
+	if rr.Uuid == "" {
+		if storedUUID := s.getPendingUUID(targetID); storedUUID != "" {
+			rr.Uuid = storedUUID
+			log.Printf("[signal] RelayResponse from %s has empty UUID — recovered original %s from pending store", senderAddr, storedUUID[:8])
+		} else {
+			// Last resort: generate a new UUID. This will likely fail relay pairing
+			// because target already connected with different (empty?) UUID.
+			rr.Uuid = uuid.New().String()
+			log.Printf("[signal] WARNING: RelayResponse from %s has empty UUID and no pending UUID found — generated %s (relay pairing may fail)", senderAddr, rr.Uuid[:8])
 		}
 	}
 
@@ -1253,6 +1278,8 @@ func (s *Server) sendRelayResponse(target *peer.Entry, raddr *net.UDPAddr, msg *
 		},
 	}
 	if target.UDPAddr != nil {
+		// Store the UUID so we can recover it if target responds with empty UUID.
+		s.storePendingUUID(target.ID, relayUUID)
 		s.sendUDP(reqRelay, target.UDPAddr)
 		log.Printf("[signal] sendRelayResponse: forwarded RequestRelay to target %s at %s (uuid=%s)", target.ID, target.UDPAddr, relayUUID[:8])
 	}

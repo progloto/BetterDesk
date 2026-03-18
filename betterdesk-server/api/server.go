@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -120,6 +121,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/peers", s.handleListPeers)
 	mux.HandleFunc("GET /api/peers/{id}", s.handleGetPeer)
 	mux.HandleFunc("DELETE /api/peers/{id}", s.requireRole(auth.RoleAdmin, s.handleDeletePeer))
+	mux.HandleFunc("PATCH /api/peers/{id}", s.handleUpdatePeerFields)
 	mux.HandleFunc("POST /api/peers/{id}/ban", s.requireRole(auth.RoleAdmin, s.handleBanPeer))
 	mux.HandleFunc("POST /api/peers/{id}/unban", s.requireRole(auth.RoleAdmin, s.handleUnbanPeer))
 	mux.HandleFunc("POST /api/peers/{id}/change-id", s.requireRole(auth.RoleAdmin, s.handleChangePeerID))
@@ -128,6 +130,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/peers/status/summary", s.handleStatusSummary)
 	mux.HandleFunc("GET /api/peers/online", s.handleOnlinePeers)
 	mux.HandleFunc("GET /api/peers/{id}/status", s.handlePeerStatus)
+	mux.HandleFunc("GET /api/peers/{id}/metrics", s.handlePeerMetrics)
 
 	// Blocklist management
 	mux.HandleFunc("GET /api/blocklist", s.handleListBlocklist)
@@ -406,6 +409,49 @@ func (s *Server) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleUpdatePeerFields partially updates a peer's editable fields (note, user, tags).
+// PATCH /api/peers/{id}
+func (s *Server) handleUpdatePeerFields(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var body struct {
+		Note *string `json:"note"`
+		User *string `json:"user"`
+		Tags *string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
+		return
+	}
+
+	fields := make(map[string]string)
+	if body.Note != nil {
+		fields["note"] = *body.Note
+	}
+	if body.User != nil {
+		fields["user"] = *body.User
+	}
+	if body.Tags != nil {
+		fields["tags"] = *body.Tags
+	}
+
+	if len(fields) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "No fields to update"})
+		return
+	}
+
+	if err := s.db.UpdatePeerFields(id, fields); err != nil {
+		writeInternalError(w, err, "UpdatePeerFields")
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionPeerUpdated, s.remoteIP(r), id, nil)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated", "id": id})
+}
+
 func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	hard := r.URL.Query().Get("hard") == "true"
@@ -627,6 +673,36 @@ func (s *Server) handlePeerStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePeerMetrics returns historical metrics (CPU, memory, disk) for a peer.
+// GET /api/peers/{id}/metrics?limit=100
+func (s *Server) handlePeerMetrics(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" || !peerIDRegexp.MatchString(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid peer ID"})
+		return
+	}
+
+	// Parse optional limit param (default 100, max 1000)
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 1000 {
+			limit = parsed
+		}
+	}
+
+	metrics, err := s.db.GetPeerMetrics(id, limit)
+	if err != nil {
+		writeInternalError(w, err, "GetPeerMetrics")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id": id,
+		"count":   len(metrics),
+		"metrics": metrics,
+	})
+}
+
 // handleListBlocklist returns all blocklist entries.
 // GET /api/blocklist
 func (s *Server) handleListBlocklist(w http.ResponseWriter, r *http.Request) {
@@ -758,27 +834,53 @@ func (s *Server) remoteIP(r *http.Request) string {
 
 // handleSetPeerTags updates tags for a peer.
 // PUT /api/peers/{id}/tags
+// Accepts either { "tags": "tag1,tag2" } (string) or { "tags": ["tag1","tag2"] } (array).
 func (s *Server) handleSetPeerTags(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	var body struct {
-		Tags string `json:"tags"` // comma-separated tags
+	var raw json.RawMessage
+	var wrapper struct {
+		Tags json.RawMessage `json:"tags"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&wrapper); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 		return
 	}
+	raw = wrapper.Tags
 
-	if err := s.db.UpdatePeerTags(id, body.Tags); err != nil {
+	// Determine if tags is a string or an array
+	var tagsStr string
+	if len(raw) > 0 && raw[0] == '"' {
+		// JSON string
+		if err := json.Unmarshal(raw, &tagsStr); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid tags value"})
+			return
+		}
+	} else if len(raw) > 0 && raw[0] == '[' {
+		// JSON array
+		var arr []string
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid tags array"})
+			return
+		}
+		tagsStr = strings.Join(arr, ",")
+	} else if len(raw) == 0 || string(raw) == "null" {
+		tagsStr = ""
+	} else {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Tags must be a string or array"})
+		return
+	}
+
+	if err := s.db.UpdatePeerTags(id, tagsStr); err != nil {
 		writeInternalError(w, err, "UpdatePeerTags")
 		return
 	}
 
 	if s.auditLog != nil {
-		s.auditLog.Log(audit.ActionPeerTagsUpdated, s.remoteIP(r), id, map[string]string{"tags": body.Tags})
+		s.auditLog.Log(audit.ActionPeerTagsUpdated, s.remoteIP(r), id, map[string]string{"tags": tagsStr})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "updated", "id": id, "tags": body.Tags})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated", "id": id, "tags": tagsStr})
 }
 
 // handlePeersByTag returns peers matching a tag.

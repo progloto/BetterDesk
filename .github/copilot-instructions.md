@@ -504,6 +504,27 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 129. [x] **Dynamic codec negotiation**: `buildLoginRequest()` in `protocol.js` now detects `VideoDecoder` (WebCodecs) and `JMuxer` availability. HTTPS: reports VP9+H264+AV1+VP8 with Auto preference. HTTP: reports H264-only with H264 preference. Gives peer more encoding options on HTTPS.
 130. [x] **FPS option after login**: `_startSession()` in `client.js` sends `customFps` option as Misc message after login. Default reduced from 60 to 30 fps for stability. Helps peer establish target framerate without relying solely on `video_received` ack timing.
 
+#### Go Server & Node.js — Device Management Fix (Phase 23) ✅ COMPLETED 2026-03-18
+131. [x] **IsPeerSoftDeleted interface + impl**: Added `IsPeerSoftDeleted(id string) (bool, error)` to `db/database.go` interface. Implemented in both `sqlite.go` and `postgres.go` — queries `soft_deleted` column for deleted device detection.
+132. [x] **Zombie device prevention (Issues #65, #64, #38)**: Signal handler now checks `IsPeerSoftDeleted()` after `IsPeerBanned()` in both `handleRegisterPeer()` and `processRegisterPk()`. Deleted devices cannot re-register, preventing "zombie" devices from reappearing after admin deletion.
+133. [x] **UpdatePeerFields method**: Added `UpdatePeerFields(id string, fields map[string]string) error` to Database interface + implementations. Supports dynamic partial updates for `note`, `user`, `tags` fields with SQL-safe allowed-key validation.
+134. [x] **PATCH /api/peers/{id} endpoint**: New REST endpoint in `api/server.go` for partial peer updates. Accepts JSON body `{"note": "...", "user": "...", "tags": "..."}`. Used by Node.js panel instead of direct SQLite writes.
+135. [x] **Tags type mismatch fix (Issues #65, #38)**: `handleSetPeerTags` in `api/server.go` now accepts both JSON string (`"tag1,tag2"`) and array (`["tag1","tag2"]`) using `json.RawMessage`. Fixes 400 errors when panel sends array format.
+136. [x] **Notes routed through Go API**: `serverBackend.js` `updateDevice()` now calls Go server's `PATCH /api/peers/{id}` endpoint instead of writing directly to Node.js SQLite. Ensures notes/user/tags stored in Go server's `db_v2.sqlite3`.
+137. [x] **Tag serialization fix**: `betterdeskApi.js` `setPeerTags()` now sends tags as array in request body. Added `updatePeer()` method for PATCH requests.
+138. [x] **auth.db cleanup on delete**: `devices.routes.js` delete handler now calls `db.cleanupDeletedPeerData(id)` to remove user linkages from auth.db when device is deleted. Implemented `cleanupDeletedPeerData()` in `dbAdapter.js` for both SQLite and PostgreSQL.
+139. [x] **Relay UUID tracking (Issues #65, #64)**: Old RustDesk clients respond with empty UUID in `RelayResponse`. Added `pendingRelayUUIDs sync.Map` to track UUIDs sent to targets in `RequestRelay`/`PunchHole`. When target responds with empty UUID, `handleRelayResponseForward` recovers original UUID from store. Fixes relay pairing failures.
+140. [x] **ActionPeerUpdated audit**: Added `ActionPeerUpdated` constant to `audit/logger.go` for tracking peer field updates.
+141. [x] **getPendingUUID retry support**: Changed `getPendingUUID()` from `LoadAndDelete` to `Load` — UUID now remains available for multiple retry attempts from target device. Cleanup handled by existing ticker goroutine (2-min TTL).
+
+#### Go Server — Peer Metrics Persistence (Phase 24) ✅ COMPLETED 2026-03-19
+142. [x] **PeerMetric struct**: Added `PeerMetric` struct to `db/database.go` (ID, PeerID, CPU, Memory, Disk, CreatedAt) for heartbeat metrics storage.
+143. [x] **Database interface methods**: Added `SavePeerMetric()`, `GetPeerMetrics()`, `GetLatestPeerMetric()`, `CleanupOldMetrics()` to Database interface.
+144. [x] **peer_metrics table (SQLite)**: Added `peer_metrics` table to `sqlite.go` Migrate() with indexes on peer_id and created_at. Implemented all 4 metric methods.
+145. [x] **peer_metrics table (PostgreSQL)**: Added `peer_metrics` table to `postgres.go` Migrate() with BIGSERIAL PK and TIMESTAMPTZ. Implemented all 4 metric methods.
+146. [x] **handleClientHeartbeat extended**: Now parses `cpu`, `memory`, `disk` float64 fields from request body and calls `SavePeerMetric()` when any value > 0.
+147. [x] **GET /api/peers/{id}/metrics endpoint**: New API endpoint returns historical metrics for a peer with configurable limit (default 100, max 1000). Enables Node.js console to fetch metrics from Go server.
+
 ---
 
 ## 🔄 System Statusu v3.0
@@ -680,6 +701,10 @@ Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
 31. ~~**Password modal plaintext (Issue #60)**~~ ✅ ROZWIĄZANE - `modal.js` prompt checked `options.type` but `users.js` passed `inputType`. Fixed to check both — Phase 18
 32. ~~**Empty UUID in relay causes all WAN connections to fail (Issues #58, #63, #64)**~~ ✅ ROZWIĄZANE - `PunchHoleResponse` has no `uuid` field, so when hole-punch fails, client sends `RequestRelay{uuid=""}`. Signal server now generates `uuid.New().String()` when empty in both `handleRequestRelay()` (UDP) and `handleRequestRelayTCP()` (TCP). Relay address validation rejects `host < 2 chars` (prevents `relay=a:21117`) — Phase 19
 33. ~~**Docker DNS failures during build (Issue #62)**~~ ✅ ROZWIĄZANE - Added retry logic to all `apk add --no-cache` commands in Dockerfile, Dockerfile.server, Dockerfile.console — Phase 19
+34. ~~**Target device sends empty UUID in RelayResponse (Issues #64, #65)**~~ ✅ ROZWIĄZANE - Old RustDesk clients don't echo UUID back in `RelayResponse`. Added `pendingRelayUUIDs sync.Map` to track UUIDs sent to targets in `RequestRelay`/`PunchHole`. When target responds with empty UUID, `handleRelayResponseForward` recovers original UUID from store. Fixes relay pairing failures where initiator and target used mismatched UUIDs — Phase 23
+35. ~~**Notes/tags written to wrong database**~~ ✅ ROZWIĄZANE - Node.js panel was writing notes/user/tags directly to local SQLite instead of Go server's database. Now routes through `PATCH /api/peers/{id}` endpoint on Go server — Phase 23
+36. ~~**Deleted devices reappear as zombies**~~ ✅ ROZWIĄZANE - Added `IsPeerSoftDeleted()` check in signal handlers. Soft-deleted devices cannot re-register, preventing "zombie" devices from reappearing after admin deletion — Phase 23
+37. ~~**Metrics not visible in device detail (Issue #65)**~~ ✅ ROZWIĄZANE - Added `peer_metrics` table to Go server database (SQLite + PostgreSQL), extended `handleClientHeartbeat` to parse and save CPU/memory/disk metrics, added `GET /api/peers/{id}/metrics` endpoint for Node.js console to fetch metrics from Go server — Phase 24
 
 ---
 
@@ -769,4 +794,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-18 (Go Server & Installers — API TLS Separation Fix — Phase 21) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-19 (Go Server — Peer Metrics Persistence — Phase 24) przez GitHub Copilot*

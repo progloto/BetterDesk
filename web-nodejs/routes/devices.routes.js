@@ -195,6 +195,11 @@ router.delete('/api/devices/:id', requireAuth, requireRole('operator'), async (r
             });
         }
         
+        // Clean up local auth.db data for this peer
+        try {
+            await db.cleanupDeletedPeerData(id);
+        } catch { /* non-critical: auth.db cleanup is secondary */ }
+        
         // Log action
         await db.logAction(req.session.userId, 'device_deleted', `Device ${id} deleted`, req.ip);
         

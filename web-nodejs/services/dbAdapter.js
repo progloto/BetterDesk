@@ -963,6 +963,14 @@ function createSqliteAdapter(config) {
             openMain().prepare('UPDATE peer SET is_deleted = 1 WHERE id = ?').run(id);
         },
 
+        async cleanupDeletedPeerData(id) {
+            const authDb = openAuth();
+            authDb.prepare('DELETE FROM peer_sysinfo WHERE peer_id = ?').run(id);
+            authDb.prepare('DELETE FROM peer_metrics WHERE peer_id = ?').run(id);
+            authDb.prepare('DELETE FROM device_folder_assignments WHERE peer_id = ?').run(id);
+            authDb.prepare('DELETE FROM device_group_peers WHERE peer_id = ?').run(id);
+        },
+
         async setBanStatus(id, banned, reason = '') {
             openMain().prepare(`
                 UPDATE peer SET is_banned = ?, banned_at = CASE WHEN ? THEN datetime('now') ELSE NULL END, banned_reason = ?
@@ -3212,6 +3220,13 @@ function createPostgresAdapter() {
 
         async softDeletePeer(id) {
             await q('UPDATE peer SET is_deleted = TRUE WHERE id = $1', [id]);
+        },
+
+        async cleanupDeletedPeerData(id) {
+            await q('DELETE FROM peer_sysinfo WHERE peer_id = $1', [id]);
+            await q('DELETE FROM peer_metrics WHERE peer_id = $1', [id]);
+            await q('DELETE FROM device_folder_assignments WHERE peer_id = $1', [id]);
+            await q('DELETE FROM device_group_peers WHERE peer_id = $1', [id]);
         },
 
         async setBanStatus(id, banned, reason = '') {

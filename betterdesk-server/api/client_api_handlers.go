@@ -441,8 +441,11 @@ func (s *Server) handleClientAddressBookTags(w http.ResponseWriter, r *http.Requ
 //	{ "modified_at": "2026-..." }                   (normal ACK)
 func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID   string `json:"id"`
-		UUID string `json:"uuid"`
+		ID     string  `json:"id"`
+		UUID   string  `json:"uuid"`
+		CPU    float64 `json:"cpu"`
+		Memory float64 `json:"memory"`
+		Disk   float64 `json:"disk"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusOK, map[string]string{"modified_at": time.Now().UTC().Format(time.RFC3339)})
@@ -473,6 +476,13 @@ func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Update peer status to ONLINE
 	clientIP := s.remoteIP(r)
 	_ = s.db.UpdatePeerStatus(deviceID, "ONLINE", clientIP)
+
+	// Save metrics if any values provided (values > 0)
+	if body.CPU > 0 || body.Memory > 0 || body.Disk > 0 {
+		if err := s.db.SavePeerMetric(deviceID, body.CPU, body.Memory, body.Disk); err != nil {
+			log.Printf("[api] Failed to save peer metrics for %s: %v", deviceID, err)
+		}
+	}
 
 	// Request sysinfo if hostname is empty (never received)
 	if peer.Hostname == "" {
