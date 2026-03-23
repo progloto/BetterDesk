@@ -1081,8 +1081,20 @@ router.post('/api/audit/conn', async (req, res) => {
  * GET /api/audit/conn
  * Query connection audit events.
  * Query params: host_id, peer_id, action, limit, offset
+ * Supports both Bearer token (RustDesk client) and session cookie (panel).
  */
-router.get('/api/audit/conn', requireAuth, async (req, res) => {
+router.get('/api/audit/conn', async (req, res) => {
+    // Check Bearer token first, then session cookie
+    const token = extractBearerToken(req);
+    if (token) {
+        const user = await authService.validateAccessToken(token);
+        if (!user) return res.status(401).json({ error: 'Invalid or expired token' });
+        req.authUser = user;
+    } else if (req.session && req.session.userId) {
+        // Session-based panel auth — allowed
+    } else {
+        return res.status(401).json({ error: 'Authorization required' });
+    }
     try {
         const filters = {
             host_id: req.query.host_id || '',

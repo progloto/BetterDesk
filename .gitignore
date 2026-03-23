@@ -1,4 +1,9 @@
-# Python
+# ============================================================
+# BetterDesk Console — .gitignore
+# Organized by category, no duplicate patterns
+# ============================================================
+
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,6 +11,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -22,56 +28,59 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Flask
 instance/
 .webassets-cache
 
-# Rust
+# --- Rust ---
 target/
 Cargo.lock
 **/*.rs.bk
 *.pdb
 
-# IDEs
+# --- Node.js ---
+node_modules/
+package-lock.json
+
+# --- IDEs & OS ---
 .vscode/
 .idea/
+.playwright-mcp/
 *.swp
 *.swo
 *~
 .DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
 
-# Logs
+# --- Logs ---
 *.log
 logs/
 
-# Database
+# --- Database files ---
 *.sqlite3
 *.db
 
-# Sensitive data & reports
-*.key
-*.pem
-*.pub
-*credentials*
-*REPORT*.md
-test_*.sh
-verify_*.sh
-.security_scan_report.md
+# --- Temporary files & caches ---
+*.tmp
+*.temp
+/tmp/
+.cache/
 
-# Archive folder (contains old files with potential sensitive data)
-archive/
-
-# Backups
+# --- Backups ---
+*.bak
 *.backup
 *backup*/
 rustdesk-backup*/
+rustdesk-backup-*/
 
-# Old binary versions (keep only latest in bin/)
-hbbs-v[0-7]-patched
-hbbr-v[0-7]-patched
-
-# Sensitive data (should never be committed)
+# --- Environment & secrets ---
+.env
+.env.local
+.env.*.local
+config.local.*
+*_local.sh
+*_local.ps1
 *credentials*
 *.password
 *.passwords
@@ -79,72 +88,77 @@ hbbr-v[0-7]-patched
 *_password.log
 *secret*.key
 *secret*.pem
-.env
-config.local.*
 
-# Temporary files
-*.tmp
-*.temp
-/tmp/
-
-
-# Backups
-*.bak
-*.backup
-rustdesk-backup-*/
-
-# Temporary files
-*.tmp
-*.temp
-/tmp/
-.cache/
-
-# OS
-Thumbs.db
-.Spotlight-V100
-.Trashes
-
-# Project specific
-screenshots/*.png
-!screenshots/.gitkeep
-web-nodejs/uploads/
+# --- Cryptographic keys & certificates ---
 *.key
 *.pem
-id_*.pub
+*.pub
 id_*
 
-# Environment
-.env
-.env.local
-.env.*.local
-config.local.*
-*_local.sh
-*_local.ps1
+# --- Sensitive internal documents (security audits, reports) ---
+docs/_internal/
+*REPORT*.md
+.security_scan_report.md
 
-# Testing
+# --- Testing ---
 .coverage
 htmlcov/
 .pytest_cache/
 test_*.sh
+verify_*.sh
 TESTING.local.md
+web-nodejs/test-db.js
 
-# Dev scripts (removed — old Flask/Rust-era utilities, not needed for production)
+# --- Test screenshots (moved from root to screenshots/tests/) ---
+screenshots/tests/
+/test-*.png
+
+#visual_studio
+.vs/CopilotSnapshots
+.vs/
+
+# --- Temporary test scripts (contain credentials/URLs — moved to dev_modules/) ---
+tmp_test_*.py
+tmp_test_*.sh
+
+# --- Archive (old files with potential sensitive data) ---
+archive/
+
+# --- Legacy binaries ---
+hbbs-patch/
+hbbs-patch-v2/
+hbbs-v[0-7]-patched
+hbbr-v[0-7]-patched
+
+# --- Dev scripts (old Flask/Rust-era utilities) ---
 dev_modules/
 scripts/legacy/
 migrations/
 templates/
 test_api.sh
 build_windows.sh
-
-# Dev scripts with potential sensitive data
-web-nodejs/_test_*.sh
-web-nodejs/_fix_*.sh
 _write_readme.py
 
-# BetterDesk Desktop Client (development paused — using RustDesk client instead)
+# --- Dev scripts with potential sensitive data ---
+web-nodejs/_test_*.sh
+web-nodejs/_fix_*.sh
+
+# --- BetterDesk Desktop Client (dev paused — using RustDesk client) ---
 betterdesk-client/
 
-# BetterDesk Go server binary files (compiled locally, not shipped in repo)
+# --- BetterDesk Agent binaries & config (compiled locally) ---
+betterdesk-agent/betterdesk-agent
+betterdesk-agent/betterdesk-agent-*
+betterdesk-agent/*.exe
+betterdesk-agent/deploy-config.json
+betterdesk-agent/*.json
+betterdesk-agent/create_key.py
+betterdesk-agent/fix_devid.py
+betterdesk-agent/fix_type.py
+betterdesk-agent/update_config.py
+!betterdesk-agent/package.json
+
+# --- BetterDesk Go server binaries (compiled locally) ---
 betterdesk-server/betterdesk-server
 betterdesk-server/betterdesk-server-*
 betterdesk-server/*.exe
@@ -154,27 +168,36 @@ betterdesk-server/id_ed25519*
 betterdesk-server/test_*.go
 betterdesk-server/_test_*
 
-# Node.js
-node_modules/
-package-lock.json
-
-# Root-level image duplicates (originals in web-nodejs/public/img/)
+# --- Root-level image duplicates (originals in web-nodejs/public/img/) ---
 /betterdesk.png
 /betterdesk_icon.png
+/betterdesk_wallpaper.png
 
-# Internal dev/analysis documents (not for public repo)
+# --- Screenshots ---
+screenshots/*.png
+!screenshots/.gitkeep
+web-nodejs/uploads/
+
+# --- Deployment temporary files & artifacts ---
+_deploy_tmp/
+_server_checksums.txt
+deploy_console.tar.gz
+*.tar.gz
+
+# --- Wallpapers (128MB+ — too large for git, ship separately) ---
+web-nodejs/wallpapers/
+
+# --- Internal dev/analysis documents (not for public repo) ---
 .github/audyt_bezpieczenstwa.md
 .github/RUSTDESK_SZYFROWANIE.md
 .github/rustdesk_client_server_data_analysis.md
 .github/rustdesk_encryption_analysis.md
 .github/new_functions.md
 .github/rustdesk_client.md
+.github/copilot-instructions.md
 
-# Legacy Rust binaries (archived, removed from repo)
-hbbs-patch/
-hbbs-patch-v2/
+# --- Playwright MCP screenshots ---
+.playwright-mcp/
+
+# --- Task tracking (local only) ---
 tasks/todo.md
-docs/SECURITY_AUDIT_FULL_2026-03-19.md
-.github/copilot-instructions.md
-.github/copilot-instructions.md
-.github/copilot-instructions.md

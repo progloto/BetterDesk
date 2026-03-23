@@ -135,6 +135,8 @@ func (s *Server) handleConn(conn net.Conn) {
 			return
 		}
 		if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(scanner.Text())), []byte(s.adminPassword)) != 1 {
+			// BD-2026-011: Delay after failed auth to slow brute-force attempts
+			time.Sleep(2 * time.Second)
 			fmt.Fprintln(conn, "Authentication failed.")
 			log.Printf("[admin] Authentication failed from %s", remote)
 			return

@@ -92,6 +92,7 @@
             serverPubKey: window.BetterDesk.serverPubKey || '',
             scaleMode: 'fit',
             fps: 60,
+            imageQuality: 'Best',
             disableAudio: false
         });
 

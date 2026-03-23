@@ -172,22 +172,22 @@ Start with these files in order:
 1. **[README.md](README.md)** - Project overview and features
 2. **[install.sh](install.sh)** - Install web console
 3. **[hbbs-patch/QUICKSTART.md](hbbs-patch/QUICKSTART.md)** - Install HBBS patch
-4. **[docs/CHANGELOG.md](docs/CHANGELOG.md)** - Version history
+4. **[docs/CHANGELOG.md](../development/CHANGELOG.md)** - Version history
 
 ## 🔄 For Existing Users
 
 When updating:
 
-1. **[docs/UPDATE_GUIDE.md](docs/UPDATE_GUIDE.md)** - General update process
+1. **[docs/UPDATE_GUIDE.md](../setup/UPDATE_GUIDE.md)** - General update process
 2. **[update.sh](update.sh)** - Run automated update
-3. **[docs/CHANGELOG.md](docs/CHANGELOG.md)** - See what changed
+3. **[docs/CHANGELOG.md](../development/CHANGELOG.md)** - See what changed
 
 ## 🤝 For Contributors
 
 Before contributing:
 
-1. **[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md)** - Contribution guidelines
-2. **[docs/DEVELOPMENT_ROADMAP.md](docs/DEVELOPMENT_ROADMAP.md)** - Planned features
+1. **[docs/CONTRIBUTING.md](../development/CONTRIBUTING.md)** - Contribution guidelines
+2. **[docs/DEVELOPMENT_ROADMAP.md](../enterprise/ENTERPRISE_ROADMAP.md)** - Planned features
 3. **[dev_modules/](dev_modules/)** - Development tools
 
 ## 📋 File Naming Conventions

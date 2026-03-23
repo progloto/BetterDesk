@@ -25,6 +25,32 @@ echo ""
 # Ensure data directories exist
 mkdir -p "${DATA_DIR:-/app/data}" 2>/dev/null || true
 
+# Verify SQLite database path is writable (catches :ro volume mounts early)
+DB_FILE="${DB_PATH:-/opt/rustdesk/db_v2.sqlite3}"
+DB_DIR="$(dirname "$DB_FILE")"
+if [ "${DB_TYPE:-sqlite}" = "sqlite" ]; then
+    if [ -f "$DB_FILE" ] && [ ! -w "$DB_FILE" ]; then
+        echo ""
+        echo "ERROR: Database file $DB_FILE is not writable!"
+        echo "  This usually means the volume is mounted read-only (:ro)."
+        echo "  Fix: In docker-compose.yml, change the console volume mount from:"
+        echo "    rustdesk-data:/opt/rustdesk:ro"
+        echo "  to:"
+        echo "    rustdesk-data:/opt/rustdesk"
+        echo ""
+        echo "  Then run: docker compose down && docker compose up -d"
+        echo ""
+        exit 1
+    fi
+    if [ ! -w "$DB_DIR" ]; then
+        echo ""
+        echo "WARNING: Database directory $DB_DIR is not writable."
+        echo "  SQLite needs write access for WAL journal files (.db-wal, .db-shm)."
+        echo "  Check volume mount permissions in docker-compose.yml."
+        echo ""
+    fi
+fi
+
 # Wait for BetterDesk server (hbbs) to be available if using betterdesk backend
 if [ "${SERVER_BACKEND}" = "betterdesk" ] && [ -n "${HBBS_API_URL}" ]; then
     echo "Waiting for BetterDesk server..."

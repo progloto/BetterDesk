@@ -635,6 +635,9 @@ function createSqliteAdapter(config) {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
+                policy_type TEXT DEFAULT '',
+                action TEXT DEFAULT 'log',
+                scope TEXT DEFAULT '',
                 enabled INTEGER DEFAULT 1,
                 rules TEXT DEFAULT '[]',
                 created_at DATETIME DEFAULT (datetime('now')),
@@ -656,6 +659,13 @@ function createSqliteAdapter(config) {
             CREATE INDEX IF NOT EXISTS idx_dlp_events_time ON dlp_events (created_at);
             CREATE INDEX IF NOT EXISTS idx_dlp_events_source ON dlp_events (event_source);
         `);
+        // Migrate existing tables: add new columns if missing
+        try {
+            const cols = db.prepare("PRAGMA table_info(dlp_policies)").all().map(c => c.name);
+            if (!cols.includes('policy_type')) db.exec("ALTER TABLE dlp_policies ADD COLUMN policy_type TEXT DEFAULT ''");
+            if (!cols.includes('action')) db.exec("ALTER TABLE dlp_policies ADD COLUMN action TEXT DEFAULT 'log'");
+            if (!cols.includes('scope')) db.exec("ALTER TABLE dlp_policies ADD COLUMN scope TEXT DEFAULT ''");
+        } catch (_) { /* table may not exist yet */ }
     }
 
     // -- Saved reports table -----------------------------------------------
@@ -1700,11 +1710,14 @@ function createSqliteAdapter(config) {
         },
         async createDlpPolicy(data) {
             const r = openMain().prepare(`
-                INSERT INTO dlp_policies (name, description, enabled, rules)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO dlp_policies (name, description, policy_type, action, scope, enabled, rules)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             `).run(
                 data.name,
                 data.description || '',
+                data.policy_type || '',
+                data.action || 'log',
+                data.scope || '',
                 data.enabled !== undefined ? (data.enabled ? 1 : 0) : 1,
                 typeof data.rules === 'string' ? data.rules : JSON.stringify(data.rules || [])
             );
@@ -1715,6 +1728,9 @@ function createSqliteAdapter(config) {
             const params = [];
             if (data.name !== undefined) { sets.push('name = ?'); params.push(data.name); }
             if (data.description !== undefined) { sets.push('description = ?'); params.push(data.description); }
+            if (data.policy_type !== undefined) { sets.push('policy_type = ?'); params.push(data.policy_type); }
+            if (data.action !== undefined) { sets.push('action = ?'); params.push(data.action); }
+            if (data.scope !== undefined) { sets.push('scope = ?'); params.push(data.scope); }
             if (data.enabled !== undefined) { sets.push('enabled = ?'); params.push(data.enabled ? 1 : 0); }
             if (data.rules !== undefined) {
                 sets.push('rules = ?');
@@ -2741,12 +2757,21 @@ function createPostgresAdapter() {
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
+                policy_type TEXT DEFAULT '',
+                action TEXT DEFAULT 'log',
+                scope TEXT DEFAULT '',
                 enabled BOOLEAN DEFAULT TRUE,
                 rules JSONB DEFAULT '[]',
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         `);
+        // Migrate existing tables: add new columns if missing
+        const dlpCols = await all("SELECT column_name FROM information_schema.columns WHERE table_name = 'dlp_policies'");
+        const dlpColNames = dlpCols.map(c => c.column_name);
+        if (!dlpColNames.includes('policy_type')) await q("ALTER TABLE dlp_policies ADD COLUMN policy_type TEXT DEFAULT ''");
+        if (!dlpColNames.includes('action')) await q("ALTER TABLE dlp_policies ADD COLUMN action TEXT DEFAULT 'log'");
+        if (!dlpColNames.includes('scope')) await q("ALTER TABLE dlp_policies ADD COLUMN scope TEXT DEFAULT ''");
 
         await q(`
             CREATE TABLE IF NOT EXISTS dlp_events (
@@ -3200,11 +3225,11 @@ function createPostgresAdapter() {
         async upsertPeer({ id, uuid, pk, info, ip }) {
             await q(`
                 INSERT INTO peer (id, uuid, pk, info, ip, status_online, created_at)
-                VALUES ($1, $2, $3, $4, $5, TRUE, NOW())
+                VALUES ($1, $2, $3, $4::jsonb, $5, TRUE, NOW())
                 ON CONFLICT(id) DO UPDATE SET
                     uuid = COALESCE(NULLIF($2, ''), peer.uuid),
                     pk = COALESCE($3, peer.pk),
-                    info = COALESCE(NULLIF($4, ''), peer.info),
+                    info = COALESCE(NULLIF(EXCLUDED.info, '{}'::jsonb), peer.info),
                     ip = COALESCE(NULLIF($5, ''), peer.ip),
                     status_online = TRUE,
                     last_online = NOW(),
@@ -3876,12 +3901,15 @@ function createPostgresAdapter() {
         async createDlpPolicy(data) {
             const rules = typeof data.rules === 'string' ? data.rules : JSON.stringify(data.rules || []);
             return one(`
-                INSERT INTO dlp_policies (name, description, enabled, rules)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO dlp_policies (name, description, policy_type, action, scope, enabled, rules)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING *
             `, [
                 data.name,
                 data.description || '',
+                data.policy_type || '',
+                data.action || 'log',
+                data.scope || '',
                 data.enabled !== undefined ? data.enabled : true,
                 rules
             ]);
@@ -3892,6 +3920,9 @@ function createPostgresAdapter() {
             let idx = 1;
             if (data.name !== undefined) { sets.push(`name = $${idx++}`); params.push(data.name); }
             if (data.description !== undefined) { sets.push(`description = $${idx++}`); params.push(data.description); }
+            if (data.policy_type !== undefined) { sets.push(`policy_type = $${idx++}`); params.push(data.policy_type); }
+            if (data.action !== undefined) { sets.push(`action = $${idx++}`); params.push(data.action); }
+            if (data.scope !== undefined) { sets.push(`scope = $${idx++}`); params.push(data.scope); }
             if (data.enabled !== undefined) { sets.push(`enabled = $${idx++}`); params.push(!!data.enabled); }
             if (data.rules !== undefined) {
                 sets.push(`rules = $${idx++}`);

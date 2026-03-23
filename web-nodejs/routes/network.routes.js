@@ -37,13 +37,15 @@
 const express = require('express');
 const router = express.Router();
 const { NetworkMonitor, pingHost, checkTcpPort, checkHttp, resolveHost } = require('../services/networkMonitor');
+const { getAdapter } = require('../services/dbAdapter');
 
 // Monitor instance (initialized lazily)
 let monitor = null;
 
-function getMonitor(req) {
-    if (!monitor && req.app.locals.dbAdapter) {
-        monitor = new NetworkMonitor(req.app.locals.dbAdapter);
+function getMonitor() {
+    if (!monitor) {
+        const adapter = getAdapter();
+        if (adapter) monitor = new NetworkMonitor(adapter);
     }
     return monitor;
 }
@@ -71,8 +73,8 @@ const VALID_CHECK_TYPES = ['ping', 'tcp', 'http', 'https'];
 router.get('/targets', requireAdmin, async (req, res) => {
     try {
         const { enabled, check_type } = req.query;
-        const db = req.app.locals.dbAdapter;
-        const targets = await db.getNetworkTargets({
+        const adapter = getAdapter();
+        const targets = await adapter.getNetworkTargets({
             enabled: enabled !== undefined ? enabled === 'true' : undefined,
             check_type,
         });
@@ -99,7 +101,7 @@ router.post('/targets', requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'host or url is required' });
         }
 
-        const target = await req.app.locals.dbAdapter.createNetworkTarget({
+        const target = await getAdapter().createNetworkTarget({
             name,
             host: host || '',
             port: parseInt(port, 10) || null,
@@ -121,7 +123,7 @@ router.post('/targets', requireAdmin, async (req, res) => {
  */
 router.get('/targets/:id', requireAdmin, async (req, res) => {
     try {
-        const target = await req.app.locals.dbAdapter.getNetworkTargetById(req.params.id);
+        const target = await getAdapter().getNetworkTargetById(req.params.id);
         if (!target) {
             return res.status(404).json({ error: 'Target not found' });
         }
@@ -151,7 +153,7 @@ router.patch('/targets/:id', requireAdmin, async (req, res) => {
         if (interval_ms !== undefined) updates.interval_ms = parseInt(interval_ms, 10);
         if (enabled !== undefined) updates.enabled = enabled;
 
-        const target = await req.app.locals.dbAdapter.updateNetworkTarget(req.params.id, updates);
+        const target = await getAdapter().updateNetworkTarget(req.params.id, updates);
         if (!target) {
             return res.status(404).json({ error: 'Target not found' });
         }
@@ -166,7 +168,7 @@ router.patch('/targets/:id', requireAdmin, async (req, res) => {
  */
 router.delete('/targets/:id', requireAdmin, async (req, res) => {
     try {
-        const ok = await req.app.locals.dbAdapter.deleteNetworkTarget(req.params.id);
+        const ok = await getAdapter().deleteNetworkTarget(req.params.id);
         if (!ok) {
             return res.status(404).json({ error: 'Target not found' });
         }
@@ -185,12 +187,12 @@ router.delete('/targets/:id', requireAdmin, async (req, res) => {
  */
 router.post('/targets/:id/check', requireAdmin, async (req, res) => {
     try {
-        const target = await req.app.locals.dbAdapter.getNetworkTargetById(req.params.id);
+        const target = await getAdapter().getNetworkTargetById(req.params.id);
         if (!target) {
             return res.status(404).json({ error: 'Target not found' });
         }
 
-        const m = getMonitor(req);
+        const m = getMonitor();
         if (!m) {
             return res.status(503).json({ error: 'Monitor not available' });
         }
@@ -208,7 +210,7 @@ router.post('/targets/:id/check', requireAdmin, async (req, res) => {
 router.get('/targets/:id/history', requireAdmin, async (req, res) => {
     try {
         const { limit, from, to } = req.query;
-        const history = await req.app.locals.dbAdapter.getNetworkCheckHistory(req.params.id, {
+        const history = await getAdapter().getNetworkCheckHistory(req.params.id, {
             limit: parseInt(limit, 10) || 100,
             from,
             to,
@@ -224,13 +226,15 @@ router.get('/targets/:id/history', requireAdmin, async (req, res) => {
  */
 router.get('/stats', requireAdmin, async (req, res) => {
     try {
-        const targets = await req.app.locals.dbAdapter.getNetworkTargets({});
+        const targets = await getAdapter().getNetworkTargets({});
         const total = targets.length;
         const up = targets.filter(t => t.last_status === 'up').length;
         const down = targets.filter(t => t.last_status === 'down').length;
         const unknown = total - up - down;
+        const latencies = targets.filter(t => t.last_latency_ms != null).map(t => t.last_latency_ms);
+        const avg_latency = latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : null;
 
-        res.json({ total, up, down, unknown });
+        res.json({ total, up, down, unknown, avg_latency });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -304,7 +308,7 @@ router.post('/resolve', requireAdmin, async (req, res) => {
  * POST /api/network/monitor/start
  */
 router.post('/monitor/start', requireAdmin, (req, res) => {
-    const m = getMonitor(req);
+    const m = getMonitor();
     if (!m) return res.status(503).json({ error: 'Monitor not available' });
     const interval = parseInt(req.body.interval_ms, 10) || undefined;
     m.start(interval);
@@ -315,7 +319,7 @@ router.post('/monitor/start', requireAdmin, (req, res) => {
  * POST /api/network/monitor/stop
  */
 router.post('/monitor/stop', requireAdmin, (req, res) => {
-    const m = getMonitor(req);
+    const m = getMonitor();
     if (!m) return res.status(503).json({ error: 'Monitor not available' });
     m.stop();
     res.json({ status: 'stopped' });
@@ -325,7 +329,7 @@ router.post('/monitor/stop', requireAdmin, (req, res) => {
  * GET /api/network/monitor/status
  */
 router.get('/monitor/status', requireAdmin, (req, res) => {
-    const m = getMonitor(req);
+    const m = getMonitor();
     res.json({
         running: m ? m.running : false,
         interval_ms: m ? m.pollInterval : null,

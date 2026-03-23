@@ -1,5 +1,5 @@
 /**
- * BetterDesk Console - Desktop Mode Styles
+ * BetterDesk Console - Desktop Mode Styles (BETA)
  * Windows-like desktop environment with floating windows, taskbar, and animations.
  * Only active on viewports >= 1200px.
  */
@@ -8,12 +8,29 @@
 
 .desktop-toggle-btn {
     display: none !important;
+    position: relative;
 }
 
 @media (min-width: 1200px) {
     .desktop-toggle-btn {
         display: flex !important;
     }
+}
+
+/* Beta badge on desktop toggle button */
+.beta-badge {
+    position: absolute;
+    top: -4px;
+    right: -8px;
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--accent-color, #f0883e);
+    color: #fff;
+    line-height: 1.2;
+    pointer-events: none;
 }
 
 /* ============ Desktop Shell ============ */
@@ -45,6 +62,22 @@ body.desktop-active .desktop-shell {
     background-position: center;
     background-repeat: no-repeat;
     z-index: 0;
+}
+
+/* Crossfade transition layer */
+.desktop-wallpaper-new {
+    position: absolute;
+    inset: 0;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    opacity: 0;
+    transition: opacity 0.6s ease-out;
+    z-index: 1;
+}
+
+.desktop-wallpaper-new.fade-in {
+    opacity: 1;
 }
 
 .desktop-wallpaper::after {

@@ -32,6 +32,8 @@ betterdesk-server/_test_*
 # Archive (old/deprecated files)
 archive/
 
+
+
 # Documentation (not needed in image)
 docs/
 screenshots/

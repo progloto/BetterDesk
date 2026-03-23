@@ -24,6 +24,14 @@ echo ""
 mkdir -p /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
 chown -R betterdesk:betterdesk /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
 
+# BD-2026-007: Warn about weak default secrets
+if [ -n "${SESSION_SECRET}" ] && [ ${#SESSION_SECRET} -lt 32 ]; then
+    echo "WARNING [SECURITY]: SESSION_SECRET is shorter than 32 characters — generate a stronger secret"
+fi
+if [ -n "${ADMIN_PASSWORD}" ] && [ ${#ADMIN_PASSWORD} -lt 12 ]; then
+    echo "WARNING [SECURITY]: ADMIN_PASSWORD is shorter than 12 characters — use a stronger password"
+fi
+
 # Determine database DSN for Go server
 # DB_URL env var is read by Go server's config.LoadEnv()
 if [ "${DB_TYPE}" = "postgres" ] || [ "${DB_TYPE}" = "postgresql" ]; then

@@ -1,41 +1,63 @@
 # Documentation
 
-This directory contains comprehensive documentation for BetterDesk Console.
+This directory contains comprehensive documentation for BetterDesk Console, organized by topic.
 
-## Quick Start
-- **[INSTALLATION_V1.4.0.md](INSTALLATION_V1.4.0.md)** - Installation guide
-- **[UPDATE_GUIDE.md](UPDATE_GUIDE.md)** - Updating existing installations
-- **[TROUBLESHOOTING_EN.md](TROUBLESHOOTING_EN.md)** - Common issues & solutions
+## Setup & Installation
+
+- **[Installation Guide](setup/INSTALLATION_V1.4.0.md)** — Full installation instructions
+- **[Update Guide](setup/UPDATE_GUIDE.md)** — Updating existing installations
+- **[Build Guide](setup/BUILD_GUIDE.md)** — Building from source
+- **[Synology Installation](setup/SYNOLOGY_INSTALLATION.md)** — NAS-specific setup
+- **[HTTPS Setup](setup/HTTPS_SETUP.md)** — SSL/TLS certificate configuration
 
 ## Docker
-- **[DOCKER_SUPPORT.md](DOCKER_SUPPORT.md)** - Docker installation guide
-- **[DOCKER_TROUBLESHOOTING.md](DOCKER_TROUBLESHOOTING.md)** - Docker-specific issues
+
+- **[Docker Support](docker/DOCKER_SUPPORT.md)** — Docker installation guide
+- **[Docker Quick Start](docker/DOCKER_QUICKSTART.md)** — 30-second quick start with pre-built images
+- **[Docker Troubleshooting](docker/DOCKER_TROUBLESHOOTING.md)** — Docker-specific issues & fixes
+- **[Docker Migration](docker/DOCKER_MIGRATION.md)** — Migrating from existing RustDesk Docker
 
 ## Features
-- **[CLIENT_GENERATOR.md](CLIENT_GENERATOR.md)** - Custom client generator
-- **[CLIENT_GENERATOR_QUICKSTART_EN.md](CLIENT_GENERATOR_QUICKSTART_EN.md)** - Client generator quick start
-- **[ID_CHANGE_FEATURE.md](ID_CHANGE_FEATURE.md)** - Device ID change feature
-- **[STATUS_TRACKING_v3.md](STATUS_TRACKING_v3.md)** - Device status tracking system
+
+- **[Client Generator](features/CLIENT_GENERATOR.md)** — Custom client generator
+- **[Client Generator Quick Start](features/CLIENT_GENERATOR_QUICKSTART_EN.md)** — Quick start guide
+- **[Device ID Change](features/ID_CHANGE_FEATURE.md)** — Device ID change feature
+- **[Status Tracking v3](features/STATUS_TRACKING_v3.md)** — Device status tracking system
+- **[CDAP / Custom Device API](features/CUSTOM_DEVICE_API.md)** — Custom Device Access Protocol
+- **[Web Remote Client](features/WEB_REMOTE_CLIENT_PLAN.md)** — Browser-based remote desktop
+
+## Architecture
+
+- **[Project Structure](architecture/PROJECT_STRUCTURE.md)** — Codebase overview
+- **[BetterDesk Client](architecture/BETTERDESK_CLIENT_ARCHITECTURE.md)** — Desktop client architecture
+- **[BetterDesk v3 Overview](architecture/BETTERDESK_v3_OVERVIEW.md)** — v3 architecture summary
+- **[CDAP Protocol](architecture/CDAP_PROTOCOL.md)** — CDAP wire protocol specification
+- **[CDAP Implementation](architecture/CDAP_IMPLEMENTATION_PLAN.md)** — CDAP implementation plan
+- **[Port Security](architecture/PORT_SECURITY.md)** — Port configuration & security
+
+## Troubleshooting
+
+- **[General Troubleshooting](troubleshooting/TROUBLESHOOTING_EN.md)** — Common issues & solutions
+- **[Key Troubleshooting](troubleshooting/KEY_TROUBLESHOOTING.md)** — Key and encryption issues
+- **[Quick Fix](troubleshooting/QUICK_FIX_EN.md)** — Quick fixes for common problems
 
 ## Performance
-- **[GPU_OPTIMIZATION_EN.md](GPU_OPTIMIZATION_EN.md)** - GPU optimization
-- **[GPU_FIX_QUICKSTART_EN.md](GPU_FIX_QUICKSTART_EN.md)** - Quick GPU fix guide
-- **[OPTIMIZATION_SUMMARY_EN.md](OPTIMIZATION_SUMMARY_EN.md)** - Performance optimization summary
 
-## Security & Troubleshooting
-- **[KEY_TROUBLESHOOTING.md](KEY_TROUBLESHOOTING.md)** - Key and encryption issues
-- **[PORT_SECURITY.md](PORT_SECURITY.md)** - Port configuration & security
-- **[QUICK_FIX_EN.md](QUICK_FIX_EN.md)** - Quick fixes for common issues
+- **[GPU Optimization](performance/GPU_OPTIMIZATION_EN.md)** — GPU optimization guide
+- **[GPU Quick Fix](performance/GPU_FIX_QUICKSTART_EN.md)** — Quick GPU fix
+- **[Optimization Summary](performance/OPTIMIZATION_SUMMARY_EN.md)** — Performance optimization overview
 
 ## Development
-- **[BUILD_GUIDE.md](BUILD_GUIDE.md)** - Building from source
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines
-- **[PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)** - Project structure overview
-- **[CHANGELOG.md](CHANGELOG.md)** - Version history
 
-## Additional
-- **[TRANSLATION_SUMMARY.md](TRANSLATION_SUMMARY.md)** - Documentation translation status
+- **[Contributing](development/CONTRIBUTING.md)** — Contribution guidelines
+- **[Translation Guide](development/CONTRIBUTING_TRANSLATIONS.md)** — Adding new languages
+- **[Translation Summary](development/TRANSLATION_SUMMARY.md)** — Translation coverage status
+- **[Changelog](development/CHANGELOG.md)** — Version history
 
-## Legacy HBBS Patch (Archived)
+## Enterprise
 
-The original Rust-based HBBS patch (`hbbs-patch-v2/`) has been replaced by the [Go server](../betterdesk-server/) and moved to `archive/`. See the main [README](../README.md) for current architecture.
+- **[Enterprise Roadmap](enterprise/ENTERPRISE_ROADMAP.md)** — Future enterprise features
+
+---
+
+> **Note:** The original Rust-based HBBS patch has been replaced by the [Go server](../betterdesk-server/) and moved to `archive/`. See the main [README](../README.md) for current architecture.

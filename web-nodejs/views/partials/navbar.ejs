@@ -14,8 +14,10 @@
                     <span class="separator">/</span>
                     <% if (index === breadcrumb.length - 1) { %>
                         <span class="current"><%= item.label %></span>
-                    <% } else { %>
+                    <% } else if (item.href) { %>
                         <a href="<%= item.href %>"><%= item.label %></a>
+                    <% } else { %>
+                        <span class="breadcrumb-section"><%= item.label %></span>
                     <% } %>
                 <% }); %>
             <% } %>
@@ -28,9 +30,10 @@
             <span class="material-icons">refresh</span>
         </button>
         
-        <!-- Desktop mode toggle (visible only on large screens) -->
-        <button class="navbar-btn desktop-toggle-btn" id="desktop-toggle-btn" title="<%= _('desktop.switch_mode') %>">
+        <!-- Desktop mode toggle (Beta) - visible only on large screens -->
+        <button class="navbar-btn desktop-toggle-btn" id="desktop-toggle-btn" title="<%= _('desktop.switch_mode') %> (Beta)">
             <span class="material-icons">desktop_windows</span>
+            <span class="beta-badge">BETA</span>
         </button>
         
         <!-- Language selector -->

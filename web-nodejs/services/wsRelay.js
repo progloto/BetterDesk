@@ -64,9 +64,16 @@ function initWsProxy(server) {
     const relayWss = new WebSocket.Server({ noServer: true });
 
     // Handle upgrade requests — verify session cookie before allowing WebSocket
+    // Only handles /ws/rendezvous and /ws/relay; other paths are left for
+    // downstream handlers (chatRelay, remoteRelay, cdapProxy, etc.)
     server.on('upgrade', (request, socket, head) => {
         const url = new URL(request.url, `http://${request.headers.host}`);
         const pathname = url.pathname;
+
+        // Only handle paths this proxy owns
+        if (pathname !== '/ws/rendezvous' && pathname !== '/ws/relay') {
+            return; // let other upgrade handlers deal with it
+        }
 
         // Parse session cookie to verify authentication
         const cookies = {};
@@ -88,12 +95,10 @@ function initWsProxy(server) {
             rendezvousWss.handleUpgrade(request, socket, head, (ws) => {
                 rendezvousWss.emit('connection', ws, request);
             });
-        } else if (pathname === '/ws/relay') {
+        } else {
             relayWss.handleUpgrade(request, socket, head, (ws) => {
                 relayWss.emit('connection', ws, request);
             });
-        } else {
-            socket.destroy();
         }
     });
 

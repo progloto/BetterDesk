@@ -1,7 +1,7 @@
 <%- include('layouts/main', {
     title: _('cdap.device_detail'),
     pageStyles: ['cdap'],
-    pageScripts: ['cdap-widgets', 'cdap-commands'],
+    pageScripts: ['cdap-widgets', 'cdap-commands', 'cdap-terminal', 'cdap-desktop', 'cdap-video', 'cdap-filebrowser', 'cdap-audio'],
     currentPage: 'devices',
     breadcrumb: [
         { label: _('nav.devices'), href: '/devices' },
@@ -43,6 +43,41 @@
             <div class="cdap-offline-banner hidden" id="cdap-offline-banner">
                 <span class="material-icons">cloud_off</span>
                 <span>${_('cdap.device_offline_msg')}</span>
+            </div>
+
+            <!-- Active Alerts Panel -->
+            <div class="cdap-alerts-panel hidden" id="cdap-alerts-panel">
+                <div class="cdap-alerts-header">
+                    <h3>
+                        <span class="material-icons">warning</span>
+                        ${_('cdap.active_alerts')}
+                        <span class="cdap-alerts-count" id="cdap-alerts-count">0</span>
+                    </h3>
+                </div>
+                <div class="cdap-alerts-list" id="cdap-alerts-list">
+                    <!-- Alert items rendered by cdap-widgets.js -->
+                </div>
+            </div>
+
+            <!-- Linked Devices Panel -->
+            <div class="cdap-linked-panel" id="cdap-linked-panel">
+                <div class="cdap-linked-header">
+                    <h3>
+                        <span class="material-icons">device_hub</span>
+                        ${_('cdap.linked_devices')}
+                        <span class="cdap-linked-count" id="cdap-linked-count">0</span>
+                    </h3>
+                    <button class="btn-sm btn-accent" id="cdap-link-btn" title="${_('cdap.link_device')}">
+                        <span class="material-icons">add_link</span>
+                        <span>${_('cdap.link_device')}</span>
+                    </button>
+                </div>
+                <div class="cdap-linked-list" id="cdap-linked-list">
+                    <div class="cdap-linked-empty" id="cdap-linked-empty">
+                        <span class="material-icons">link_off</span>
+                        <span>${_('cdap.no_linked_devices')}</span>
+                    </div>
+                </div>
             </div>
 
             <!-- Widget Grid -->

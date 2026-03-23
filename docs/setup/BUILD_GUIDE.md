@@ -283,7 +283,7 @@ curl http://localhost:21114/api/peers
 3. Submit PR with updated source files
 4. CI will automatically build and test
 
-See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for full guidelines.
+See [CONTRIBUTING.md](../development/CONTRIBUTING.md) for full guidelines.
 
 ---
 

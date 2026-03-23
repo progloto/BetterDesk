@@ -196,8 +196,8 @@ checkFPS();
 
 ## 📚 Documentation
 
-- 📖 Full documentation: [GPU_OPTIMIZATION.md](docs/GPU_OPTIMIZATION.md)
-- ⚡ Quick start: [GPU_FIX_QUICKSTART.md](docs/GPU_FIX_QUICKSTART.md)
+- 📖 Full documentation: [GPU_OPTIMIZATION_EN.md](GPU_OPTIMIZATION_EN.md)
+- ⚡ Quick start: [GPU_FIX_QUICKSTART_EN.md](GPU_FIX_QUICKSTART_EN.md)
 - ⚙️ Performance profiles: `web/static/performance-config.css`
 
 ## ✅ Implementation Checklist

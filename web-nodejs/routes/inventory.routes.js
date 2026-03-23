@@ -22,6 +22,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../services/database');
 const { getAdapter } = require('../services/dbAdapter');
+const betterdeskApi = require('../services/betterdeskApi');
 
 // ---------------------------------------------------------------------------
 //  Helpers (shared with bd-api.routes.js)
@@ -197,28 +198,55 @@ router.get('/', requireAdmin, async (req, res) => {
         const inventories = await adapter.getAllInventories();
         const devices = [];
 
-        for (const inv of inventories) {
-            const telemetry = await adapter.getTelemetry(inv.device_id);
-            devices.push({
-                device_id: inv.device_id,
-                hostname: inv.hardware?.hostname || inv.device_id,
-                os: `${inv.hardware?.os_name || ''} ${inv.hardware?.os_version || ''}`.trim(),
-                cpu: inv.hardware?.cpu?.brand || 'Unknown',
-                cpu_cores: inv.hardware?.cpu?.logical_cores || 0,
-                cpu_usage: telemetry?.cpu_usage_percent ?? inv.hardware?.cpu?.usage_percent ?? null,
-                memory_total_mb: inv.hardware?.memory?.total_bytes
-                    ? Math.round(inv.hardware.memory.total_bytes / 1048576)
-                    : 0,
-                memory_used_mb: telemetry?.memory_used_bytes
-                    ? Math.round(telemetry.memory_used_bytes / 1048576)
-                    : inv.hardware?.memory?.used_bytes
-                        ? Math.round(inv.hardware.memory.used_bytes / 1048576)
+        if (inventories.length > 0) {
+            for (const inv of inventories) {
+                const telemetry = await adapter.getTelemetry(inv.device_id);
+                devices.push({
+                    device_id: inv.device_id,
+                    hostname: inv.hardware?.hostname || inv.device_id,
+                    os: `${inv.hardware?.os_name || ''} ${inv.hardware?.os_version || ''}`.trim(),
+                    cpu: inv.hardware?.cpu?.brand || 'Unknown',
+                    cpu_cores: inv.hardware?.cpu?.logical_cores || 0,
+                    cpu_usage: telemetry?.cpu_usage_percent ?? inv.hardware?.cpu?.usage_percent ?? null,
+                    memory_total_mb: inv.hardware?.memory?.total_bytes
+                        ? Math.round(inv.hardware.memory.total_bytes / 1048576)
                         : 0,
-                disk_count: inv.hardware?.disks?.length || 0,
-                software_count: inv.software?.apps?.length || 0,
-                last_seen: telemetry?.received_at || inv.received_at,
-                collected_at: inv.collected_at,
-            });
+                    memory_used_mb: telemetry?.memory_used_bytes
+                        ? Math.round(telemetry.memory_used_bytes / 1048576)
+                        : inv.hardware?.memory?.used_bytes
+                            ? Math.round(inv.hardware.memory.used_bytes / 1048576)
+                            : 0,
+                    disk_count: inv.hardware?.disks?.length || 0,
+                    software_count: inv.software?.apps?.length || 0,
+                    last_seen: telemetry?.received_at || inv.received_at,
+                    collected_at: inv.collected_at,
+                });
+            }
+        } else {
+            // Fallback: populate from Go server peer list when no agent inventory exists
+            try {
+                const peers = await betterdeskApi.getAllPeers();
+                const peerList = Array.isArray(peers) ? peers : (peers?.data || []);
+                for (const p of peerList) {
+                    devices.push({
+                        device_id: p.id,
+                        hostname: p.hostname || p.id,
+                        os: p.platform || p.os || '',
+                        cpu: '',
+                        cpu_cores: 0,
+                        cpu_usage: null,
+                        memory_total_mb: 0,
+                        memory_used_mb: 0,
+                        disk_count: 0,
+                        software_count: 0,
+                        last_seen: p.last_online || null,
+                        collected_at: null,
+                        source: 'peer_list',
+                    });
+                }
+            } catch (fallbackErr) {
+                console.warn('[Inventory] Peer list fallback failed:', fallbackErr.message);
+            }
         }
 
         res.json({ devices, total: devices.length });

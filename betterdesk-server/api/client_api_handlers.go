@@ -440,6 +440,13 @@ func (s *Server) handleClientAddressBookTags(w http.ResponseWriter, r *http.Requ
 //
 //	{ "modified_at": "2026-..." }                   (normal ACK)
 func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
+	// BD-2026-001: Rate-limit heartbeat requests per IP
+	clientIP := s.remoteIP(r)
+	if !s.heartbeatLimiter.Allow(clientIP) {
+		writeJSON(w, http.StatusOK, map[string]string{"modified_at": time.Now().UTC().Format(time.RFC3339)})
+		return
+	}
+
 	var body struct {
 		ID     string  `json:"id"`
 		UUID   string  `json:"uuid"`
@@ -474,7 +481,6 @@ func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update peer status to ONLINE
-	clientIP := s.remoteIP(r)
 	_ = s.db.UpdatePeerStatus(deviceID, "ONLINE", clientIP)
 
 	// Save metrics if any values provided (values > 0)
@@ -503,6 +509,13 @@ func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 //
 //	"ID_NOT_FOUND" (client retries), or "ERROR".
 func (s *Server) handleClientSysinfo(w http.ResponseWriter, r *http.Request) {
+	// BD-2026-001: Rate-limit sysinfo requests per IP
+	if !s.heartbeatLimiter.Allow(s.remoteIP(r)) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("ID_NOT_FOUND")) //nolint:errcheck
+		return
+	}
+
 	var body struct {
 		ID       string `json:"id"`
 		UUID     string `json:"uuid"`
@@ -573,6 +586,13 @@ func (s *Server) handleClientSysinfo(w http.ResponseWriter, r *http.Request) {
 // POST /api/sysinfo_ver
 // Returns a hash of existing sysinfo; empty response triggers full upload.
 func (s *Server) handleClientSysinfoVer(w http.ResponseWriter, r *http.Request) {
+	// BD-2026-001: Rate-limit sysinfo_ver requests per IP
+	if !s.heartbeatLimiter.Allow(s.remoteIP(r)) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("")) //nolint:errcheck
+		return
+	}
+
 	var body struct {
 		ID   string `json:"id"`
 		UUID string `json:"uuid"`

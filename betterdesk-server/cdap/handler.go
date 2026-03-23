@@ -60,16 +60,17 @@ func (g *Gateway) handleRegister(ctx context.Context, dc *DeviceConn) error {
 	// Upsert the peer in the database
 	tags := strings.Join(rp.Manifest.Device.Tags, ",")
 	peer := &db.Peer{
-		ID:         dc.ID,
-		Hostname:   rp.Manifest.Device.Name,
-		Status:     "ONLINE",
-		IP:         dc.ClientIP,
-		DeviceType: rp.Manifest.Device.Type,
-		Tags:       tags,
-		User:       dc.Username,
-		LastOnline: time.Now(),
-		OS:         rp.Manifest.Bridge.Protocol,
-		Version:    rp.Manifest.Bridge.Version,
+		ID:           dc.ID,
+		Hostname:     rp.Manifest.Device.Name,
+		Status:       "ONLINE",
+		IP:           dc.ClientIP,
+		DeviceType:   rp.Manifest.Device.Type,
+		LinkedPeerID: rp.Manifest.Device.LinkedPeerID,
+		Tags:         tags,
+		User:         dc.Username,
+		LastOnline:   time.Now(),
+		OS:           rp.Manifest.Bridge.Protocol,
+		Version:      rp.Manifest.Bridge.Version,
 	}
 	if err := g.db.UpsertPeer(peer); err != nil {
 		return fmt.Errorf("save peer: %w", err)
@@ -154,6 +155,11 @@ func (g *Gateway) handleHeartbeat(ctx context.Context, dc *DeviceConn, msg *Mess
 			dc.widgetState.Store(widgetID, value)
 		}
 
+		// Evaluate alert conditions
+		if g.alertEngine != nil && dc.Manifest != nil {
+			g.alertEngine.Evaluate(dc.ID, dc.Manifest, collectWidgetState(dc))
+		}
+
 		// Publish widget state update event
 		if g.eventBus != nil {
 			valuesJSON, _ := json.Marshal(payload.WidgetValues)
@@ -192,6 +198,11 @@ func (g *Gateway) handleStateUpdate(ctx context.Context, dc *DeviceConn, msg *Me
 	// Update cached state
 	dc.widgetState.Store(payload.WidgetID, payload.Value)
 
+	// Evaluate alert conditions
+	if g.alertEngine != nil && dc.Manifest != nil {
+		g.alertEngine.Evaluate(dc.ID, dc.Manifest, collectWidgetState(dc))
+	}
+
 	// Publish to event bus for real-time panel updates
 	if g.eventBus != nil {
 		valueJSON, _ := json.Marshal(payload.Value)
@@ -222,6 +233,11 @@ func (g *Gateway) handleBulkUpdate(ctx context.Context, dc *DeviceConn, msg *Mes
 		}
 	}
 
+	// Evaluate alert conditions after all updates are applied
+	if g.alertEngine != nil && dc.Manifest != nil && len(updates) > 0 {
+		g.alertEngine.Evaluate(dc.ID, dc.Manifest, collectWidgetState(dc))
+	}
+
 	if g.eventBus != nil && len(updates) > 0 {
 		valuesJSON, _ := json.Marshal(updates)
 		g.eventBus.Publish(events.Event{
@@ -240,6 +256,19 @@ func (g *Gateway) handleCommandResponse(ctx context.Context, dc *DeviceConn, msg
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		sendError(ctx, dc.conn, 3005, "invalid command_response payload")
 		return
+	}
+
+	// Resolve pending command tracking
+	if pc, ok := g.ResolvePendingCommand(payload.CommandID); ok {
+		latency := time.Since(pc.SentAt)
+		if pc.ResultCh != nil {
+			select {
+			case pc.ResultCh <- &payload:
+			default:
+			}
+		}
+		log.Printf("[cdap] %s: command %s → %s (latency: %s)",
+			dc.ID, payload.CommandID, payload.Status, latency.Round(time.Millisecond))
 	}
 
 	// Publish to event bus so the panel can display the result
@@ -353,4 +382,137 @@ func (g *Gateway) handleTokenRefresh(ctx context.Context, dc *DeviceConn, msg *M
 		"token":      newToken,
 		"expires_at": dc.TokenExpiry.UTC().Format(time.RFC3339),
 	})
+}
+
+// collectWidgetState builds a flat map of all cached widget values for a device.
+func collectWidgetState(dc *DeviceConn) map[string]any {
+	state := make(map[string]any)
+	dc.widgetState.Range(func(key, value any) bool {
+		state[key.(string)] = value
+		return true
+	})
+	return state
+}
+
+// handleTerminalOutput forwards terminal output from device to the browser.
+func (g *Gateway) handleTerminalOutput(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload TerminalOutputPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	if payload.Stream == "" {
+		payload.Stream = "stdout"
+	}
+	g.HandleTerminalOutput(ctx, payload.SessionID, payload.Data, payload.Stream)
+}
+
+// handleTerminalEnd processes device-initiated terminal session end.
+func (g *Gateway) handleTerminalEnd(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload TerminalEndPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.EndTerminalSession(ctx, payload.SessionID, payload.Reason)
+}
+
+// handleDesktopFrame forwards a desktop frame from device to the browser.
+func (g *Gateway) handleDesktopFrame(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload DesktopFramePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.HandleDesktopFrame(ctx, payload.SessionID, &payload)
+}
+
+// handleDesktopEnd processes device-initiated desktop session end.
+func (g *Gateway) handleDesktopEnd(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload DesktopEndPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.EndDesktopSession(ctx, payload.SessionID, payload.Reason)
+}
+
+// handleVideoFrame forwards a video frame from device to the browser.
+func (g *Gateway) handleVideoFrame(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload VideoFramePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.HandleVideoFrame(ctx, payload.SessionID, &payload)
+}
+
+// handleVideoEnd processes device-initiated video session end.
+func (g *Gateway) handleVideoEnd(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload VideoEndPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.EndVideoSession(ctx, payload.SessionID, payload.Reason)
+}
+
+// handleFileResponse forwards a file browser response from device to browser.
+func (g *Gateway) handleFileResponse(ctx context.Context, dc *DeviceConn, msg *Message) {
+	// Extract session_id from the payload
+	var base struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(msg.Payload, &base); err != nil || base.SessionID == "" {
+		return
+	}
+	g.HandleFileResponse(ctx, base.SessionID, msg.Type, msg.Payload)
+}
+
+// handleFileEnd processes device-initiated file session end.
+func (g *Gateway) handleFileEnd(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload FileEndPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.EndFileSession(ctx, payload.SessionID, payload.Reason)
+}
+
+// handleAudioFrame forwards an audio frame from device to the browser.
+func (g *Gateway) handleAudioFrame(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload AudioFramePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.HandleAudioFrame(ctx, payload.SessionID, &payload)
+}
+
+// handleAudioEnd processes device-initiated audio session end.
+func (g *Gateway) handleAudioEnd(ctx context.Context, dc *DeviceConn, msg *Message) {
+	var payload AudioEndPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	if payload.SessionID == "" {
+		return
+	}
+	g.EndAudioSession(ctx, payload.SessionID, payload.Reason)
 }

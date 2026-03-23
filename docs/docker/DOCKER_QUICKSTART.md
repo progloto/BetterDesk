@@ -70,7 +70,7 @@ volumes:
 
 ### SSL/TLS
 
-See [HTTPS_SETUP.md](docs/HTTPS_SETUP.md) for full instructions.
+See [HTTPS_SETUP.md](../setup/HTTPS_SETUP.md) for full instructions.
 
 Quick self-signed cert:
 ```bash
@@ -161,7 +161,7 @@ docker compose up -d
 
 ### Need more help?
 
-See [DOCKER_TROUBLESHOOTING.md](docs/DOCKER_TROUBLESHOOTING.md) for advanced issues.
+See [DOCKER_TROUBLESHOOTING.md](../docker/DOCKER_TROUBLESHOOTING.md) for advanced issues.
 
 ---
 

@@ -122,6 +122,7 @@ type Database interface {
 	HardDeletePeer(id string) error // permanent delete
 	ListPeers(includeDeleted bool) ([]*Peer, error)
 	GetPeerCount() (total int, online int, err error)
+	GetBannedPeerCount() (int, error)
 
 	// Status tracking
 	UpdatePeerStatus(id string, status string, ip string) error
@@ -152,6 +153,7 @@ type Database interface {
 	GetConfig(key string) (string, error)
 	SetConfig(key, value string) error
 	DeleteConfig(key string) error
+	ListConfigByPrefix(prefix string) ([]ServerConfig, error)
 
 	// Users
 	CreateUser(u *User) error

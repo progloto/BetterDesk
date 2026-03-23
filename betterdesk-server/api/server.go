@@ -54,8 +54,9 @@ type Server struct {
 	metrics           *metrics.Collector
 	jwtManager        *auth.JWTManager
 	loginLimiter      *ratelimit.IPLimiter
-	keyPair           *crypto.KeyPair // Ed25519 keypair for signing
-	cdapGw            *cdap.Gateway   // CDAP gateway (nil if CDAP disabled)
+	heartbeatLimiter  *ratelimit.IPLimiter // BD-2026-001: rate-limit heartbeat/sysinfo
+	keyPair           *crypto.KeyPair      // Ed25519 keypair for signing
+	cdapGw            *cdap.Gateway        // CDAP gateway (nil if CDAP disabled)
 	clientTFASessions *tfaSessionStore
 	httpSrv           *http.Server
 	wg                sync.WaitGroup
@@ -71,6 +72,7 @@ func New(cfg *config.Config, database db.Database, peerMap *peer.Map, relaySrv *
 		relay:             relaySrv,
 		version:           version,
 		loginLimiter:      ratelimit.NewIPLimiter(5, 5*time.Minute, 10*time.Minute),
+		heartbeatLimiter:  ratelimit.NewIPLimiter(20, 60*time.Second, 5*time.Minute), // BD-2026-001: 20 req/min per IP
 		clientTFASessions: newTFASessionStore(),
 	}
 }
@@ -138,6 +140,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/peers/online", s.handleOnlinePeers)
 	mux.HandleFunc("GET /api/peers/{id}/status", s.handlePeerStatus)
 	mux.HandleFunc("GET /api/peers/{id}/metrics", s.handlePeerMetrics)
+	mux.HandleFunc("GET /api/peers/{id}/linked", s.handleLinkedPeers)
 
 	// Blocklist management
 	mux.HandleFunc("GET /api/blocklist", s.handleListBlocklist)
@@ -208,6 +211,19 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/enrollment/mode", s.requireRole(auth.RoleAdmin, s.handleGetEnrollmentMode))
 	mux.HandleFunc("PUT /api/enrollment/mode", s.requireRole(auth.RoleAdmin, s.handleSetEnrollmentMode))
 
+	// Enrollment — device self-registration (public, no auth)
+	mux.HandleFunc("POST /api/devices/register", s.handleDeviceRegister)
+	mux.HandleFunc("GET /api/devices/register/status", s.handleDeviceRegisterStatus)
+
+	// Enrollment — operator approval (admin/operator)
+	mux.HandleFunc("GET /api/enrollment/pending", s.requireRole(auth.RoleOperator, s.handleListPendingDevices))
+	mux.HandleFunc("POST /api/enrollment/approve/{id}", s.requireRole(auth.RoleOperator, s.handleApproveDevice))
+	mux.HandleFunc("POST /api/enrollment/reject/{id}", s.requireRole(auth.RoleOperator, s.handleRejectDevice))
+
+	// Branding (GET is public for desktop clients, POST is admin)
+	mux.HandleFunc("GET /api/branding", s.handleGetBranding)
+	mux.HandleFunc("POST /api/branding", s.requireRole(auth.RoleAdmin, s.handleSaveBranding))
+
 	// CDAP device management (requires CDAP gateway to be enabled)
 	mux.HandleFunc("GET /api/cdap/status", s.handleCDAPStatus)
 	mux.HandleFunc("GET /api/cdap/devices", s.handleCDAPListDevices)
@@ -215,6 +231,27 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/cdap/devices/{id}/manifest", s.handleCDAPDeviceManifest)
 	mux.HandleFunc("GET /api/cdap/devices/{id}/state", s.handleCDAPDeviceState)
 	mux.HandleFunc("POST /api/cdap/devices/{id}/command", s.requireRole(auth.RoleOperator, s.handleCDAPSendCommand))
+	mux.HandleFunc("GET /api/cdap/alerts", s.handleCDAPAlerts)
+
+	// CDAP auth delegation (admin only)
+	mux.HandleFunc("POST /api/cdap/delegate", s.requireRole(auth.RoleAdmin, s.handleCDAPDelegateCreate))
+	mux.HandleFunc("DELETE /api/cdap/delegate/{id}", s.requireRole(auth.RoleAdmin, s.handleCDAPDelegateRevoke))
+	mux.HandleFunc("GET /api/cdap/delegations", s.requireRole(auth.RoleAdmin, s.handleCDAPDelegateList))
+
+	// CDAP terminal WebSocket (admin only, upgraded inside handler)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/terminal", s.requireRole(auth.RoleAdmin, s.handleCDAPTerminal))
+
+	// CDAP remote desktop WebSocket (admin only)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/desktop", s.requireRole(auth.RoleAdmin, s.handleCDAPDesktop))
+
+	// CDAP video stream WebSocket (operator+)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/video", s.requireRole(auth.RoleOperator, s.handleCDAPVideo))
+
+	// CDAP file browser WebSocket (admin only)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/files", s.requireRole(auth.RoleAdmin, s.handleCDAPFileBrowser))
+
+	// CDAP audio stream WebSocket (operator+)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/audio", s.requireRole(auth.RoleOperator, s.handleCDAPAudio))
 
 	// Prometheus metrics (public, no API key required)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -323,13 +360,18 @@ func (s *Server) handleServerStats(w http.ResponseWriter, r *http.Request) {
 		"uptime":          time.Since(startTime).String(),
 		"uptime_seconds":  int(time.Since(startTime).Seconds()),
 		// Enhanced status stats from peer map
-		"peers_online_live":   peerStats.Online,
-		"peers_degraded":      peerStats.Degraded,
-		"peers_critical":      peerStats.Critical,
-		"peers_udp":           peerStats.UDP,
-		"peers_tcp":           peerStats.TCP,
-		"peers_ws":            peerStats.WS,
-		"peers_banned":        peerStats.Banned,
+		"peers_online_live": peerStats.Online,
+		"peers_degraded":    peerStats.Degraded,
+		"peers_critical":    peerStats.Critical,
+		"peers_udp":         peerStats.UDP,
+		"peers_tcp":         peerStats.TCP,
+		"peers_ws":          peerStats.WS,
+		"peers_banned": func() int {
+			if n, err := s.db.GetBannedPeerCount(); err == nil {
+				return n
+			}
+			return peerStats.Banned
+		}(),
 		"peers_disabled":      peerStats.Disabled,
 		"avg_uptime_secs":     peerStats.AvgUptimeSecs,
 		"avg_beat_age_secs":   peerStats.AvgBeatAge,
@@ -443,6 +485,23 @@ func (s *Server) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLinkedPeers returns all peers linked to the given peer ID.
+// GET /api/peers/{id}/linked
+func (s *Server) handleLinkedPeers(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	linked, err := s.db.GetLinkedPeers(id)
+	if err != nil {
+		writeInternalError(w, err, "GetLinkedPeers")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id": id,
+		"linked":  linked,
+		"total":   len(linked),
+	})
+}
+
 // handleUpdatePeerFields partially updates a peer's editable fields (note, user, tags).
 // PATCH /api/peers/{id}
 func (s *Server) handleUpdatePeerFields(w http.ResponseWriter, r *http.Request) {
@@ -521,6 +580,14 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 		s.blocklist.BlockID(id, "revoked via panel")
 	}
 
+	// CDAP revocation: send revoke message and disconnect CDAP device.
+	if revoke && s.cdapGw != nil {
+		if err := s.cdapGw.SendRevoke(r.Context(), id, "revoked via panel"); err != nil {
+			// Not an error — device may not be CDAP-connected
+			_ = err
+		}
+	}
+
 	// Cascade: revoke linked devices (e.g., paired mobile→desktop).
 	var cascadedIDs []string
 	if cascade && len(linkedIDs) > 0 {
@@ -533,6 +600,9 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 			s.peers.Remove(lid)
 			if revoke && s.blocklist != nil {
 				s.blocklist.BlockID(lid, "revoked via cascade")
+			}
+			if revoke && s.cdapGw != nil {
+				s.cdapGw.SendRevoke(r.Context(), lid, "revoked via cascade")
 			}
 			cascadedIDs = append(cascadedIDs, lid)
 		}

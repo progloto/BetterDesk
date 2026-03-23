@@ -163,9 +163,18 @@
         const badge = document.getElementById('reg-sidebar-badge');
         if (!badge) return;
 
+        let badgeInterval = null;
+
         async function updateBadge() {
             try {
                 const resp = await fetch('/api/registrations/count');
+                if (!resp.ok) {
+                    if (resp.status === 401 && badgeInterval) {
+                        clearInterval(badgeInterval);
+                        badgeInterval = null;
+                    }
+                    return;
+                }
                 const data = await resp.json();
                 const count = data.count || 0;
                 badge.textContent = count;
@@ -174,7 +183,7 @@
         }
 
         updateBadge();
-        setInterval(updateBadge, 30000); // every 30s
+        badgeInterval = setInterval(updateBadge, 30000); // every 30s
     }
     
     /**

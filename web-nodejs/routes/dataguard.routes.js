@@ -105,7 +105,7 @@ router.get('/policies/:id', requireSession, async (req, res) => {
  */
 router.post('/policies', requireAdmin, async (req, res) => {
     try {
-        const { name, description, enabled, rules } = req.body;
+        const { name, description, policy_type, action, scope, enabled, rules } = req.body;
         if (!name || typeof name !== 'string' || !name.trim()) {
             return res.status(400).json({ error: 'Policy name is required' });
         }
@@ -114,7 +114,7 @@ router.post('/policies', requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'rules must be an array' });
         }
         const db = getAdapter();
-        const policy = await db.createDlpPolicy({ name: name.trim(), description, enabled, rules });
+        const policy = await db.createDlpPolicy({ name: name.trim(), description, policy_type, action, scope, enabled, rules });
         if (policy) {
             policy.rules = typeof policy.rules === 'string' ? JSON.parse(policy.rules) : (policy.rules || []);
         }
@@ -135,11 +135,11 @@ router.patch('/policies/:id', requireAdmin, async (req, res) => {
         const existing = await db.getDlpPolicyById(id);
         if (!existing) return res.status(404).json({ error: 'Policy not found' });
 
-        const { name, description, enabled, rules } = req.body;
+        const { name, description, policy_type, action, scope, enabled, rules } = req.body;
         if (rules !== undefined && !Array.isArray(rules)) {
             return res.status(400).json({ error: 'rules must be an array' });
         }
-        const updated = await db.updateDlpPolicy(id, { name, description, enabled, rules });
+        const updated = await db.updateDlpPolicy(id, { name, description, policy_type, action, scope, enabled, rules });
         if (updated) {
             updated.rules = typeof updated.rules === 'string' ? JSON.parse(updated.rules) : (updated.rules || []);
         }

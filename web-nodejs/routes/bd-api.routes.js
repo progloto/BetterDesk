@@ -29,6 +29,15 @@ const router = express.Router();
 const crypto = require('crypto');
 const db = require('../services/database');
 const bdRelay = require('../services/bdRelay');
+const brandingService = require('../services/brandingService');
+const authService = require('../services/authService');
+
+// ---------------------------------------------------------------------------
+//  In-memory help-request store (survives restarts via audit log for history)
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, Object>} */
+const helpRequests = new Map();
 
 // ---------------------------------------------------------------------------
 //  Helpers
@@ -314,6 +323,272 @@ router.get('/peer/:id', identifyDevice, async (req, res) => {
     } catch (err) {
         console.error('[BD-API] Peer error:', err.message);
         res.status(500).json({ error: 'Failed to get peer info' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+//  GET /api/bd/branding — Public branding for desktop client (no auth)
+// ---------------------------------------------------------------------------
+
+router.get('/branding', (req, res) => {
+    try {
+        const branding = brandingService.getBranding();
+        res.json({
+            company_name: branding.appName || 'BetterDesk',
+            accent_color: branding.colors?.accentBlue || '#3b82f6',
+            support_contact: branding.supportContact || '',
+        });
+    } catch (err) {
+        console.error('[BD-API] Branding error:', err.message);
+        // Return defaults on error — never block the client
+        res.json({
+            company_name: 'BetterDesk',
+            accent_color: '#3b82f6',
+            support_contact: '',
+        });
+    }
+});
+
+// ---------------------------------------------------------------------------
+//  POST /api/bd/help-request — Desktop client requests operator assistance
+// ---------------------------------------------------------------------------
+
+router.post('/help-request', identifyDevice, async (req, res) => {
+    try {
+        const { device_id, hostname, message } = req.body;
+
+        if (!device_id || typeof device_id !== 'string') {
+            return res.status(400).json({ error: 'Missing device_id' });
+        }
+
+        const helpRequest = {
+            id: crypto.randomUUID(),
+            device_id: String(device_id).substring(0, 32),
+            hostname: String(hostname || '').substring(0, 128),
+            message: String(message || '').substring(0, 500),
+            status: 'pending',
+            created_at: Date.now(),
+        };
+
+        // Emit to all connected operator WebSocket clients
+        const io = req.app.get('io');
+        if (io) {
+            io.emit('help-request', helpRequest);
+        }
+
+        // Store in memory for dashboard polling
+        helpRequests.set(helpRequest.id, helpRequest);
+
+        // Auto-prune: keep max 200 entries
+        if (helpRequests.size > 200) {
+            const oldest = [...helpRequests.keys()].slice(0, helpRequests.size - 200);
+            for (const key of oldest) helpRequests.delete(key);
+        }
+
+        // Log the help request
+        await db.logAction(null, 'help_request', `Help requested by ${helpRequest.device_id}: ${helpRequest.message}`, getClientIp(req));
+
+        console.log(`[BD-API] Help request from ${helpRequest.device_id} (${helpRequest.hostname}): ${helpRequest.message}`);
+
+        res.json({ success: true, request_id: helpRequest.id });
+    } catch (err) {
+        console.error('[BD-API] Help request error:', err.message);
+        res.status(500).json({ error: 'Failed to process help request' });
+    }
+});
+
+// ===========================================================================
+//  Operator Authentication (desktop client operator mode)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+//  POST /api/bd/operator/login — Authenticate operator from desktop client
+// ---------------------------------------------------------------------------
+
+router.post('/operator/login', async (req, res) => {
+    try {
+        const ip = getClientIp(req);
+        const { username, password, device_id } = req.body;
+
+        if (!username || typeof username !== 'string' || !password || typeof password !== 'string') {
+            return res.status(400).json({ error: 'Username and password are required' });
+        }
+
+        // Brute-force protection
+        const blocked = await authService.checkBruteForce(username, ip);
+        if (blocked) {
+            return res.status(429).json({ error: 'Too many failed attempts. Try again later.' });
+        }
+
+        // Authenticate
+        const user = await authService.authenticate(username, password);
+        if (!user) {
+            authService.recordAttempt(username, ip, false);
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // Only admin and operator roles can use operator mode
+        if (user.role !== 'admin' && user.role !== 'operator') {
+            authService.recordAttempt(username, ip, false);
+            return res.status(403).json({ error: 'Insufficient permissions. Admin or operator role required.' });
+        }
+
+        // Issue access token
+        authService.recordAttempt(username, ip, true);
+        const token = await authService.generateAccessToken(
+            user.id,
+            String(device_id || '').substring(0, 32),
+            '',
+            ip
+        );
+        await db.updateLastLogin(user.id);
+
+        await db.logAction(user.id, 'operator_login', `Operator login from desktop client (${device_id || 'unknown'})`, ip);
+
+        res.json({
+            access_token: token,
+            user: {
+                name: user.username || user.name || username,
+                role: user.role,
+            },
+        });
+    } catch (err) {
+        console.error('[BD-API] Operator login error:', err.message);
+        res.status(500).json({ error: 'Authentication failed' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+//  GET /api/bd/operator/devices — List all devices (requires operator auth)
+// ---------------------------------------------------------------------------
+
+router.get('/operator/devices', requireDeviceAuth, async (req, res) => {
+    try {
+        // Only admin/operator can list devices
+        if (req.deviceUser && req.deviceUser.role !== 'admin' && req.deviceUser.role !== 'operator') {
+            return res.status(403).json({ error: 'Insufficient permissions' });
+        }
+
+        const peers = await db.getAllPeers({});
+        const devices = peers.map((p) => {
+            let hostname = '';
+            let platform = '';
+            try {
+                const info = typeof p.info === 'string' ? JSON.parse(p.info) : (p.info || {});
+                hostname = info.hostname || p.note || '';
+                platform = info.os || info.platform || '';
+            } catch (_) {
+                hostname = p.note || '';
+            }
+            return {
+                id: p.id,
+                hostname: hostname,
+                platform: platform,
+                online: !!(p.status_online || p.online),
+                last_online: p.last_online || '',
+            };
+        });
+
+        res.json({ success: true, devices });
+    } catch (err) {
+        console.error('[BD-API] Operator devices error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch devices' });
+    }
+});
+
+// ===========================================================================
+//  Help Request Management (web panel operators)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+//  GET /api/bd/help-requests — List all help requests (requires auth)
+// ---------------------------------------------------------------------------
+
+router.get('/help-requests', requireDeviceAuth, async (req, res) => {
+    try {
+        const items = [...helpRequests.values()]
+            .sort((a, b) => b.created_at - a.created_at);
+
+        res.json({ success: true, requests: items });
+    } catch (err) {
+        console.error('[BD-API] List help requests error:', err.message);
+        res.status(500).json({ error: 'Failed to list help requests' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+//  POST /api/bd/help-requests/:id/accept — Accept a help request
+// ---------------------------------------------------------------------------
+
+router.post('/help-requests/:id/accept', requireDeviceAuth, async (req, res) => {
+    try {
+        const entry = helpRequests.get(req.params.id);
+        if (!entry) {
+            return res.status(404).json({ error: 'Help request not found' });
+        }
+
+        entry.status = 'accepted';
+        entry.accepted_by = req.deviceUser?.username || 'operator';
+        entry.accepted_at = Date.now();
+
+        await db.logAction(
+            req.deviceUser?.id || null,
+            'help_request_accept',
+            `Accepted help request ${entry.id} from ${entry.device_id}`,
+            getClientIp(req)
+        );
+
+        res.json({ success: true, request: entry });
+    } catch (err) {
+        console.error('[BD-API] Accept help request error:', err.message);
+        res.status(500).json({ error: 'Failed to accept help request' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+//  POST /api/bd/help-requests/:id/resolve — Resolve a help request
+// ---------------------------------------------------------------------------
+
+router.post('/help-requests/:id/resolve', requireDeviceAuth, async (req, res) => {
+    try {
+        const entry = helpRequests.get(req.params.id);
+        if (!entry) {
+            return res.status(404).json({ error: 'Help request not found' });
+        }
+
+        entry.status = 'resolved';
+        entry.resolved_by = req.deviceUser?.username || 'operator';
+        entry.resolved_at = Date.now();
+
+        await db.logAction(
+            req.deviceUser?.id || null,
+            'help_request_resolve',
+            `Resolved help request ${entry.id} from ${entry.device_id}`,
+            getClientIp(req)
+        );
+
+        res.json({ success: true, request: entry });
+    } catch (err) {
+        console.error('[BD-API] Resolve help request error:', err.message);
+        res.status(500).json({ error: 'Failed to resolve help request' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+//  DELETE /api/bd/help-requests/:id — Delete a help request
+// ---------------------------------------------------------------------------
+
+router.delete('/help-requests/:id', requireDeviceAuth, async (req, res) => {
+    try {
+        if (!helpRequests.has(req.params.id)) {
+            return res.status(404).json({ error: 'Help request not found' });
+        }
+
+        helpRequests.delete(req.params.id);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[BD-API] Delete help request error:', err.message);
+        res.status(500).json({ error: 'Failed to delete help request' });
     }
 });
 

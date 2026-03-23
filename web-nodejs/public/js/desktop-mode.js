@@ -1,7 +1,10 @@
 /**
- * BetterDesk Console - Desktop Mode
+ * BetterDesk Console - Desktop Mode (BETA)
  * Windows-like desktop environment with floating windows, taskbar, and app icons.
  * Available on viewports >= 1200px.
+ * 
+ * Status: BETA - Experimental feature, under active development.
+ * Known limitations: iframe-based routing, mobile not supported, performance with many windows.
  */
 
 (function() {
@@ -16,6 +19,7 @@
     const STORAGE_KEY = 'betterdesk_desktop_mode';
     const STORAGE_WINS_KEY = 'betterdesk_desktop_wins';
     const CASCADE_OFFSET = 32;
+    const STORAGE_FOLDABLE_AUTO = 'betterdesk_foldable_auto'; // Auto-switch on unfold
 
     // ============ State ============
 
@@ -26,6 +30,14 @@
     let cascadeIndex = 0;
     let dragState = null;
     let resizeState = null;
+
+    // Widget mode: 'windows' or 'widgets'
+    let currentMode = 'widgets'; // Default to widgets mode
+    const STORAGE_MODE = 'betterdesk_desktop_view_mode';
+
+    // Foldable phone detection
+    let isFoldableDevice = false;
+    let devicePosture = 'unknown'; // 'continuous', 'folded', 'folded-over'
 
     // ============ Apps Definition ============
 
@@ -55,13 +67,133 @@
 
     function init() {
         if (window.BetterDesk && window.BetterDesk.embed) return;
-        if (window.innerWidth < BREAKPOINT) return;
+        
+        // Initialize foldable device detection
+        initFoldableDetection();
+        
+        if (window.innerWidth < BREAKPOINT && !isFoldableDevice) return;
 
         setupGlobalListeners();
 
         if (localStorage.getItem(STORAGE_KEY) === 'true' && window.innerWidth >= BREAKPOINT) {
             activate(true);
         }
+    }
+
+    // ============ Foldable Phone Detection ============
+
+    function initFoldableDetection() {
+        // Method 1: Device Posture API (Chrome 125+)
+        if ('devicePosture' in navigator) {
+            isFoldableDevice = true;
+            devicePosture = navigator.devicePosture.type || 'unknown';
+            
+            navigator.devicePosture.addEventListener('change', function() {
+                devicePosture = navigator.devicePosture.type;
+                handlePostureChange(devicePosture);
+            });
+        }
+        
+        // Method 2: Screen Fold API (experimental)
+        if ('getScreenFold' in window) {
+            isFoldableDevice = true;
+            window.getScreenFold().then(function(fold) {
+                if (fold) {
+                    fold.addEventListener('change', function() {
+                        handleFoldChange(fold.angle, fold.posture);
+                    });
+                }
+            }).catch(function() {});
+        }
+        
+        // Method 3: CSS screen-spanning media query detection
+        if (window.matchMedia) {
+            var foldQuery = window.matchMedia('(screen-spanning: single-fold-vertical)');
+            if (foldQuery.matches || foldQuery.media !== 'not all') {
+                // Device supports screen-spanning query = likely foldable
+                isFoldableDevice = checkFoldableByMediaQuery();
+            }
+            foldQuery.addEventListener('change', function(e) {
+                if (e.matches) {
+                    isFoldableDevice = true;
+                    handlePostureChange('continuous');
+                }
+            });
+        }
+        
+        // Method 4: Viewport size heuristic for known foldable aspect ratios
+        // Samsung Galaxy Z Fold: ~880px unfolded inner width
+        // Vivo X Fold: ~1080px unfolded inner width
+        if (!isFoldableDevice) {
+            isFoldableDevice = detectFoldableByAspectRatio();
+        }
+        
+        // Log foldable detection status
+        if (isFoldableDevice) {
+            console.log('BetterDesk: Foldable device detected, posture:', devicePosture);
+        }
+    }
+    
+    function checkFoldableByMediaQuery() {
+        return window.matchMedia('(horizontal-viewport-segments: 2)').matches ||
+               window.matchMedia('(vertical-viewport-segments: 2)').matches ||
+               window.matchMedia('(screen-spanning: single-fold-horizontal)').matches ||
+               window.matchMedia('(screen-spanning: single-fold-vertical)').matches;
+    }
+    
+    function detectFoldableByAspectRatio() {
+        var w = window.innerWidth;
+        var h = window.innerHeight;
+        var ratio = w / h;
+        
+        // Foldable phones when unfolded typically have wider aspect ratios
+        // Samsung Z Fold unfolded: ~1.0-1.2 (almost square)
+        // Most regular phones: 0.4-0.6 (portrait) or 1.6-2.0 (landscape)
+        
+        // Consider device foldable if:
+        // - Has touch support (mobile device)
+        // - Inner width >= 700px (large for a phone)
+        // - Aspect ratio between 0.8 and 1.4 (nearly square)
+        var hasTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+        var isLargeForPhone = w >= 700 && w <= 1400;
+        var nearlySquare = ratio >= 0.8 && ratio <= 1.4;
+        
+        return hasTouch && isLargeForPhone && nearlySquare;
+    }
+    
+    function handlePostureChange(posture) {
+        devicePosture = posture;
+        var autoSwitchEnabled = localStorage.getItem(STORAGE_FOLDABLE_AUTO) !== 'false';
+        
+        if (posture === 'continuous') {
+            // Device is unfolded / flat
+            if (autoSwitchEnabled && window.innerWidth >= BREAKPOINT) {
+                activate(true);
+            }
+        } else if (posture === 'folded' || posture === 'folded-over') {
+            // Device is folded
+            if (autoSwitchEnabled && active) {
+                deactivate(true);
+            }
+        }
+    }
+    
+    function handleFoldChange(angle, posture) {
+        // angle > 160° = nearly flat (unfolded)
+        // angle < 90° = folded
+        if (angle > 160) {
+            handlePostureChange('continuous');
+        } else if (angle < 90) {
+            handlePostureChange('folded');
+        }
+    }
+    
+    function setFoldableAutoSwitch(enabled) {
+        localStorage.setItem(STORAGE_FOLDABLE_AUTO, enabled ? 'true' : 'false');
+    }
+    
+    function isFoldableAutoSwitchEnabled() {
+        return localStorage.getItem(STORAGE_FOLDABLE_AUTO) !== 'false';
     }
 
     function setupGlobalListeners() {
@@ -83,15 +215,26 @@
             startBtn.addEventListener('click', function() { openStartMenu(); });
         }
 
+        // Taskbar wallpaper button
+        var wallBtn = document.getElementById('taskbar-wallpaper-btn');
+        if (wallBtn) {
+            wallBtn.addEventListener('click', function() {
+                if (window.DesktopWidgets) window.DesktopWidgets.openWallpaperPicker();
+            });
+        }
+
         // Global mouse events for drag/resize
         document.addEventListener('mousemove', handleMouseMove);
         document.addEventListener('mouseup', handleMouseUp);
 
         // Responsive: deactivate if viewport shrinks below breakpoint
+        // and re-clamp windows that may be offscreen after resize
         window.addEventListener('resize', Utils.debounce(function() {
             if (active && window.innerWidth < BREAKPOINT) {
                 deactivate(true);
+                return;
             }
+            if (active) clampAllWindows();
         }, 200));
     }
 
@@ -112,12 +255,22 @@
 
         renderDesktopIcons();
         startClock();
+
+        // Restore saved mode or default to widgets
+        currentMode = localStorage.getItem(STORAGE_MODE) || 'widgets';
+        applyMode(currentMode);
     }
 
     function deactivate(silent) {
         if (!active) return;
         active = false;
         localStorage.setItem(STORAGE_KEY, 'false');
+
+        // Destroy widget mode
+        if (window.DesktopWidgets) {
+            window.DesktopWidgets.destroy();
+            window.DesktopWidgets.removeAddButton();
+        }
 
         // Close all windows
         windows.forEach(function(win) {
@@ -127,7 +280,7 @@
         focusedWindowId = null;
         cascadeIndex = 0;
 
-        document.body.classList.remove('desktop-active', 'desktop-entering');
+        document.body.classList.remove('desktop-active', 'desktop-entering', 'desktop-mode-widgets', 'desktop-mode-windows');
         stopClock();
         clearDesktopIcons();
         clearTaskbar();
@@ -355,7 +508,7 @@
                     '<div class="window-loading-text">' + escapeHtml(t('desktop.loading')) + '</div>' +
                 '</div>' +
                 '<iframe src="' + escapeAttr(win.app.route + '?embed=1') + '" ' +
-                    'sandbox="allow-same-origin allow-scripts allow-forms allow-popups" ' +
+                    'sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals" ' +
                     'loading="lazy"></iframe>' +
             '</div>' +
             '<div class="window-edge edge-n" data-dir="n"></div>' +
@@ -601,8 +754,18 @@
             var win = windows.get(dragState.winId);
             if (!win) return;
 
-            win.x = dragState.origX + dx;
-            win.y = Math.max(0, dragState.origY + dy); // don't drag above viewport
+            var vw = window.innerWidth;
+            var vh = window.innerHeight;
+            var newX = dragState.origX + dx;
+            var newY = dragState.origY + dy;
+
+            // Clamp: keep at least 80px of title bar visible horizontally
+            newX = Math.max(-win.width + 80, Math.min(newX, vw - 80));
+            // Clamp: don't drag above viewport or below into taskbar
+            newY = Math.max(0, Math.min(newY, vh - TASKBAR_HEIGHT - 32));
+
+            win.x = newX;
+            win.y = newY;
 
             var el = document.getElementById(dragState.winId);
             if (el) {
@@ -620,25 +783,27 @@
             var dir = resizeState.dir;
             var newX = win.x, newY = win.y;
             var newW = win.width, newH = win.height;
+            var vh = window.innerHeight;
+            var vw = window.innerWidth;
 
             if (dir.indexOf('e') !== -1) {
-                newW = Math.max(MIN_WIDTH, resizeState.origW + dx);
+                newW = Math.max(MIN_WIDTH, Math.min(resizeState.origW + dx, vw - newX));
             }
             if (dir.indexOf('w') !== -1) {
                 var dw = resizeState.origW - dx;
                 if (dw >= MIN_WIDTH) {
                     newW = dw;
-                    newX = resizeState.origX + dx;
+                    newX = Math.max(0, resizeState.origX + dx);
                 }
             }
             if (dir.indexOf('s') !== -1) {
-                newH = Math.max(MIN_HEIGHT, resizeState.origH + dy);
+                newH = Math.max(MIN_HEIGHT, Math.min(resizeState.origH + dy, vh - TASKBAR_HEIGHT - newY));
             }
             if (dir === 'n' || dir === 'ne' || dir === 'nw') {
                 var dh = resizeState.origH - dy;
                 if (dh >= MIN_HEIGHT) {
                     newH = dh;
-                    newY = resizeState.origY + dy;
+                    newY = Math.max(0, resizeState.origY + dy);
                 }
             }
 
@@ -664,6 +829,33 @@
         }
         dragState = null;
         resizeState = null;
+    }
+
+    /**
+     * Re-clamp all windows within viewport bounds (e.g. after browser resize).
+     */
+    function clampAllWindows() {
+        var vw = window.innerWidth;
+        var vh = window.innerHeight;
+        windows.forEach(function(win) {
+            if (win.maximized) return;
+            var changed = false;
+            // Keep at least 80px visible horizontally
+            var clampedX = Math.max(-win.width + 80, Math.min(win.x, vw - 80));
+            var clampedY = Math.max(0, Math.min(win.y, vh - TASKBAR_HEIGHT - 32));
+            if (clampedX !== win.x || clampedY !== win.y) {
+                win.x = clampedX;
+                win.y = clampedY;
+                changed = true;
+            }
+            if (changed) {
+                var el = document.getElementById(win.id);
+                if (el) {
+                    el.style.left = win.x + 'px';
+                    el.style.top = win.y + 'px';
+                }
+            }
+        });
     }
 
     // ============ Resize ============
@@ -773,11 +965,13 @@
     // ============ Helpers ============
 
     function getDesktopArea() {
+        // In widgets mode, taskbar is hidden — full height minus topnav (42px)
+        var bottomOffset = (currentMode === 'widgets') ? 0 : TASKBAR_HEIGHT;
         return {
             x: 0,
-            y: 0,
+            y: 42,
             width: window.innerWidth,
-            height: window.innerHeight - TASKBAR_HEIGHT
+            height: window.innerHeight - 42 - bottomOffset
         };
     }
 
@@ -792,6 +986,82 @@
                           .replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
+    // ============ Mode Switching (Windows ↔ Widgets) ============
+
+    function switchMode(mode) {
+        if (mode === currentMode) return;
+        currentMode = mode;
+        localStorage.setItem(STORAGE_MODE, mode);
+        applyMode(mode);
+    }
+
+    function applyMode(mode) {
+        // Unified mode: widgets always visible, windows layer on top
+        document.body.classList.remove('desktop-mode-widgets', 'desktop-mode-windows');
+        document.body.classList.add('desktop-mode-unified');
+
+        // Always show windows container (for float windows)
+        var winsContainer = document.getElementById('desktop-windows');
+        if (winsContainer) winsContainer.style.display = '';
+
+        // Hide desktop icons in unified mode (apps open as windows)
+        var iconsContainer = document.getElementById('desktop-icons');
+        if (iconsContainer) iconsContainer.style.display = 'none';
+
+        // Always initialize widgets
+        if (window.DesktopWidgets) {
+            window.DesktopWidgets.init();
+            window.DesktopWidgets.renderAddButton();
+        }
+    }
+
+    // ============ Open App By Route ============
+
+    // Extra route → app mappings for pages not in getApps()
+    function _getExtraRoutes() {
+        return {
+            '/audit':        { id: 'audit',      icon: 'monitoring',          color: '#f0883e', name: t('nav.activity') },
+            '/network':      { id: 'network',    icon: 'wifi',                color: '#56d364', name: t('nav.network') },
+            '/cdap/devices': { id: 'cdap',       icon: 'developer_board',     color: '#79c0ff', name: t('nav.cdap') },
+            '/tokens':       { id: 'tokens',     icon: 'token',               color: '#d2a8ff', name: t('nav.tokens') },
+            '/inventory':    { id: 'inventory',   icon: 'inventory_2',         color: '#f78166', name: t('nav.inventory') },
+            '/tickets':      { id: 'tickets',     icon: 'confirmation_number', color: '#d2a8ff', name: t('nav.tickets') },
+            '/automation':   { id: 'automation',  icon: 'auto_fix_high',       color: '#56d364', name: t('nav.automation') },
+            '/reports':      { id: 'reports',     icon: 'assessment',          color: '#79c0ff', name: t('nav.reports') },
+            '/dataguard':    { id: 'dataguard',   icon: 'shield',              color: '#f0883e', name: t('nav.dataguard') },
+            '/tenants':      { id: 'tenants',     icon: 'business',            color: '#d2a8ff', name: t('nav.tenants') },
+            '/activity':     { id: 'activity',    icon: 'timeline',            color: '#f0883e', name: t('nav.activity') }
+        };
+    }
+
+    function openAppByRoute(route) {
+        if (!active) return;
+        if (!route) return;
+
+        // Unified mode: open apps directly as float windows (no mode switching)
+
+        // Find matching app in getApps()
+        var apps = getApps();
+        var found = null;
+        for (var i = 0; i < apps.length; i++) {
+            if (apps[i].route === route) { found = apps[i]; break; }
+        }
+
+        // Check extra routes
+        var extraRoutes = _getExtraRoutes();
+        if (!found && extraRoutes[route]) {
+            found = Object.assign({ route: route }, extraRoutes[route]);
+        }
+
+        // Fallback: create ad-hoc app entry
+        if (!found) {
+            var label = route.replace(/^\//, '').replace(/\//g, ' > ') || 'Page';
+            found = { id: 'page-' + route.replace(/\W/g, '_'), icon: 'open_in_new', route: route, color: '#8b949e', name: label };
+        }
+
+        openApp(found);
+    }
+
     // ============ Public API ============
 
     window.DesktopMode = {
@@ -799,7 +1069,15 @@
         toggle: toggle,
         isActive: function() { return active; },
         activate: activate,
-        deactivate: deactivate
+        deactivate: deactivate,
+        switchMode: switchMode,
+        getMode: function() { return currentMode; },
+        openAppByRoute: openAppByRoute,
+        // Foldable device API
+        isFoldable: function() { return isFoldableDevice; },
+        getDevicePosture: function() { return devicePosture; },
+        setFoldableAutoSwitch: setFoldableAutoSwitch,
+        isFoldableAutoSwitchEnabled: isFoldableAutoSwitchEnabled
     };
 
 })();

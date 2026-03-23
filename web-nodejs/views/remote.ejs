@@ -3,15 +3,15 @@
     pageScripts: ['remote'],
     body: `
 
-<!-- Work In Progress Banner -->
-<div class="wip-banner" style="background: linear-gradient(90deg, #f59e0b 0%, #d97706 100%); color: #fff; padding: 12px 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 10px; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; box-shadow: 0 2px 10px rgba(0,0,0,0.2);">
-    <span class="material-icons" style="font-size: 20px;">construction</span>
-    <span>${_('remote.wip_notice') || 'Web Remote Client is currently under development and may not work as expected. For reliable connections, please use the RustDesk desktop client.'}</span>
-    <span class="material-icons" style="font-size: 20px;">construction</span>
+<!-- Beta Notice Banner (dismissible) -->
+<div class="beta-banner" id="beta-banner" style="background: linear-gradient(90deg, #1f6feb 0%, #388bfd 100%); color: #fff; padding: 8px 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 10px; position: fixed; top: 0; left: 0; right: 0; z-index: 10000; box-shadow: 0 2px 10px rgba(0,0,0,0.2); font-size: 13px;">
+    <span class="material-icons" style="font-size: 16px;">info</span>
+    <span>${_('remote.beta_notice') || 'Web Remote Client — Beta. Some features may not work as expected.'}</span>
+    <button onclick="document.getElementById('beta-banner').style.display='none'; document.getElementById('viewer-container').style.marginTop='0';" style="background: rgba(255,255,255,0.2); border: none; color: #fff; padding: 2px 8px; border-radius: 4px; cursor: pointer; margin-left: 8px; font-size: 12px;">✕</button>
 </div>
 
 <!-- Remote Desktop Viewer -->
-<div class="viewer-container" id="viewer-container" style="margin-top: 48px;">
+<div class="viewer-container" id="viewer-container" style="margin-top: 36px;">
 
     <!-- Connection overlay (shown before/during connection) -->
     <div class="viewer-overlay" id="connection-overlay">

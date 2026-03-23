@@ -527,10 +527,8 @@ td.column-hidden {
 
 .kebab-menu {
     display: none;
-    position: absolute;
-    top: 100%;
-    right: 0;
-    z-index: 200;
+    position: fixed;
+    z-index: 9999;
     min-width: 180px;
     background: var(--bg-elevated, #2d333b);
     border: 1px solid var(--border-primary);

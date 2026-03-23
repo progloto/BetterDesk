@@ -187,6 +187,9 @@ class RDProtocol {
         const hasWebCodecs = typeof VideoDecoder !== 'undefined';
         const hasJMuxer = typeof JMuxer !== 'undefined';
 
+        // Default to Best quality for sharpest image
+        const quality = opts.imageQuality || 'Best';
+
         return {
             loginRequest: {
                 username: opts.username || '',
@@ -197,7 +200,7 @@ class RDProtocol {
                 version: 'BetterDesk-Web/1.0',
                 sessionId: Date.now(),
                 option: {
-                    imageQuality: this.enums.ImageQuality.values.Balanced,
+                    imageQuality: this.enums.ImageQuality.values[quality] || this.enums.ImageQuality.values.Best,
                     supportedDecoding: {
                         abilityVp9: hasWebCodecs ? 1 : 0,
                         abilityH264: (hasWebCodecs || hasJMuxer) ? 1 : 0,
@@ -205,7 +208,7 @@ class RDProtocol {
                         abilityVp8: hasWebCodecs ? 1 : 0,
                         prefer: hasWebCodecs ? 0 : 2 // Auto when WebCodecs, H264 when fallback
                     },
-                    customFps: opts.fps || 30,
+                    customFps: opts.fps || 60,
                     showRemoteCursor: 2, // Yes
                     disableAudio: opts.disableAudio ? 2 : 1,
                     disableClipboard: 1, // No

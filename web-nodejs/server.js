@@ -27,9 +27,12 @@ const { initWsProxy } = require('./services/wsRelay');
 const { initBdRelay } = require('./services/bdRelay');
 const { initChatRelay } = require('./services/chatRelay');
 const { initRemoteRelay } = require('./services/remoteRelay');
+const { initCdapTerminalProxy } = require('./services/cdapTerminalProxy');
+const { initCdapMediaProxies } = require('./services/cdapMediaProxy');
 const { startDiscoveryService } = require('./services/lanDiscovery');
 const routes = require('./routes');
 const rustdeskApiRoutes = require('./routes/rustdesk-api.routes');
+const bdApiRoutes = require('./routes/bd-api.routes');
 const { getWanMiddlewareStack } = require('./middleware/wanSecurity');
 
 // Create Express app
@@ -78,9 +81,13 @@ const sessionMiddleware = session({
 });
 app.use(sessionMiddleware);
 
+// Cache version — changes on every restart/deployment, stable during runtime.
+// Used in ?v= query strings so browsers cache assets per deployment.
+app.locals.cacheVersion = config.appVersion + '.' + Date.now();
+
 // Static files
 app.use(express.static(path.join(__dirname, 'public'), {
-    maxAge: config.isProduction ? '1d' : '0',
+    maxAge: config.isProduction ? '7d' : '0',
     etag: true
 }));
 
@@ -88,6 +95,13 @@ app.use(express.static(path.join(__dirname, 'public'), {
 app.use('/protos', express.static(path.join(__dirname, 'protos'), {
     maxAge: config.isProduction ? '7d' : '0',
     etag: true
+}));
+
+// Serve desktop wallpapers
+app.use('/wallpapers', express.static(path.join(__dirname, 'wallpapers'), {
+    maxAge: config.isProduction ? '30d' : '0',
+    etag: true,
+    immutable: true
 }));
 
 // Rate limiting for API
@@ -98,6 +112,10 @@ app.use('/api/', apiLimiter);
 // dedicated WAN-facing port (21121) with additional hardening.
 app.use(rustdeskApiRoutes);
 
+// BetterDesk Desktop Client API — device-facing endpoints that use
+// Bearer token or X-Device-Id header, not browser CSRF cookies.
+app.use('/api/bd', bdApiRoutes);
+
 // i18n middleware
 app.use(initI18n());
 
@@ -105,12 +123,23 @@ app.use(initI18n());
 // Used by Desktop Mode to load pages inside floating windows (iframes)
 app.use((req, res, next) => {
     res.locals.embed = req.query.embed === '1';
+    // Prevent HTML page caching — only static assets should be cached
+    if (!req.path.match(/\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map|proto)$/)) {
+        res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
     next();
 });
 
 // CSRF protection — generate token for views, validate on POST/PUT/DELETE/PATCH
+// Skip CSRF for device-facing API routes (/api/bd/*) — these use Bearer token
+// or X-Device-Id header authentication, not browser cookie-based CSRF.
 app.use(csrfTokenProvider);
-app.use(doubleCsrfProtection);
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/bd/')) {
+        return next();
+    }
+    doubleCsrfProtection(req, res, next);
+});
 
 // ============ Routes ============
 
@@ -303,6 +332,12 @@ async function startServer() {
 
         // Initialize Remote Desktop relay (WebSocket — agent JPEG ↔ browser viewer)
         initRemoteRelay(server, sessionMiddleware);
+
+        // Initialize CDAP Terminal WebSocket proxy (browser ↔ Go server)
+        initCdapTerminalProxy(server, sessionMiddleware);
+
+        // Initialize CDAP Media WebSocket proxies (desktop, video, file browser)
+        initCdapMediaProxies(server, sessionMiddleware);
 
         // Start LAN Discovery UDP service
         startDiscoveryService();
@@ -498,6 +533,28 @@ function printStartupBanner(protocol, port) {
     console.log('  ║                                                  ║');
     console.log('  ╚══════════════════════════════════════════════════╝');
     console.log('');
+
+    // BD-2026-006: Warn if panel is bound to all interfaces in non-Docker environments
+    if (config.host === '0.0.0.0' && !config.isDocker) {
+        console.log('  ⚠️  WARNING [SECURITY]: Panel bound to 0.0.0.0 (all interfaces).');
+        console.log('     Set HOST=127.0.0.1 in .env to restrict to localhost only.');
+        console.log('');
+    }
+
+    // BD-2026-008: Warn if plaintext credentials file exists
+    const credFile = path.join(config.keysPath, '.admin_credentials');
+    if (fs.existsSync(credFile)) {
+        console.log('  ⚠️  WARNING [SECURITY]: Plaintext .admin_credentials file detected.');
+        console.log('     Delete it after noting the password: ' + credFile);
+        console.log('');
+    }
+
+    // BD-2026-009: Warn when proxy trust is enabled
+    if (trustProxy && trustProxy !== false && trustProxy !== 0) {
+        console.log('  ⚠️  NOTICE [SECURITY]: TRUST_PROXY is enabled (' + trustProxy + ').');
+        console.log('     Ensure a trusted reverse proxy sets X-Forwarded-For correctly.');
+        console.log('');
+    }
 }
 
 // Start the server

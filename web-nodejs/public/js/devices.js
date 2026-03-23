@@ -15,13 +15,14 @@
     // Map device_type to Material Icons
     function getDeviceTypeIcon(type) {
         switch ((type || '').toLowerCase()) {
+            case 'betterdesk': return 'desktop_windows';
             case 'desktop':  return 'desktop_windows';
             case 'scada':    return 'precision_manufacturing';
             case 'iot':      return 'sensors';
             case 'os_agent': return 'terminal';
             case 'mobile':   return 'phone_android';
             case 'rustdesk': return 'connected_tv';
-            default:         return 'connected_tv';
+            default:         return 'devices';
         }
     }
     
@@ -93,12 +94,53 @@
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') closeAllKebabMenus();
         });
+
+        // Close on scroll (position:fixed menus don't follow scroll)
+        document.addEventListener('scroll', closeAllKebabMenus, true);
+        window.addEventListener('resize', closeAllKebabMenus);
     }
 
     function closeAllKebabMenus() {
-        document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
+        document.querySelectorAll('.kebab-menu.open').forEach(m => {
+            m.classList.remove('open');
+            m.style.top = '';
+            m.style.left = '';
+        });
         const overlay = document.getElementById('kebab-overlay');
         if (overlay) overlay.classList.remove('open');
+    }
+
+    /**
+     * Position a fixed kebab menu relative to its trigger button.
+     * Flips upward if there is not enough space below.
+     * Skips on mobile (≤600px) where CSS bottom-sheet handles positioning.
+     */
+    function positionKebabMenu(btn, menu) {
+        if (window.innerWidth <= 600) return;
+
+        const rect = btn.getBoundingClientRect();
+        const menuHeight = menu.offsetHeight || 200;
+        const menuWidth = menu.offsetWidth || 180;
+        const spaceBelow = window.innerHeight - rect.bottom;
+
+        let top, left;
+
+        // Vertical: prefer below, flip above if not enough space
+        if (spaceBelow >= menuHeight + 8) {
+            top = rect.bottom + 4;
+        } else {
+            top = rect.top - menuHeight - 4;
+        }
+
+        // Horizontal: align right edge to button right edge
+        left = rect.right - menuWidth;
+        if (left < 8) left = 8;
+        if (left + menuWidth > window.innerWidth - 8) {
+            left = window.innerWidth - menuWidth - 8;
+        }
+
+        menu.style.top = top + 'px';
+        menu.style.left = left + 'px';
     }
     
     /**
@@ -231,7 +273,7 @@
                 <td data-column="device_type">
                     <div class="platform-icon">
                         <span class="material-icons">${getDeviceTypeIcon(device.device_type)}</span>
-                        <span>${Utils.escapeHtml(device.device_type || 'rustdesk')}</span>
+                        <span>${Utils.escapeHtml(device.device_type || '-')}</span>
                     </div>
                 </td>
                 <td data-column="platform">
@@ -252,13 +294,9 @@
                             <span class="material-icons">more_vert</span>
                         </button>
                         <div class="kebab-menu">
-                            <button class="kebab-menu-item connect" data-action="connect" data-id="${eid}">
-                                <span class="material-icons">link</span>
-                                <span>${_('actions.connect')}</span>
-                            </button>
                             <button class="kebab-menu-item connect-desktop" data-action="connect-desktop" data-id="${eid}">
                                 <span class="material-icons">computer</span>
-                                <span>${_('actions.connect_desktop')}</span>
+                                <span>${_('actions.connect')}</span>
                             </button>
                             <div class="kebab-divider"></div>
                             <button class="kebab-menu-item info" data-action="details" data-id="${eid}">
@@ -312,6 +350,7 @@
                 closeAllKebabMenus();
                 if (!wasOpen) {
                     menu.classList.add('open');
+                    positionKebabMenu(btn, menu);
                     const overlay = document.getElementById('kebab-overlay');
                     if (overlay) overlay.classList.add('open');
                 }
@@ -345,10 +384,6 @@
      */
     async function handleAction(action, deviceId, data) {
         switch (action) {
-            case 'connect':
-                connectToDevice(deviceId);
-                break;
-                
             case 'connect-desktop':
                 connectDesktopClient(deviceId);
                 break;
@@ -380,17 +415,10 @@
     }
     
     /**
-     * Connect to device via web remote client
-     */
-    function connectToDevice(deviceId) {
-        window.location.href = '/remote/' + encodeURIComponent(deviceId);
-    }
-
-    /**
-     * Connect to device via RustDesk desktop client (rustdesk:// protocol)
+     * Connect to device via BetterDesk desktop client (betterdesk:// protocol)
      */
     function connectDesktopClient(deviceId) {
-        window.open('rustdesk://' + encodeURIComponent(deviceId), '_blank');
+        window.open('betterdesk://' + encodeURIComponent(deviceId), '_blank');
     }
     
     /**
@@ -558,11 +586,14 @@
             let countdown = 3;
             const timer = setInterval(() => {
                 countdown--;
-                countdownEl.textContent = countdown;
+                if (countdownEl) {
+                    countdownEl.textContent = countdown;
+                }
                 if (countdown <= 0) {
                     clearInterval(timer);
                     confirmBtn.disabled = false;
-                    confirmBtn.querySelector('.btn-text').textContent = _('actions.delete');
+                    const btnText = confirmBtn.querySelector('.btn-text');
+                    if (btnText) btnText.textContent = _('actions.delete');
                 }
             }, 1000);
             

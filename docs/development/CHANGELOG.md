@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] - 2026-03-21
+
+### 🖥️ Web Remote Client — Mouse, Quality & FPS Fix (Phase 32)
+
+Critical fixes for the embedded web remote client (`/remote/:deviceId`) — mouse clicks, image quality, and frame rate.
+
+#### Mouse Click Fix (Critical)
+- **Root cause**: RustDesk parses mouse mask as `button = mask >> 3; type = mask & 7`. Web client sent flat values (e.g., mask=1 for left click), so server computed `button = 0` (no button). Hover worked because mask=0 is correct for both formats.
+- **input.js**: Replaced flat mask values with correct `TYPE | (BUTTON << 3)` encoding. Left click now sends mask=9 (`1 | (1<<3)`), right click mask=17 (`1 | (2<<3)`), etc. Added static constants for mouse types and buttons.
+
+#### Image Quality Fix
+- **Root cause**: `buildLoginRequest` in protocol.js hardcoded `imageQuality: Balanced`, ignoring any quality setting.
+- **protocol.js**: Login request now uses configurable quality (default `Best` instead of `Balanced`).
+- **remote.js**: Constructor passes `imageQuality: 'Best'` to RDClient.
+
+#### FPS Fix
+- **Root cause**: Login request used `customFps: opts.fps || 30` despite remote.js wanting 60fps. Session start only sent FPS option, not quality.
+- **protocol.js**: Default FPS changed from 30 to 60.
+- **client.js**: `_startSession()` now sends both `customFps` and `imageQuality` options. `authenticate()` passes `fps: 60` and `imageQuality: 'Best'` to login builder.
+
+#### UI Polish
+- **remote.ejs**: Replaced large orange "Work in Progress" banner with slim blue "Beta" banner with dismiss button.
+
+#### Files Changed
+- `public/js/rdclient/input.js` — Mouse mask encoding + static constants
+- `public/js/rdclient/protocol.js` — Configurable quality + FPS defaults
+- `public/js/rdclient/client.js` — Session start sends quality + FPS
+- `public/js/remote.js` — imageQuality: 'Best' in constructor
+- `views/remote.ejs` — Dismissible beta banner
+
+---
+
 ## [2.4.2] - 2026-03-20
 
 ### 🔒 Security & Installer Fixes (Phase 31)

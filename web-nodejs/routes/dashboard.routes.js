@@ -115,6 +115,7 @@ router.get('/api/server/status', requireAuth, async (req, res) => {
             success: true,
             data: {
                 backend: isBD ? 'betterdesk' : 'rustdesk',
+                uptime: Math.floor(process.uptime()),
                 // Main status indicators
                 hbbs: apiRunning ? { status: 'running' } : { status: 'stopped' },
                 hbbr: relayStatus,
@@ -136,6 +137,33 @@ router.get('/api/server/status', requireAuth, async (req, res) => {
             success: false,
             error: req.t('errors.server_error')
         });
+    }
+});
+
+/**
+ * GET /api/server/bandwidth - Get relay/bandwidth metrics from Go server
+ */
+router.get('/api/server/bandwidth', requireAuth, async (req, res) => {
+    try {
+        const betterdeskApi = require('../services/betterdeskApi');
+        const stats = await betterdeskApi.getServerStats();
+        if (!stats || !stats.success) {
+            return res.json({ success: true, data: { relay_active: 0, total_relayed: 0, bytes_transferred: 0, active_sessions: 0, throttle_hits: 0 } });
+        }
+        const d = stats.data || {};
+        res.json({
+            success: true,
+            data: {
+                relay_active: d.relay_active_sessions || 0,
+                total_relayed: d.relay_total_relayed || 0,
+                bytes_transferred: d.bandwidth_bytes_transferred || 0,
+                active_sessions: d.bandwidth_active_sessions || 0,
+                throttle_hits: d.bandwidth_throttle_hits || 0
+            }
+        });
+    } catch (err) {
+        console.error('Bandwidth stats error:', err);
+        res.json({ success: true, data: { relay_active: 0, total_relayed: 0, bytes_transferred: 0, active_sessions: 0, throttle_hits: 0 } });
     }
 });
 

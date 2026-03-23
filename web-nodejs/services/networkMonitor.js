@@ -22,6 +22,7 @@ const net = require('net');
 const dns = require('dns');
 const { spawn } = require('child_process');
 const os = require('os');
+const config = require('../config/config');
 
 // ---------------------------------------------------------------------------
 //  Config
@@ -161,7 +162,7 @@ function checkHttp(url, timeoutMs = DEFAULT_TIMEOUT_MS, expectedStatus = 200) {
         const start = Date.now();
         const lib = url.startsWith('https') ? https : http;
 
-        const req = lib.get(url, { timeout: timeoutMs, rejectUnauthorized: false }, (res) => {
+        const req = lib.get(url, { timeout: timeoutMs, rejectUnauthorized: !config.allowSelfSignedCerts }, (res) => {
             const rtt = Date.now() - start;
             // Drain response body
             res.resume();

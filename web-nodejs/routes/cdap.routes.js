@@ -12,24 +12,49 @@ const betterdeskApi = require('../services/betterdeskApi');
 // ── Page Routes ──────────────────────────────────────────────────────────
 
 /**
+ * CDAP devices list page
+ * GET /cdap
+ */
+router.get('/cdap', requireAuth, (req, res) => {
+    res.render('cdap-devices', {
+        title: req.t('cdap.devices_title'),
+        activePage: 'cdap',
+        currentPage: 'cdap'
+    });
+});
+
+/**
+ * CDAP devices list page (alternative path, used by desktop embed)
+ * GET /cdap/devices
+ */
+router.get('/cdap/devices', requireAuth, (req, res) => {
+    res.render('cdap-devices', {
+        title: req.t('cdap.devices_title'),
+        activePage: 'cdap',
+        currentPage: 'cdap'
+    });
+});
+
+/**
  * CDAP device detail page with widget panel
  * GET /cdap/devices/:id
  */
-router.get('/cdap/devices/:id', requireAuth, async (req, res) => {
-    try {
-        const { id } = req.params;
-        res.render('cdap-device', {
-            title: req.__('cdap.device_detail'),
-            activePage: 'devices',
-            deviceId: id
-        });
-    } catch (err) {
-        console.error('CDAP device page error:', err.message);
-        res.redirect('/devices');
-    }
+router.get('/cdap/devices/:id', requireAuth, (req, res) => {
+    const { id } = req.params;
+    res.render('cdap-device', {
+        title: req.t('cdap.device_detail'),
+        activePage: 'devices',
+        deviceId: id
+    });
 });
 
 // ── API Routes ───────────────────────────────────────────────────────────
+
+// Unwrap the { success, data } envelope returned by betterdeskApi helpers
+// so that the CDAP frontend receives the flat Go server response it expects.
+function unwrap(result) {
+    return (result && result.success && result.data) ? result.data : result;
+}
 
 /**
  * GET /api/cdap/status
@@ -38,9 +63,9 @@ router.get('/cdap/devices/:id', requireAuth, async (req, res) => {
 router.get('/api/cdap/status', requireAuth, async (req, res) => {
     try {
         const result = await betterdeskApi.getCDAPStatus();
-        res.json(result);
+        res.json(unwrap(result));
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Failed to get CDAP status' });
+        res.status(500).json({ enabled: false, error: 'Failed to get CDAP status' });
     }
 });
 
@@ -51,9 +76,9 @@ router.get('/api/cdap/status', requireAuth, async (req, res) => {
 router.get('/api/cdap/devices', requireAuth, async (req, res) => {
     try {
         const result = await betterdeskApi.getCDAPDevices();
-        res.json(result);
+        res.json(unwrap(result));
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Failed to list CDAP devices' });
+        res.status(500).json({ devices: [], error: 'Failed to list CDAP devices' });
     }
 });
 
@@ -64,9 +89,9 @@ router.get('/api/cdap/devices', requireAuth, async (req, res) => {
 router.get('/api/cdap/devices/:id', requireAuth, async (req, res) => {
     try {
         const result = await betterdeskApi.getCDAPDeviceInfo(req.params.id);
-        res.json(result);
+        res.json(unwrap(result));
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Failed to get CDAP device info' });
+        res.status(500).json({ error: 'Failed to get CDAP device info' });
     }
 });
 
@@ -77,9 +102,9 @@ router.get('/api/cdap/devices/:id', requireAuth, async (req, res) => {
 router.get('/api/cdap/devices/:id/manifest', requireAuth, async (req, res) => {
     try {
         const result = await betterdeskApi.getCDAPDeviceManifest(req.params.id);
-        res.json(result);
+        res.json(unwrap(result));
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Failed to get CDAP device manifest' });
+        res.status(500).json({ error: 'Failed to get CDAP device manifest' });
     }
 });
 
@@ -90,9 +115,9 @@ router.get('/api/cdap/devices/:id/manifest', requireAuth, async (req, res) => {
 router.get('/api/cdap/devices/:id/state', requireAuth, async (req, res) => {
     try {
         const result = await betterdeskApi.getCDAPDeviceState(req.params.id);
-        res.json(result);
+        res.json(unwrap(result));
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Failed to get CDAP device state' });
+        res.status(500).json({ error: 'Failed to get CDAP device state' });
     }
 });
 
@@ -106,7 +131,7 @@ router.post('/api/cdap/devices/:id/command', requireAuth, requireRole('operator'
         const { widget_id, action, value, reason } = req.body;
 
         if (!widget_id || !action) {
-            return res.status(400).json({ success: false, error: 'widget_id and action are required' });
+            return res.status(400).json({ error: 'widget_id and action are required' });
         }
 
         const result = await betterdeskApi.sendCDAPCommand(
@@ -116,9 +141,73 @@ router.post('/api/cdap/devices/:id/command', requireAuth, requireRole('operator'
             value,
             reason
         );
-        res.json(result);
+        res.json(unwrap(result));
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Failed to send command' });
+        res.status(500).json({ error: 'Failed to send command' });
+    }
+});
+
+/**
+ * POST /api/cdap/toggle
+ * Enable or disable CDAP gateway (saves config; requires server restart)
+ * Body: { enabled: true|false }
+ */
+router.post('/api/cdap/toggle', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+        const { enabled } = req.body;
+        if (typeof enabled !== 'boolean') {
+            return res.status(400).json({ success: false, error: 'enabled must be a boolean' });
+        }
+        await betterdeskApi.setConfig('cdap_enabled', enabled ? 'Y' : 'N');
+        res.json({ success: true, enabled, restart_required: true });
+    } catch (err) {
+        console.error('[CDAP] Toggle error:', err.message);
+        res.status(500).json({ success: false, error: 'Failed to toggle CDAP' });
+    }
+});
+
+/**
+ * GET /api/cdap/alerts
+ * Returns all currently firing CDAP alerts
+ * Query: ?device_id=optional (filter by device)
+ */
+router.get('/api/cdap/alerts', requireAuth, async (req, res) => {
+    try {
+        const result = await betterdeskApi.getCDAPAlerts(req.query.device_id);
+        res.json(unwrap(result));
+    } catch (err) {
+        res.status(500).json({ alerts: [], total: 0, error: 'Failed to get CDAP alerts' });
+    }
+});
+
+/**
+ * GET /api/cdap/devices/:id/linked
+ * Returns all peers linked to this CDAP device
+ */
+router.get('/api/cdap/devices/:id/linked', requireAuth, async (req, res) => {
+    try {
+        const result = await betterdeskApi.getLinkedPeers(req.params.id);
+        res.json(unwrap(result));
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to get linked devices' });
+    }
+});
+
+/**
+ * POST /api/cdap/devices/:id/link
+ * Link or unlink a peer to this CDAP device
+ * Body: { linked_peer_id: "PEERID" } or { linked_peer_id: "" } to unlink
+ */
+router.post('/api/cdap/devices/:id/link', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+        const { linked_peer_id } = req.body;
+        if (linked_peer_id === undefined) {
+            return res.status(400).json({ error: 'linked_peer_id is required' });
+        }
+        const result = await betterdeskApi.linkDevice(req.params.id, linked_peer_id);
+        res.json(unwrap(result));
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to link device' });
     }
 });
 

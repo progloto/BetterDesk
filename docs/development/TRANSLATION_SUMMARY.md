@@ -89,12 +89,12 @@ docs/
 ## 📝 Usage
 
 For **English-speaking users**, reference the `*_EN.md` files:
-- [Client Generator Quick Start](docs/CLIENT_GENERATOR_QUICKSTART_EN.md)
-- [Troubleshooting Guide](docs/TROUBLESHOOTING_EN.md)
-- [Quick Fix Guide](docs/QUICK_FIX_EN.md)
-- [GPU Optimization Details](docs/GPU_OPTIMIZATION_EN.md)
-- [GPU Quick Start](docs/GPU_FIX_QUICKSTART_EN.md)
-- [Optimization Summary](docs/OPTIMIZATION_SUMMARY_EN.md)
+- [Client Generator Quick Start](../features/CLIENT_GENERATOR_QUICKSTART_EN.md)
+- [Troubleshooting Guide](../troubleshooting/TROUBLESHOOTING_EN.md)
+- [Quick Fix Guide](../troubleshooting/QUICK_FIX_EN.md)
+- [GPU Optimization Details](../performance/GPU_OPTIMIZATION_EN.md)
+- [GPU Quick Start](../performance/GPU_FIX_QUICKSTART_EN.md)
+- [Optimization Summary](../performance/OPTIMIZATION_SUMMARY_EN.md)
 
 For **Polish-speaking users**, original Polish versions remain available.
 

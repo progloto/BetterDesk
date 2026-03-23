@@ -1,4 +1,4 @@
-# 🚀 BetterDesk — RustDesk-Compatible Server & Web Console
+# 🚀 BetterDesk v3 — Ultimate Remote Desktop & CDAP Solution
 
 <div align="center">
 
@@ -9,11 +9,12 @@
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)
 ![Node.js](https://img.shields.io/badge/Node.js-18+-339933.svg)
-![Version](https://img.shields.io/badge/version-2.4.0-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-3.0.0-brightgreen.svg)
 ![Security](https://img.shields.io/badge/Security-TLS%20%2B%20NaCl%20%2B%20TOTP-green.svg)
 ![Database](https://img.shields.io/badge/DB-SQLite%20%2B%20PostgreSQL-blue.svg)
+![CDAP](https://img.shields.io/badge/CDAP-v1.0-orange.svg)
 
-**A clean-room RustDesk-compatible server written in Go — single binary replacing hbbs + hbbr — with full protocol support, TLS everywhere, PostgreSQL backend, and a modern Node.js web management console.**
+**A clean-room RustDesk-compatible server written in Go — single binary replacing hbbs + hbbr — with full protocol support, TLS everywhere, PostgreSQL backend, CDAP (Custom Device API Protocol) for IoT/SCADA/network devices, and a modern Node.js web management console.**
 
 [Architecture](#-architecture) • [Installation](#-installation) • [Configuration](#-configuration) • [Security](#-security-architecture) • [API](#-api-reference) • [Troubleshooting](#-troubleshooting)
 
@@ -530,7 +531,7 @@ docker compose up -d
 docker compose logs console 2>&1 | grep -i "Admin password"
 ```
 
-Open http://localhost:5000 — done in 30 seconds! See [DOCKER_QUICKSTART.md](DOCKER_QUICKSTART.md) for more options.
+Open http://localhost:5000 — done in 30 seconds! See [DOCKER_QUICKSTART.md](docs/docker/DOCKER_QUICKSTART.md) for more options.
 
 **Build from source (advanced):**
 
@@ -1353,7 +1354,7 @@ BetterDesk Console supports multiple languages through JSON-based translations.
 3. Update the `_meta` section with language info
 4. Upload via Settings → Language Settings or place in the `lang/` folder
 
-See [Contributing Translations](docs/CONTRIBUTING_TRANSLATIONS.md) for details.
+See [Contributing Translations](docs/development/CONTRIBUTING_TRANSLATIONS.md) for details.
 
 ---
 
@@ -1404,7 +1405,7 @@ Rustdesk-FreeConsole/
 
 ## 🤝 Contributing
 
-Contributions are welcome! See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
+Contributions are welcome! See [CONTRIBUTING.md](docs/development/CONTRIBUTING.md) for guidelines.
 
 ### Reporting Issues
 

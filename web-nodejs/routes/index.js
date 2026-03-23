@@ -16,7 +16,7 @@ const i18nRoutes = require('./i18n.routes');
 const usersRoutes = require('./users.routes');
 const foldersRoutes = require('./folders.routes');
 const remoteRoutes = require('./remote.routes');
-const bdApiRoutes = require('./bd-api.routes');
+// bdApiRoutes mounted in server.js (before CSRF) for desktop client access
 const inventoryRoutes = require('./inventory.routes');
 const ticketsRoutes = require('./tickets.routes');
 const activityRoutes = require('./activity.routes');
@@ -28,6 +28,9 @@ const reportsRoutes = require('./reports.routes');
 const tenantsRoutes = require('./tenants.routes');
 const registrationRoutes = require('./registration.routes');
 const cdapRoutes = require('./cdap.routes');
+const tokensRoutes = require('./tokens.routes');
+const pagesRoutes = require('./pages.routes');
+const desktopRoutes = require('./desktop.routes');
 
 /**
  * Middleware to require JSON Content-Type for POST/PATCH/PUT requests to API routes.
@@ -75,7 +78,7 @@ router.use('/', usersRoutes);
 router.use('/', foldersRoutes);
 router.use('/', remoteRoutes);
 router.use('/api/i18n', i18nRoutes);
-router.use('/api/bd', bdApiRoutes);
+// bdApiRoutes now mounted in server.js (before CSRF) for desktop client access
 router.use('/api/bd', inventoryRoutes);     // device-facing: /api/bd/inventory, /api/bd/telemetry
 router.use('/api/inventory', inventoryRoutes); // admin-facing: /api/inventory, /api/inventory/:id
 router.use('/api/tickets', ticketsRoutes);      // admin-facing: /api/tickets CRUD
@@ -93,6 +96,9 @@ router.use('/api/reports', reportsRoutes);       // admin-facing: /api/reports/*
 router.use('/api/tenants', tenantsRoutes);       // admin-facing: /api/tenants/*
 router.use('/', registrationRoutes);               // admin-facing: /registrations, /api/registrations/*
 router.use('/api/bd', registrationRoutes);          // device-facing: /api/bd/register-request, /api/bd/register-status
+router.use('/', pagesRoutes);                          // page routes: /inventory, /tickets, /automation, etc.
 router.use('/', cdapRoutes);                            // admin-facing: /cdap/devices/:id, /api/cdap/*
+router.use('/', tokensRoutes);                          // admin-facing: /tokens, /api/panel/tokens/*
+router.use('/api/desktop', desktopRoutes);               // admin-facing: /api/desktop/layout, /api/desktop/wallpapers
 
 module.exports = router;

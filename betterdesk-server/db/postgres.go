@@ -357,6 +357,14 @@ func (pg *PostgresDB) GetPeerCount() (total int, online int, err error) {
 	return total, online, err
 }
 
+// GetBannedPeerCount returns the number of banned peers in the database.
+func (pg *PostgresDB) GetBannedPeerCount() (int, error) {
+	var count int
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT COUNT(*) FROM peers WHERE banned = TRUE AND soft_deleted = FALSE`).Scan(&count)
+	return count, err
+}
+
 // UpdatePeerStatus updates a peer's status and IP, plus last_online timestamp.
 func (pg *PostgresDB) UpdatePeerStatus(id string, status string, ip string) error {
 	_, err := pg.pool.Exec(pg.ctx,
@@ -613,6 +621,27 @@ func (pg *PostgresDB) SetConfig(key, value string) error {
 func (pg *PostgresDB) DeleteConfig(key string) error {
 	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM server_config WHERE key = $1`, key)
 	return err
+}
+
+// ListConfigByPrefix returns all configuration entries whose key starts with the given prefix.
+func (pg *PostgresDB) ListConfigByPrefix(prefix string) ([]ServerConfig, error) {
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT key, value FROM server_config WHERE key LIKE $1`,
+		prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var configs []ServerConfig
+	for rows.Next() {
+		var c ServerConfig
+		if err := rows.Scan(&c.Key, &c.Value); err != nil {
+			return nil, err
+		}
+		configs = append(configs, c)
+	}
+	return configs, rows.Err()
 }
 
 // ── User Operations ───────────────────────────────────────────────────

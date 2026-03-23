@@ -1,0 +1,78 @@
+{
+  "cdap": {
+    "server": "ws://192.168.0.110:21122/cdap",
+    "api_key": "YOUR_API_KEY",
+    "device_name": "SNMP Bridge",
+    "device_type": "bridge",
+    "bridge_name": "snmp",
+    "heartbeat_sec": 15
+  },
+  "snmp": {
+    "version": "2c",
+    "host": "192.168.1.1",
+    "port": 161,
+    "community": "public",
+    "timeout_sec": 5,
+    "poll_interval_sec": 10,
+    "v3_user": "",
+    "v3_auth_key": "",
+    "v3_auth_proto": "SHA",
+    "v3_priv_key": "",
+    "v3_priv_proto": "AES128"
+  },
+  "oids": [
+    {
+      "widget_id": "sys_name",
+      "label": "System Name",
+      "oid": "1.3.6.1.2.1.1.5.0",
+      "widget": "text",
+      "readonly": true
+    },
+    {
+      "widget_id": "sys_uptime",
+      "label": "Uptime",
+      "oid": "1.3.6.1.2.1.1.3.0",
+      "widget": "text",
+      "format": "timeticks",
+      "readonly": true
+    },
+    {
+      "widget_id": "cpu_load",
+      "label": "CPU Load",
+      "oid": "1.3.6.1.4.1.2021.11.11.0",
+      "widget": "gauge",
+      "unit": "%",
+      "min": 0,
+      "max": 100,
+      "transform": "100 - x",
+      "readonly": true
+    },
+    {
+      "widget_id": "mem_total",
+      "label": "Total Memory",
+      "oid": "1.3.6.1.4.1.2021.4.5.0",
+      "widget": "text",
+      "format": "bytes_kb",
+      "readonly": true
+    },
+    {
+      "widget_id": "mem_avail",
+      "label": "Available Memory",
+      "oid": "1.3.6.1.4.1.2021.4.6.0",
+      "widget": "text",
+      "format": "bytes_kb",
+      "readonly": true
+    },
+    {
+      "widget_id": "if_in_octets",
+      "label": "Eth0 In",
+      "oid": "1.3.6.1.2.1.2.2.1.10.1",
+      "widget": "gauge",
+      "unit": "B/s",
+      "min": 0,
+      "max": 125000000,
+      "format": "counter_rate",
+      "readonly": true
+    }
+  ]
+}

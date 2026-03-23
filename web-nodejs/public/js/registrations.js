@@ -168,7 +168,7 @@
     function openRejectModal(id) {
         rejectTargetId = id;
         rejectReasonInput.value = '';
-        rejectModal.style.display = '';
+        rejectModal.style.display = 'flex';
     }
 
     async function confirmReject() {
@@ -234,19 +234,13 @@
 
     function formatTimeAgo(dateStr) {
         if (!dateStr) return '—';
-        const date = new Date(dateStr);
-        const now = new Date();
-        const diffMs = now - date;
-        const diffSec = Math.floor(diffMs / 1000);
-        const diffMin = Math.floor(diffSec / 60);
-        const diffHour = Math.floor(diffMin / 60);
-        const diffDay = Math.floor(diffHour / 24);
-
-        if (diffSec < 60) return `${diffSec}s ago`;
-        if (diffMin < 60) return `${diffMin}m ago`;
-        if (diffHour < 24) return `${diffHour}h ago`;
-        if (diffDay < 30) return `${diffDay}d ago`;
-        return date.toLocaleDateString();
+        const d = new Date(dateStr);
+        const diff = Math.floor((Date.now() - d) / 1000);
+        if (diff < 60) return _('time.seconds_ago').replace('{count}', diff);
+        if (diff < 3600) return _('time.minutes_ago').replace('{count}', Math.floor(diff / 60));
+        if (diff < 86400) return _('time.hours_ago').replace('{count}', Math.floor(diff / 3600));
+        if (diff < 2592000) return _('time.days_ago').replace('{count}', Math.floor(diff / 86400));
+        return d.toLocaleDateString();
     }
 
     function showToast(message, type) {

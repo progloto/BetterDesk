@@ -11,14 +11,16 @@
     <link rel="icon" type="image/svg+xml" href="/branding/favicon.svg">
     
     <!-- Stylesheets -->
-    <link rel="stylesheet" href="/css/main.css">
-    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/main.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/theme.css?v=<%= cacheVersion %>">
     <% if (!embed) { %>
-    <link rel="stylesheet" href="/css/desktop-mode.css">
+    <link rel="stylesheet" href="/css/desktop-mode.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/desktop-widgets.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/tutorial.css?v=<%= cacheVersion %>">
     <% } %>
     <% if (typeof pageStyles !== 'undefined' && pageStyles.length) { %>
         <% pageStyles.forEach(style => { %>
-    <link rel="stylesheet" href="/css/<%= style %>.css">
+    <link rel="stylesheet" href="/css/<%= style %>.css?v=<%= cacheVersion %>">
         <% }); %>
     <% } %>
 </head>
@@ -50,6 +52,7 @@
     <!-- Desktop Mode Shell (hidden by default, activated via toggle) -->
     <div id="desktop-shell" class="desktop-shell">
         <div class="desktop-wallpaper"></div>
+        <div class="widget-canvas" id="widget-canvas"></div>
         <div class="desktop-icons" id="desktop-icons"></div>
         <div class="desktop-windows" id="desktop-windows"></div>
         <div class="desktop-taskbar" id="desktop-taskbar">
@@ -60,7 +63,10 @@
             </div>
             <div class="taskbar-apps" id="taskbar-apps"></div>
             <div class="taskbar-right">
-                <button class="taskbar-btn taskbar-console-btn" id="taskbar-console-btn" title="<%= _('desktop.console_mode') %>">
+                <button class="taskbar-btn" id="taskbar-wallpaper-btn" title="<%= _('desktop.wallpaper') %>">
+                    <span class="material-icons">wallpaper</span>
+                </button>
+                <button class="taskbar-btn taskbar-console-btn" id="taskbar-console-btn" title="<%= _('desktop.exit_desktop') %>">
                     <span class="material-icons">view_sidebar</span>
                 </button>
                 <div class="taskbar-clock" id="taskbar-clock"></div>
@@ -87,17 +93,20 @@
             embed: <%= embed ? 'true' : 'false' %>
         };
     </script>
-    <script src="/js/utils.js"></script>
-    <script src="/js/i18n-client.js?v=<%= Date.now() %>"></script>
-    <script src="/js/notifications.js?v=<%= Date.now() %>"></script>
-    <script src="/js/modal.js?v=<%= Date.now() %>"></script>
-    <script src="/js/app.js?v=<%= Date.now() %>"></script>
+    <script src="/js/utils.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/i18n-client.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/notifications.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/modal.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/app.js?v=<%= cacheVersion %>"></script>
     <% if (!embed) { %>
-    <script src="/js/desktop-mode.js?v=<%= Date.now() %>"></script>
+    <script src="/js/widget-plugins.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/desktop-widgets.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/desktop-mode.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/tutorial.js?v=<%= cacheVersion %>"></script>
     <% } %>
     <% if (typeof pageScripts !== 'undefined' && pageScripts.length) { %>
         <% pageScripts.forEach(script => { %>
-    <script src="/js/<%= script %>.js?v=<%= Date.now() %>"></script>
+    <script src="/js/<%= script %>.js?v=<%= cacheVersion %>"></script>
         <% }); %>
     <% } %>
 </body>

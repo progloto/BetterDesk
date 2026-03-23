@@ -127,6 +127,14 @@ module.exports = {
     betterdeskApiKey: process.env.BETTERDESK_API_KEY || apiKey,
     betterdeskApiTimeout: parseInt(process.env.BETTERDESK_API_TIMEOUT, 10) || 5000,
     
+    // TLS certificate verification (BD-2026-002)
+    // When true, self-signed certificates are accepted for internal connections.
+    // Set to 'false' in production with proper certificates.
+    allowSelfSignedCerts: (process.env.ALLOW_SELF_SIGNED_CERTS || 'true').toLowerCase() === 'true',
+    // SMTP TLS verification — separate control for outbound email.
+    // Set to 'true' when using a trusted SMTP server with valid certificates.
+    smtpTlsVerify: (process.env.SMTP_TLS_VERIFY || 'false').toLowerCase() === 'true',
+    
     // Session
     sessionSecret: sessionSecret,
     sessionMaxAge: parseInt(process.env.SESSION_MAX_AGE, 10) || 24 * 60 * 60 * 1000, // 24 hours

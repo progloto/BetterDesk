@@ -34,8 +34,8 @@ RUN apk add --no-cache \
     curl \
     tini \
     || { sleep 2 && apk add --no-cache sqlite curl tini; } \
-    && addgroup -S betterdesk \
-    && adduser -S -G betterdesk betterdesk
+    && addgroup -g 10001 -S betterdesk \
+    && adduser -u 10001 -S -G betterdesk betterdesk
 
 # Copy application files FIRST, then overlay compiled node_modules.
 # This prevents local node_modules from overwriting Alpine/musl native modules.

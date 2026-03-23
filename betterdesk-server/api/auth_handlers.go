@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -631,6 +632,10 @@ func (s *Server) authenticateRequest(r *http.Request) (username, role string, ok
 	apiKey := r.Header.Get("X-API-Key")
 	if apiKey == "" {
 		apiKey = r.URL.Query().Get("api_key")
+		if apiKey != "" {
+			// BD-2026-005: Deprecation warning for query-param API keys
+			log.Printf("[SECURITY] DEPRECATED: API key passed via query parameter from %s %s — use X-API-Key header instead", r.Method, r.URL.Path)
+		}
 	}
 	if apiKey != "" {
 		keyHash := hashAPIKey(apiKey)
@@ -649,6 +654,8 @@ func (s *Server) authenticateRequest(r *http.Request) (username, role string, ok
 		// 3. Legacy: match against config table's api_key value (full admin access)
 		storedKey, _ := s.db.GetConfig("api_key")
 		if storedKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(storedKey)) == 1 {
+			// BD-2026-005: Deprecation warning for legacy config-table API key
+			log.Printf("[SECURITY] DEPRECATED: Legacy config-table API key used from %s — migrate to scoped api_keys table", s.remoteIP(r))
 			return "legacy_apikey", auth.RoleAdmin, true
 		}
 	}
@@ -670,7 +677,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			path == "/api/auth/login" || path == "/api/auth/login/2fa" ||
 			path == "/api/server/pubkey" || path == "/api/server/stats" ||
 			path == "/api/login" || path == "/api/login-options" || path == "/api/logout" ||
-			path == "/api/heartbeat" || path == "/api/sysinfo" || path == "/api/sysinfo_ver" {
+			path == "/api/heartbeat" || path == "/api/sysinfo" || path == "/api/sysinfo_ver" ||
+			path == "/api/branding" ||
+			path == "/api/devices/register" || path == "/api/devices/register/status" {
 			next.ServeHTTP(w, r)
 			return
 		}

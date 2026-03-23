@@ -417,6 +417,16 @@ func (s *SQLiteDB) GetPeerCount() (total int, online int, err error) {
 	return total, online, err
 }
 
+// GetBannedPeerCount returns the number of banned peers in the database.
+func (s *SQLiteDB) GetBannedPeerCount() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM peers WHERE banned = 1 AND soft_deleted = 0`).Scan(&count)
+	return count, err
+}
+
 // UpdatePeerStatus updates a peer's status and IP, plus last_online timestamp.
 func (s *SQLiteDB) UpdatePeerStatus(id string, status string, ip string) error {
 	s.mu.Lock()
@@ -676,6 +686,29 @@ func (s *SQLiteDB) DeleteConfig(key string) error {
 
 	_, err := s.db.Exec(`DELETE FROM server_config WHERE key = ?`, key)
 	return err
+}
+
+// ListConfigByPrefix returns all configuration entries whose key starts with the given prefix.
+func (s *SQLiteDB) ListConfigByPrefix(prefix string) ([]ServerConfig, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`SELECT key, value FROM server_config WHERE key LIKE ?`,
+		prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var configs []ServerConfig
+	for rows.Next() {
+		var c ServerConfig
+		if err := rows.Scan(&c.Key, &c.Value); err != nil {
+			return nil, err
+		}
+		configs = append(configs, c)
+	}
+	return configs, rows.Err()
 }
 
 // UpdatePeerTags updates the tags field for a peer.

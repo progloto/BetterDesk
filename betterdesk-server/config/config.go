@@ -85,9 +85,10 @@ type Config struct {
 	EnrollmentMode string
 
 	// CDAP Gateway
-	CDAPPort    int  // WebSocket gateway port (default 21122)
-	CDAPEnabled bool // Enable CDAP gateway (default false)
-	CDAPTLS     bool // Enable TLS on CDAP port
+	CDAPPort      int  // WebSocket gateway port (default 21122)
+	CDAPEnabled   bool // Enable CDAP gateway (default false)
+	CDAPTLS       bool // Enable TLS on CDAP port
+	CDAPRateLimit int  // Max requests per minute per IP (default 30)
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -103,6 +104,8 @@ func DefaultConfig() *Config {
 		RelayMaxConnsIP: 20,
 		EnrollmentMode:  EnrollmentModeOpen, // Backward compatible default
 		CDAPPort:        21122,
+		CDAPEnabled:     true, // Enabled by default; set CDAP_ENABLED=N for minimal installs
+		CDAPRateLimit:   30,
 	}
 }
 
@@ -226,11 +229,18 @@ func (c *Config) LoadEnv() {
 			c.CDAPPort = n
 		}
 	}
-	if strings.ToUpper(os.Getenv("CDAP_ENABLED")) == "Y" {
+	if v := strings.ToUpper(os.Getenv("CDAP_ENABLED")); v == "N" || v == "NO" || v == "FALSE" || v == "0" {
+		c.CDAPEnabled = false
+	} else if v == "Y" || v == "YES" || v == "TRUE" || v == "1" {
 		c.CDAPEnabled = true
 	}
 	if strings.ToUpper(os.Getenv("CDAP_TLS")) == "Y" {
 		c.CDAPTLS = true
+	}
+	if v := os.Getenv("CDAP_RATE_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.CDAPRateLimit = n
+		}
 	}
 }
 

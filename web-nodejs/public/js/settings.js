@@ -146,14 +146,19 @@
                 return;
             }
             
-            tbody.innerHTML = logs.map(log => `
+            tbody.innerHTML = logs.map(log => {
+                var actionKey = 'audit.action_' + (log.action || '').replace(/[^a-z0-9_]/gi, '_');
+                var actionLabel = typeof _ === 'function' ? _(actionKey) : log.action;
+                if (actionLabel === actionKey) actionLabel = log.action;
+                return `
                 <tr>
                     <td>${Utils.formatDate(log.created_at)}</td>
                     <td>${Utils.escapeHtml(log.username || '-')}</td>
-                    <td><span class="audit-action ${log.action}">${Utils.escapeHtml(log.action)}</span></td>
+                    <td><span class="audit-action ${log.action}">${Utils.escapeHtml(actionLabel)}</span></td>
                     <td>${Utils.escapeHtml(log.details || '-')}</td>
                 </tr>
-            `).join('');
+            `;
+            }).join('');
             
         } catch (error) {
             tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">${_('errors.load_audit_failed')}</td></tr>`;

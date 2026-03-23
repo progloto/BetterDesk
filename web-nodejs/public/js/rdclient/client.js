@@ -138,13 +138,60 @@ class RDClient {
             // Store peer's server-signed pk for SignedId verification (from RelayResponse.pk)
             this._peerSignedPk = rendezvousResponse.pk || null;
 
-            // Step 7: Close rendezvous, connect to relay
+            // Step 7: Determine relay UUID.
+            //
+            // PunchHoleResponse does NOT contain a UUID — only natType and relayServer.
+            // The signal server expects us to send RequestRelay{uuid} back on the SAME
+            // rendezvous connection so it can forward the UUID to the target device.
+            // Both sides then connect to hbbr with the same UUID → relay pairs them.
+            //
+            // If we already received a RelayResponse (which has a UUID), skip this step.
+            let relayUUID = rendezvousResponse.uuid || '';
+            let relayServer = rendezvousResponse.relayServer || '';
+
+            if (!relayUUID) {
+                // Generate UUID for relay pairing (crypto.randomUUID requires
+                // secure context HTTPS — use fallback for HTTP)
+                relayUUID = (window.crypto && window.crypto.randomUUID
+                    ? window.crypto.randomUUID()
+                    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                        const r = Math.random() * 16 | 0;
+                        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+                    }));
+
+                // Step 8: Send RequestRelay back to hbbs (signal server) via rendezvous
+                // so it can tell the target device to connect to relay with our UUID.
+                this._emit('log', `Requesting relay (uuid: ${relayUUID.substring(0, 8)}...)...`);
+                const requestRelaySignal = this.proto.buildRequestRelay(
+                    this.deviceId,
+                    relayUUID,
+                    relayServer,
+                    this.opts.serverPubKey
+                );
+                const signalData = this.proto.encodeRendezvous(requestRelaySignal);
+                this.conn.sendRendezvous(signalData);
+
+                // Step 9: Wait for RelayResponse from hbbs confirming the relay setup
+                const relayConfirm = await this._waitForSignalRelayResponse();
+                if (relayConfirm.error) {
+                    throw new Error(`Relay refused: ${relayConfirm.error}`);
+                }
+                // Use the confirmed UUID and relay server from hbbs
+                relayUUID = relayConfirm.uuid || relayUUID;
+                relayServer = relayConfirm.relayServer || relayServer;
+                if (relayConfirm.pk) {
+                    this._peerSignedPk = relayConfirm.pk;
+                }
+                console.log(`[RDClient] RelayResponse confirmed: uuid=${relayUUID.substring(0, 8)}... relay=${relayServer}`);
+            }
+
+            // Step 10: Close rendezvous, connect to relay
             this.conn.closeRendezvous();
 
             this._emit('log', 'Connecting to relay server...');
             await this.conn.connectRelay();
 
-            // Step 8: Setup relay message handler BEFORE sending anything
+            // Step 11: Setup relay message handler BEFORE sending anything
             this.conn.on('relay:message', (data) => this._handleRelayData(data));
             this.conn.on('relay:close', () => {
                 if (this._state !== 'disconnected' && this._state !== 'error') {
@@ -153,18 +200,18 @@ class RDClient {
             });
             this.conn.on('relay:error', (e) => this._handleDisconnect('Relay error: ' + e.message));
 
-            // Step 9: Send RequestRelay to hbbr (with licence_key - hbbr validates this!)
-            this._emit('log', `Requesting relay (uuid: ${(rendezvousResponse.uuid || '').substring(0, 8)}...)...`);
+            // Step 12: Send RequestRelay to hbbr (relay expects this as first message for pairing)
+            this._emit('log', `Connecting to relay (uuid: ${relayUUID.substring(0, 8)}...)...`);
             const requestRelay = this.proto.buildRequestRelay(
                 this.deviceId,
-                rendezvousResponse.uuid || '',
-                rendezvousResponse.relayServer || '',
+                relayUUID,
+                relayServer,
                 this.opts.serverPubKey
             );
             const relayData = this.proto.encodeRendezvous(requestRelay);
             this.conn.sendRelay(relayData);
 
-            // Step 10: Wait for target's SignedId (first message from relay)
+            // Step 13: Wait for target's SignedId (first message from relay)
             // Target sends SignedId FIRST (unencrypted, signed with their Ed25519 key).
             // We do NOT send anything until we process SignedId and perform key exchange.
             this._emit('log', 'Waiting for peer handshake...');
@@ -201,7 +248,8 @@ class RDClient {
                 myId: 'betterdesk-web-' + Date.now().toString(36),
                 myName: 'BetterDesk Web',
                 disableAudio: this.opts.disableAudio || false,
-                fps: this.opts.fps || 30
+                fps: this.opts.fps || 60,
+                imageQuality: this.opts.imageQuality || 'Best'
             });
 
             console.log('[RDClient] Auth: sending LoginRequest, crypto.enabled=' + this.crypto.enabled
@@ -339,6 +387,75 @@ class RDClient {
                     } catch (err) {
                         // Protobuf decode error — skip this frame and continue
                         console.warn('[RDClient] Failed to decode rendezvous frame, skipping:', err.message);
+                    }
+                }
+            };
+
+            this.conn.on('rendezvous:message', handler);
+        });
+    }
+
+    /**
+     * Wait for RelayResponse from signal server (hbbs) after sending RequestRelay.
+     *
+     * After PunchHoleResponse (natType=SYMMETRIC), we send RequestRelay{uuid} back
+     * to hbbs on the same rendezvous connection. hbbs forwards the request to the
+     * target device (tells it to connect to relay with our UUID) and sends back a
+     * RelayResponse confirming the UUID and relay server.
+     *
+     * @returns {Promise<{uuid: string, relayServer: string, pk: Uint8Array|null, error?: string}>}
+     */
+    _waitForSignalRelayResponse() {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this.conn.off('rendezvous:message', handler);
+                reject(new Error('RelayResponse timeout (15s) — target device may be unreachable'));
+            }, 15000);
+
+            const handler = (rawData) => {
+                const frames = this._rendezvousDecoder.feed(rawData);
+                if (frames.length === 0) return;
+
+                for (const frame of frames) {
+                    try {
+                        const msg = this.proto.decodeRendezvous(frame);
+
+                        // Skip KeyExchange, HealthCheck, and other housekeeping
+                        if (msg.keyExchange || msg.hc) continue;
+
+                        if (msg.relayResponse) {
+                            clearTimeout(timeout);
+                            this.conn.off('rendezvous:message', handler);
+                            const rr = msg.relayResponse;
+                            console.log('[RDClient] Signal RelayResponse:', JSON.stringify({
+                                relayServer: rr.relayServer || '',
+                                uuid: (rr.uuid || '').substring(0, 8) + '...',
+                                hasPk: !!(rr.pk && rr.pk.length),
+                                refuseReason: rr.refuseReason || ''
+                            }));
+                            if (rr.refuseReason && rr.refuseReason.length > 0) {
+                                resolve({ error: rr.refuseReason });
+                            } else {
+                                resolve({
+                                    uuid: rr.uuid || '',
+                                    relayServer: rr.relayServer || '',
+                                    pk: rr.pk || null
+                                });
+                            }
+                            return;
+                        }
+
+                        // PunchHoleSent may arrive from target — it's just an update,
+                        // not what we are waiting for. Log and continue.
+                        if (msg.punchHoleResponse || msg.punchHoleSent) {
+                            console.log('[RDClient] Skipping late PunchHoleResponse/Sent while waiting for RelayResponse');
+                            continue;
+                        }
+
+                        const fieldNames = Object.keys(msg).filter(k => msg[k] != null && k !== 'union');
+                        console.log('[RDClient] Skipping signal message while waiting for RelayResponse:', fieldNames.join(', '));
+                    } catch (err) {
+                        console.warn('[RDClient] Failed to decode signal frame:', err.message);
                     }
                 }
             };
@@ -832,9 +949,13 @@ class RDClient {
             });
         }
 
-        // Tell peer our desired FPS to avoid unnecessary throttling
-        const fps = this.opts.fps || 30;
-        this._sendPeerMessage(this.proto.buildOptionMisc({ customFps: fps }));
+        // Tell peer our desired FPS and image quality after session establishment
+        const fps = this.opts.fps || 60;
+        const quality = this.opts.imageQuality || 'Best';
+        this._sendPeerMessage(this.proto.buildOptionMisc({
+            customFps: fps,
+            imageQuality: quality
+        }));
 
         // Start ping interval
         this._pingInterval = setInterval(() => {

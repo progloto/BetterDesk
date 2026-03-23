@@ -37,9 +37,54 @@
             </a>
         </div>
         
+        <!-- Management Section -->
+        <div class="sidebar-section">
+            <div class="sidebar-section-title"><%= _('nav.management') || 'Management' %></div>
+            
+            <a href="/inventory" class="sidebar-link <%= currentPage === 'inventory' ? 'active' : '' %>">
+                <span class="material-icons">inventory_2</span>
+                <span class="sidebar-link-text"><%= _('nav.inventory') %></span>
+            </a>
+            
+            <a href="/tickets" class="sidebar-link <%= currentPage === 'tickets' ? 'active' : '' %>">
+                <span class="material-icons">confirmation_number</span>
+                <span class="sidebar-link-text"><%= _('nav.tickets') %></span>
+            </a>
+
+            <a href="/help-requests" class="sidebar-link <%= currentPage === 'help-requests' ? 'active' : '' %>">
+                <span class="material-icons">support_agent</span>
+                <span class="sidebar-link-text"><%= _('nav.help_requests') %></span>
+            </a>
+            
+            <a href="/automation" class="sidebar-link <%= currentPage === 'automation' ? 'active' : '' %>">
+                <span class="material-icons">smart_toy</span>
+                <span class="sidebar-link-text"><%= _('nav.automation') %></span>
+            </a>
+            
+            <a href="/network" class="sidebar-link <%= currentPage === 'network' ? 'active' : '' %>">
+                <span class="material-icons">lan</span>
+                <span class="sidebar-link-text"><%= _('nav.network') %></span>
+            </a>
+            
+            <a href="/activity" class="sidebar-link <%= currentPage === 'activity' ? 'active' : '' %>">
+                <span class="material-icons">timeline</span>
+                <span class="sidebar-link-text"><%= _('nav.activity') %></span>
+            </a>
+            
+            <a href="/cdap" class="sidebar-link <%= currentPage === 'cdap' ? 'active' : '' %>">
+                <span class="material-icons">developer_board</span>
+                <span class="sidebar-link-text"><%= _('nav.cdap') %></span>
+            </a>
+        </div>
+        
         <!-- Tools Section -->
         <div class="sidebar-section">
             <div class="sidebar-section-title"><%= _('nav.tools') %></div>
+            
+            <a href="/reports" class="sidebar-link <%= currentPage === 'reports' ? 'active' : '' %>">
+                <span class="material-icons">assessment</span>
+                <span class="sidebar-link-text"><%= _('nav.reports') %></span>
+            </a>
             
             <a href="/keys" class="sidebar-link <%= currentPage === 'keys' ? 'active' : '' %>">
                 <span class="material-icons">vpn_key</span>
@@ -57,6 +102,21 @@
             <div class="sidebar-section-title"><%= _('nav.system') %></div>
             
             <% if (user && user.role === 'admin') { %>
+            <a href="/tokens" class="sidebar-link <%= currentPage === 'tokens' ? 'active' : '' %>">
+                <span class="material-icons">token</span>
+                <span class="sidebar-link-text"><%= _('nav.tokens') %></span>
+            </a>
+            
+            <a href="/tenants" class="sidebar-link <%= currentPage === 'tenants' ? 'active' : '' %>">
+                <span class="material-icons">business</span>
+                <span class="sidebar-link-text"><%= _('nav.tenants') %></span>
+            </a>
+            
+            <a href="/dataguard" class="sidebar-link <%= currentPage === 'dataguard' ? 'active' : '' %>">
+                <span class="material-icons">shield</span>
+                <span class="sidebar-link-text"><%= _('nav.dataguard') %></span>
+            </a>
+            
             <a href="/users" class="sidebar-link <%= currentPage === 'users' ? 'active' : '' %>">
                 <span class="material-icons">group</span>
                 <span class="sidebar-link-text"><%= _('nav.users') %></span>
@@ -83,3 +143,28 @@
         </div>
     </div>
 </aside>
+<script>
+// Preserve sidebar scroll position across page navigations
+(function() {
+    var nav = document.querySelector('.sidebar-nav');
+    if (!nav) return;
+    var KEY = 'bd_sidebar_scroll';
+    try {
+        var saved = sessionStorage.getItem(KEY);
+        if (saved) nav.scrollTop = parseInt(saved, 10) || 0;
+    } catch(e) {}
+    // Also scroll active link into view if not visible
+    var active = nav.querySelector('.sidebar-link.active');
+    if (active) {
+        var rect = active.getBoundingClientRect();
+        var navRect = nav.getBoundingClientRect();
+        if (rect.top < navRect.top || rect.bottom > navRect.bottom) {
+            active.scrollIntoView({ block: 'center' });
+        }
+    }
+    // Save scroll on navigation
+    window.addEventListener('beforeunload', function() {
+        try { sessionStorage.setItem(KEY, String(nav.scrollTop)); } catch(e) {}
+    });
+})();
+</script>

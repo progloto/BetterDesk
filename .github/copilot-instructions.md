@@ -5,7 +5,7 @@
 
 ---
 
-## 📊 Stan Projektu (aktualizacja: 2026-03-01)
+## 📊 Stan Projektu (aktualizacja: 2026-03-21)
 
 ### Wersja Skryptów ALL-IN-ONE (v2.4.0)
 
@@ -182,6 +182,17 @@ Rustdesk-FreeConsole/
 │   ├── proto/               # Generated protobuf (rendezvous + message)
 │   └── tools/               # Migration utilities
 ├── web-nodejs/              # Node.js web console (active)
+├── betterdesk-agent/        # Native CDAP agent (Go binary)
+│   ├── main.go              # CLI entry point, 14 flags, signal handling
+│   ├── agent/               # Core: config, agent, system, manifest, terminal, filebrowser, clipboard, screenshot
+│   └── install/             # Systemd + NSSM service installers
+├── sdks/                    # CDAP Bridge SDKs
+│   ├── python/              # betterdesk-cdap v1.0.0 (async CDAPBridge, Widget helpers)
+│   └── nodejs/              # betterdesk-cdap v1.0.0 (EventEmitter CDAPBridge, Widget class)
+├── bridges/                 # Reference CDAP bridges
+│   ├── modbus/              # Modbus TCP/RTU bridge (pymodbus)
+│   ├── snmp/                # SNMP v2c/v3 bridge (pysnmplib)
+│   └── rest-webhook/        # REST polling + webhook bridge (aiohttp)
 ├── web/                     # Flask web console (deprecated)
 ├── hbbs-patch-v2/           # Legacy Rust server binaries (v2.1.3)
 │   ├── hbbs-linux-x86_64    # Signal server Linux (Rust)
@@ -209,6 +220,7 @@ Rustdesk-FreeConsole/
 | 21119 | WS | WebSocket Relay (relay port + 2) |
 | 5000 | HTTP | Web Console (admin panel, LAN) |
 | 21121 | TCP | RustDesk Client API (WAN-facing, Node.js) |
+| 21122 | WS | CDAP Gateway (WebSocket, path: /cdap) |
 
 ### Go Server — Architecture Flow
 
@@ -300,7 +312,7 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 20. [x] **Nowe endpointy API** - /api/config, /api/peers/stats, /api/server/stats
 21. [x] **Dokumentacja v3.0** - STATUS_TRACKING_v3.md
 22. [x] **Zmiana ID urządzenia** - moduł id_change.rs, endpoint POST /api/peers/:id/change-id
-23. [x] **Dokumentacja ID Change** - docs/ID_CHANGE_FEATURE.md
+23. [x] **Dokumentacja ID Change** - docs/features/ID_CHANGE_FEATURE.md
 
 ### ✅ Ukończone (2026-02-11)
 24. [x] **System i18n** - wielojęzyczność panelu web przez JSON
@@ -308,7 +320,7 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 26. [x] **JavaScript i18n** - web/static/js/i18n.js client-side
 27. [x] **Tłumaczenia EN/PL** - web/lang/en.json, web/lang/pl.json
 28. [x] **Selector języka** - w sidebarze panelu
-29. [x] **Dokumentacja i18n** - docs/CONTRIBUTING_TRANSLATIONS.md
+29. [x] **Dokumentacja i18n** - docs/development/CONTRIBUTING_TRANSLATIONS.md
 
 ### ✅ Ukończone (2026-02-17)
 30. [x] **Security audit v2.3.0** - 3 Critical, 5 High, 8 Medium, 6 Low findings - all Critical/High fixed
@@ -576,9 +588,57 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 183. [x] **Password `$` escaping in systemd (Issue #68)**: systemd interprets `$` as variable substitution in ExecStart and Environment directives. Admin password and PostgreSQL URL now escaped `$` → `$$` before writing to `.service` files. Auto-generated passwords (alphanumeric) unaffected.
 184. [x] **Port CONFLICT false positive**: `ss -tlnp` shows `MainThread` instead of `node` on some Linux systems (Ubuntu 24.04+). Added `MainThread` to expected process patterns for ports 5000 and 21121.
 
----
+#### Web Remote Client — Mouse, Quality & FPS Fix (Phase 32) ✅ COMPLETED 2026-03-21
+185. [x] **Mouse click fix (Critical)**: RustDesk parses mouse mask as `button = mask >> 3; type = mask & 7`. Web client sent flat values (mask=1 for left click → `button = 1>>3 = 0` = no button). Hover worked because mask=0 is correct for both formats. Fixed `input.js`: replaced flat values with `TYPE | (BUTTON << 3)` encoding (left click = `1|(1<<3)=9`, right click = `1|(2<<3)=17`, etc.). Added static constants `MOUSE_TYPE_DOWN=1`, `MOUSE_TYPE_UP=2`, `MOUSE_TYPE_WHEEL=3`, `MOUSE_BUTTON_LEFT=1`, `MOUSE_BUTTON_RIGHT=2`, `MOUSE_BUTTON_MIDDLE=4`.
+186. [x] **Image quality fix**: `buildLoginRequest` in `protocol.js` hardcoded `imageQuality: Balanced`. Changed to configurable with default `Best`. `remote.js` passes `imageQuality: 'Best'` in constructor.
+187. [x] **FPS fix**: Login used `customFps: opts.fps || 30` despite wanting 60fps. Changed default to 60. `client.js` `_startSession()` now sends both `customFps` and `imageQuality` options. `authenticate()` passes `fps: 60` and `imageQuality: 'Best'`.
+188. [x] **Beta banner**: Replaced large orange "WIP" banner in `remote.ejs` with slim blue "Beta" banner with dismiss button.
 
-## 🔄 System Statusu v3.0
+#### CDAP Full-Stack — Audio, Clipboard, Cursor, Quality, Codec, Multi-Monitor (Phase 33) ✅ COMPLETED 2026-03-21
+189. [x] **clipboard.go rewrite**: Fixed all field mismatches (sync.Map Load, DeviceConn.WriteMessage, session.browser, session.DeviceID, context.Background(), gw.auditAction()). Bidirectional browser↔device clipboard sync with format detection.
+190. [x] **audio.go**: Full audio session management (~230 lines). AudioSession struct, AudioStartPayload (codec/sample_rate/channels/direction), AudioFramePayload (codec/data/timestamp/duration/sequence). StartAudioSession checks "audio" capability on device manifest. HandleAudioFrame/RelayAudioInput/EndAudioSession.
+191. [x] **media_control.go**: Cursor rendering, adaptive quality, codec negotiation, multi-monitor, key exchange relay, keyframe requests (~320 lines). CursorUpdatePayload (format/width/height/hotspot_x/y/data/cursor_id/hidden), QualityReportPayload (bandwidth_kb/latency_ms/frame_loss/fps), computeQualityAdjustment (adaptive), CodecOffer/Answer relay, MonitorList/MonitorSelect, HandleKeyExchange, RelayKeyframeRequest.
+192. [x] **gateway.go + handler.go integration**: Added audioSessions sync.Map. 7 new message cases in messageLoop: audio_frame, audio_end, clipboard_update, key_exchange, cursor_update, codec_answer, monitor_list. handleAudioFrame/handleAudioEnd in handler.go.
+193. [x] **cdap_handlers.go extensions**: Desktop handler: 6 new switch cases (clipboard_set, quality_report, codec_offer, key_exchange, keyframe_request, monitor_select). Video handler: 4 new switch cases (quality_report, codec_offer, key_exchange, keyframe_request). New handleCDAPAudio WS handler (~100 lines) with init/ready/audio_input/close protocol.
+194. [x] **server.go audio route**: `GET /api/cdap/devices/{id}/audio` with operator role requirement.
+195. [x] **cdapMediaProxy.js audio entry**: Added audio channel to DRY proxy factory (subprotocol: cdap-audio, minRole: operator).
+196. [x] **cdap-audio.js** (~310 lines, NEW): Web Audio API browser client. PCM 16-bit decode + Opus via decodeAudioData. Microphone capture via getUserMedia + ScriptProcessorNode. Volume/mute control, RMS level meter. WS init/ready/audio_frame/error/end protocol. Public API: CDAPAudio.open/close/isActive/setVolume/toggleMute/isMuted.
+197. [x] **cdap-desktop.js rewrite** (~500 lines): Cursor rendering (PNG/RGBA format, LRU cache 50, hidden cursor), clipboard sync (navigator.clipboard API, paste events, clipboard indicator), quality reporting (5s interval, bandwidth/latency/frame_loss/fps), codec negotiation (sendCodecOffer on ready), multi-monitor (select UI in toolbar), keyframe requests.
+198. [x] **cdap-video.js rewrite** (~280 lines): Quality reporting (5s interval), codec negotiation, keyframe request, frame byte/drop tracking.
+199. [x] **cdap-widgets.js updates**: Audio widget renderer (status indicator, level meter, mute/connect buttons), desktop toolbar with clipboard indicator, audio connect/mute event listeners.
+200. [x] **cdap.css** (~170 lines added): Audio widget styles (streaming/connecting/disconnected status, level meter with color thresholds), desktop toolbar, clipboard indicator (fade animation), monitor selector, .cdap-widget-md grid span.
+201. [x] **i18n**: 7 new keys in EN/PL/ZH: connect_audio, audio_connecting, audio_streaming, clipboard_in, clipboard_out, monitor_select, keyframe_request, quality_auto.
+202. [x] **Deployed & verified**: Go binary (28MB) + 10 Node.js files deployed to 192.168.0.110. Both services active. CDAP endpoint returns JSON, console returns 302 (auth redirect) — all correct.
+
+#### Native BetterDesk Agent — Go Binary (Phase 34) ✅ COMPLETED 2026-03-21
+203. [x] **betterdesk-agent/main.go**: CLI entry point with 14 flags, signal handling (SIGINT/SIGTERM), graceful shutdown.
+204. [x] **agent/config.go**: Config struct + JSON/env loading + Validate(). Supports `server`, `auth_method` (api_key/device_token/user_password), `device_id`, `device_name`, `device_type`, `tags`, `terminal`, `file_browser`, `clipboard`, `screenshot`, `file_root`, `heartbeat_sec`, `reconnect_sec`, `log_level`.
+205. [x] **agent/agent.go** (~750 lines): Core agent — WebSocket connect, CDAP auth, manifest registration, heartbeat loop with system metric → widget_values mapping (sys_cpu, sys_memory, sys_disk, sys_hostname, sys_uptime), message dispatch for 20+ CDAP message types (command, terminal_start/input/resize/kill, file_list/read/write/delete, clipboard_get/set, screenshot_capture, state_update, bulk_update, alert_ack, ping).
+206. [x] **agent/system.go**: gopsutil metrics (CPU 1s sample, Memory, Disk root), SystemInfo (hostname/os/platform/version/arch/uptime/total_memory/total_disk), live Uptime() method.
+207. [x] **agent/manifest.go**: CDAP manifest builder — device descriptor, capabilities (telemetry, commands, remote_desktop, file_transfer, clipboard), 9 system widgets (3 gauges, 2 text, 1 terminal, 1 file_browser, 1 button, 1 clipboard text), `heartbeat_interval` field.
+208. [x] **agent/terminal_{unix,windows}.go**: Cross-platform terminal — creack/pty on Unix, cmd.exe StdinPipe/StdoutPipe on Windows.
+209. [x] **agent/filebrowser.go**: safePath() path traversal protection, ListDirectory, ReadFileChunk (base64, 1MB max), WriteFileChunk (base64 decode), DeletePath.
+210. [x] **agent/clipboard.go**: Cross-platform clipboard via OS commands (xclip/xsel/pbcopy/powershell).
+211. [x] **agent/screenshot_{unix,windows}.go**: Platform-specific screenshot capture (screencapture/import/scrot on Unix, System.Drawing on Windows).
+212. [x] **install/install.sh**: Linux systemd installer with ProtectSystem=strict, PrivateTmp, NoNewPrivileges security hardening.
+213. [x] **install/install.ps1**: Windows NSSM service installer.
+214. [x] **Protocol mismatches fixed**: terminal_output (not terminal_data), terminal_end (not terminal_close), file_write_response (not file_write_ack), file_delete_response (not file_delete_ack), flat widget fields (label/group, not nested config), heartbeat_interval (not heartbeat).
+215. [x] **Deployed & verified**: Binary on 192.168.0.110, device_id=CDAP-6A9A5452, type=os_agent, 9 widgets, heartbeat=15s, telemetry flowing (CPU/Memory/Disk/Hostname/Uptime). CDAP API key created via REST (`POST /api/keys`), `api_keys` table entry active.
+
+#### Bridge Ecosystem SDK — Python + Node.js + Reference Bridges (Phase 35) ✅ COMPLETED 2026-03-21
+216. [x] **sdks/python/**: betterdesk-cdap v1.0.0 — CDAPBridge async class (~330 lines), Widget dataclass + 9 factory helpers, Message dataclass, all CDAP constants. Deps: websockets>=12.0.
+217. [x] **sdks/nodejs/**: betterdesk-cdap v1.0.0 — CDAPBridge extends EventEmitter (~300 lines), Widget class + factory helpers, protocol constants. Dep: ws ^8.18.0. Smoke test verified.
+218. [x] **bridges/modbus/**: Modbus TCP/RTU bridge (~200 lines) — register polling, data type encode/decode, write-back commands. Dep: pymodbus>=3.6.0.
+219. [x] **bridges/snmp/**: SNMP v2c/v3 bridge (~200 lines) — OID polling, timetick formatting, counter rate computation. Dep: pysnmplib>=5.0.0.
+220. [x] **bridges/rest-webhook/**: REST polling + aiohttp webhook listener (~230 lines) — JMESPath-lite extraction, configurable polling intervals. Dep: aiohttp>=3.9.0.
+221. [x] **sdks/README.md + bridges/README.md**: Architecture overview, quick start, bridge creation guide.
+222. [x] **WebSocket path fixed**: All SDKs, bridges, agent, and install scripts updated from `/ws` to `/cdap` (27 replacements across 14 files).
+
+#### Node.js Console
+31. [ ] Kompilacja binarek v3.0.0 z nowymi plikami źródłowymi (Rust legacy)
+32. [ ] WebSocket real-time push dla statusu
+33. [ ] Dodać testy jednostkowe dla HTTP API
+34. [ ] Deploy v2.3.0 to production and test all new features
 
 ### Nowe Pliki Źródłowe
 
@@ -608,7 +668,7 @@ OFFLINE  → Przekroczony timeout
 
 ### Dokumentacja
 
-Pełna dokumentacja: [STATUS_TRACKING_v3.md](../docs/STATUS_TRACKING_v3.md)
+Pełna dokumentacja: [STATUS_TRACKING_v3.md](../docs/features/STATUS_TRACKING_v3.md)
 
 ---
 
@@ -641,7 +701,7 @@ X-API-Key: <api-key>
 
 ### Dokumentacja
 
-Pełna dokumentacja: [ID_CHANGE_FEATURE.md](../docs/ID_CHANGE_FEATURE.md)
+Pełna dokumentacja: [ID_CHANGE_FEATURE.md](../docs/features/ID_CHANGE_FEATURE.md)
 
 ---
 
@@ -674,7 +734,7 @@ Pełna dokumentacja: [ID_CHANGE_FEATURE.md](../docs/ID_CHANGE_FEATURE.md)
 
 ### Dokumentacja
 
-Pełna dokumentacja: [CONTRIBUTING_TRANSLATIONS.md](../docs/CONTRIBUTING_TRANSLATIONS.md)
+Pełna dokumentacja: [CONTRIBUTING_TRANSLATIONS.md](../docs/development/CONTRIBUTING_TRANSLATIONS.md)
 
 ---
 
@@ -713,7 +773,7 @@ Workflow `.github/workflows/build.yml` automatycznie:
 
 ### Dokumentacja
 
-Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/BUILD_GUIDE.md)
+Pełna dokumentacja budowania: [BUILD_GUIDE.md](../docs/setup/BUILD_GUIDE.md)
 
 ---
 
@@ -845,4 +905,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-03-20 (Security & Installer Fixes — Phase 31) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-03-21 (Native Agent + Bridge SDK — Phase 34+35) przez GitHub Copilot*

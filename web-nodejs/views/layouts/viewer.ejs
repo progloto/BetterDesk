@@ -14,9 +14,9 @@
     <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
     
     <!-- Stylesheets -->
-    <link rel="stylesheet" href="/css/variables.css">
-    <link rel="stylesheet" href="/css/theme.css">
-    <link rel="stylesheet" href="/css/remote.css">
+    <link rel="stylesheet" href="/css/variables.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/theme.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/remote.css?v=<%= cacheVersion %>">
 </head>
 <body class="viewer-body">
     <%- body %>
@@ -35,28 +35,28 @@
     </script>
     
     <!-- Translation helper -->
-    <script src="/js/i18n-client.js?v=<%= Date.now() %>"></script>
+    <script src="/js/i18n-client.js?v=<%= cacheVersion %>"></script>
     
     <!-- Vendor libraries for remote client -->
-    <script src="/js/vendor/protobuf.min.js"></script>
-    <script src="/js/vendor/nacl.min.js"></script>
-    <script src="/js/vendor/nacl-util.min.js"></script>
-    <script src="/js/vendor/jmuxer.min.js"></script>
+    <script src="/js/vendor/protobuf.min.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/vendor/nacl.min.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/vendor/nacl-util.min.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/vendor/jmuxer.min.js?v=<%= cacheVersion %>"></script>
     
     <!-- RDClient modules (order matters) -->
-    <script src="/js/rdclient/connection.js?v=<%= Date.now() %>"></script>
-    <script src="/js/rdclient/crypto.js?v=<%= Date.now() %>"></script>
-    <script src="/js/rdclient/protocol.js?v=<%= Date.now() %>"></script>
-    <script src="/js/rdclient/video.js?v=<%= Date.now() %>"></script>
-    <script src="/js/rdclient/audio.js?v=<%= Date.now() %>"></script>
-    <script src="/js/rdclient/renderer.js?v=<%= Date.now() %>"></script>
-    <script src="/js/rdclient/input.js?v=<%= Date.now() %>"></script>
-    <script src="/js/rdclient/client.js?v=<%= Date.now() %>"></script>
+    <script src="/js/rdclient/connection.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/rdclient/crypto.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/rdclient/protocol.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/rdclient/video.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/rdclient/audio.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/rdclient/renderer.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/rdclient/input.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/rdclient/client.js?v=<%= cacheVersion %>"></script>
     
     <!-- Page-specific scripts -->
     <% if (typeof pageScripts !== 'undefined' && pageScripts) { %>
         <% (Array.isArray(pageScripts) ? pageScripts : [pageScripts]).forEach(script => { %>
-    <script src="/js/<%= script %>.js?v=<%= Date.now() %>"></script>
+    <script src="/js/<%= script %>.js?v=<%= cacheVersion %>"></script>
         <% }); %>
     <% } %>
 </body>
