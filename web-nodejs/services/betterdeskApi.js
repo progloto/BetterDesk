@@ -698,6 +698,42 @@ async function saveBranding(brandingData) {
     }
 }
 
+/**
+ * Get unattended access policy for a peer device.
+ */
+async function getAccessPolicy(id) {
+    try {
+        const { data } = await apiClient.get(`/peers/${id}/access-policy`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Save unattended access policy for a peer device.
+ */
+async function saveAccessPolicy(id, policy) {
+    try {
+        const { data } = await apiClient.put(`/peers/${id}/access-policy`, policy);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Delete unattended access policy for a peer device.
+ */
+async function deleteAccessPolicy(id) {
+    try {
+        const { data } = await apiClient.delete(`/peers/${id}/access-policy`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
 module.exports = {
     // Health / Stats
     getHealth,
@@ -757,6 +793,10 @@ module.exports = {
     // Branding (Go server)
     getBranding: getBranding,
     saveBranding: saveBranding,
+    // Access Policies (Unattended Access)
+    getAccessPolicy,
+    saveAccessPolicy,
+    deleteAccessPolicy,
     // Helpers
     normalisePeer,
     // Raw axios client (for services that need direct API access)

@@ -482,6 +482,52 @@
         document.getElementById('display-menu')?.classList.toggle('open');
     });
 
+    // Monitor selector dropdown
+    document.getElementById('btn-monitors')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeAllDropdowns('monitors-menu');
+        updateMonitorMenu();
+        document.getElementById('monitors-menu')?.classList.toggle('open');
+    });
+
+    function updateMonitorMenu() {
+        if (!client) return;
+        var monitors = client.getMonitors();
+        var menu = document.getElementById('monitors-menu');
+        if (!menu || monitors.length < 2) return;
+
+        // Show the monitors button
+        var btn = document.getElementById('btn-monitors');
+        if (btn) btn.style.display = '';
+
+        // Keep only the label, rebuild items
+        var label = menu.querySelector('.dropdown-label');
+        menu.innerHTML = '';
+        if (label) menu.appendChild(label);
+
+        monitors.forEach(function (m) {
+            var item = document.createElement('button');
+            item.className = 'dropdown-item monitor-item';
+            item.dataset.idx = m.idx;
+            item.innerHTML = '<span class="material-icons">' +
+                (m.primary ? 'desktop_windows' : 'monitor') +
+                '</span> ' + escapeHtml(m.name) +
+                (m.width ? ' (' + m.width + '×' + m.height + ')' : '');
+            item.addEventListener('click', function () {
+                client.switchMonitor(m.idx);
+                menu.querySelectorAll('.monitor-item').forEach(function (i) { i.classList.remove('active'); });
+                item.classList.add('active');
+            });
+            menu.appendChild(item);
+        });
+    }
+
+    function escapeHtml(str) {
+        var div = document.createElement('div');
+        div.textContent = str || '';
+        return div.innerHTML;
+    }
+
     /** Close all dropdowns except the one with given ID */
     function closeAllDropdowns(exceptId) {
         document.querySelectorAll('.toolbar-dropdown-menu.open').forEach(m => {

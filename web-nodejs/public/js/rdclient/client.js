@@ -1106,6 +1106,167 @@ class RDClient {
         this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
     }
 
+    // ---- Session Recording (WebM via MediaRecorder) ----
+
+    /**
+     * Start recording the remote session as WebM video.
+     * @returns {boolean} True if recording started
+     */
+    startRecording() {
+        if (this._recorder) return false;
+        if (this._state !== 'streaming') return false;
+
+        try {
+            var canvas = this.renderer.canvas;
+            var stream = canvas.captureStream(15); // 15fps recording
+
+            // Add audio if available
+            if (this.audio && this.audio._audioCtx && this.audio._audioCtx.state === 'running') {
+                try {
+                    var dest = this.audio._audioCtx.createMediaStreamDestination();
+                    if (this.audio._gainNode) this.audio._gainNode.connect(dest);
+                    stream.addTrack(dest.stream.getAudioTracks()[0]);
+                } catch (_) { /* audio capture optional */ }
+            }
+
+            var mimeType = 'video/webm;codecs=vp9,opus';
+            if (!MediaRecorder.isTypeSupported(mimeType)) {
+                mimeType = 'video/webm;codecs=vp8,opus';
+            }
+            if (!MediaRecorder.isTypeSupported(mimeType)) {
+                mimeType = 'video/webm';
+            }
+
+            this._recordedChunks = [];
+            this._recorder = new MediaRecorder(stream, {
+                mimeType: mimeType,
+                videoBitsPerSecond: 2500000 // 2.5 Mbps
+            });
+
+            this._recorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) {
+                    this._recordedChunks.push(e.data);
+                }
+            };
+
+            this._recorder.onstop = () => {
+                this._emit('recording_stopped', this._recordedChunks);
+            };
+
+            this._recorder.start(1000); // 1 second chunks
+            this._recordingStartTime = Date.now();
+            this._emit('recording_started');
+            return true;
+        } catch (err) {
+            console.warn('[RDClient] Recording failed:', err.message);
+            return false;
+        }
+    }
+
+    /**
+     * Stop recording and return the WebM blob.
+     * @returns {Promise<Blob|null>}
+     */
+    stopRecording() {
+        return new Promise((resolve) => {
+            if (!this._recorder || this._recorder.state === 'inactive') {
+                resolve(null);
+                return;
+            }
+
+            this._recorder.onstop = () => {
+                var blob = new Blob(this._recordedChunks, { type: this._recorder.mimeType });
+                this._recordedChunks = [];
+                this._recorder = null;
+                this._emit('recording_stopped');
+                resolve(blob);
+            };
+
+            this._recorder.stop();
+        });
+    }
+
+    /**
+     * Download recorded session as a file.
+     */
+    async downloadRecording() {
+        var blob = await this.stopRecording();
+        if (!blob) return;
+
+        var ts = new Date().toISOString().replace(/[:.]/g, '-');
+        var filename = 'session_' + this.deviceId + '_' + ts + '.webm';
+
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    /** @returns {boolean} Whether recording is active */
+    get isRecording() {
+        return this._recorder && this._recorder.state === 'recording';
+    }
+
+    /** @returns {number} Recording duration in seconds */
+    get recordingDuration() {
+        if (!this._recordingStartTime || !this.isRecording) return 0;
+        return Math.floor((Date.now() - this._recordingStartTime) / 1000);
+    }
+
+    // ---- Monitor Switching ----
+
+    /**
+     * Get list of available remote monitors.
+     * @returns {Array<{idx:number, name:string, width:number, height:number}>}
+     */
+    getMonitors() {
+        if (!this._peerInfo || !this._peerInfo.displays) return [];
+        return this._peerInfo.displays.map(function (d, i) {
+            return {
+                idx: i,
+                name: d.name || ('Monitor ' + (i + 1)),
+                width: d.width || 0,
+                height: d.height || 0,
+                primary: d.is_primary || false
+            };
+        });
+    }
+
+    /**
+     * Switch to a specific monitor.
+     * @param {number} monitorIdx - Monitor index
+     */
+    switchMonitor(monitorIdx) {
+        if (this._state !== 'streaming') return;
+        this._sendPeerMessage(this.proto.buildMisc('switchDisplay', monitorIdx));
+        this.sendRefreshScreen();
+    }
+
+    // ---- Image Quality Control ----
+
+    /**
+     * Set image quality preset.
+     * @param {'speed'|'balanced'|'quality'|'best'} preset
+     */
+    setQualityPreset(preset) {
+        if (this._state !== 'streaming') return;
+
+        var config = {
+            speed:    { imageQuality: 'Low',      customFps: 60 },
+            balanced: { imageQuality: 'Balanced', customFps: 30 },
+            quality:  { imageQuality: 'Best',     customFps: 30 },
+            best:     { imageQuality: 'Best',     customFps: 60 }
+        };
+
+        var c = config[preset] || config.balanced;
+        this._sendPeerMessage(this.proto.buildMisc('imageQuality', c.imageQuality));
+        this._sendPeerMessage(this.proto.buildMisc('customFps', c.customFps));
+        this.opts.qualityPreset = preset;
+        this._emit('quality_changed', preset);
+    }
+
     /**
      * Request remote device restart
      */

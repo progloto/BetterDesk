@@ -1400,6 +1400,7 @@
             '<button class="sidebar-icon" data-action="wallpaper" title="Wallpaper"><span class="material-icons">wallpaper</span></button>' +
             '<div class="sidebar-sep"></div>' +
             '<button class="sidebar-icon" data-action="edit" title="Edit Layout"><span class="material-icons">edit</span></button>' +
+            '<button class="sidebar-icon" data-action="snap-layout" title="' + esc(t('desktop.label_snap_layout') || 'Snap Layout') + '"><span class="material-icons">grid_view</span></button>' +
             '<button class="sidebar-icon" data-action="reset" title="Reset Layout"><span class="material-icons">restart_alt</span></button>' +
             '<div class="sidebar-spacer"></div>' +
             '<button class="sidebar-icon" data-action="help" title="Help"><span class="material-icons">help_outline</span></button>';
@@ -1426,6 +1427,8 @@
                         destroy();
                         init();
                     }
+                } else if (action === 'snap-layout') {
+                    openSnapLayoutPicker();
                 } else if (action === 'help') {
                     // Open docs in float window
                     if (window.DesktopMode && typeof window.DesktopMode.openAppByRoute === 'function') {
@@ -1577,6 +1580,358 @@
         return result;
     }
 
+    // ============ Phase 42: Snap Layout Zones ============
+
+    var SNAP_LAYOUTS = [
+        { key: '2col',   name: t('desktop.label_2col_equal'), zones: [{ x: 0, y: 0, w: 0.5, h: 1 }, { x: 0.5, y: 0, w: 0.5, h: 1 }] },
+        { key: '2col64', name: t('desktop.label_2col_wide'),  zones: [{ x: 0, y: 0, w: 0.6, h: 1 }, { x: 0.6, y: 0, w: 0.4, h: 1 }] },
+        { key: '3col',   name: t('desktop.label_3col'),       zones: [{ x: 0, y: 0, w: 0.33, h: 1 }, { x: 0.33, y: 0, w: 0.34, h: 1 }, { x: 0.67, y: 0, w: 0.33, h: 1 }] },
+        { key: '2x2',    name: t('desktop.label_2x2_grid'),   zones: [{ x: 0, y: 0, w: 0.5, h: 0.5 }, { x: 0.5, y: 0, w: 0.5, h: 0.5 }, { x: 0, y: 0.5, w: 0.5, h: 0.5 }, { x: 0.5, y: 0.5, w: 0.5, h: 0.5 }] },
+        { key: '1_2',    name: t('desktop.label_1_2'),        zones: [{ x: 0, y: 0, w: 0.5, h: 1 }, { x: 0.5, y: 0, w: 0.5, h: 0.5 }, { x: 0.5, y: 0.5, w: 0.5, h: 0.5 }] },
+        { key: '1_3',    name: t('desktop.label_1_3'),        zones: [{ x: 0, y: 0, w: 0.5, h: 1 }, { x: 0.5, y: 0, w: 0.5, h: 0.33 }, { x: 0.5, y: 0.33, w: 0.5, h: 0.34 }, { x: 0.5, y: 0.67, w: 0.5, h: 0.33 }] }
+    ];
+
+    var _snapOverlay = null;
+
+    /** Show the snap layout picker overlay */
+    function openSnapLayoutPicker() {
+        if (_snapOverlay) { closeSnapLayoutPicker(); return; }
+        _snapOverlay = document.createElement('div');
+        _snapOverlay.className = 'snap-layout-overlay';
+        var html = '<div class="snap-layout-picker">' +
+            '<div class="snap-layout-title">' + esc(t('desktop.label_snap_layout')) + '</div>' +
+            '<div class="snap-layout-options">';
+        SNAP_LAYOUTS.forEach(function (layout) {
+            html += '<div class="snap-layout-option" data-key="' + layout.key + '" title="' + esc(layout.name) + '">';
+            html += '<div class="snap-layout-preview">';
+            layout.zones.forEach(function (z) {
+                html += '<div class="snap-zone-preview" style="left:' + (z.x * 100) + '%;top:' + (z.y * 100) + '%;width:' + (z.w * 100) + '%;height:' + (z.h * 100) + '%"></div>';
+            });
+            html += '</div><div class="snap-layout-label">' + esc(layout.name) + '</div></div>';
+        });
+        html += '</div>' +
+            '<button class="snap-auto-arrange-btn"><span class="material-icons">auto_fix_high</span>' + esc(t('desktop.label_auto_arrange')) + '</button>' +
+            '</div>';
+        _snapOverlay.innerHTML = html;
+
+        // Click layout option
+        _snapOverlay.querySelectorAll('.snap-layout-option').forEach(function (opt) {
+            opt.addEventListener('click', function (e) {
+                e.stopPropagation();
+                applySnapLayout(opt.dataset.key);
+                closeSnapLayoutPicker();
+            });
+        });
+
+        // Auto-arrange
+        var autoBtn = _snapOverlay.querySelector('.snap-auto-arrange-btn');
+        if (autoBtn) {
+            autoBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                autoArrangeWidgets();
+                closeSnapLayoutPicker();
+            });
+        }
+
+        // Click outside to close
+        _snapOverlay.addEventListener('click', function (e) {
+            if (e.target === _snapOverlay) closeSnapLayoutPicker();
+        });
+
+        var shell = document.getElementById('desktop-shell');
+        (shell || document.body).appendChild(_snapOverlay);
+    }
+
+    function closeSnapLayoutPicker() {
+        if (_snapOverlay && _snapOverlay.parentNode) {
+            _snapOverlay.parentNode.removeChild(_snapOverlay);
+        }
+        _snapOverlay = null;
+    }
+
+    /** Apply a snap layout — distribute existing widgets across zones */
+    function applySnapLayout(key) {
+        var layout = SNAP_LAYOUTS.find(function (l) { return l.key === key; });
+        if (!layout) return;
+
+        var area = getCanvasArea();
+        var PAD = 10;
+        var widgetArr = [];
+        _widgets.forEach(function (w) { widgetArr.push(w); });
+        if (!widgetArr.length) return;
+
+        // Assign widgets to zones round-robin
+        widgetArr.forEach(function (w, idx) {
+            var zone = layout.zones[idx % layout.zones.length];
+            w.x = snap(zone.x * area.w + PAD);
+            w.y = snap(zone.y * area.h + PAD);
+            w.w = snap(zone.w * area.w - PAD * 2);
+            w.h = snap(zone.h * area.h - PAD * 2);
+            w.w = Math.max(MIN_W, w.w);
+            w.h = Math.max(MIN_H, w.h);
+
+            var el = document.getElementById(w.id);
+            if (el) {
+                el.style.left = w.x + 'px';
+                el.style.top = w.y + 'px';
+                el.style.width = w.w + 'px';
+                el.style.height = w.h + 'px';
+            }
+        });
+        saveLayout();
+    }
+
+    /** Auto-arrange: tile widgets in a grid layout filling available space */
+    function autoArrangeWidgets() {
+        var area = getCanvasArea();
+        var count = _widgets.size;
+        if (!count) return;
+
+        // Determine grid columns (√n rounded up)
+        var cols = Math.ceil(Math.sqrt(count));
+        var rows = Math.ceil(count / cols);
+        var PAD = 10;
+        var cellW = Math.floor(area.w / cols);
+        var cellH = Math.floor(area.h / rows);
+
+        var idx = 0;
+        _widgets.forEach(function (w) {
+            var col = idx % cols;
+            var row = Math.floor(idx / cols);
+            w.x = snap(col * cellW + PAD);
+            w.y = snap(row * cellH + PAD);
+            w.w = snap(cellW - PAD * 2);
+            w.h = snap(cellH - PAD * 2);
+            w.w = Math.max(MIN_W, w.w);
+            w.h = Math.max(MIN_H, w.h);
+
+            var el = document.getElementById(w.id);
+            if (el) {
+                el.style.left = w.x + 'px';
+                el.style.top = w.y + 'px';
+                el.style.width = w.w + 'px';
+                el.style.height = w.h + 'px';
+            }
+            idx++;
+        });
+        saveLayout();
+    }
+
+    // ============ Widget Groups (Tabbed Containers) ============
+
+    var _groups = new Map(); // groupId → { id, label, tabs: [widgetId, ...], activeTab: 0 }
+    var STORAGE_GROUPS = 'bd_widget_groups';
+
+    function loadGroups() {
+        try {
+            var raw = localStorage.getItem(STORAGE_GROUPS);
+            if (!raw) return;
+            var arr = JSON.parse(raw);
+            if (Array.isArray(arr)) arr.forEach(function (g) { _groups.set(g.id, g); });
+        } catch (_) { /* ignore */ }
+    }
+
+    function saveGroups() {
+        var arr = [];
+        _groups.forEach(function (g) { arr.push(g); });
+        localStorage.setItem(STORAGE_GROUPS, JSON.stringify(arr));
+    }
+
+    function createGroup(widgetIds, label) {
+        if (!widgetIds || widgetIds.length < 2) return null;
+        var groupId = 'group-' + uid();
+        var group = {
+            id: groupId,
+            label: label || t('desktop.widget_group'),
+            tabs: widgetIds.slice(),
+            activeTab: 0
+        };
+        _groups.set(groupId, group);
+
+        // Use the first widget's position for the group
+        var first = _widgets.get(widgetIds[0]);
+        if (!first) return null;
+
+        // Hide all widgets except the active one
+        widgetIds.forEach(function (wid, idx) {
+            var w = _widgets.get(wid);
+            if (w) {
+                w._groupId = groupId;
+                w._groupIdx = idx;
+                var el = document.getElementById(wid);
+                if (el) el.style.display = (idx === 0) ? '' : 'none';
+            }
+        });
+
+        // Add tab bar to the active widget's DOM
+        _renderGroupTabs(groupId);
+        saveGroups();
+        saveLayout();
+        return groupId;
+    }
+
+    function _renderGroupTabs(groupId) {
+        var group = _groups.get(groupId);
+        if (!group) return;
+
+        // Attach tab bar to the first visible widget
+        var activeWid = group.tabs[group.activeTab];
+        var el = document.getElementById(activeWid);
+        if (!el) return;
+
+        // Remove existing tab bar if any
+        var existing = el.querySelector('.widget-group-tabs');
+        if (existing) existing.remove();
+
+        var tabBar = document.createElement('div');
+        tabBar.className = 'widget-group-tabs';
+
+        group.tabs.forEach(function (wid, idx) {
+            var w = _widgets.get(wid);
+            var plugin = window.WidgetPlugins && window.WidgetPlugins.get(w ? w.type : '');
+            var label = (plugin && plugin.label) || (w ? w.type : 'Tab');
+
+            var tab = document.createElement('button');
+            tab.className = 'widget-group-tab' + (idx === group.activeTab ? ' active' : '');
+            tab.textContent = label;
+            tab.addEventListener('click', function (e) {
+                e.stopPropagation();
+                switchGroupTab(groupId, idx);
+            });
+            tabBar.appendChild(tab);
+        });
+
+        // Ungroup button
+        var ungroupBtn = document.createElement('button');
+        ungroupBtn.className = 'widget-group-ungroup';
+        ungroupBtn.innerHTML = '<span class="material-icons" style="font-size:14px">tab_unselected</span>';
+        ungroupBtn.title = t('desktop.ungroup_widgets');
+        ungroupBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            ungroupWidgets(groupId);
+        });
+        tabBar.appendChild(ungroupBtn);
+
+        // Insert after header
+        var header = el.querySelector('.widget-header');
+        if (header) header.after(tabBar);
+        else el.prepend(tabBar);
+    }
+
+    function switchGroupTab(groupId, tabIdx) {
+        var group = _groups.get(groupId);
+        if (!group || tabIdx < 0 || tabIdx >= group.tabs.length) return;
+
+        var prevWid = group.tabs[group.activeTab];
+        var nextWid = group.tabs[tabIdx];
+        group.activeTab = tabIdx;
+
+        // Hide previous, show next
+        var prevEl = document.getElementById(prevWid);
+        var nextEl = document.getElementById(nextWid);
+
+        if (prevEl) {
+            // Copy position to next widget
+            var prevW = _widgets.get(prevWid);
+            var nextW = _widgets.get(nextWid);
+            if (prevW && nextW) {
+                nextW.x = prevW.x;
+                nextW.y = prevW.y;
+                nextW.w = prevW.w;
+                nextW.h = prevW.h;
+                nextW.z = prevW.z;
+            }
+            prevEl.style.display = 'none';
+        }
+
+        if (nextEl) {
+            var nw = _widgets.get(nextWid);
+            if (nw) {
+                nextEl.style.left = nw.x + 'px';
+                nextEl.style.top = nw.y + 'px';
+                nextEl.style.width = nw.w + 'px';
+                nextEl.style.height = nw.h + 'px';
+            }
+            nextEl.style.display = '';
+        }
+
+        _renderGroupTabs(groupId);
+        saveGroups();
+    }
+
+    function ungroupWidgets(groupId) {
+        var group = _groups.get(groupId);
+        if (!group) return;
+
+        var baseX = 0, baseY = 0;
+        var first = _widgets.get(group.tabs[0]);
+        if (first) { baseX = first.x; baseY = first.y; }
+
+        group.tabs.forEach(function (wid, idx) {
+            var w = _widgets.get(wid);
+            if (w) {
+                delete w._groupId;
+                delete w._groupIdx;
+                w.x = baseX + idx * 30;
+                w.y = baseY + idx * 30;
+            }
+            var el = document.getElementById(wid);
+            if (el) {
+                el.style.display = '';
+                if (w) {
+                    el.style.left = w.x + 'px';
+                    el.style.top = w.y + 'px';
+                }
+                var tabBar = el.querySelector('.widget-group-tabs');
+                if (tabBar) tabBar.remove();
+            }
+        });
+
+        _groups.delete(groupId);
+        saveGroups();
+        saveLayout();
+    }
+
+    // ============ Responsive Auto-Reposition ============
+
+    function autoReposition() {
+        var area = getCanvasArea();
+        if (area.w < 400 || area.h < 300) return; // Too small — skip
+
+        _widgets.forEach(function (w) {
+            var el = document.getElementById(w.id);
+            if (!el) return;
+
+            // Clamp: keep widget fully inside canvas area
+            var maxX = area.w - w.w;
+            var maxY = area.h - w.h;
+            var changed = false;
+
+            if (w.x > maxX) { w.x = Math.max(0, maxX); changed = true; }
+            if (w.y > maxY) { w.y = Math.max(0, maxY); changed = true; }
+
+            // If widget is larger than canvas, shrink it
+            if (w.w > area.w) { w.w = Math.max(MIN_W, area.w - 20); changed = true; }
+            if (w.h > area.h) { w.h = Math.max(MIN_H, area.h - 20); changed = true; }
+
+            if (changed) {
+                el.style.left = w.x + 'px';
+                el.style.top = w.y + 'px';
+                el.style.width = w.w + 'px';
+                el.style.height = w.h + 'px';
+            }
+        });
+
+        saveLayout();
+    }
+
+    // Watch for window resize and auto-reposition
+    var _repositionTimeout = null;
+    window.addEventListener('resize', function () {
+        clearTimeout(_repositionTimeout);
+        _repositionTimeout = setTimeout(autoReposition, 300);
+    });
+
     // ============ Public API ============
 
     window.DesktopWidgets = {
@@ -1596,7 +1951,16 @@
         savePreset: savePreset,
         loadPreset: loadPreset,
         deletePreset: deletePreset,
-        listPresets: listPresets
+        listPresets: listPresets,
+        openSnapLayout: openSnapLayoutPicker,
+        autoArrange: autoArrangeWidgets,
+        applySnapLayout: applySnapLayout,
+        // Widget groups (Phase 11)
+        createGroup: createGroup,
+        ungroupWidgets: ungroupWidgets,
+        switchGroupTab: switchGroupTab,
+        getGroups: function () { return _groups; },
+        autoReposition: autoReposition
     };
 
 })();

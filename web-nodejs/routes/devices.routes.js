@@ -440,4 +440,50 @@ router.post('/api/devices/bulk-delete', requireAuth, requireRole('operator'), as
     }
 });
 
+// ============================================================
+// Access Policies (Unattended Access Management)
+// ============================================================
+
+/**
+ * GET /api/devices/:id/access-policy - Get access policy for a device
+ */
+router.get('/api/devices/:id/access-policy', requireAuth, requireRole('operator'), async (req, res) => {
+    try {
+        const goApi = require('../services/betterdeskApi');
+        const result = await goApi.getAccessPolicy(req.params.id);
+        res.json(result);
+    } catch (err) {
+        console.error('Get access policy error:', err);
+        res.status(500).json({ success: false, error: 'Failed to get access policy' });
+    }
+});
+
+/**
+ * PUT /api/devices/:id/access-policy - Save access policy for a device
+ */
+router.put('/api/devices/:id/access-policy', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+        const goApi = require('../services/betterdeskApi');
+        const result = await goApi.saveAccessPolicy(req.params.id, req.body);
+        res.json(result);
+    } catch (err) {
+        console.error('Save access policy error:', err);
+        res.status(500).json({ success: false, error: 'Failed to save access policy' });
+    }
+});
+
+/**
+ * DELETE /api/devices/:id/access-policy - Delete access policy for a device
+ */
+router.delete('/api/devices/:id/access-policy', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+        const goApi = require('../services/betterdeskApi');
+        const result = await goApi.deleteAccessPolicy(req.params.id);
+        res.json(result);
+    } catch (err) {
+        console.error('Delete access policy error:', err);
+        res.status(500).json({ success: false, error: 'Failed to delete access policy' });
+    }
+});
+
 module.exports = router;

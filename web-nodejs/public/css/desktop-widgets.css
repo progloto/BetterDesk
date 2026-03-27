@@ -2431,3 +2431,232 @@
     }
     .widget-add-btn { bottom: 52px; right: 8px; width: 36px; height: 36px; }
 }
+
+/* ─── Phase 42: Snap Layout Overlay ─────────────────────────────────────────── */
+
+.snap-layout-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(4px);
+    animation: snap-overlay-fade-in 0.2s ease;
+}
+
+@keyframes snap-overlay-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+.snap-layout-picker {
+    background: rgba(30, 30, 46, 0.95);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    padding: 24px;
+    min-width: 380px;
+    max-width: 480px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+}
+
+.snap-layout-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.9);
+    margin-bottom: 16px;
+    text-align: center;
+}
+
+.snap-layout-options {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.snap-layout-option {
+    cursor: pointer;
+    padding: 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    transition: background 0.15s, border-color 0.15s, transform 0.1s;
+    text-align: center;
+}
+
+.snap-layout-option:hover {
+    background: rgba(88, 166, 255, 0.12);
+    border-color: rgba(88, 166, 255, 0.3);
+    transform: translateY(-2px);
+}
+
+.snap-layout-preview {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 10;
+    border-radius: 6px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.2);
+    margin-bottom: 6px;
+}
+
+.snap-zone-preview {
+    position: absolute;
+    background: rgba(88, 166, 255, 0.2);
+    border: 1px solid rgba(88, 166, 255, 0.4);
+    border-radius: 3px;
+    box-sizing: border-box;
+    /* Inset 2px to show gap between zones */
+    margin: 2px;
+}
+
+.snap-layout-label {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.55);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.snap-auto-arrange-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    padding: 10px 16px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.snap-auto-arrange-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.snap-auto-arrange-btn .material-icons {
+    font-size: 18px;
+    color: rgba(88, 166, 255, 0.8);
+}
+
+/* Light theme adjustments */
+[data-desktop-theme="light"] .snap-layout-picker {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(0, 0, 0, 0.1);
+}
+
+[data-desktop-theme="light"] .snap-layout-title {
+    color: rgba(0, 0, 0, 0.85);
+}
+
+[data-desktop-theme="light"] .snap-layout-option {
+    border-color: rgba(0, 0, 0, 0.08);
+    background: rgba(0, 0, 0, 0.02);
+}
+
+[data-desktop-theme="light"] .snap-layout-option:hover {
+    background: rgba(88, 166, 255, 0.08);
+    border-color: rgba(88, 166, 255, 0.3);
+}
+
+[data-desktop-theme="light"] .snap-layout-label {
+    color: rgba(0, 0, 0, 0.5);
+}
+
+[data-desktop-theme="light"] .snap-auto-arrange-btn {
+    background: rgba(0, 0, 0, 0.04);
+    border-color: rgba(0, 0, 0, 0.1);
+    color: rgba(0, 0, 0, 0.7);
+}
+
+/* ============ Widget Group Tabs (Phase 11) ============ */
+
+.widget-group-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 2px 6px;
+    background: rgba(0, 0, 0, 0.2);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+
+.widget-group-tabs::-webkit-scrollbar {
+    display: none;
+}
+
+.widget-group-tab {
+    all: unset;
+    cursor: pointer;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.45);
+    border-radius: 4px;
+    white-space: nowrap;
+    transition: all 0.12s ease;
+}
+
+.widget-group-tab:hover {
+    color: rgba(255, 255, 255, 0.7);
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.widget-group-tab.active {
+    color: rgba(255, 255, 255, 0.9);
+    background: rgba(88, 166, 255, 0.15);
+}
+
+.widget-group-ungroup {
+    all: unset;
+    cursor: pointer;
+    margin-left: auto;
+    padding: 2px 4px;
+    color: rgba(255, 255, 255, 0.3);
+    border-radius: 3px;
+    transition: all 0.12s;
+    display: flex;
+    align-items: center;
+}
+
+.widget-group-ungroup:hover {
+    color: rgba(255, 255, 255, 0.7);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+/* Light theme overrides */
+[data-desktop-theme="light"] .widget-group-tabs {
+    background: rgba(0, 0, 0, 0.04);
+    border-bottom-color: rgba(0, 0, 0, 0.06);
+}
+
+[data-desktop-theme="light"] .widget-group-tab {
+    color: rgba(0, 0, 0, 0.4);
+}
+
+[data-desktop-theme="light"] .widget-group-tab:hover {
+    color: rgba(0, 0, 0, 0.6);
+    background: rgba(0, 0, 0, 0.04);
+}
+
+[data-desktop-theme="light"] .widget-group-tab.active {
+    color: rgba(0, 0, 0, 0.8);
+    background: rgba(0, 100, 210, 0.1);
+}
+
+[data-desktop-theme="light"] .widget-group-ungroup {
+    color: rgba(0, 0, 0, 0.3);
+}
+
+[data-desktop-theme="light"] .widget-group-ungroup:hover {
+    color: rgba(0, 0, 0, 0.6);
+    background: rgba(0, 0, 0, 0.06);
+}

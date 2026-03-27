@@ -380,6 +380,10 @@
                                 <span class="material-icons">info</span>
                                 <span>${_('actions.details')}</span>
                             </button>
+                            <button class="kebab-menu-item" data-action="access-policy" data-id="${eid}">
+                                <span class="material-icons">lock</span>
+                                <span>${_('devices.access_policy') || 'Access Policy'}</span>
+                            </button>
                             <button class="kebab-menu-item ${device.banned ? 'unban' : 'ban'}" data-action="toggle-ban" data-id="${eid}" data-banned="${device.banned}">
                                 <span class="material-icons">${device.banned ? 'check_circle' : 'block'}</span>
                                 <span>${device.banned ? _('actions.unban') : _('actions.ban')}</span>
@@ -492,6 +496,10 @@
             case 'delete':
                 await deleteDevice(deviceId);
                 break;
+
+            case 'access-policy':
+                showAccessPolicyModal(deviceId);
+                break;
         }
     }
     
@@ -556,7 +564,135 @@
             Notifications.error(error.message || _('errors.load_device_failed'));
         }
     }
-    
+
+    /**
+     * Show Access Policy modal for unattended access management
+     */
+    async function showAccessPolicyModal(deviceId) {
+        try {
+            const resp = await Utils.api(`/api/devices/${deviceId}/access-policy`);
+            const policy = resp.data || resp;
+
+            const days = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+            const activeDays = (policy.schedule_days || '').split(',').map(d => d.trim().toLowerCase()).filter(Boolean);
+
+            const dayCheckboxes = days.map(d => {
+                const checked = activeDays.includes(d) ? 'checked' : '';
+                const label = _('days.' + d) || d.charAt(0).toUpperCase() + d.slice(1);
+                return `<label class="day-checkbox"><input type="checkbox" name="schedule_day" value="${d}" ${checked}> ${label}</label>`;
+            }).join('');
+
+            const content = `
+                <div class="access-policy-form">
+                    <div class="form-section">
+                        <h4><span class="material-icons">vpn_key</span> ${_('devices.unattended_access') || 'Unattended Access'}</h4>
+                        <label class="toggle-row">
+                            <input type="checkbox" id="ap-unattended" ${policy.unattended_enabled ? 'checked' : ''}>
+                            <span>${_('devices.enable_unattended') || 'Enable unattended access'}</span>
+                        </label>
+                    </div>
+                    <div class="form-section">
+                        <h4><span class="material-icons">lock</span> ${_('devices.access_password') || 'Access Password'}</h4>
+                        <p class="form-hint">${policy.password_set ? '<span class="badge badge-success">✓ ' + (_('devices.password_configured') || 'Password set') + '</span>' : '<span class="badge badge-warning">' + (_('devices.no_password') || 'No password') + '</span>'}</p>
+                        <div class="form-row">
+                            <input type="password" id="ap-password" class="form-input" placeholder="${_('devices.new_password') || 'New password (leave empty to keep current)'}">
+                        </div>
+                        <label class="toggle-row">
+                            <input type="checkbox" id="ap-clear-password">
+                            <span>${_('devices.clear_password') || 'Clear password'}</span>
+                        </label>
+                    </div>
+                    <div class="form-section">
+                        <h4><span class="material-icons">schedule</span> ${_('devices.access_schedule') || 'Access Schedule'}</h4>
+                        <label class="toggle-row">
+                            <input type="checkbox" id="ap-schedule" ${policy.schedule_enabled ? 'checked' : ''}>
+                            <span>${_('devices.enable_schedule') || 'Enable time-based access'}</span>
+                        </label>
+                        <div id="ap-schedule-fields" style="${policy.schedule_enabled ? '' : 'opacity:0.5;pointer-events:none'}">
+                            <div class="form-row">
+                                <label>${_('devices.allowed_days') || 'Allowed days'}:</label>
+                                <div class="day-checkboxes">${dayCheckboxes}</div>
+                            </div>
+                            <div class="form-row form-row-inline">
+                                <div>
+                                    <label>${_('devices.start_time') || 'Start time'}:</label>
+                                    <input type="time" id="ap-start-time" class="form-input" value="${policy.schedule_start_time || '08:00'}">
+                                </div>
+                                <div>
+                                    <label>${_('devices.end_time') || 'End time'}:</label>
+                                    <input type="time" id="ap-end-time" class="form-input" value="${policy.schedule_end_time || '18:00'}">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <label>${_('devices.timezone') || 'Timezone'}:</label>
+                                <input type="text" id="ap-timezone" class="form-input" placeholder="Europe/Warsaw" value="${Utils.escapeHtml(policy.schedule_timezone || Intl.DateTimeFormat().resolvedOptions().timeZone)}">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h4><span class="material-icons">people</span> ${_('devices.allowed_operators') || 'Allowed Operators'}</h4>
+                        <div class="form-row">
+                            <input type="text" id="ap-operators" class="form-input" placeholder="${_('devices.all_operators') || 'All operators (leave empty)'}" value="${Utils.escapeHtml(policy.allowed_operators || '')}">
+                            <p class="form-hint">${_('devices.operators_hint') || 'Comma-separated usernames. Leave empty to allow all operators.'}</p>
+                        </div>
+                    </div>
+                    ${policy.updated_by ? `<p class="form-meta">${_('devices.last_updated_by') || 'Last updated by'}: ${Utils.escapeHtml(policy.updated_by)} ${policy.updated_at ? '(' + Utils.formatDate(policy.updated_at) + ')' : ''}</p>` : ''}
+                </div>
+            `;
+
+            Modal.show({
+                title: (_('devices.access_policy') || 'Access Policy') + ' — ' + deviceId,
+                content: content,
+                size: 'large',
+                buttons: [
+                    { label: _('actions.cancel'), class: 'btn-secondary', onClick: () => Modal.close() },
+                    {
+                        label: _('actions.save'), class: 'btn-primary', onClick: async () => {
+                            const scheduleCheckbox = document.getElementById('ap-schedule');
+                            const selectedDays = Array.from(document.querySelectorAll('input[name="schedule_day"]:checked')).map(cb => cb.value);
+                            const payload = {
+                                unattended_enabled: document.getElementById('ap-unattended').checked,
+                                password: document.getElementById('ap-password').value,
+                                clear_password: document.getElementById('ap-clear-password').checked,
+                                schedule_enabled: scheduleCheckbox ? scheduleCheckbox.checked : false,
+                                schedule_days: selectedDays.join(','),
+                                schedule_start_time: document.getElementById('ap-start-time') ? document.getElementById('ap-start-time').value : '',
+                                schedule_end_time: document.getElementById('ap-end-time') ? document.getElementById('ap-end-time').value : '',
+                                schedule_timezone: document.getElementById('ap-timezone') ? document.getElementById('ap-timezone').value : '',
+                                allowed_operators: document.getElementById('ap-operators') ? document.getElementById('ap-operators').value : ''
+                            };
+
+                            try {
+                                await Utils.api(`/api/devices/${deviceId}/access-policy`, {
+                                    method: 'PUT',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(payload)
+                                });
+                                Notifications.success(_('devices.access_policy_saved') || 'Access policy saved');
+                                Modal.close();
+                            } catch (err) {
+                                Notifications.error(err.message || 'Failed to save access policy');
+                            }
+                        }
+                    }
+                ]
+            });
+
+            // Toggle schedule fields on checkbox change
+            const scheduleChk = document.getElementById('ap-schedule');
+            const scheduleFields = document.getElementById('ap-schedule-fields');
+            if (scheduleChk && scheduleFields) {
+                scheduleChk.addEventListener('change', () => {
+                    scheduleFields.style.opacity = scheduleChk.checked ? '1' : '0.5';
+                    scheduleFields.style.pointerEvents = scheduleChk.checked ? 'auto' : 'none';
+                });
+            }
+
+        } catch (error) {
+            Notifications.error(error.message || 'Failed to load access policy');
+        }
+    }
+
     /**
      * Toggle device ban status
      */

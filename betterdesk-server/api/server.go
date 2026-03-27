@@ -31,6 +31,7 @@ import (
 	"github.com/unitronix/betterdesk-server/security"
 
 	"github.com/coder/websocket"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // peerIDRegexp validates RustDesk peer ID format: 6-16 alphanumeric chars, hyphens, underscores.
@@ -141,6 +142,10 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/peers/{id}/status", s.handlePeerStatus)
 	mux.HandleFunc("GET /api/peers/{id}/metrics", s.handlePeerMetrics)
 	mux.HandleFunc("GET /api/peers/{id}/linked", s.handleLinkedPeers)
+	mux.HandleFunc("POST /api/peers/{id}/wol", s.requireRole(auth.RoleOperator, s.handleWakeOnLan))
+	mux.HandleFunc("GET /api/peers/{id}/access-policy", s.requireRole(auth.RoleOperator, s.handleGetAccessPolicy))
+	mux.HandleFunc("PUT /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleSaveAccessPolicy))
+	mux.HandleFunc("DELETE /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleDeleteAccessPolicy))
 
 	// Blocklist management
 	mux.HandleFunc("GET /api/blocklist", s.handleListBlocklist)
@@ -1248,4 +1253,220 @@ func (s *Server) handleWSEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// POST /api/peers/{id}/wol — Send Wake-on-LAN magic packet (Phase 44)
+func (s *Server) handleWakeOnLan(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, `{"error":"missing peer id"}`, http.StatusBadRequest)
+		return
+	}
+
+	peer, err := s.db.GetPeer(id)
+	if err != nil || peer == nil {
+		http.Error(w, `{"error":"peer not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Try to get MAC from request body (operator may provide it)
+	var body struct {
+		MAC string `json:"mac"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	mac := body.MAC
+	if mac == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   "MAC address required. Provide {\"mac\": \"AA:BB:CC:DD:EE:FF\"} in request body.",
+		})
+		return
+	}
+
+	if err := sendWOLPacket(mac); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"success": false,
+			"error":   fmt.Sprintf("Failed to send WOL packet: %v", err),
+		})
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionPeerUpdated, s.remoteIP(r), id, map[string]string{"action": "wol", "mac": mac})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "mac": mac})
+}
+
+// sendWOLPacket sends a Wake-on-LAN magic packet to the given MAC address.
+func sendWOLPacket(macStr string) error {
+	mac, err := net.ParseMAC(macStr)
+	if err != nil {
+		return fmt.Errorf("invalid MAC address %q: %w", macStr, err)
+	}
+
+	// Build magic packet: 6 bytes of 0xFF + 16 repetitions of MAC address
+	var packet [102]byte
+	for i := 0; i < 6; i++ {
+		packet[i] = 0xFF
+	}
+	for i := 0; i < 16; i++ {
+		copy(packet[6+i*6:], mac)
+	}
+
+	// Send via UDP broadcast
+	addr, err := net.ResolveUDPAddr("udp4", "255.255.255.255:9")
+	if err != nil {
+		return err
+	}
+	conn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(packet[:])
+	return err
+}
+
+// ============================================================
+// Access Policy Handlers (Unattended Access Management)
+// ============================================================
+
+func (s *Server) handleGetAccessPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "peer ID required"})
+		return
+	}
+
+	policy, err := s.db.GetAccessPolicy(id)
+	if err != nil {
+		// No policy = defaults (all disabled)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"peer_id":             id,
+			"unattended_enabled":  false,
+			"password_set":        false,
+			"schedule_enabled":    false,
+			"schedule_days":       "",
+			"schedule_start_time": "",
+			"schedule_end_time":   "",
+			"schedule_timezone":   "",
+			"allowed_operators":   "",
+			"updated_at":          "",
+			"updated_by":          "",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) handleSaveAccessPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "peer ID required"})
+		return
+	}
+
+	var body struct {
+		UnattendedEnabled bool   `json:"unattended_enabled"`
+		Password          string `json:"password,omitempty"`       // Plain text — will be hashed
+		ClearPassword     bool   `json:"clear_password,omitempty"` // If true, remove password
+		ScheduleEnabled   bool   `json:"schedule_enabled"`
+		ScheduleDays      string `json:"schedule_days"`
+		ScheduleStartTime string `json:"schedule_start_time"`
+		ScheduleEndTime   string `json:"schedule_end_time"`
+		ScheduleTimezone  string `json:"schedule_timezone"`
+		AllowedOperators  string `json:"allowed_operators"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+
+	// Validate schedule time format (HH:MM)
+	timeRe := regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
+	if body.ScheduleEnabled {
+		if body.ScheduleStartTime != "" && !timeRe.MatchString(body.ScheduleStartTime) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid schedule_start_time format (HH:MM)"})
+			return
+		}
+		if body.ScheduleEndTime != "" && !timeRe.MatchString(body.ScheduleEndTime) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid schedule_end_time format (HH:MM)"})
+			return
+		}
+	}
+
+	// Validate schedule days
+	validDays := map[string]bool{"mon": true, "tue": true, "wed": true, "thu": true, "fri": true, "sat": true, "sun": true}
+	if body.ScheduleDays != "" {
+		for _, d := range strings.Split(body.ScheduleDays, ",") {
+			if !validDays[strings.TrimSpace(strings.ToLower(d))] {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid day in schedule_days: " + d})
+				return
+			}
+		}
+	}
+
+	policy := &db.AccessPolicy{
+		PeerID:            id,
+		UnattendedEnabled: body.UnattendedEnabled,
+		ScheduleEnabled:   body.ScheduleEnabled,
+		ScheduleDays:      body.ScheduleDays,
+		ScheduleStartTime: body.ScheduleStartTime,
+		ScheduleEndTime:   body.ScheduleEndTime,
+		ScheduleTimezone:  body.ScheduleTimezone,
+		AllowedOperators:  body.AllowedOperators,
+		UpdatedBy:         s.remoteIP(r),
+	}
+
+	// Hash password if provided
+	if body.Password != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to hash password"})
+			return
+		}
+		policy.PasswordHash = string(hash)
+	} else if body.ClearPassword {
+		policy.PasswordHash = "CLEAR"
+	}
+	// If PasswordHash is empty string, SaveAccessPolicy preserves existing hash
+
+	if err := s.db.SaveAccessPolicy(policy); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to save access policy"})
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionPeerUpdated, s.remoteIP(r), id, map[string]string{
+			"action":    "access_policy_updated",
+			"unattended": fmt.Sprintf("%v", body.UnattendedEnabled),
+			"schedule":  fmt.Sprintf("%v", body.ScheduleEnabled),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+func (s *Server) handleDeleteAccessPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "peer ID required"})
+		return
+	}
+
+	if err := s.db.DeleteAccessPolicy(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to delete access policy"})
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionPeerUpdated, s.remoteIP(r), id, map[string]string{
+			"action": "access_policy_deleted",
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }

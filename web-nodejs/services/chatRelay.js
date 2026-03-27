@@ -202,7 +202,7 @@ function handleAgentConnection(ws, deviceId) {
                     type: 'welcome',
                     device_id: deviceId,
                     server_time: Date.now(),
-                    capabilities: ['multi_conversation', 'contacts', 'groups', 'history'],
+                    capabilities: ['multi_conversation', 'contacts', 'groups', 'history', 'e2e_encryption', 'read_receipts', 'typing', 'presence', 'file_share'],
                 });
                 break;
 
@@ -303,6 +303,60 @@ function handleAgentConnection(ws, deviceId) {
                 }
                 break;
 
+            // E2E key exchange: relay public key to operators
+            case 'key_exchange':
+                broadcast(room, {
+                    type: 'key_exchange',
+                    from: deviceId,
+                    public_key: frame.public_key,
+                    conversation_id: frame.conversation_id || deviceId,
+                }, ws);
+                break;
+
+            // Read receipts
+            case 'read_receipt':
+                broadcast(room, {
+                    type: 'read_receipt',
+                    from: deviceId,
+                    message_ids: frame.message_ids || [],
+                    conversation_id: frame.conversation_id || deviceId,
+                    timestamp: Date.now(),
+                }, ws);
+                if (goApi && frame.conversation_id) {
+                    goApi.post('/api/chat/read', {
+                        conversation_id: frame.conversation_id,
+                        reader_id: deviceId,
+                        message_ids: frame.message_ids || [],
+                    }).catch(() => {});
+                }
+                break;
+
+            // Online presence broadcast
+            case 'presence_update':
+                broadcast(room, {
+                    type: 'presence',
+                    device_id: deviceId,
+                    online: frame.online !== false,
+                    status: frame.status || 'available',
+                    timestamp: Date.now(),
+                }, ws);
+                break;
+
+            // Encrypted file share: relay encrypted file metadata
+            case 'file_share':
+                broadcast(room, {
+                    type: 'file_share',
+                    from: deviceId,
+                    from_name: frame.from_name || deviceId,
+                    conversation_id: frame.conversation_id || 'operator',
+                    file_id: frame.file_id || ('file_' + Date.now()),
+                    file_name_encrypted: frame.file_name_encrypted || '',
+                    file_size: frame.file_size || 0,
+                    encrypted_metadata: frame.encrypted_metadata || '',
+                    timestamp: Date.now(),
+                }, ws);
+                break;
+
             default:
                 break;
         }
@@ -375,6 +429,44 @@ function handleOperatorConnection(ws, deviceId, operatorName) {
                     from: 'operator',
                     operator: operatorName,
                     conversation_id: frame.conversation_id || deviceId,
+                }, ws);
+                break;
+
+            // E2E key exchange: relay operator public key to agents
+            case 'key_exchange':
+                broadcast(room, {
+                    type: 'key_exchange',
+                    from: 'operator',
+                    operator: operatorName,
+                    public_key: frame.public_key,
+                    conversation_id: frame.conversation_id || deviceId,
+                }, ws);
+                break;
+
+            // Read receipts from operator
+            case 'read_receipt':
+                broadcast(room, {
+                    type: 'read_receipt',
+                    from: 'operator',
+                    operator: operatorName,
+                    message_ids: frame.message_ids || [],
+                    conversation_id: frame.conversation_id || deviceId,
+                    timestamp: Date.now(),
+                }, ws);
+                break;
+
+            // Encrypted file share from operator
+            case 'file_share':
+                broadcast(room, {
+                    type: 'file_share',
+                    from: 'operator',
+                    from_name: operatorName,
+                    conversation_id: frame.conversation_id || deviceId,
+                    file_id: frame.file_id || ('file_' + Date.now()),
+                    file_name_encrypted: frame.file_name_encrypted || '',
+                    file_size: frame.file_size || 0,
+                    encrypted_metadata: frame.encrypted_metadata || '',
+                    timestamp: Date.now(),
                 }, ws);
                 break;
 

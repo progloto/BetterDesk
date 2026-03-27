@@ -240,6 +240,19 @@ func (s *SQLiteDB) Migrate() error {
 			value TEXT DEFAULT '',
 			PRIMARY KEY(org_id, key)
 		)`,
+		`CREATE TABLE IF NOT EXISTS access_policies (
+			peer_id TEXT PRIMARY KEY,
+			unattended_enabled INTEGER DEFAULT 0,
+			password_hash TEXT DEFAULT '',
+			schedule_enabled INTEGER DEFAULT 0,
+			schedule_days TEXT DEFAULT '',
+			schedule_start_time TEXT DEFAULT '',
+			schedule_end_time TEXT DEFAULT '',
+			schedule_timezone TEXT DEFAULT '',
+			allowed_operators TEXT DEFAULT '',
+			updated_at TEXT DEFAULT '',
+			updated_by TEXT DEFAULT ''
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -1609,5 +1622,67 @@ func (s *SQLiteDB) DeleteChatGroup(id string) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec(`DELETE FROM chat_groups WHERE id = ?`, id)
+	return err
+}
+
+// ============================================================
+// Access Policies (unattended access management)
+// ============================================================
+
+// GetAccessPolicy retrieves the access policy for a peer device.
+func (s *SQLiteDB) GetAccessPolicy(peerID string) (*AccessPolicy, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	row := s.db.QueryRow(
+		`SELECT peer_id, unattended_enabled, password_hash, schedule_enabled,
+				schedule_days, schedule_start_time, schedule_end_time, schedule_timezone,
+				allowed_operators, updated_at, updated_by
+		 FROM access_policies WHERE peer_id = ?`, peerID)
+
+	var p AccessPolicy
+	err := row.Scan(&p.PeerID, &p.UnattendedEnabled, &p.PasswordHash, &p.ScheduleEnabled,
+		&p.ScheduleDays, &p.ScheduleStartTime, &p.ScheduleEndTime, &p.ScheduleTimezone,
+		&p.AllowedOperators, &p.UpdatedAt, &p.UpdatedBy)
+	if err != nil {
+		return nil, err
+	}
+	p.PasswordSet = p.PasswordHash != ""
+	return &p, nil
+}
+
+// SaveAccessPolicy creates or updates the access policy for a peer device.
+func (s *SQLiteDB) SaveAccessPolicy(p *AccessPolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`INSERT INTO access_policies (peer_id, unattended_enabled, password_hash,
+			schedule_enabled, schedule_days, schedule_start_time, schedule_end_time,
+			schedule_timezone, allowed_operators, updated_at, updated_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(peer_id) DO UPDATE SET
+			unattended_enabled = excluded.unattended_enabled,
+			password_hash = CASE WHEN excluded.password_hash = '' THEN access_policies.password_hash WHEN excluded.password_hash = 'CLEAR' THEN '' ELSE excluded.password_hash END,
+			schedule_enabled = excluded.schedule_enabled,
+			schedule_days = excluded.schedule_days,
+			schedule_start_time = excluded.schedule_start_time,
+			schedule_end_time = excluded.schedule_end_time,
+			schedule_timezone = excluded.schedule_timezone,
+			allowed_operators = excluded.allowed_operators,
+			updated_at = excluded.updated_at,
+			updated_by = excluded.updated_by`,
+		p.PeerID, p.UnattendedEnabled, p.PasswordHash,
+		p.ScheduleEnabled, p.ScheduleDays, p.ScheduleStartTime, p.ScheduleEndTime,
+		p.ScheduleTimezone, p.AllowedOperators, p.UpdatedAt, p.UpdatedBy)
+	return err
+}
+
+// DeleteAccessPolicy removes the access policy for a peer device.
+func (s *SQLiteDB) DeleteAccessPolicy(peerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`DELETE FROM access_policies WHERE peer_id = ?`, peerID)
 	return err
 }

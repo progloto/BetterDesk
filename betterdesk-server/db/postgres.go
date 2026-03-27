@@ -256,6 +256,19 @@ func (pg *PostgresDB) Migrate() error {
 			value  TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(org_id, key)
 		)`,
+		`CREATE TABLE IF NOT EXISTS access_policies (
+			peer_id TEXT PRIMARY KEY,
+			unattended_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			password_hash TEXT NOT NULL DEFAULT '',
+			schedule_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			schedule_days TEXT NOT NULL DEFAULT '',
+			schedule_start_time TEXT NOT NULL DEFAULT '',
+			schedule_end_time TEXT NOT NULL DEFAULT '',
+			schedule_timezone TEXT NOT NULL DEFAULT '',
+			allowed_operators TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ,
+			updated_by TEXT NOT NULL DEFAULT ''
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -1432,4 +1445,59 @@ func scanPeerRows(rows pgx.Rows) ([]*Peer, error) {
 // (e.g., migration tools, raw queries). Not part of the Database interface.
 func (pg *PostgresDB) Pool() *pgxpool.Pool {
 	return pg.pool
+}
+
+// ============================================================
+// Access Policies (unattended access management)
+// ============================================================
+
+// GetAccessPolicy retrieves the access policy for a peer device.
+func (pg *PostgresDB) GetAccessPolicy(peerID string) (*AccessPolicy, error) {
+	row := pg.pool.QueryRow(pg.ctx,
+		`SELECT peer_id, unattended_enabled, password_hash, schedule_enabled,
+				schedule_days, schedule_start_time, schedule_end_time, schedule_timezone,
+				allowed_operators, COALESCE(updated_at, NOW()), updated_by
+		 FROM access_policies WHERE peer_id = $1`, peerID)
+
+	var p AccessPolicy
+	var updatedAt time.Time
+	err := row.Scan(&p.PeerID, &p.UnattendedEnabled, &p.PasswordHash, &p.ScheduleEnabled,
+		&p.ScheduleDays, &p.ScheduleStartTime, &p.ScheduleEndTime, &p.ScheduleTimezone,
+		&p.AllowedOperators, &updatedAt, &p.UpdatedBy)
+	if err != nil {
+		return nil, err
+	}
+	p.UpdatedAt = updatedAt.Format(time.RFC3339)
+	p.PasswordSet = p.PasswordHash != ""
+	return &p, nil
+}
+
+// SaveAccessPolicy creates or updates the access policy for a peer device.
+func (pg *PostgresDB) SaveAccessPolicy(p *AccessPolicy) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`INSERT INTO access_policies (peer_id, unattended_enabled, password_hash,
+			schedule_enabled, schedule_days, schedule_start_time, schedule_end_time,
+			schedule_timezone, allowed_operators, updated_at, updated_by)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10)
+		 ON CONFLICT(peer_id) DO UPDATE SET
+			unattended_enabled = EXCLUDED.unattended_enabled,
+			password_hash = CASE WHEN EXCLUDED.password_hash = '' THEN access_policies.password_hash WHEN EXCLUDED.password_hash = 'CLEAR' THEN '' ELSE EXCLUDED.password_hash END,
+			schedule_enabled = EXCLUDED.schedule_enabled,
+			schedule_days = EXCLUDED.schedule_days,
+			schedule_start_time = EXCLUDED.schedule_start_time,
+			schedule_end_time = EXCLUDED.schedule_end_time,
+			schedule_timezone = EXCLUDED.schedule_timezone,
+			allowed_operators = EXCLUDED.allowed_operators,
+			updated_at = NOW(),
+			updated_by = EXCLUDED.updated_by`,
+		p.PeerID, p.UnattendedEnabled, p.PasswordHash,
+		p.ScheduleEnabled, p.ScheduleDays, p.ScheduleStartTime, p.ScheduleEndTime,
+		p.ScheduleTimezone, p.AllowedOperators, p.UpdatedBy)
+	return err
+}
+
+// DeleteAccessPolicy removes the access policy for a peer device.
+func (pg *PostgresDB) DeleteAccessPolicy(peerID string) error {
+	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM access_policies WHERE peer_id = $1`, peerID)
+	return err
 }

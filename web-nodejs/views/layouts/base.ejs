@@ -13,6 +13,7 @@
     <!-- Stylesheets -->
     <link rel="stylesheet" href="/css/main.css?v=<%= cacheVersion %>">
     <link rel="stylesheet" href="/css/theme.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/ui-polish.css?v=<%= cacheVersion %>">
     <% if (typeof pageStyles !== 'undefined' && pageStyles.length) { %>
         <% pageStyles.forEach(style => { %>
     <link rel="stylesheet" href="/css/<%= style %>.css?v=<%= cacheVersion %>">
@@ -41,6 +42,7 @@
     </script>
     <script src="/js/utils.js?v=<%= cacheVersion %>"></script>
     <script src="/js/i18n-client.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/toast.js?v=<%= cacheVersion %>"></script>
     <script src="/js/notifications.js?v=<%= cacheVersion %>"></script>
     <script src="/js/app.js?v=<%= cacheVersion %>"></script>
     <% if (typeof pageScripts !== 'undefined' && pageScripts.length) { %>

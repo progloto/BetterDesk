@@ -193,6 +193,22 @@ type OrgSetting struct {
 	Value string `json:"value"`
 }
 
+// AccessPolicy controls unattended access for a peer device.
+type AccessPolicy struct {
+	PeerID              string `json:"peer_id"`
+	UnattendedEnabled   bool   `json:"unattended_enabled"`          // Whether unattended access is allowed
+	PasswordHash        string `json:"-"`                           // bcrypt hash of unattended password
+	PasswordSet         bool   `json:"password_set"`                // Whether a password is configured (computed, not stored)
+	ScheduleEnabled     bool   `json:"schedule_enabled"`            // Whether access schedule is active
+	ScheduleDays        string `json:"schedule_days,omitempty"`     // Comma-separated days: "mon,tue,wed,thu,fri"
+	ScheduleStartTime   string `json:"schedule_start_time,omitempty"` // HH:MM (24h format)
+	ScheduleEndTime     string `json:"schedule_end_time,omitempty"`   // HH:MM (24h format)
+	ScheduleTimezone    string `json:"schedule_timezone,omitempty"`   // IANA timezone (e.g. "Europe/Warsaw")
+	AllowedOperators    string `json:"allowed_operators,omitempty"` // Comma-separated operator usernames (empty = all)
+	UpdatedAt           string `json:"updated_at,omitempty"`
+	UpdatedBy           string `json:"updated_by,omitempty"`        // Admin/operator who last changed the policy
+}
+
 // OrgRole constants
 const (
 	OrgRoleOwner    = "owner"
@@ -340,4 +356,9 @@ type Database interface {
 	SetOrgSetting(orgID, key, value string) error
 	DeleteOrgSetting(orgID, key string) error
 	ListOrgSettings(orgID string) ([]*OrgSetting, error)
+
+	// Access Policies (unattended access management)
+	GetAccessPolicy(peerID string) (*AccessPolicy, error)
+	SaveAccessPolicy(p *AccessPolicy) error
+	DeleteAccessPolicy(peerID string) error
 }

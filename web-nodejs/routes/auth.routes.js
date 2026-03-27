@@ -12,8 +12,31 @@ const { loginLimiter, passwordChangeLimiter } = require('../middleware/rateLimit
 
 /**
  * GET /login - Login page
+ * Serves desktop-style login when user previously had desktop mode active
+ * (detected via localStorage preference or explicit ?desktop=1 query param).
  */
-router.get('/login', guestOnly, (req, res) => {
+router.get('/login', guestOnly, async (req, res) => {
+    const useDesktop = req.query.desktop === '1' || req.cookies.betterdesk_desktop_mode === 'true';
+
+    if (useDesktop) {
+        // Fetch user list for multi-user selector (usernames + roles only, no secrets)
+        let loginUsers = [];
+        try {
+            const users = typeof db.getAllUsersForBackup === 'function'
+                ? await db.getAllUsersForBackup() : [];
+            loginUsers = (Array.isArray(users) ? users : []).map(u => ({
+                username: u.username,
+                role: u.role || 'operator'
+            }));
+        } catch (_) { /* empty list is fine */ }
+
+        return res.render('desktop-login', {
+            title: req.t('nav.login'),
+            activePage: 'login',
+            loginUsers
+        });
+    }
+
     res.render('login', {
         title: req.t('nav.login'),
         activePage: 'login'

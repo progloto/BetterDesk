@@ -33,6 +33,35 @@
     let resizeState = null;
     let currentTheme = localStorage.getItem(STORAGE_THEME) || 'auto';
 
+    // ============ Windows 11 Snap System ============
+
+    let _snapPreview = null;   // DOM element for blue snap zone preview
+    let _snapTarget = null;    // {zone:'left'|'right'|'top-left'|...} active snap target
+    let _snapPickerEl = null;  // Snap layout picker DOM (hover over maximize btn)
+    let _snapPickerTimeout = null;
+    let _shakeOrigins = [];    // For Aero Shake detection
+
+    // ---- Draggable Zone Borders state ----
+    let _activeLayoutKey = null;        // Currently applied snap layout key
+    let _activeZones = null;            // Array of zone objects (deep copy of layout zones) with mutable x/y/w/h
+    let _zoneWinMap = [];               // Array mapping zone index → window id
+    let _zoneDividers = [];             // DOM elements for zone border dividers
+    let _zoneDragState = null;          // { dividerIdx, axis, startMouse, origZones }
+    const ZONE_DIVIDER_HIT = 8;        // px hit area for divider drag
+    const ZONE_MIN_FRACTION = 0.15;    // minimum zone width/height as fraction
+
+    var SNAP_EDGE_THRESHOLD = 12;  // px from screen edge to trigger snap
+    var SNAP_CORNER_SIZE = 80;     // px area in corners for quarter-snap
+
+    var SNAP_LAYOUTS = [
+        { key: '2col',     label: '50 / 50',     zones: [{x:0,y:0,w:.5,h:1},{x:.5,y:0,w:.5,h:1}] },
+        { key: '2col-lr',  label: '60 / 40',     zones: [{x:0,y:0,w:.6,h:1},{x:.6,y:0,w:.4,h:1}] },
+        { key: '3col',     label: '33 / 33 / 33', zones: [{x:0,y:0,w:.333,h:1},{x:.333,y:0,w:.334,h:1},{x:.667,y:0,w:.333,h:1}] },
+        { key: '2x2',      label: '2 × 2',        zones: [{x:0,y:0,w:.5,h:.5},{x:.5,y:0,w:.5,h:.5},{x:0,y:.5,w:.5,h:.5},{x:.5,y:.5,w:.5,h:.5}] },
+        { key: '1+2',      label: '1 + 2',        zones: [{x:0,y:0,w:.5,h:1},{x:.5,y:0,w:.5,h:.5},{x:.5,y:.5,w:.5,h:.5}] },
+        { key: '1+3',      label: '1 + 3',        zones: [{x:0,y:0,w:.5,h:1},{x:.5,y:0,w:.5,h:.333},{x:.5,y:.333,w:.5,h:.334},{x:.5,y:.667,w:.5,h:.333}] }
+    ];
+
     // Widget mode: 'windows' or 'widgets'
     let currentMode = 'widgets'; // Default to widgets mode
     const STORAGE_MODE = 'betterdesk_desktop_view_mode';
@@ -263,6 +292,8 @@
         if (active) return;
         active = true;
         localStorage.setItem(STORAGE_KEY, 'true');
+        // Set HTTP cookie so server can detect desktop mode for login page
+        document.cookie = 'betterdesk_desktop_mode=true;path=/;max-age=31536000;SameSite=Lax';
 
         document.body.classList.add('desktop-active');
         if (!skipAnimation) {
@@ -286,6 +317,8 @@
         if (!active) return;
         active = false;
         localStorage.setItem(STORAGE_KEY, 'false');
+        // Clear HTTP cookie
+        document.cookie = 'betterdesk_desktop_mode=;path=/;max-age=0;SameSite=Lax';
 
         // Destroy widget mode
         if (window.DesktopWidgets) {
@@ -300,6 +333,7 @@
         windows.clear();
         focusedWindowId = null;
         cascadeIndex = 0;
+        clearActiveZoneLayout();
 
         document.body.classList.remove('desktop-active', 'desktop-entering', 'desktop-mode-widgets', 'desktop-mode-windows');
         clearDesktopIcons();
@@ -553,6 +587,20 @@
             toggleMaximize(win.id);
         });
 
+        // Event: snap layout picker on maximize button hover (Windows 11 style)
+        var maxBtn = el.querySelector('.maximize-btn');
+        if (maxBtn) {
+            var _hoverTimeout = null;
+            maxBtn.addEventListener('mouseenter', function() {
+                _hoverTimeout = setTimeout(function() {
+                    showSnapPicker(win.id, maxBtn);
+                }, 350);
+            });
+            maxBtn.addEventListener('mouseleave', function() {
+                clearTimeout(_hoverTimeout);
+            });
+        }
+
         // Event: resize edges/corners
         el.querySelectorAll('.window-edge').forEach(function(edge) {
             edge.addEventListener('mousedown', function(e) {
@@ -738,10 +786,35 @@
 
     function startDrag(winId, e) {
         var win = windows.get(winId);
-        if (!win || win.maximized) return;
+        if (!win) return;
+
+        // If maximized, un-maximize on drag start (Windows 11 behavior)
+        if (win.maximized) {
+            var el = document.getElementById(winId);
+            var pct = e.clientX / window.innerWidth; // mouse % across screen
+            win.maximized = false;
+            if (el) el.classList.remove('maximized');
+            if (win.prevBounds) {
+                win.width = win.prevBounds.width;
+                win.height = win.prevBounds.height;
+                win.x = e.clientX - win.width * pct;
+                win.y = e.clientY - 20;
+                if (el) {
+                    el.style.width = win.width + 'px';
+                    el.style.height = win.height + 'px';
+                    el.style.left = win.x + 'px';
+                    el.style.top = win.y + 'px';
+                }
+                var maxIcon = el && el.querySelector('.maximize-btn .material-icons');
+                if (maxIcon) maxIcon.textContent = 'crop_square';
+            }
+            win.prevBounds = null;
+        }
 
         e.preventDefault();
         focusWindow(winId);
+
+        _shakeOrigins = []; // Reset shake detection
 
         dragState = {
             winId: winId,
@@ -778,6 +851,19 @@
             if (el) {
                 el.style.left = win.x + 'px';
                 el.style.top = win.y + 'px';
+            }
+
+            // Windows 11 snap zone detection during drag
+            var zone = detectSnapZone(e.clientX, e.clientY);
+            if (zone) {
+                showSnapPreview(zone);
+            } else {
+                removeSnapPreview();
+            }
+
+            // Aero Shake detection
+            if (detectAeroShake(dragState.winId, e.clientX, e.clientY)) {
+                aeroShake(dragState.winId);
             }
         }
 
@@ -828,12 +914,21 @@
         }
     }
 
-    function handleMouseUp() {
+    function handleMouseUp(e) {
         if (dragState) {
             var win = windows.get(dragState.winId);
-            if (win && !win.maximized) {
+            // Apply snap zone if active
+            if (_snapTarget && win) {
+                applySnap(dragState.winId, _snapTarget);
+            } else if (win && !win.maximized) {
                 saveWindowBounds(win.appId, win.x, win.y, win.width, win.height);
+                // User manually moved a window — clear snap zone layout tracking
+                if (win.snappedZone) {
+                    win.snappedZone = null;
+                    clearActiveZoneLayout();
+                }
             }
+            removeSnapPreview();
         }
         if (resizeState) {
             var win = windows.get(resizeState.winId);
@@ -932,6 +1027,586 @@
         document.querySelectorAll('.desktop-window iframe').forEach(function(iframe) {
             iframe.style.pointerEvents = '';
         });
+    }
+
+    // ============ Snap Zone Detection & Preview ============
+
+    function detectSnapZone(clientX, clientY) {
+        var area = getDesktopArea();
+        var nearLeft   = clientX <= SNAP_EDGE_THRESHOLD;
+        var nearRight  = clientX >= area.width - SNAP_EDGE_THRESHOLD;
+        var nearTop    = clientY <= area.y + SNAP_EDGE_THRESHOLD;
+        var nearBottom = clientY >= area.y + area.height - SNAP_EDGE_THRESHOLD;
+        var inCornerTop = clientY < area.y + SNAP_CORNER_SIZE;
+        var inCornerBottom = clientY > area.y + area.height - SNAP_CORNER_SIZE;
+
+        if (nearTop && !nearLeft && !nearRight) return 'maximize';
+        if (nearLeft && inCornerTop)   return 'top-left';
+        if (nearLeft && inCornerBottom) return 'bottom-left';
+        if (nearLeft)                   return 'left';
+        if (nearRight && inCornerTop)  return 'top-right';
+        if (nearRight && inCornerBottom) return 'bottom-right';
+        if (nearRight)                  return 'right';
+        return null;
+    }
+
+    function getSnapBounds(zone) {
+        var area = getDesktopArea();
+        var PAD = 6;
+        switch (zone) {
+            case 'left':         return { x: area.x + PAD, y: area.y + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: area.height - PAD * 2 };
+            case 'right':        return { x: area.x + Math.floor(area.width / 2) + PAD, y: area.y + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: area.height - PAD * 2 };
+            case 'top-left':     return { x: area.x + PAD, y: area.y + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: Math.floor(area.height / 2) - PAD * 2 };
+            case 'top-right':    return { x: area.x + Math.floor(area.width / 2) + PAD, y: area.y + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: Math.floor(area.height / 2) - PAD * 2 };
+            case 'bottom-left':  return { x: area.x + PAD, y: area.y + Math.floor(area.height / 2) + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: Math.floor(area.height / 2) - PAD * 2 };
+            case 'bottom-right': return { x: area.x + Math.floor(area.width / 2) + PAD, y: area.y + Math.floor(area.height / 2) + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: Math.floor(area.height / 2) - PAD * 2 };
+            case 'maximize':     return { x: area.x + PAD, y: area.y + PAD, w: area.width - PAD * 2, h: area.height - PAD * 2 };
+            default: return null;
+        }
+    }
+
+    function showSnapPreview(zone) {
+        if (_snapTarget && _snapTarget === zone) return;
+        _snapTarget = zone;
+        removeSnapPreview();
+
+        var bounds = getSnapBounds(zone);
+        if (!bounds) return;
+
+        _snapPreview = document.createElement('div');
+        _snapPreview.className = 'desktop-snap-preview';
+        _snapPreview.style.left   = bounds.x + 'px';
+        _snapPreview.style.top    = bounds.y + 'px';
+        _snapPreview.style.width  = bounds.w + 'px';
+        _snapPreview.style.height = bounds.h + 'px';
+
+        var container = document.getElementById('desktop-windows') || document.body;
+        container.appendChild(_snapPreview);
+
+        // Trigger animation
+        requestAnimationFrame(function() {
+            if (_snapPreview) _snapPreview.classList.add('visible');
+        });
+    }
+
+    function removeSnapPreview() {
+        _snapTarget = null;
+        if (_snapPreview) {
+            _snapPreview.remove();
+            _snapPreview = null;
+        }
+    }
+
+    function applySnap(winId, zone) {
+        var win = windows.get(winId);
+        if (!win) return;
+
+        var bounds = getSnapBounds(zone);
+        if (!bounds) return;
+
+        // Save original bounds for un-snap (like Win11 restore)
+        if (!win.prevBounds) {
+            win.prevBounds = { x: win.x, y: win.y, width: win.width, height: win.height };
+        }
+
+        win.x = bounds.x;
+        win.y = bounds.y;
+        win.width = bounds.w;
+        win.height = bounds.h;
+        win.maximized = (zone === 'maximize');
+        win.snappedZone = zone;
+
+        var el = document.getElementById(winId);
+        if (el) {
+            el.style.transition = 'left 0.2s ease, top 0.2s ease, width 0.2s ease, height 0.2s ease';
+            el.style.left   = win.x + 'px';
+            el.style.top    = win.y + 'px';
+            el.style.width  = win.width + 'px';
+            el.style.height = win.height + 'px';
+
+            if (zone === 'maximize') el.classList.add('maximized');
+            else el.classList.remove('maximized');
+
+            // Update maximize icon
+            var maxIcon = el.querySelector('.maximize-btn .material-icons');
+            if (maxIcon) maxIcon.textContent = (zone === 'maximize') ? 'filter_none' : 'crop_square';
+
+            // Remove transition after animation
+            setTimeout(function() { el.style.transition = ''; }, 250);
+        }
+
+        saveWindowBounds(win.appId, win.x, win.y, win.width, win.height);
+    }
+
+    // ============ Snap Layout Picker (Maximize Button Hover) ============
+
+    function showSnapPicker(winId, anchorEl) {
+        hideSnapPicker();
+
+        var area = getDesktopArea();
+        var rect = anchorEl.getBoundingClientRect();
+
+        _snapPickerEl = document.createElement('div');
+        _snapPickerEl.className = 'snap-layout-picker';
+
+        var html = '<div class="snap-picker-title">Snap Layouts</div><div class="snap-picker-grid">';
+
+        SNAP_LAYOUTS.forEach(function(layout) {
+            html += '<button class="snap-picker-option" data-key="' + layout.key + '" title="' + escapeAttr(layout.label) + '">';
+            html += '<div class="snap-picker-preview">';
+            layout.zones.forEach(function(z) {
+                html += '<div class="snap-picker-zone" style="' +
+                    'left:' + (z.x * 100) + '%;top:' + (z.y * 100) + '%;' +
+                    'width:' + (z.w * 100) + '%;height:' + (z.h * 100) + '%"></div>';
+            });
+            html += '</div></button>';
+        });
+
+        html += '</div>';
+        _snapPickerEl.innerHTML = html;
+
+        // Position below the maximize button
+        _snapPickerEl.style.position = 'fixed';
+        _snapPickerEl.style.left = Math.max(4, Math.min(rect.left - 80, area.width - 280)) + 'px';
+        _snapPickerEl.style.top  = (rect.bottom + 6) + 'px';
+        _snapPickerEl.style.zIndex = '99999';
+
+        document.body.appendChild(_snapPickerEl);
+
+        // Animate in
+        requestAnimationFrame(function() {
+            if (_snapPickerEl) _snapPickerEl.classList.add('visible');
+        });
+
+        // Click handler for each layout option
+        _snapPickerEl.querySelectorAll('.snap-picker-option').forEach(function(opt) {
+            opt.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var key = opt.getAttribute('data-key');
+                applySnapLayoutToWindows(key, winId);
+                hideSnapPicker();
+            });
+        });
+
+        // Close on outside click
+        setTimeout(function() {
+            document.addEventListener('click', _onSnapPickerOutsideClick, { once: true });
+        }, 50);
+
+        // Close on mouse leave after delay
+        _snapPickerEl.addEventListener('mouseleave', function() {
+            _snapPickerTimeout = setTimeout(hideSnapPicker, 400);
+        });
+        _snapPickerEl.addEventListener('mouseenter', function() {
+            clearTimeout(_snapPickerTimeout);
+        });
+    }
+
+    function _onSnapPickerOutsideClick(e) {
+        if (_snapPickerEl && !_snapPickerEl.contains(e.target)) {
+            hideSnapPicker();
+        }
+    }
+
+    function hideSnapPicker() {
+        clearTimeout(_snapPickerTimeout);
+        if (_snapPickerEl) {
+            _snapPickerEl.remove();
+            _snapPickerEl = null;
+        }
+        document.removeEventListener('click', _onSnapPickerOutsideClick);
+    }
+
+    function applySnapLayoutToWindows(layoutKey, primaryWinId) {
+        var layout = SNAP_LAYOUTS.find(function(l) { return l.key === layoutKey; });
+        if (!layout) return;
+
+        var area = getDesktopArea();
+        var PAD = 6;
+
+        // Collect visible (non-minimized) windows, put primaryWinId first
+        var winArr = [];
+        windows.forEach(function(w) {
+            if (!w.minimized) winArr.push(w);
+        });
+
+        // Sort: primary window first
+        winArr.sort(function(a, b) {
+            if (a.id === primaryWinId) return -1;
+            if (b.id === primaryWinId) return 1;
+            return 0;
+        });
+
+        winArr.forEach(function(w, idx) {
+            if (idx >= layout.zones.length) return; // More windows than zones — skip extra
+            var z = layout.zones[idx];
+
+            w.x = Math.round(area.x + z.x * area.width + PAD);
+            w.y = Math.round(area.y + z.y * area.height + PAD);
+            w.width  = Math.round(z.w * area.width - PAD * 2);
+            w.height = Math.round(z.h * area.height - PAD * 2);
+            w.width  = Math.max(MIN_WIDTH, w.width);
+            w.height = Math.max(MIN_HEIGHT, w.height);
+            w.maximized = false;
+            w.snappedZone = layoutKey + '-' + idx;
+
+            var el = document.getElementById(w.id);
+            if (el) {
+                el.classList.remove('maximized');
+                el.style.transition = 'left 0.25s ease, top 0.25s ease, width 0.25s ease, height 0.25s ease';
+                el.style.left   = w.x + 'px';
+                el.style.top    = w.y + 'px';
+                el.style.width  = w.width + 'px';
+                el.style.height = w.height + 'px';
+                var maxIcon = el.querySelector('.maximize-btn .material-icons');
+                if (maxIcon) maxIcon.textContent = 'crop_square';
+                setTimeout(function() { el.style.transition = ''; }, 300);
+            }
+
+            saveWindowBounds(w.appId, w.x, w.y, w.width, w.height);
+        });
+
+        // Track active layout for draggable zone borders
+        _activeLayoutKey = layoutKey;
+        _activeZones = layout.zones.map(function(z) { return { x: z.x, y: z.y, w: z.w, h: z.h }; });
+        _zoneWinMap = winArr.slice(0, layout.zones.length).map(function(w) { return w.id; });
+        createZoneDividers();
+    }
+
+    // ============ Draggable Zone Borders ============
+
+    /**
+     * Detect shared edges between adjacent zones and create draggable divider elements.
+     * Dividers are thin hit-areas placed at shared boundaries that the user can drag
+     * to resize adjacent zones proportionally.
+     */
+    function createZoneDividers() {
+        removeZoneDividers();
+        if (!_activeZones || _activeZones.length < 2) return;
+
+        var area = getDesktopArea();
+        var container = document.getElementById('desktop-windows') || document.body;
+        var edges = findSharedEdges(_activeZones);
+
+        edges.forEach(function(edge, idx) {
+            var div = document.createElement('div');
+            div.className = 'zone-divider zone-divider-' + edge.axis;
+            div.dataset.dividerIdx = idx;
+
+            // Position the divider along the shared edge
+            var PAD = 6;
+            if (edge.axis === 'col') {
+                // Vertical divider between left/right zones
+                var cx = area.x + edge.pos * area.width;
+                var minY = Math.min.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].y; }));
+                var maxY = Math.max.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].y + _activeZones[zi].h; }));
+                div.style.left   = (cx - ZONE_DIVIDER_HIT / 2) + 'px';
+                div.style.top    = (area.y + minY * area.height + PAD) + 'px';
+                div.style.width  = ZONE_DIVIDER_HIT + 'px';
+                div.style.height = ((maxY - minY) * area.height - PAD * 2) + 'px';
+                div.style.cursor = 'col-resize';
+            } else {
+                // Horizontal divider between top/bottom zones
+                var cy = area.y + edge.pos * area.height;
+                var minX = Math.min.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].x; }));
+                var maxX = Math.max.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].x + _activeZones[zi].w; }));
+                div.style.left   = (area.x + minX * area.width + PAD) + 'px';
+                div.style.top    = (cy - ZONE_DIVIDER_HIT / 2) + 'px';
+                div.style.width  = ((maxX - minX) * area.width - PAD * 2) + 'px';
+                div.style.height = ZONE_DIVIDER_HIT + 'px';
+                div.style.cursor = 'row-resize';
+            }
+
+            div.addEventListener('mousedown', onZoneDividerMouseDown);
+            container.appendChild(div);
+            _zoneDividers.push({ el: div, edge: edge });
+        });
+    }
+
+    function removeZoneDividers() {
+        _zoneDividers.forEach(function(d) { d.el.remove(); });
+        _zoneDividers = [];
+    }
+
+    /**
+     * Find shared edges between zones. A shared edge is where one zone's right
+     * boundary equals another zone's left boundary (col), or one zone's bottom
+     * equals another's top (row).
+     * Returns array of { axis: 'col'|'row', pos: fraction, zones: [zoneIdx...], leftZones: [...], rightZones: [...] }
+     */
+    function findSharedEdges(zones) {
+        var EPSILON = 0.01;
+        var edges = [];
+        var seen = {};
+
+        for (var i = 0; i < zones.length; i++) {
+            for (var j = i + 1; j < zones.length; j++) {
+                var a = zones[i], b = zones[j];
+
+                // Check vertical shared edge: a.right == b.left or b.right == a.left
+                var aRight = a.x + a.w;
+                var bRight = b.x + b.w;
+
+                if (Math.abs(aRight - b.x) < EPSILON) {
+                    // a is to the left of b, shared vertical edge at aRight
+                    addEdge(edges, seen, 'col', aRight, i, j, 'left', 'right');
+                } else if (Math.abs(bRight - a.x) < EPSILON) {
+                    // b is to the left of a
+                    addEdge(edges, seen, 'col', bRight, j, i, 'left', 'right');
+                }
+
+                // Check horizontal shared edge: a.bottom == b.top or b.bottom == a.top
+                var aBottom = a.y + a.h;
+                var bBottom = b.y + b.h;
+
+                if (Math.abs(aBottom - b.y) < EPSILON) {
+                    // a is above b
+                    addEdge(edges, seen, 'row', aBottom, i, j, 'top', 'bottom');
+                } else if (Math.abs(bBottom - a.y) < EPSILON) {
+                    // b is above a
+                    addEdge(edges, seen, 'row', bBottom, j, i, 'top', 'bottom');
+                }
+            }
+        }
+        return edges;
+    }
+
+    function addEdge(edges, seen, axis, pos, leftIdx, rightIdx, leftSide, rightSide) {
+        var key = axis + ':' + pos.toFixed(4);
+        if (!seen[key]) {
+            seen[key] = { axis: axis, pos: pos, zones: [], leftZones: [], rightZones: [] };
+            edges.push(seen[key]);
+        }
+        var e = seen[key];
+        if (e.zones.indexOf(leftIdx) === -1) e.zones.push(leftIdx);
+        if (e.zones.indexOf(rightIdx) === -1) e.zones.push(rightIdx);
+        if (e.leftZones.indexOf(leftIdx) === -1) e.leftZones.push(leftIdx);
+        if (e.rightZones.indexOf(rightIdx) === -1) e.rightZones.push(rightIdx);
+    }
+
+    function onZoneDividerMouseDown(e) {
+        e.preventDefault();
+        e.stopPropagation();
+
+        var idx = parseInt(e.target.dataset.dividerIdx, 10);
+        if (isNaN(idx) || !_zoneDividers[idx]) return;
+
+        var edge = _zoneDividers[idx].edge;
+        _zoneDragState = {
+            dividerIdx: idx,
+            axis: edge.axis,
+            startMouseX: e.clientX,
+            startMouseY: e.clientY,
+            origZones: _activeZones.map(function(z) { return { x: z.x, y: z.y, w: z.w, h: z.h }; }),
+            edge: edge
+        };
+
+        document.addEventListener('mousemove', onZoneDividerMouseMove);
+        document.addEventListener('mouseup', onZoneDividerMouseUp);
+        document.body.style.cursor = edge.axis === 'col' ? 'col-resize' : 'row-resize';
+        document.body.classList.add('zone-resizing');
+    }
+
+    function onZoneDividerMouseMove(e) {
+        if (!_zoneDragState || !_activeZones) return;
+
+        var area = getDesktopArea();
+        var ds = _zoneDragState;
+        var delta;
+
+        if (ds.axis === 'col') {
+            delta = (e.clientX - ds.startMouseX) / area.width;
+        } else {
+            delta = (e.clientY - ds.startMouseY) / area.height;
+        }
+
+        // Apply delta to zones: shrink left/top zones, grow right/bottom zones (or vice versa)
+        var origZones = ds.origZones;
+        var canApply = true;
+
+        // Check that all affected zones stay above minimum size
+        ds.edge.leftZones.forEach(function(zi) {
+            var orig = origZones[zi];
+            var newSize = ds.axis === 'col' ? orig.w + delta : orig.h + delta;
+            if (newSize < ZONE_MIN_FRACTION) canApply = false;
+        });
+        ds.edge.rightZones.forEach(function(zi) {
+            var orig = origZones[zi];
+            var newSize = ds.axis === 'col' ? orig.w - delta : orig.h - delta;
+            if (newSize < ZONE_MIN_FRACTION) canApply = false;
+        });
+
+        if (!canApply) return;
+
+        // Apply the resize
+        ds.edge.leftZones.forEach(function(zi) {
+            var orig = origZones[zi];
+            if (ds.axis === 'col') {
+                _activeZones[zi].w = orig.w + delta;
+            } else {
+                _activeZones[zi].h = orig.h + delta;
+            }
+        });
+        ds.edge.rightZones.forEach(function(zi) {
+            var orig = origZones[zi];
+            if (ds.axis === 'col') {
+                _activeZones[zi].x = orig.x + delta;
+                _activeZones[zi].w = orig.w - delta;
+            } else {
+                _activeZones[zi].y = orig.y + delta;
+                _activeZones[zi].h = orig.h - delta;
+            }
+        });
+
+        // Update window positions to match new zone sizes
+        updateWindowsFromZones(area);
+        // Update divider positions
+        updateZoneDividerPositions(area);
+    }
+
+    function onZoneDividerMouseUp() {
+        document.removeEventListener('mousemove', onZoneDividerMouseMove);
+        document.removeEventListener('mouseup', onZoneDividerMouseUp);
+        document.body.style.cursor = '';
+        document.body.classList.remove('zone-resizing');
+        _zoneDragState = null;
+
+        // Save window bounds after resize
+        if (_activeZones && _zoneWinMap) {
+            _zoneWinMap.forEach(function(winId) {
+                var win = windows.get(winId);
+                if (win) saveWindowBounds(win.appId, win.x, win.y, win.width, win.height);
+            });
+        }
+    }
+
+    function updateWindowsFromZones(area) {
+        if (!_activeZones || !_zoneWinMap) return;
+        var PAD = 6;
+
+        _zoneWinMap.forEach(function(winId, idx) {
+            if (idx >= _activeZones.length) return;
+            var z = _activeZones[idx];
+            var win = windows.get(winId);
+            if (!win) return;
+
+            win.x = Math.round(area.x + z.x * area.width + PAD);
+            win.y = Math.round(area.y + z.y * area.height + PAD);
+            win.width  = Math.max(MIN_WIDTH, Math.round(z.w * area.width - PAD * 2));
+            win.height = Math.max(MIN_HEIGHT, Math.round(z.h * area.height - PAD * 2));
+
+            var el = document.getElementById(winId);
+            if (el) {
+                el.style.left   = win.x + 'px';
+                el.style.top    = win.y + 'px';
+                el.style.width  = win.width + 'px';
+                el.style.height = win.height + 'px';
+            }
+        });
+    }
+
+    function updateZoneDividerPositions(area) {
+        var PAD = 6;
+        _zoneDividers.forEach(function(d) {
+            var edge = d.edge;
+            var el = d.el;
+
+            if (edge.axis === 'col') {
+                var cx = area.x + edge.pos * area.width;
+                // Recalculate pos from active zones (leftZones right edge)
+                if (edge.leftZones.length > 0) {
+                    var zi = edge.leftZones[0];
+                    cx = area.x + (_activeZones[zi].x + _activeZones[zi].w) * area.width;
+                    // Update edge.pos for consistency
+                    edge.pos = _activeZones[zi].x + _activeZones[zi].w;
+                }
+                var minY = Math.min.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].y; }));
+                var maxY = Math.max.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].y + _activeZones[zi].h; }));
+                el.style.left   = (cx - ZONE_DIVIDER_HIT / 2) + 'px';
+                el.style.top    = (area.y + minY * area.height + PAD) + 'px';
+                el.style.height = ((maxY - minY) * area.height - PAD * 2) + 'px';
+            } else {
+                var cy = area.y + edge.pos * area.height;
+                if (edge.leftZones.length > 0) {
+                    var zi2 = edge.leftZones[0];
+                    cy = area.y + (_activeZones[zi2].y + _activeZones[zi2].h) * area.height;
+                    edge.pos = _activeZones[zi2].y + _activeZones[zi2].h;
+                }
+                var minX = Math.min.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].x; }));
+                var maxX = Math.max.apply(null, edge.zones.map(function(zi) { return _activeZones[zi].x + _activeZones[zi].w; }));
+                el.style.left   = (area.x + minX * area.width + PAD) + 'px';
+                el.style.top    = (cy - ZONE_DIVIDER_HIT / 2) + 'px';
+                el.style.width  = ((maxX - minX) * area.width - PAD * 2) + 'px';
+            }
+        });
+    }
+
+    /** Remove zone border tracking when user manually moves a window */
+    function clearActiveZoneLayout() {
+        _activeLayoutKey = null;
+        _activeZones = null;
+        _zoneWinMap = [];
+        removeZoneDividers();
+    }
+
+    // ============ Aero Shake ============
+
+    var SHAKE_THRESHOLD = 40;  // px total movement to detect shake
+    var SHAKE_WINDOW_MS = 500; // time window for shake detection
+
+    function detectAeroShake(winId, clientX, clientY) {
+        var now = Date.now();
+        _shakeOrigins.push({ x: clientX, y: clientY, t: now });
+
+        // Keep only recent samples
+        _shakeOrigins = _shakeOrigins.filter(function(s) { return now - s.t < SHAKE_WINDOW_MS; });
+
+        if (_shakeOrigins.length < 4) return false;
+
+        // Calculate total direction changes (X-axis)
+        var dirChanges = 0;
+        for (var i = 2; i < _shakeOrigins.length; i++) {
+            var d1 = _shakeOrigins[i-1].x - _shakeOrigins[i-2].x;
+            var d2 = _shakeOrigins[i].x - _shakeOrigins[i-1].x;
+            if ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) dirChanges++;
+        }
+
+        // Total X displacement
+        var totalDx = 0;
+        for (var j = 1; j < _shakeOrigins.length; j++) {
+            totalDx += Math.abs(_shakeOrigins[j].x - _shakeOrigins[j-1].x);
+        }
+
+        if (dirChanges >= 3 && totalDx > SHAKE_THRESHOLD) {
+            _shakeOrigins = [];
+            return true;
+        }
+        return false;
+    }
+
+    function aeroShake(keepWinId) {
+        var allMinimized = true;
+        windows.forEach(function(w) {
+            if (w.id !== keepWinId && !w.minimized) allMinimized = false;
+        });
+
+        if (allMinimized) {
+            // Un-shake: restore all
+            windows.forEach(function(w) {
+                if (w.id !== keepWinId && w.minimized && w._shakedMinimized) {
+                    restoreWindow(w.id);
+                    w._shakedMinimized = false;
+                }
+            });
+        } else {
+            // Shake: minimize all except this one
+            windows.forEach(function(w) {
+                if (w.id !== keepWinId && !w.minimized) {
+                    w._shakedMinimized = true;
+                    minimizeWindow(w.id);
+                }
+            });
+        }
     }
 
     // ============ Taskbar ============
@@ -1137,6 +1812,12 @@
         setTheme: applyTheme,
         cycleTheme: cycleTheme,
         getTheme: function() { return currentTheme; },
+        // Snap Layout API
+        showSnapPicker: showSnapPicker,
+        hideSnapPicker: hideSnapPicker,
+        applySnapLayout: applySnapLayoutToWindows,
+        getSnapLayouts: function() { return SNAP_LAYOUTS; },
+        clearZoneLayout: clearActiveZoneLayout,
         // Foldable device API
         isFoldable: function() { return isFoldableDevice; },
         getDevicePosture: function() { return devicePosture; },
