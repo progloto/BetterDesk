@@ -1428,7 +1428,11 @@
                         init();
                     }
                 } else if (action === 'snap-layout') {
-                    openSnapLayoutPicker();
+                    if (window.DesktopMode && typeof window.DesktopMode.openLayoutOverlay === 'function') {
+                        window.DesktopMode.openLayoutOverlay();
+                    } else {
+                        openWidgetSnapLayoutPicker();
+                    }
                 } else if (action === 'help') {
                     // Open docs in float window
                     if (window.DesktopMode && typeof window.DesktopMode.openAppByRoute === 'function') {
@@ -1591,62 +1595,62 @@
         { key: '1_3',    name: t('desktop.label_1_3'),        zones: [{ x: 0, y: 0, w: 0.5, h: 1 }, { x: 0.5, y: 0, w: 0.5, h: 0.33 }, { x: 0.5, y: 0.33, w: 0.5, h: 0.34 }, { x: 0.5, y: 0.67, w: 0.5, h: 0.33 }] }
     ];
 
-    var _snapOverlay = null;
+    var _widgetSnapOverlay = null;
 
     /** Show the snap layout picker overlay */
-    function openSnapLayoutPicker() {
-        if (_snapOverlay) { closeSnapLayoutPicker(); return; }
-        _snapOverlay = document.createElement('div');
-        _snapOverlay.className = 'snap-layout-overlay';
-        var html = '<div class="snap-layout-picker">' +
-            '<div class="snap-layout-title">' + esc(t('desktop.label_snap_layout')) + '</div>' +
-            '<div class="snap-layout-options">';
+    function openWidgetSnapLayoutPicker() {
+        if (_widgetSnapOverlay) { closeWidgetSnapLayoutPicker(); return; }
+        _widgetSnapOverlay = document.createElement('div');
+        _widgetSnapOverlay.className = 'widget-snap-layout-overlay';
+        var html = '<div class="widget-snap-layout-picker">' +
+            '<div class="widget-snap-layout-title">' + esc(t('desktop.label_snap_layout')) + '</div>' +
+            '<div class="widget-snap-layout-options">';
         SNAP_LAYOUTS.forEach(function (layout) {
-            html += '<div class="snap-layout-option" data-key="' + layout.key + '" title="' + esc(layout.name) + '">';
-            html += '<div class="snap-layout-preview">';
+            html += '<div class="widget-snap-layout-option" data-key="' + layout.key + '" title="' + esc(layout.name) + '">';
+            html += '<div class="widget-snap-layout-preview">';
             layout.zones.forEach(function (z) {
-                html += '<div class="snap-zone-preview" style="left:' + (z.x * 100) + '%;top:' + (z.y * 100) + '%;width:' + (z.w * 100) + '%;height:' + (z.h * 100) + '%"></div>';
+                html += '<div class="widget-snap-zone-preview" style="left:' + (z.x * 100) + '%;top:' + (z.y * 100) + '%;width:' + (z.w * 100) + '%;height:' + (z.h * 100) + '%"></div>';
             });
-            html += '</div><div class="snap-layout-label">' + esc(layout.name) + '</div></div>';
+            html += '</div><div class="widget-snap-layout-label">' + esc(layout.name) + '</div></div>';
         });
         html += '</div>' +
-            '<button class="snap-auto-arrange-btn"><span class="material-icons">auto_fix_high</span>' + esc(t('desktop.label_auto_arrange')) + '</button>' +
+            '<button class="widget-snap-auto-arrange-btn"><span class="material-icons">auto_fix_high</span>' + esc(t('desktop.label_auto_arrange')) + '</button>' +
             '</div>';
-        _snapOverlay.innerHTML = html;
+        _widgetSnapOverlay.innerHTML = html;
 
         // Click layout option
-        _snapOverlay.querySelectorAll('.snap-layout-option').forEach(function (opt) {
+        _widgetSnapOverlay.querySelectorAll('.widget-snap-layout-option').forEach(function (opt) {
             opt.addEventListener('click', function (e) {
                 e.stopPropagation();
                 applySnapLayout(opt.dataset.key);
-                closeSnapLayoutPicker();
+                closeWidgetSnapLayoutPicker();
             });
         });
 
         // Auto-arrange
-        var autoBtn = _snapOverlay.querySelector('.snap-auto-arrange-btn');
+        var autoBtn = _widgetSnapOverlay.querySelector('.widget-snap-auto-arrange-btn');
         if (autoBtn) {
             autoBtn.addEventListener('click', function (e) {
                 e.stopPropagation();
                 autoArrangeWidgets();
-                closeSnapLayoutPicker();
+                closeWidgetSnapLayoutPicker();
             });
         }
 
         // Click outside to close
-        _snapOverlay.addEventListener('click', function (e) {
-            if (e.target === _snapOverlay) closeSnapLayoutPicker();
+        _widgetSnapOverlay.addEventListener('click', function (e) {
+            if (e.target === _widgetSnapOverlay) closeWidgetSnapLayoutPicker();
         });
 
         var shell = document.getElementById('desktop-shell');
-        (shell || document.body).appendChild(_snapOverlay);
+        (shell || document.body).appendChild(_widgetSnapOverlay);
     }
 
-    function closeSnapLayoutPicker() {
-        if (_snapOverlay && _snapOverlay.parentNode) {
-            _snapOverlay.parentNode.removeChild(_snapOverlay);
+    function closeWidgetSnapLayoutPicker() {
+        if (_widgetSnapOverlay && _widgetSnapOverlay.parentNode) {
+            _widgetSnapOverlay.parentNode.removeChild(_widgetSnapOverlay);
         }
-        _snapOverlay = null;
+        _widgetSnapOverlay = null;
     }
 
     /** Apply a snap layout — distribute existing widgets across zones */
@@ -1952,7 +1956,7 @@
         loadPreset: loadPreset,
         deletePreset: deletePreset,
         listPresets: listPresets,
-        openSnapLayout: openSnapLayoutPicker,
+        openSnapLayout: openWidgetSnapLayoutPicker,
         autoArrange: autoArrangeWidgets,
         applySnapLayout: applySnapLayout,
         // Widget groups (Phase 11)

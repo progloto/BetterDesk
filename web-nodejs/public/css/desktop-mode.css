@@ -816,6 +816,175 @@ body.embed-mode .main-content {
     border-color: rgba(0, 100, 210, 0.4);
 }
 
+/* ============ Layout Overlay (Desktop Button) ============ */
+
+.snap-layout-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99995;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(5, 8, 12, 0.42);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    padding: 24px;
+}
+
+.snap-layout-picker--overlay {
+    min-width: 420px;
+    max-width: 560px;
+    width: min(100%, 560px);
+    padding: 20px;
+}
+
+.snap-layout-picker--overlay.visible {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+}
+
+.snap-layout-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.92);
+    margin-bottom: 8px;
+}
+
+.snap-layout-help {
+    font-size: 13px;
+    line-height: 1.5;
+    color: rgba(255, 255, 255, 0.64);
+    margin-bottom: 18px;
+}
+
+.snap-layout-options {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.snap-layout-option {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.04);
+    padding: 10px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+    color: inherit;
+}
+
+.snap-layout-option:hover {
+    background: rgba(88, 166, 255, 0.12);
+    border-color: rgba(88, 166, 255, 0.34);
+    transform: translateY(-2px);
+}
+
+.snap-layout-preview {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 10;
+    border-radius: 6px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.18);
+    margin-bottom: 8px;
+}
+
+.snap-zone-preview {
+    position: absolute;
+    margin: 2px;
+    border-radius: 4px;
+    background: rgba(88, 166, 255, 0.2);
+    border: 1px solid rgba(88, 166, 255, 0.38);
+    box-sizing: border-box;
+}
+
+.snap-layout-label {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.72);
+    text-align: center;
+}
+
+.snap-layout-empty {
+    padding: 18px;
+    border: 1px dashed rgba(255, 255, 255, 0.16);
+    border-radius: 10px;
+    color: rgba(255, 255, 255, 0.68);
+    text-align: center;
+    line-height: 1.5;
+}
+
+.snap-auto-arrange-btn {
+    width: 100%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 12px 16px;
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.82);
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.snap-auto-arrange-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.desktop-theme-light .snap-layout-overlay {
+    background: rgba(232, 237, 243, 0.55);
+}
+
+.desktop-theme-light .snap-layout-title {
+    color: rgba(0, 0, 0, 0.86);
+}
+
+.desktop-theme-light .snap-layout-help,
+.desktop-theme-light .snap-layout-label,
+.desktop-theme-light .snap-layout-empty {
+    color: rgba(0, 0, 0, 0.64);
+}
+
+.desktop-theme-light .snap-layout-option {
+    background: rgba(0, 0, 0, 0.03);
+    border-color: rgba(0, 0, 0, 0.08);
+}
+
+.desktop-theme-light .snap-layout-option:hover {
+    background: rgba(0, 100, 210, 0.08);
+    border-color: rgba(0, 100, 210, 0.26);
+}
+
+.desktop-theme-light .snap-layout-preview {
+    background: rgba(0, 0, 0, 0.05);
+}
+
+.desktop-theme-light .snap-zone-preview {
+    background: rgba(0, 100, 210, 0.14);
+    border-color: rgba(0, 100, 210, 0.3);
+}
+
+.desktop-theme-light .snap-auto-arrange-btn {
+    background: rgba(0, 0, 0, 0.04);
+    border-color: rgba(0, 0, 0, 0.1);
+    color: rgba(0, 0, 0, 0.78);
+}
+
+@media (max-width: 768px) {
+    .snap-layout-picker--overlay {
+        min-width: 0;
+        width: 100%;
+        padding: 16px;
+    }
+
+    .snap-layout-options {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
 /* ============ Draggable Zone Borders ============ */
 
 .zone-divider {

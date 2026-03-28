@@ -2434,7 +2434,7 @@
 
 /* ─── Phase 42: Snap Layout Overlay ─────────────────────────────────────────── */
 
-.snap-layout-overlay {
+.widget-snap-layout-overlay {
     position: fixed;
     inset: 0;
     z-index: 9999;
@@ -2451,7 +2451,7 @@
     to { opacity: 1; }
 }
 
-.snap-layout-picker {
+.widget-snap-layout-picker {
     background: rgba(30, 30, 46, 0.95);
     backdrop-filter: blur(20px);
     border: 1px solid rgba(255, 255, 255, 0.1);
@@ -2462,7 +2462,7 @@
     box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
 }
 
-.snap-layout-title {
+.widget-snap-layout-title {
     font-size: 16px;
     font-weight: 600;
     color: rgba(255, 255, 255, 0.9);
@@ -2470,14 +2470,14 @@
     text-align: center;
 }
 
-.snap-layout-options {
+.widget-snap-layout-options {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 12px;
     margin-bottom: 16px;
 }
 
-.snap-layout-option {
+.widget-snap-layout-option {
     cursor: pointer;
     padding: 8px;
     border-radius: 10px;
@@ -2487,13 +2487,13 @@
     text-align: center;
 }
 
-.snap-layout-option:hover {
+.widget-snap-layout-option:hover {
     background: rgba(88, 166, 255, 0.12);
     border-color: rgba(88, 166, 255, 0.3);
     transform: translateY(-2px);
 }
 
-.snap-layout-preview {
+.widget-snap-layout-preview {
     position: relative;
     width: 100%;
     aspect-ratio: 16 / 10;
@@ -2503,7 +2503,7 @@
     margin-bottom: 6px;
 }
 
-.snap-zone-preview {
+.widget-snap-zone-preview {
     position: absolute;
     background: rgba(88, 166, 255, 0.2);
     border: 1px solid rgba(88, 166, 255, 0.4);
@@ -2513,7 +2513,7 @@
     margin: 2px;
 }
 
-.snap-layout-label {
+.widget-snap-layout-label {
     font-size: 11px;
     color: rgba(255, 255, 255, 0.55);
     white-space: nowrap;
@@ -2521,7 +2521,7 @@
     text-overflow: ellipsis;
 }
 
-.snap-auto-arrange-btn {
+.widget-snap-auto-arrange-btn {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -2537,41 +2537,41 @@
     transition: background 0.15s, border-color 0.15s;
 }
 
-.snap-auto-arrange-btn:hover {
+.widget-snap-auto-arrange-btn:hover {
     background: rgba(255, 255, 255, 0.1);
     border-color: rgba(255, 255, 255, 0.2);
 }
 
-.snap-auto-arrange-btn .material-icons {
+.widget-snap-auto-arrange-btn .material-icons {
     font-size: 18px;
     color: rgba(88, 166, 255, 0.8);
 }
 
 /* Light theme adjustments */
-[data-desktop-theme="light"] .snap-layout-picker {
+[data-desktop-theme="light"] .widget-snap-layout-picker {
     background: rgba(255, 255, 255, 0.95);
     border-color: rgba(0, 0, 0, 0.1);
 }
 
-[data-desktop-theme="light"] .snap-layout-title {
+[data-desktop-theme="light"] .widget-snap-layout-title {
     color: rgba(0, 0, 0, 0.85);
 }
 
-[data-desktop-theme="light"] .snap-layout-option {
+[data-desktop-theme="light"] .widget-snap-layout-option {
     border-color: rgba(0, 0, 0, 0.08);
     background: rgba(0, 0, 0, 0.02);
 }
 
-[data-desktop-theme="light"] .snap-layout-option:hover {
+[data-desktop-theme="light"] .widget-snap-layout-option:hover {
     background: rgba(88, 166, 255, 0.08);
     border-color: rgba(88, 166, 255, 0.3);
 }
 
-[data-desktop-theme="light"] .snap-layout-label {
+[data-desktop-theme="light"] .widget-snap-layout-label {
     color: rgba(0, 0, 0, 0.5);
 }
 
-[data-desktop-theme="light"] .snap-auto-arrange-btn {
+[data-desktop-theme="light"] .widget-snap-auto-arrange-btn {
     background: rgba(0, 0, 0, 0.04);
     border-color: rgba(0, 0, 0, 0.1);
     color: rgba(0, 0, 0, 0.7);

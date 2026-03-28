@@ -38,6 +38,7 @@
     let _snapPreview = null;   // DOM element for blue snap zone preview
     let _snapTarget = null;    // {zone:'left'|'right'|'top-left'|...} active snap target
     let _snapPickerEl = null;  // Snap layout picker DOM (hover over maximize btn)
+    let _layoutOverlayEl = null; // Dedicated layout overlay opened from desktop sidebar
     let _snapPickerTimeout = null;
     let _shakeOrigins = [];    // For Aero Shake detection
 
@@ -434,11 +435,15 @@
         var taskbar = document.getElementById('desktop-taskbar');
         if (!taskbar) return;
 
-        // Show taskbar only in windows mode or when there are open windows
-        if (currentMode === 'widgets' && windows.size === 0) {
-            taskbar.classList.add('taskbar-hidden');
-        } else {
-            taskbar.classList.remove('taskbar-hidden');
+        var shouldHide = windows.size === 0;
+        var wasHidden = taskbar.classList.contains('taskbar-hidden');
+
+        taskbar.classList.toggle('taskbar-hidden', shouldHide);
+
+        if (wasHidden !== shouldHide) {
+            requestAnimationFrame(function() {
+                if (active) clampAllWindows();
+            });
         }
     }
 
@@ -1217,6 +1222,129 @@
         document.removeEventListener('click', _onSnapPickerOutsideClick);
     }
 
+    function openLayoutOverlay() {
+        if (_layoutOverlayEl) {
+            closeLayoutOverlay();
+            return;
+        }
+
+        var visibleWindows = [];
+        windows.forEach(function(w) {
+            if (!w.minimized) visibleWindows.push(w);
+        });
+
+        _layoutOverlayEl = document.createElement('div');
+        _layoutOverlayEl.className = 'snap-layout-overlay';
+
+        var html = '<div class="snap-layout-picker snap-layout-picker--overlay">' +
+            '<div class="snap-layout-title">' + escapeHtml((typeof _ === 'function' ? _('desktop.label_snap_layout') : 'Window Layout')) + '</div>' +
+            '<div class="snap-layout-help">' + escapeHtml('Arrange open application windows. Widgets stay in place.') + '</div>';
+
+        if (visibleWindows.length > 0) {
+            html += '<div class="snap-layout-options">';
+            SNAP_LAYOUTS.forEach(function(layout) {
+                html += '<button class="snap-layout-option" data-key="' + layout.key + '" title="' + escapeAttr(layout.label) + '">';
+                html += '<div class="snap-layout-preview">';
+                layout.zones.forEach(function(zone) {
+                    html += '<div class="snap-zone-preview" style="left:' + (zone.x * 100) + '%;top:' + (zone.y * 100) + '%;width:' + (zone.w * 100) + '%;height:' + (zone.h * 100) + '%"></div>';
+                });
+                html += '</div>' +
+                    '<div class="snap-layout-label">' + escapeHtml(layout.label) + '</div>' +
+                    '</button>';
+            });
+            html += '</div>' +
+                '<button class="snap-auto-arrange-btn" data-action="auto-arrange"><span class="material-icons">grid_view</span>' + escapeHtml('Tile Open Windows') + '</button>';
+        } else {
+            html += '<div class="snap-layout-empty">' + escapeHtml('Open at least one app window to use multi-window layouts.') + '</div>';
+        }
+
+        html += '</div>';
+        _layoutOverlayEl.innerHTML = html;
+
+        _layoutOverlayEl.addEventListener('click', function(e) {
+            if (e.target === _layoutOverlayEl) closeLayoutOverlay();
+        });
+
+        if (visibleWindows.length > 0) {
+            _layoutOverlayEl.querySelectorAll('.snap-layout-option').forEach(function(option) {
+                option.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    var primaryWinId = focusedWindowId || (visibleWindows[0] && visibleWindows[0].id) || null;
+                    applySnapLayoutToWindows(option.getAttribute('data-key'), primaryWinId);
+                    closeLayoutOverlay();
+                });
+            });
+
+            var autoArrangeBtn = _layoutOverlayEl.querySelector('[data-action="auto-arrange"]');
+            if (autoArrangeBtn) {
+                autoArrangeBtn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    autoArrangeWindows();
+                    closeLayoutOverlay();
+                });
+            }
+        }
+
+        document.body.appendChild(_layoutOverlayEl);
+        requestAnimationFrame(function() {
+            var picker = _layoutOverlayEl && _layoutOverlayEl.querySelector('.snap-layout-picker--overlay');
+            if (picker) picker.classList.add('visible');
+        });
+    }
+
+    function closeLayoutOverlay() {
+        if (_layoutOverlayEl && _layoutOverlayEl.parentNode) {
+            _layoutOverlayEl.parentNode.removeChild(_layoutOverlayEl);
+        }
+        _layoutOverlayEl = null;
+    }
+
+    function autoArrangeWindows() {
+        var visibleWindows = [];
+        windows.forEach(function(w) {
+            if (!w.minimized) visibleWindows.push(w);
+        });
+        if (!visibleWindows.length) return;
+
+        var area = getDesktopArea();
+        var cols = Math.ceil(Math.sqrt(visibleWindows.length));
+        var rows = Math.ceil(visibleWindows.length / cols);
+        var pad = 6;
+        var cellWidth = Math.floor(area.width / cols);
+        var cellHeight = Math.floor(area.height / rows);
+
+        clearActiveZoneLayout();
+
+        visibleWindows.forEach(function(win, index) {
+            var col = index % cols;
+            var row = Math.floor(index / cols);
+
+            win.x = Math.round(area.x + col * cellWidth + pad);
+            win.y = Math.round(area.y + row * cellHeight + pad);
+            win.width = Math.max(MIN_WIDTH, Math.round(cellWidth - pad * 2));
+            win.height = Math.max(MIN_HEIGHT, Math.round(cellHeight - pad * 2));
+            win.maximized = false;
+            win.prevBounds = null;
+            win.snappedZone = null;
+
+            var el = document.getElementById(win.id);
+            if (el) {
+                el.classList.remove('maximized');
+                el.style.transition = 'left 0.25s ease, top 0.25s ease, width 0.25s ease, height 0.25s ease';
+                el.style.left = win.x + 'px';
+                el.style.top = win.y + 'px';
+                el.style.width = win.width + 'px';
+                el.style.height = win.height + 'px';
+
+                var maxIcon = el.querySelector('.maximize-btn .material-icons');
+                if (maxIcon) maxIcon.textContent = 'crop_square';
+                setTimeout(function() { el.style.transition = ''; }, 300);
+            }
+
+            saveWindowBounds(win.appId, win.x, win.y, win.width, win.height);
+        });
+    }
+
     function applySnapLayoutToWindows(layoutKey, primaryWinId) {
         var layout = SNAP_LAYOUTS.find(function(l) { return l.key === layoutKey; });
         if (!layout) return;
@@ -1651,6 +1779,13 @@
 
     // ============ Helpers ============
 
+    function shouldReserveTaskbarSpace() {
+        if (!active) return false;
+        var taskbar = document.getElementById('desktop-taskbar');
+        if (windows.size > 0) return true;
+        return !!(taskbar && !taskbar.classList.contains('taskbar-hidden'));
+    }
+
     function getDesktopArea() {
         // Use visualViewport for accurate available space (excludes on-screen keyboards,
         // browser chrome, etc.). Falls back to window.innerWidth/Height.
@@ -1658,8 +1793,7 @@
         var vpWidth = vp ? vp.width : window.innerWidth;
         var vpHeight = vp ? vp.height : window.innerHeight;
 
-        // In widgets mode, taskbar is hidden — full height minus topnav (42px)
-        var bottomOffset = (currentMode === 'widgets') ? 0 : TASKBAR_HEIGHT;
+        var bottomOffset = shouldReserveTaskbarSpace() ? TASKBAR_HEIGHT : 0;
 
         // Respect CSS safe-area-inset-bottom (accounts for system UI overlap)
         var safeBottom = 0;
@@ -1815,7 +1949,10 @@
         // Snap Layout API
         showSnapPicker: showSnapPicker,
         hideSnapPicker: hideSnapPicker,
+        openLayoutOverlay: openLayoutOverlay,
+        closeLayoutOverlay: closeLayoutOverlay,
         applySnapLayout: applySnapLayoutToWindows,
+        autoArrangeWindows: autoArrangeWindows,
         getSnapLayouts: function() { return SNAP_LAYOUTS; },
         clearZoneLayout: clearActiveZoneLayout,
         // Foldable device API
