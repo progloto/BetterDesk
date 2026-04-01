@@ -570,7 +570,11 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: u.CreatedAt, LastLogin: u.LastLogin,
 		}
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": len(result),
+		"data":  result,
+		"msg":   "success",
+	})
 }
 
 // handleClientUsersList returns users in the {total,data} envelope format
@@ -1057,7 +1061,11 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: k.CreatedAt, ExpiresAt: k.ExpiresAt, LastUsed: k.LastUsed,
 		}
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": len(result),
+		"data":  result,
+		"msg":   "success",
+	})
 }
 
 // handleCreateAPIKey generates a new API key. The plaintext key is returned ONCE.
@@ -1237,7 +1245,6 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			path != "/metrics" && path != "/api/health" {
 			log.Printf("[api] %s %s from %s", r.Method, redactPathSegment(path), s.remoteIP(r))
 		}
-
 		// Limit request body size to 1 MB for all requests (S10)
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 

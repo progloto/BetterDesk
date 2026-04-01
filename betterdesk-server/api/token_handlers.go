@@ -97,8 +97,8 @@ func (s *Server) handleListDeviceTokens(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"tokens": resp,
-		"count":  len(resp),
+		"total": len(resp),
+		"data":  resp,
 	})
 }
 

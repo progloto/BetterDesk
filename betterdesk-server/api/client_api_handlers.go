@@ -223,7 +223,9 @@ func (s *Server) handleClientLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"type":         "access_token",
 		"access_token": token,
-		"user":         rustdeskUserPayload(user.Username, user.Role),
+		"user": map[string]any{
+			"name": user.Username,
+		},
 	})
 }
 
@@ -272,7 +274,9 @@ func (s *Server) handleClientTFAVerify(w http.ResponseWriter, clientIP, totpCode
 	writeJSON(w, http.StatusOK, map[string]any{
 		"type":         "access_token",
 		"access_token": token,
-		"user":         rustdeskUserPayload(user.Username, user.Role),
+		"user": map[string]any{
+			"name": user.Username,
+		},
 	})
 }
 
@@ -317,11 +321,12 @@ func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request)
 		data, err := s.db.GetAddressBook(username, "legacy")
 		if err != nil {
 			log.Printf("[api] GetAddressBook error for %s: %v", username, err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
+			writeInternalError(w, err, "GetAddressBook")
 			return
 		}
 		// Merge admin-set tags from peers table into AB (#76 TAG sync)
 		data = s.mergeAdminTagsIntoAB(data)
+		// Return exactly what the client expects: a JSON object with a 'data' string field
 		writeJSON(w, http.StatusOK, map[string]any{"data": data, "licensed_devices": 0})
 
 	case http.MethodPost:
@@ -379,7 +384,7 @@ func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.
 		data, err := s.db.GetAddressBook(username, "personal")
 		if err != nil {
 			log.Printf("[api] GetAddressBook(personal) error for %s: %v", username, err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
+			writeInternalError(w, err, "GetAddressBookPersonal")
 			return
 		}
 		// Merge admin-set tags from peers table into AB (#76 TAG sync)
@@ -1173,6 +1178,32 @@ func (s *Server) handleClientSysinfoVer(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(hash)) //nolint:errcheck
+}
+
+// handleClientDeviceGroups returns accessible device groups (empty map for now).
+func (s *Server) handleClientDeviceGroups(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": 0,
+		"data":  []any{},
+		"msg":   "success",
+	})
+}
+
+// handleClientUserGroups returns user groups (empty map for now).
+func (s *Server) handleClientUserGroups(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": 0,
+		"data":  []any{},
+		"msg":   "success",
+	})
+}
+
+// handleClientUserGroupSingle returns the current user's group.
+func (s *Server) handleClientUserGroupSingle(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name": "Default",
+		"guid": "default-group",
+	})
 }
 
 // truncate returns s capped at maxLen bytes.

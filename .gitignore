@@ -226,7 +226,11 @@ web-nodejs/wallpapers/
 
 # --- Task tracking (local only) ---
 tasks/todo.md
-t
-k-server
-
 docs/security/PROJECT_SECURITY_ANALYSIS_2026-05-19.md
+docs/SECURITY_AUDIT_FULL_2026-03-19.md
+.github/copilot-instructions.md
+betterdesk-server-linux
+etc/
+.rustdesk_current_version
+*.jpg
+gen_hash.go

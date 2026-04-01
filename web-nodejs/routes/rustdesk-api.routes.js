@@ -1073,7 +1073,7 @@ router.get('/api/peers', async (req, res, next) => {
         return res.json(result);
     } catch (err) {
         console.error('[API:PEERS] Error:', err.message);
-        return res.json({ data: [], total: 0 });
+        return res.json({ data: [], total: 0, msg: 'success' });
     }
 });
 
@@ -1188,7 +1188,7 @@ router.get('/api/user/group', requireAuth, async (req, res) => {
             }
         });
     } catch (err) {
-        return res.json({ data: { name: 'Default', guid: 'default' } });
+        return res.json({ name: 'Default', guid: 'default' });
     }
 });
 
@@ -1371,7 +1371,9 @@ router.post('/api/login', async (req, res) => {
         return res.json({
             type: 'access_token',
             access_token: token,
-            user: buildUserPayload(user)
+            user: {
+                name: user.username
+            }
         });
 
     } catch (err) {
@@ -1427,10 +1429,9 @@ async function handleTfaVerification(req, res, ip, totpCode) {
         return res.json({
             type: 'access_token',
             access_token: token,
-            user: buildUserPayload({
-                username: session.username,
-                role: session.role
-            })
+            user: {
+                name: session.username
+            }
         });
 
     } catch (err) {
@@ -1640,10 +1641,10 @@ router.get('/api/audit/conn', async (req, res) => {
         const data = await db.getAuditConnections(filters);
         const total = await db.countAuditConnections(filters);
 
-        return res.json({ data, total });
+        return res.json({ data, total, msg: 'success' });
     } catch (err) {
         console.error('[API:AUDIT/CONN] Query error:', err.message);
-        return res.json({ data: [], total: 0 });
+        return res.json({ data: [], total: 0, msg: 'success' });
     }
 });
 
@@ -1704,10 +1705,10 @@ router.get('/api/audit/file', requireAuth, async (req, res) => {
         const data = await db.getAuditFiles(filters);
         const total = await db.countAuditFiles(filters);
 
-        return res.json({ data, total });
+        return res.json({ data, total, msg: 'success' });
     } catch (err) {
         console.error('[API:AUDIT/FILE] Query error:', err.message);
-        return res.json({ data: [], total: 0 });
+        return res.json({ data: [], total: 0, msg: 'success' });
     }
 });
 
@@ -1762,10 +1763,10 @@ router.get('/api/audit/alarm', requireAuth, async (req, res) => {
         const data = await db.getAuditAlarms(filters);
         const total = await db.countAuditAlarms(filters);
 
-        return res.json({ data, total });
+        return res.json({ data, total, msg: 'success' });
     } catch (err) {
         console.error('[API:AUDIT/ALARM] Query error:', err.message);
-        return res.json({ data: [], total: 0 });
+        return res.json({ data: [], total: 0, msg: 'success' });
     }
 });
 
@@ -1789,11 +1790,12 @@ router.get('/api/user-groups', requireAuth, async (req, res) => {
                 note: g.note || '',
                 team_id: g.team_id || ''
             })),
-            total: groups.length
+            total: groups.length,
+            msg: 'success'
         });
     } catch (err) {
         console.error('[API:USER-GROUPS] Error:', err.message);
-        return res.json({ data: [], total: 0 });
+        return res.json({ data: [], total: 0, msg: 'success' });
     }
 });
 
@@ -1850,11 +1852,12 @@ router.get('/api/strategies', requireAuth, async (req, res) => {
                 enabled: s.enabled === 1,
                 permissions: s.permissions || {}
             })),
-            total: strategies.length
+            total: strategies.length,
+            msg: 'success'
         });
     } catch (err) {
         console.error('[API:STRATEGIES] Error:', err.message);
-        return res.json({ data: [], total: 0 });
+        return res.json({ data: [], total: 0, msg: 'success' });
     }
 });
 

@@ -311,6 +311,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /api/currentUser", s.handleClientCurrentUser)
 	mux.HandleFunc("GET /api/ab", s.handleClientAddressBook)
 	mux.HandleFunc("POST /api/ab", s.handleClientAddressBook)
+	mux.HandleFunc("POST /api/ab/get", s.handleClientAddressBook) // Legacy alias
 	mux.HandleFunc("GET /api/ab/personal", s.handleClientAddressBookPersonal)
 	mux.HandleFunc("POST /api/ab/personal", s.handleClientAddressBookPersonal)
 	mux.HandleFunc("GET /api/ab/tags", s.handleClientAddressBookTags)
@@ -350,6 +351,12 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/role-permissions", s.requirePermission(auth.PermServerConfig, s.handleListRolePermissionOverrides))
 	mux.HandleFunc("POST /api/role-permissions", s.requirePermission(auth.PermServerConfig, s.handleSetRolePermission))
 	mux.HandleFunc("DELETE /api/role-permissions/{role}/{permission}", s.requirePermission(auth.PermServerConfig, s.handleDeleteRolePermission))
+
+	// Group support (Address Book Phase 3)
+	mux.HandleFunc("/api/device-group/accessible", s.handleClientDeviceGroups)
+	mux.HandleFunc("/api/device-group", s.handleClientDeviceGroups)
+	mux.HandleFunc("/api/user-groups", s.handleClientUserGroups)
+	mux.HandleFunc("/api/user/group", s.handleClientUserGroupSingle)
 
 	// TOTP management (admin only)
 	mux.HandleFunc("POST /api/users/{id}/totp/setup", s.requireRole(auth.RoleAdmin, s.handleSetupTOTP))
@@ -465,6 +472,12 @@ func (s *Server) Start(ctx context.Context) error {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte(`{"error":"not found"}`))
+	})
+
+	// Catch-all for 404 logging
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[API] 404 NOT FOUND: %s %s from %s", r.Method, r.URL.Path, s.remoteIP(r))
+		http.NotFound(w, r)
 	})
 
 	addr := fmt.Sprintf(":%d", s.cfg.APIPort)
@@ -610,6 +623,11 @@ func (s *Server) handleServerStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+// handleListPeers returns all registered peers.
+// Note: RustDesk v1.4.6+ requires:
+// 1. A Map wrapper {"data": [...], "total": n, "msg": "success"}
+// 2. Numeric status (int) instead of string "ONLINE"
+// 3. Nested 'info' object for device details
 func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	// Detect RustDesk client group model request: the Flutter client sends
 	// ?accessible=&status=1&pageSize=100 and expects {total,data} envelope
@@ -655,9 +673,11 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	result := make([]peerResponse, len(peers))
 	for i, p := range peers {
 		liveOnline := s.peers.IsOnline(p.ID, config.RegTimeout)
-		liveStatus := peer.StatusOffline
-		if snap, ok := s.peers.GetSnapshot(p.ID, config.DegradedThreshold, config.CriticalThreshold); ok {
-			liveStatus = snap.Status
+
+		// Map string status to numeric for Flutter compatibility
+		statusInt := 0
+		if liveOnline || p.Status == "ONLINE" {
+			statusInt = 1
 		}
 
 		// CDAP overlay: device connected via CDAP gateway is online
@@ -683,7 +703,11 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": len(result),
+		"data":  result,
+		"msg":   "success",
+	})
 }
 
 // handleClientPeersList returns peers in the {total,data} envelope format
@@ -1178,8 +1202,9 @@ func (s *Server) handleStatusSummary(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleOnlinePeers(w http.ResponseWriter, r *http.Request) {
 	snapshots := s.peers.GetAllSnapshots(config.DegradedThreshold, config.CriticalThreshold)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"count": len(snapshots),
-		"peers": snapshots,
+		"total": len(snapshots),
+		"data":  snapshots,
+		"msg":   "success",
 	})
 }
 
@@ -1266,8 +1291,9 @@ func (s *Server) handleListBlocklist(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled": true,
-		"count":   s.blocklist.Count(),
-		"entries": s.blocklist.List(),
+		"total":   s.blocklist.Count(),
+		"data":    s.blocklist.List(),
+		"msg":     "success",
 	})
 }
 
@@ -1445,8 +1471,9 @@ func (s *Server) handlePeersByTag(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"tag":   tag,
-		"count": len(peers),
-		"peers": peers,
+		"total": len(peers),
+		"data":  peers,
+		"msg":   "success",
 	})
 }
 
@@ -1484,8 +1511,8 @@ func (s *Server) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled": true,
 		"total":   s.auditLog.Total(),
-		"count":   len(events),
-		"events":  events,
+		"data":    events,
+		"msg":     "success",
 	})
 }
 

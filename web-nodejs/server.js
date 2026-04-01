@@ -226,6 +226,8 @@ app.use((err, req, res, next) => {
 
 // 404 Not Found
 app.use((req, res, next) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
+    console.warn(`[WEB] 404 NOT FOUND: ${req.method} ${req.path} from ${ip}`);
     res.status(404);
 
     // Log unmatched /api/* and /ws/* paths only (avoid noise from missing

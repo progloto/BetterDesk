@@ -1,0 +1,24 @@
+# BetterDesk — Caddy Sidecar Example (HTTPS on 5443)
+# =======================================================
+# Usage: 
+#   cp docker/Caddyfile.example ./Caddyfile
+#   (edit Caddyfile with your domain and email)
+#   docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+
+services:
+  caddy:
+    image: caddy:latest
+    container_name: betterdesk-proxy
+    restart: unless-stopped
+    ports:
+      - "5443:5443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./caddy-data:/data
+      - ./caddy-config:/config
+    depends_on:
+      - betterdesk
+
+networks:
+  default:
+    name: betterdesk-net
