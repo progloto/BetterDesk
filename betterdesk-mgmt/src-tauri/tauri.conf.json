@@ -25,21 +25,6 @@
         "decorations": true,
         "visible": false,
         "skipTaskbar": false
-      },
-      {
-        "label": "chat",
-        "title": "BetterDesk Chat",
-        "url": "chat-window.html",
-        "width": 700,
-        "height": 520,
-        "minWidth": 540,
-        "minHeight": 400,
-        "resizable": true,
-        "fullscreen": false,
-        "center": true,
-        "decorations": true,
-        "visible": false,
-        "skipTaskbar": false
       }
     ],
     "security": {

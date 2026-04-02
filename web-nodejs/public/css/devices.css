@@ -90,7 +90,7 @@
     font-size: var(--font-size-xs, 0.75rem);
     cursor: pointer;
     white-space: nowrap;
-    transition: all 0.15s ease;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
     flex-shrink: 0;
     -webkit-appearance: none;
     appearance: none;
@@ -126,6 +126,7 @@
     padding: 0 5px;
     border-radius: var(--radius-full);
     line-height: 16px;
+    transition: opacity 0.15s ease;
 }
 
 .folder-chip.active .chip-count {
@@ -134,18 +135,29 @@
 
 /* Chip actions (edit/delete) — shown on hover for custom folders */
 .chip-actions {
-    display: none;
+    display: inline-flex;
     align-items: center;
     gap: 2px;
     margin-left: 2px;
+    opacity: 0;
+    visibility: hidden;
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    transition: opacity 0.15s ease, visibility 0.15s ease;
+    background: inherit;
+    padding: 0 2px;
+    border-radius: var(--radius-sm);
 }
 
 .folder-chip:hover .chip-actions {
-    display: inline-flex;
+    opacity: 1;
+    visibility: visible;
 }
 
 .folder-chip:hover .chip-count {
-    display: none;
+    opacity: 0;
 }
 
 .chip-action {

@@ -61,6 +61,25 @@ if (!fs.existsSync(config.dataDir)) {
 // Security headers (Helmet)
 app.use(securityMiddleware);
 
+// CORS for BetterDesk desktop clients (Tauri webview origins)
+app.use('/api/', (req, res, next) => {
+    const origin = req.headers.origin || '';
+    const allowed = [
+        'http://localhost:1420',    // Tauri dev
+        'tauri://localhost',        // Tauri production (macOS/Linux)
+        'https://tauri.localhost',  // Tauri production (Windows)
+    ];
+    if (allowed.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-CSRF-Token');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Max-Age', '86400');
+    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
 // Body parsing (2MB limit for base64 logo images)
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
@@ -138,6 +157,13 @@ app.use((req, res, next) => {
 app.use(csrfTokenProvider);
 app.use((req, res, next) => {
     if (req.path.startsWith('/api/bd/')) {
+        return next();
+    }
+    // Skip CSRF for BetterDesk desktop clients (Tauri) — they are not
+    // vulnerable to CSRF attacks (not browser tabs). Identified by origin.
+    const origin = req.headers.origin || '';
+    const tauriOrigins = ['http://localhost:1420', 'tauri://localhost', 'https://tauri.localhost'];
+    if (req.path.startsWith('/api/') && tauriOrigins.includes(origin)) {
         return next();
     }
     doubleCsrfProtection(req, res, next);
