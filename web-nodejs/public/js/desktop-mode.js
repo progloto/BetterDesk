@@ -1113,7 +1113,7 @@
 
     function getSnapBounds(zone) {
         var area = getDesktopArea();
-        var PAD = 6;
+        var PAD = 3;
         switch (zone) {
             case 'left':         return { x: area.x + PAD, y: area.y + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: area.height - PAD * 2 };
             case 'right':        return { x: area.x + Math.floor(area.width / 2) + PAD, y: area.y + PAD, w: Math.floor(area.width / 2) - PAD * 2, h: area.height - PAD * 2 };
@@ -1365,7 +1365,7 @@
         var area = getDesktopArea();
         var cols = Math.ceil(Math.sqrt(visibleWindows.length));
         var rows = Math.ceil(visibleWindows.length / cols);
-        var pad = 6;
+        var pad = 3;
         var cellWidth = Math.floor(area.width / cols);
         var cellHeight = Math.floor(area.height / rows);
 
@@ -1406,7 +1406,7 @@
         if (!layout) return;
 
         var area = getDesktopArea();
-        var PAD = 6;
+        var PAD = 3;
 
         // Collect visible (non-minimized) windows, put primaryWinId first
         var winArr = [];
@@ -1478,7 +1478,7 @@
             div.dataset.dividerIdx = idx;
 
             // Position the divider along the shared edge
-            var PAD = 6;
+            var PAD = 3;
             if (edge.axis === 'col') {
                 // Vertical divider between left/right zones
                 var cx = area.x + edge.pos * area.width;
@@ -1864,9 +1864,9 @@
 
         return {
             x: 0,
-            y: 42,
+            y: 0,
             width: vpWidth,
-            height: vpHeight - 42 - bottomOffset - safeBottom
+            height: vpHeight - 36 - bottomOffset - safeBottom
         };
     }
 
@@ -1897,6 +1897,19 @@
         catch (_) { /* quota */ }
     }
 
+    function toggleFullscreen() {
+        if (!document.fullscreenElement) {
+            var shell = document.getElementById('desktop-shell') || document.documentElement;
+            if (shell.requestFullscreen) shell.requestFullscreen();
+            else if (shell.webkitRequestFullscreen) shell.webkitRequestFullscreen();
+            else if (shell.msRequestFullscreen) shell.msRequestFullscreen();
+        } else {
+            if (document.exitFullscreen) document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            else if (document.msExitFullscreen) document.msExitFullscreen();
+        }
+    }
+
     function initTopbar() {
         var clockEl = document.getElementById('topbar-clock');
         if (clockEl) {
@@ -1920,14 +1933,59 @@
 
         var widgetsBtn = document.getElementById('topbar-widgets-btn');
         if (widgetsBtn) widgetsBtn.addEventListener('click', function() {
-            if (window.DesktopWidgets && typeof window.DesktopWidgets.openAddWidget === 'function') {
-                window.DesktopWidgets.openAddWidget();
+            if (window.DesktopWidgets && typeof window.DesktopWidgets.openPicker === 'function') {
+                window.DesktopWidgets.openPicker();
+            }
+        });
+
+        var addWidgetBtn = document.getElementById('topbar-add-widget-btn');
+        if (addWidgetBtn) addWidgetBtn.addEventListener('click', function() {
+            if (window.DesktopWidgets && typeof window.DesktopWidgets.openPicker === 'function') {
+                window.DesktopWidgets.openPicker();
+            }
+        });
+
+        var wallpaperBtn = document.getElementById('topbar-wallpaper-btn');
+        if (wallpaperBtn) wallpaperBtn.addEventListener('click', function() {
+            if (window.DesktopWidgets && typeof window.DesktopWidgets.openWallpaperPicker === 'function') {
+                window.DesktopWidgets.openWallpaperPicker();
+            }
+        });
+
+        var fullscreenBtn = document.getElementById('topbar-fullscreen-btn');
+        if (fullscreenBtn) fullscreenBtn.addEventListener('click', function() {
+            toggleFullscreen();
+        });
+
+        // Sync fullscreen icon when state changes (Esc key, etc.)
+        document.addEventListener('fullscreenchange', function() {
+            var btn = document.getElementById('topbar-fullscreen-btn');
+            if (!btn) return;
+            var icon = btn.querySelector('.material-icons');
+            if (icon) icon.textContent = document.fullscreenElement ? 'fullscreen_exit' : 'fullscreen';
+        });
+
+        var snapLayoutBtn = document.getElementById('topbar-snap-layout-btn');
+        if (snapLayoutBtn) snapLayoutBtn.addEventListener('click', function() {
+            if (window.DesktopWidgets && typeof window.DesktopWidgets.openSnapLayout === 'function') {
+                window.DesktopWidgets.openSnapLayout();
+            } else {
+                openSnapLayoutPicker();
             }
         });
 
         var editBtn = document.getElementById('topbar-edit-btn');
         if (editBtn) editBtn.addEventListener('click', function() {
             toggleTopbarEditMode();
+        });
+
+        var helpBtn = document.getElementById('topbar-help-btn');
+        if (helpBtn) helpBtn.addEventListener('click', function() {
+            if (window.BetterDeskTutorial && typeof window.BetterDeskTutorial.toggleHelpMenu === 'function') {
+                window.BetterDeskTutorial.toggleHelpMenu();
+            } else if (window.Tutorial && typeof window.Tutorial.toggleHelpMenu === 'function') {
+                window.Tutorial.toggleHelpMenu();
+            }
         });
 
         renderTopbarShortcuts();

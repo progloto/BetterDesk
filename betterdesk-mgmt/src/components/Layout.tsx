@@ -1,19 +1,50 @@
 /**
  * Layout — app shell with sidebar, topbar, and content area
  */
-import { createSignal, Show, Switch, Match } from 'solid-js';
+import { createSignal, Show, Switch, Match, lazy } from 'solid-js';
 import { t } from '../lib/i18n';
 import { user } from '../stores/auth';
 import Sidebar from './Sidebar';
 import Dashboard from './Dashboard';
 import DeviceList from './DeviceList';
+import DeviceDetail from './DeviceDetail';
+import RemoteView from './RemoteView';
+import ChatPanel from './ChatPanel';
 import Settings from './Settings';
+import ToastContainer from './ToastContainer';
+
+// Lazy-loaded panels (loaded only when navigated to)
+const ServerPanel = lazy(() => import('./ServerPanel'));
+const SessionHistoryPanel = lazy(() => import('./SessionHistoryPanel'));
+const NotificationCenter = lazy(() => import('./NotificationCenter'));
+const AutomationPanel = lazy(() => import('./AutomationPanel'));
+const DataGuardPanel = lazy(() => import('./DataGuardPanel'));
+const HelpRequestsPanel = lazy(() => import('./HelpRequestsPanel'));
+const FileTransferPanel = lazy(() => import('./FileTransferPanel'));
 
 export default function Layout() {
     const [activePanel, setActivePanel] = createSignal('dashboard');
+    const [detailDeviceId, setDetailDeviceId] = createSignal<string | null>(null);
 
     function handleNavigate(panel: string) {
         setActivePanel(panel);
+    }
+
+    /** Open device detail modal */
+    function handleDeviceDetail(id: string) {
+        setDetailDeviceId(id);
+    }
+
+    /** Connect to device remote view */
+    function handleConnect(id: string) {
+        setDetailDeviceId(null);
+        setActivePanel(`remote:${id}`);
+    }
+
+    function remoteDeviceId(): string {
+        const p = activePanel();
+        if (p.startsWith('remote:')) return p.substring(7);
+        return '';
     }
 
     function panelTitle(): string {
@@ -23,6 +54,13 @@ export default function Layout() {
         if (p.startsWith('remote')) return t('remote.title');
         if (p === 'chat') return t('chat.title');
         if (p === 'settings') return t('settings.title');
+        if (p === 'server') return t('server.title');
+        if (p === 'sessions') return t('sessions.title');
+        if (p === 'notifications') return t('notifications.title');
+        if (p === 'automation') return t('automation.title');
+        if (p === 'dataguard') return t('dataguard.title');
+        if (p === 'help_requests') return t('help_requests.title');
+        if (p === 'file_transfer') return t('file_transfer.title');
         return '';
     }
 
@@ -61,9 +99,15 @@ export default function Layout() {
                             <Dashboard onNavigate={handleNavigate} />
                         </Match>
                         <Match when={activePanel() === 'devices'}>
-                            <DeviceList onNavigate={handleNavigate} />
+                            <DeviceList onNavigate={handleNavigate} onDeviceDetail={handleDeviceDetail} />
                         </Match>
-                        <Match when={activePanel().startsWith('remote')}>
+                        <Match when={activePanel().startsWith('remote:') && remoteDeviceId()}>
+                            <RemoteView
+                                deviceId={remoteDeviceId()}
+                                onDisconnect={() => setActivePanel('devices')}
+                            />
+                        </Match>
+                        <Match when={activePanel() === 'remote'}>
                             <div class="empty-state">
                                 <span class="material-symbols-rounded">desktop_windows</span>
                                 <div class="empty-state-text">{t('remote.not_connected')}</div>
@@ -73,10 +117,28 @@ export default function Layout() {
                             </div>
                         </Match>
                         <Match when={activePanel() === 'chat'}>
-                            <div class="empty-state">
-                                <span class="material-symbols-rounded">chat</span>
-                                <div class="empty-state-text">{t('chat.no_conversations')}</div>
-                            </div>
+                            <ChatPanel />
+                        </Match>
+                        <Match when={activePanel() === 'server'}>
+                            <ServerPanel />
+                        </Match>
+                        <Match when={activePanel() === 'sessions'}>
+                            <SessionHistoryPanel />
+                        </Match>
+                        <Match when={activePanel() === 'notifications'}>
+                            <NotificationCenter />
+                        </Match>
+                        <Match when={activePanel() === 'automation'}>
+                            <AutomationPanel />
+                        </Match>
+                        <Match when={activePanel() === 'dataguard'}>
+                            <DataGuardPanel />
+                        </Match>
+                        <Match when={activePanel() === 'help_requests'}>
+                            <HelpRequestsPanel />
+                        </Match>
+                        <Match when={activePanel() === 'file_transfer'}>
+                            <FileTransferPanel />
                         </Match>
                         <Match when={activePanel() === 'settings'}>
                             <Settings />
@@ -84,6 +146,19 @@ export default function Layout() {
                     </Switch>
                 </div>
             </div>
+
+            {/* Device Detail Modal */}
+            <Show when={detailDeviceId()}>
+                <DeviceDetail
+                    deviceId={detailDeviceId()!}
+                    onClose={() => setDetailDeviceId(null)}
+                    onConnect={handleConnect}
+                    onDeleted={() => { setDetailDeviceId(null); setActivePanel('devices'); }}
+                />
+            </Show>
+
+            {/* Toast Notifications */}
+            <ToastContainer />
         </div>
     );
 }

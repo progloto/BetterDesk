@@ -98,6 +98,12 @@ pub fn run() {
             remote_agent: Mutex::new(None),
             cdap_agent: Mutex::new(None),
             activity: Mutex::new(commands::ActivityTracker::new()),
+            http_client: reqwest::Client::builder()
+                .cookie_store(true)
+                .timeout(std::time::Duration::from_secs(15))
+                .danger_accept_invalid_certs(false)
+                .build()
+                .expect("Failed to build HTTP client"),
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
@@ -178,6 +184,9 @@ pub fn run() {
             commands::operator_login,
             commands::operator_login_2fa,
             commands::operator_get_devices,
+            // API proxy (session-based, cookie jar)
+            commands::api_proxy,
+            commands::api_clear_session,
             commands::operator_get_help_requests,
             commands::operator_accept_help_request,
             commands::operator_record_session_event,

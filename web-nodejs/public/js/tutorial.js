@@ -532,6 +532,11 @@
 
     // ============ Export ============
 
+    function toggleHelpMenu() {
+        if (!_helpMenu) showHelpButton();
+        if (_helpMenuOpen) closeHelpMenu(); else openHelpMenu();
+    }
+
     window.Tutorial = {
         start: start,
         skip: skip,
@@ -541,7 +546,8 @@
         isDisabled: isDisabled,
         autoStart: autoStart,
         showHelpButton: showHelpButton,
-        hideHelpButton: hideHelpButton
+        hideHelpButton: hideHelpButton,
+        toggleHelpMenu: toggleHelpMenu
     };
 
     // Backward compatibility alias

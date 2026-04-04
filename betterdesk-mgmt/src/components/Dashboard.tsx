@@ -1,9 +1,10 @@
 /**
- * Dashboard — overview with stat cards, quick connect, recent sessions
+ * Dashboard — overview with stat cards, quick connect, recent sessions, help requests
  */
-import { createSignal, onMount, Show } from 'solid-js';
+import { createSignal, onMount, Show, For } from 'solid-js';
 import { t } from '../lib/i18n';
-import { getDevices, getServerHealth, type Device, type ServerHealth } from '../lib/api';
+import { getDevices, getServerHealth, getRecentSessions, getHelpRequests, type Device, type ServerHealth, type AuditEvent } from '../lib/api';
+import { toastError } from '../stores/toast';
 
 interface DashboardProps {
     onNavigate: (panel: string) => void;
@@ -12,6 +13,8 @@ interface DashboardProps {
 export default function Dashboard(props: DashboardProps) {
     const [health, setHealth] = createSignal<ServerHealth | null>(null);
     const [devices, setDevices] = createSignal<Device[]>([]);
+    const [sessions, setSessions] = createSignal<AuditEvent[]>([]);
+    const [helpRequests, setHelpRequests] = createSignal<AuditEvent[]>([]);
     const [loading, setLoading] = createSignal(true);
     const [connectId, setConnectId] = createSignal('');
 
@@ -22,12 +25,18 @@ export default function Dashboard(props: DashboardProps) {
     async function loadData() {
         setLoading(true);
         try {
-            const [h, d] = await Promise.all([
+            const [h, d, s, hr] = await Promise.all([
                 getServerHealth().catch(() => null),
                 getDevices().catch(() => []),
+                getRecentSessions(5).catch(() => []),
+                getHelpRequests().catch(() => []),
             ]);
             setHealth(h);
             setDevices(d);
+            setSessions(s);
+            setHelpRequests(hr);
+        } catch {
+            toastError(t('common.error'));
         } finally {
             setLoading(false);
         }
@@ -137,6 +146,80 @@ export default function Dashboard(props: DashboardProps) {
                                             </td>
                                         </tr>
                                     ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </Show>
+            </Show>
+
+            {/* Recent Sessions */}
+            <div class="section-title">{t('dashboard.recent_sessions')}</div>
+            <Show when={!loading()}>
+                <Show when={sessions().length > 0} fallback={
+                    <div class="empty-state small">
+                        <span class="material-symbols-rounded">history</span>
+                        <div class="empty-state-text">{t('dashboard.no_sessions')}</div>
+                    </div>
+                }>
+                    <div class="device-table-container">
+                        <table class="device-table">
+                            <thead>
+                                <tr>
+                                    <th>{t('dashboard.session_device')}</th>
+                                    <th>{t('dashboard.session_operator')}</th>
+                                    <th>{t('dashboard.session_time')}</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <For each={sessions()}>
+                                    {(s) => (
+                                        <tr>
+                                            <td>{s.target || '—'}</td>
+                                            <td>{s.actor || '—'}</td>
+                                            <td>{new Date(s.created_at).toLocaleString()}</td>
+                                        </tr>
+                                    )}
+                                </For>
+                            </tbody>
+                        </table>
+                    </div>
+                </Show>
+            </Show>
+
+            {/* Help Requests */}
+            <div class="section-title">{t('dashboard.help_requests')}</div>
+            <Show when={!loading()}>
+                <Show when={helpRequests().length > 0} fallback={
+                    <div class="empty-state small">
+                        <span class="material-symbols-rounded">support_agent</span>
+                        <div class="empty-state-text">{t('dashboard.no_help_requests')}</div>
+                    </div>
+                }>
+                    <div class="device-table-container">
+                        <table class="device-table">
+                            <thead>
+                                <tr>
+                                    <th>{t('dashboard.help_device')}</th>
+                                    <th>{t('dashboard.help_details')}</th>
+                                    <th>{t('dashboard.help_time')}</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <For each={helpRequests()}>
+                                    {(hr) => (
+                                        <tr>
+                                            <td>{hr.target || hr.actor || '—'}</td>
+                                            <td>{hr.details || '—'}</td>
+                                            <td>{new Date(hr.created_at).toLocaleString()}</td>
+                                            <td>
+                                                <button class="btn-icon" title={t('dashboard.connect')} onClick={() => props.onNavigate(`remote:${hr.target || hr.actor}`)}>
+                                                    <span class="material-symbols-rounded">open_in_new</span>
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    )}
+                                </For>
                             </tbody>
                         </table>
                     </div>

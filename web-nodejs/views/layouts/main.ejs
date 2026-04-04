@@ -68,11 +68,26 @@
             </div>
             <div class="topbar-center" id="topbar-clock"></div>
             <div class="topbar-right">
+                <button class="topbar-btn" id="topbar-add-widget-btn" title="<%= _('desktop.add_widget') || 'Add Widget' %>">
+                    <span class="material-icons">add_circle_outline</span>
+                </button>
+                <button class="topbar-btn" id="topbar-snap-layout-btn" title="<%= _('desktop.label_snap_layout') || 'Window Layout' %>">
+                    <span class="material-icons">grid_view</span>
+                </button>
+                <button class="topbar-btn" id="topbar-wallpaper-btn" title="<%= _('desktop.wallpaper') || 'Wallpaper' %>">
+                    <span class="material-icons">wallpaper</span>
+                </button>
+                <button class="topbar-btn" id="topbar-fullscreen-btn" title="<%= _('desktop.fullscreen') || 'Fullscreen' %>">
+                    <span class="material-icons">fullscreen</span>
+                </button>
                 <button class="topbar-btn" id="topbar-widgets-btn" title="<%= _('desktop.widgets') || 'Widgets' %>">
                     <span class="material-icons">widgets</span>
                 </button>
                 <button class="topbar-btn" id="topbar-theme-btn" title="<%= _('desktop.theme') || 'Theme' %>">
                     <span class="material-icons">dark_mode</span>
+                </button>
+                <button class="topbar-btn" id="topbar-help-btn" title="<%= _('desktop.help') || 'Help' %>">
+                    <span class="material-icons">help_outline</span>
                 </button>
                 <button class="topbar-btn" id="topbar-exit-btn" title="<%= _('desktop.exit_desktop') %>">
                     <span class="material-icons">logout</span>

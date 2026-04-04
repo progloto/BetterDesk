@@ -21,6 +21,13 @@ const mainNav: NavEntry[] = [
     { id: 'devices',   icon: 'devices',   labelKey: 'sidebar.devices' },
     { id: 'remote',    icon: 'desktop_windows', labelKey: 'sidebar.remote' },
     { id: 'chat',      icon: 'chat',      labelKey: 'sidebar.chat' },
+    { id: 'sessions',  icon: 'history',   labelKey: 'sidebar.sessions' },
+    { id: 'automation', icon: 'smart_toy', labelKey: 'sidebar.automation' },
+    { id: 'notifications', icon: 'notifications', labelKey: 'sidebar.notifications' },
+    { id: 'server',    icon: 'dns',       labelKey: 'sidebar.server' },
+    { id: 'dataguard',  icon: 'shield',    labelKey: 'sidebar.dataguard' },
+    { id: 'help_requests', icon: 'support_agent', labelKey: 'sidebar.help_requests' },
+    { id: 'file_transfer', icon: 'folder_open', labelKey: 'sidebar.file_transfer' },
 ];
 
 const footerNav: NavEntry[] = [

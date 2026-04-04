@@ -1,12 +1,14 @@
 /**
- * DeviceList — full device table with search, filters, click-to-connect
+ * DeviceList — full device table with search, filters, device actions dropdown
  */
 import { createSignal, createMemo, onMount, Show, For } from 'solid-js';
 import { t } from '../lib/i18n';
 import { getDevices, type Device } from '../lib/api';
+import { toastSuccess, toastError } from '../stores/toast';
 
 interface DeviceListProps {
     onNavigate: (panel: string) => void;
+    onDeviceDetail?: (id: string) => void;
 }
 
 type Filter = 'all' | 'online' | 'offline';
@@ -16,8 +18,13 @@ export default function DeviceList(props: DeviceListProps) {
     const [loading, setLoading] = createSignal(true);
     const [search, setSearch] = createSignal('');
     const [filter, setFilter] = createSignal<Filter>('all');
+    const [actionMenu, setActionMenu] = createSignal<string | null>(null);
 
     onMount(async () => {
+        await loadDevices();
+    });
+
+    async function loadDevices() {
         setLoading(true);
         try {
             const list = await getDevices();
@@ -27,7 +34,7 @@ export default function DeviceList(props: DeviceListProps) {
         } finally {
             setLoading(false);
         }
-    });
+    }
 
     const filtered = createMemo(() => {
         let list = devices();
@@ -70,8 +77,33 @@ export default function DeviceList(props: DeviceListProps) {
         return device.online || device.status === 'online';
     }
 
+    function toggleActions(e: MouseEvent, id: string) {
+        e.stopPropagation();
+        setActionMenu(actionMenu() === id ? null : id);
+    }
+
+    // Close action menu when clicking outside
+    function handleBodyClick() {
+        setActionMenu(null);
+    }
+
+    async function deviceAction(deviceId: string, action: string) {
+        setActionMenu(null);
+        try {
+            const { invoke } = await import('@tauri-apps/api/core');
+            if (action === 'wol') {
+                await invoke('operator_wake_on_lan', { deviceId });
+            } else {
+                await invoke('operator_send_device_action', { deviceId, action });
+            }
+            toastSuccess(t('devices.action_sent'), action);
+        } catch {
+            toastError(t('devices.action_failed'));
+        }
+    }
+
     return (
-        <div class="page-enter">
+        <div class="page-enter" onClick={handleBodyClick}>
             <div class="device-table-container">
                 {/* Toolbar */}
                 <div class="device-toolbar">
@@ -102,6 +134,9 @@ export default function DeviceList(props: DeviceListProps) {
                             {t('devices.filter_offline')} ({devices().filter(d => !isOnline(d)).length})
                         </button>
                     </div>
+                    <button class="btn-icon" title={t('common.retry')} onClick={loadDevices} style="margin-left: auto;">
+                        <span class="material-symbols-rounded">refresh</span>
+                    </button>
                 </div>
 
                 {/* Table */}
@@ -120,12 +155,13 @@ export default function DeviceList(props: DeviceListProps) {
                                     <th>{t('devices.col_platform')}</th>
                                     <th>{t('devices.col_status')}</th>
                                     <th>{t('devices.col_last_seen')}</th>
+                                    <th style="width: 80px;"></th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <For each={filtered()}>
                                     {(device) => (
-                                        <tr onClick={() => props.onNavigate(`remote:${device.id}`)}>
+                                        <tr onClick={() => props.onDeviceDetail ? props.onDeviceDetail(device.id) : props.onNavigate(`remote:${device.id}`)}>
                                             <td style="font-family: var(--font-mono); font-size: var(--font-size-sm);">
                                                 {device.id}
                                             </td>
@@ -137,6 +173,40 @@ export default function DeviceList(props: DeviceListProps) {
                                             </td>
                                             <td style="color: var(--text-secondary);">
                                                 {formatLastSeen(device.last_online)}
+                                            </td>
+                                            <td onClick={(e) => e.stopPropagation()}>
+                                                <div class="device-actions-cell">
+                                                    <button class="btn-icon" title={t('dashboard.connect')} onClick={() => props.onNavigate(`remote:${device.id}`)}>
+                                                        <span class="material-symbols-rounded" style="font-size: 18px;">desktop_windows</span>
+                                                    </button>
+                                                    <div class="dropdown-wrapper">
+                                                        <button class="btn-icon" title={t('devices.actions')} onClick={(e) => toggleActions(e, device.id)}>
+                                                            <span class="material-symbols-rounded" style="font-size: 18px;">more_vert</span>
+                                                        </button>
+                                                        <Show when={actionMenu() === device.id}>
+                                                            <div class="dropdown-menu">
+                                                                <button class="dropdown-item" onClick={() => deviceAction(device.id, 'lock')}>
+                                                                    <span class="material-symbols-rounded">lock</span>{t('devices.action_lock')}
+                                                                </button>
+                                                                <button class="dropdown-item" onClick={() => deviceAction(device.id, 'restart')}>
+                                                                    <span class="material-symbols-rounded">restart_alt</span>{t('devices.action_restart')}
+                                                                </button>
+                                                                <button class="dropdown-item" onClick={() => deviceAction(device.id, 'shutdown')}>
+                                                                    <span class="material-symbols-rounded">power_settings_new</span>{t('devices.action_shutdown')}
+                                                                </button>
+                                                                <Show when={!isOnline(device)}>
+                                                                    <button class="dropdown-item" onClick={() => deviceAction(device.id, 'wol')}>
+                                                                        <span class="material-symbols-rounded">power</span>{t('devices.action_wol')}
+                                                                    </button>
+                                                                </Show>
+                                                                <div class="dropdown-divider" />
+                                                                <button class="dropdown-item danger" onClick={() => deviceAction(device.id, 'ban')}>
+                                                                    <span class="material-symbols-rounded">block</span>{t('devices.action_ban')}
+                                                                </button>
+                                                            </div>
+                                                        </Show>
+                                                    </div>
+                                                </div>
                                             </td>
                                         </tr>
                                     )}
