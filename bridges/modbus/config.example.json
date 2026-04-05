@@ -1,0 +1,78 @@
+{
+  "cdap": {
+    "server": "ws://192.168.0.110:21122/cdap",
+    "api_key": "YOUR_API_KEY",
+    "device_name": "Modbus Bridge",
+    "device_type": "bridge",
+    "bridge_name": "modbus",
+    "heartbeat_sec": 15
+  },
+  "modbus": {
+    "transport": "tcp",
+    "host": "192.168.1.100",
+    "port": 502,
+    "unit_id": 1,
+    "timeout_sec": 5,
+    "poll_interval_sec": 3,
+    "serial_port": "/dev/ttyUSB0",
+    "serial_baudrate": 9600,
+    "serial_parity": "N",
+    "serial_stopbits": 1
+  },
+  "registers": [
+    {
+      "widget_id": "temperature",
+      "label": "Temperature",
+      "type": "holding",
+      "address": 0,
+      "count": 1,
+      "data_type": "int16",
+      "scale": 0.1,
+      "offset": 0,
+      "unit": "°C",
+      "widget": "gauge",
+      "min": -20,
+      "max": 80,
+      "readonly": true
+    },
+    {
+      "widget_id": "humidity",
+      "label": "Humidity",
+      "type": "holding",
+      "address": 1,
+      "count": 1,
+      "data_type": "uint16",
+      "scale": 0.1,
+      "offset": 0,
+      "unit": "%",
+      "widget": "gauge",
+      "min": 0,
+      "max": 100,
+      "readonly": true
+    },
+    {
+      "widget_id": "relay_1",
+      "label": "Relay 1",
+      "type": "coil",
+      "address": 0,
+      "widget": "toggle",
+      "readonly": false
+    },
+    {
+      "widget_id": "setpoint",
+      "label": "Setpoint",
+      "type": "holding",
+      "address": 10,
+      "count": 1,
+      "data_type": "int16",
+      "scale": 0.1,
+      "offset": 0,
+      "unit": "°C",
+      "widget": "slider",
+      "min": 10,
+      "max": 40,
+      "step": 0.5,
+      "readonly": false
+    }
+  ]
+}

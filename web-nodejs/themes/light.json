@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "type": "betterdesk-theme",
+  "branding": {
+    "appName": "BetterDesk",
+    "appDescription": "RustDesk Server Management",
+    "logoType": "icon",
+    "logoIcon": "dns",
+    "logoSvg": "",
+    "logoUrl": "",
+    "faviconSvg": "",
+    "colors": {
+      "bgPrimary": "#ffffff",
+      "bgSecondary": "#f6f8fa",
+      "bgTertiary": "#eaeef2",
+      "bgElevated": "#ffffff",
+      "textPrimary": "#1f2328",
+      "textSecondary": "#656d76",
+      "accentBlue": "#0969da",
+      "accentBlueHover": "#0550ae",
+      "accentBlueMuted": "#ddf4ff",
+      "accentGreen": "#1a7f37",
+      "accentGreenHover": "#116329",
+      "accentGreenMuted": "#dafbe1",
+      "accentRed": "#cf222e",
+      "accentRedHover": "#a40e26",
+      "accentRedMuted": "#ffebe9",
+      "accentYellow": "#9a6700",
+      "accentYellowHover": "#7d4e00",
+      "accentYellowMuted": "#fff8c5",
+      "accentPurple": "#8250df",
+      "accentPurpleHover": "#6639ba",
+      "accentPurpleMuted": "#fbefff",
+      "borderPrimary": "#d0d7de",
+      "borderSecondary": "#eaeef2"
+    }
+  }
+}

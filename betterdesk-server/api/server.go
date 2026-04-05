@@ -31,6 +31,7 @@ import (
 	"github.com/unitronix/betterdesk-server/security"
 
 	"github.com/coder/websocket"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // peerIDRegexp validates RustDesk peer ID format: 6-16 alphanumeric chars, hyphens, underscores.
@@ -54,8 +55,9 @@ type Server struct {
 	metrics           *metrics.Collector
 	jwtManager        *auth.JWTManager
 	loginLimiter      *ratelimit.IPLimiter
-	keyPair           *crypto.KeyPair // Ed25519 keypair for signing
-	cdapGw            *cdap.Gateway   // CDAP gateway (nil if CDAP disabled)
+	heartbeatLimiter  *ratelimit.IPLimiter // BD-2026-001: rate-limit heartbeat/sysinfo
+	keyPair           *crypto.KeyPair      // Ed25519 keypair for signing
+	cdapGw            *cdap.Gateway        // CDAP gateway (nil if CDAP disabled)
 	clientTFASessions *tfaSessionStore
 	httpSrv           *http.Server
 	wg                sync.WaitGroup
@@ -71,6 +73,7 @@ func New(cfg *config.Config, database db.Database, peerMap *peer.Map, relaySrv *
 		relay:             relaySrv,
 		version:           version,
 		loginLimiter:      ratelimit.NewIPLimiter(5, 5*time.Minute, 10*time.Minute),
+		heartbeatLimiter:  ratelimit.NewIPLimiter(20, 60*time.Second, 5*time.Minute), // BD-2026-001: 20 req/min per IP
 		clientTFASessions: newTFASessionStore(),
 	}
 }
@@ -138,6 +141,11 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/peers/online", s.handleOnlinePeers)
 	mux.HandleFunc("GET /api/peers/{id}/status", s.handlePeerStatus)
 	mux.HandleFunc("GET /api/peers/{id}/metrics", s.handlePeerMetrics)
+	mux.HandleFunc("GET /api/peers/{id}/linked", s.handleLinkedPeers)
+	mux.HandleFunc("POST /api/peers/{id}/wol", s.requireRole(auth.RoleOperator, s.handleWakeOnLan))
+	mux.HandleFunc("GET /api/peers/{id}/access-policy", s.requireRole(auth.RoleOperator, s.handleGetAccessPolicy))
+	mux.HandleFunc("PUT /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleSaveAccessPolicy))
+	mux.HandleFunc("DELETE /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleDeleteAccessPolicy))
 
 	// Blocklist management
 	mux.HandleFunc("GET /api/blocklist", s.handleListBlocklist)
@@ -147,6 +155,36 @@ func (s *Server) Start(ctx context.Context) error {
 	// Tags
 	mux.HandleFunc("PUT /api/peers/{id}/tags", s.handleSetPeerTags)
 	mux.HandleFunc("GET /api/tags/{tag}/peers", s.handlePeersByTag)
+
+	// Chat
+	mux.HandleFunc("GET /api/chat/history/", s.handleChatHistory)
+	mux.HandleFunc("POST /api/chat/messages", s.handleChatSendMessage)
+	mux.HandleFunc("POST /api/chat/read", s.handleChatMarkRead)
+	mux.HandleFunc("GET /api/chat/unread/", s.handleChatUnread)
+	mux.HandleFunc("GET /api/chat/contacts/", s.handleChatContacts)
+	mux.HandleFunc("POST /api/chat/groups", s.handleChatCreateGroup)
+	mux.HandleFunc("GET /api/chat/groups/", s.handleChatListGroups)
+	mux.HandleFunc("PUT /api/chat/groups/", s.handleChatUpdateGroup)
+	mux.HandleFunc("DELETE /api/chat/groups/", s.handleChatDeleteGroup)
+
+	// Organizations (v3.0.0)
+	mux.HandleFunc("POST /api/org", s.requireRole(auth.RoleAdmin, s.handleCreateOrg))
+	mux.HandleFunc("GET /api/org", s.handleListOrgs)
+	mux.HandleFunc("GET /api/org/{id}", s.handleGetOrg)
+	mux.HandleFunc("PUT /api/org/{id}", s.requireRole(auth.RoleAdmin, s.handleUpdateOrg))
+	mux.HandleFunc("DELETE /api/org/{id}", s.requireRole(auth.RoleAdmin, s.handleDeleteOrg))
+	mux.HandleFunc("GET /api/org/{id}/users", s.handleListOrgUsers)
+	mux.HandleFunc("POST /api/org/{id}/users", s.requireRole(auth.RoleAdmin, s.handleCreateOrgUser))
+	mux.HandleFunc("PUT /api/org/{id}/users/{uid}", s.requireRole(auth.RoleAdmin, s.handleUpdateOrgUser))
+	mux.HandleFunc("DELETE /api/org/{id}/users/{uid}", s.requireRole(auth.RoleAdmin, s.handleDeleteOrgUser))
+	mux.HandleFunc("POST /api/org/{id}/invite", s.requireRole(auth.RoleAdmin, s.handleCreateOrgInvitation))
+	mux.HandleFunc("GET /api/org/{id}/invitations", s.requireRole(auth.RoleAdmin, s.handleListOrgInvitations))
+	mux.HandleFunc("POST /api/org/{id}/devices", s.requireRole(auth.RoleOperator, s.handleAssignOrgDevice))
+	mux.HandleFunc("GET /api/org/{id}/devices", s.handleListOrgDevices)
+	mux.HandleFunc("DELETE /api/org/{id}/devices/{did}", s.requireRole(auth.RoleOperator, s.handleUnassignOrgDevice))
+	mux.HandleFunc("GET /api/org/{id}/settings", s.handleListOrgSettings)
+	mux.HandleFunc("PUT /api/org/{id}/settings", s.requireRole(auth.RoleAdmin, s.handleSetOrgSetting))
+	mux.HandleFunc("POST /api/org/login", s.handleOrgLogin) // public — no auth required
 
 	// Audit
 	mux.HandleFunc("GET /api/audit/events", s.handleAuditEvents)
@@ -208,6 +246,19 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/enrollment/mode", s.requireRole(auth.RoleAdmin, s.handleGetEnrollmentMode))
 	mux.HandleFunc("PUT /api/enrollment/mode", s.requireRole(auth.RoleAdmin, s.handleSetEnrollmentMode))
 
+	// Enrollment — device self-registration (public, no auth)
+	mux.HandleFunc("POST /api/devices/register", s.handleDeviceRegister)
+	mux.HandleFunc("GET /api/devices/register/status", s.handleDeviceRegisterStatus)
+
+	// Enrollment — operator approval (admin/operator)
+	mux.HandleFunc("GET /api/enrollment/pending", s.requireRole(auth.RoleOperator, s.handleListPendingDevices))
+	mux.HandleFunc("POST /api/enrollment/approve/{id}", s.requireRole(auth.RoleOperator, s.handleApproveDevice))
+	mux.HandleFunc("POST /api/enrollment/reject/{id}", s.requireRole(auth.RoleOperator, s.handleRejectDevice))
+
+	// Branding (GET is public for desktop clients, POST is admin)
+	mux.HandleFunc("GET /api/branding", s.handleGetBranding)
+	mux.HandleFunc("POST /api/branding", s.requireRole(auth.RoleAdmin, s.handleSaveBranding))
+
 	// CDAP device management (requires CDAP gateway to be enabled)
 	mux.HandleFunc("GET /api/cdap/status", s.handleCDAPStatus)
 	mux.HandleFunc("GET /api/cdap/devices", s.handleCDAPListDevices)
@@ -215,17 +266,46 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/cdap/devices/{id}/manifest", s.handleCDAPDeviceManifest)
 	mux.HandleFunc("GET /api/cdap/devices/{id}/state", s.handleCDAPDeviceState)
 	mux.HandleFunc("POST /api/cdap/devices/{id}/command", s.requireRole(auth.RoleOperator, s.handleCDAPSendCommand))
+	mux.HandleFunc("GET /api/cdap/alerts", s.handleCDAPAlerts)
+
+	// CDAP auth delegation (admin only)
+	mux.HandleFunc("POST /api/cdap/delegate", s.requireRole(auth.RoleAdmin, s.handleCDAPDelegateCreate))
+	mux.HandleFunc("DELETE /api/cdap/delegate/{id}", s.requireRole(auth.RoleAdmin, s.handleCDAPDelegateRevoke))
+	mux.HandleFunc("GET /api/cdap/delegations", s.requireRole(auth.RoleAdmin, s.handleCDAPDelegateList))
+
+	// CDAP terminal WebSocket (admin only, upgraded inside handler)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/terminal", s.requireRole(auth.RoleAdmin, s.handleCDAPTerminal))
+
+	// CDAP remote desktop WebSocket (admin only)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/desktop", s.requireRole(auth.RoleAdmin, s.handleCDAPDesktop))
+
+	// CDAP video stream WebSocket (operator+)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/video", s.requireRole(auth.RoleOperator, s.handleCDAPVideo))
+
+	// CDAP file browser WebSocket (admin only)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/files", s.requireRole(auth.RoleAdmin, s.handleCDAPFileBrowser))
+
+	// CDAP audio stream WebSocket (operator+)
+	mux.HandleFunc("GET /api/cdap/devices/{id}/audio", s.requireRole(auth.RoleOperator, s.handleCDAPAudio))
+
+	// BetterDesk desktop client management WebSocket (no API key — device auth)
+	mux.HandleFunc("GET /ws/bd-mgmt/{device_id}", s.handleBdMgmt)
+	// Management REST endpoints (admin/operator only)
+	mux.HandleFunc("GET /api/bd/mgmt/{device_id}/status", s.handleBdMgmtStatus)
+	mux.HandleFunc("POST /api/bd/mgmt/{device_id}/send", s.requireRole(auth.RoleOperator, s.handleBdMgmtSend))
+	mux.HandleFunc("GET /api/bd/mgmt/connected", s.handleBdMgmtConnected)
 
 	// Prometheus metrics (public, no API key required)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 
 	addr := fmt.Sprintf(":%d", s.cfg.APIPort)
 	s.httpSrv = &http.Server{
-		Addr:         addr,
-		Handler:      s.authMiddleware(mux),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:        addr,
+		Handler:     s.authMiddleware(mux),
+		ReadTimeout: 10 * time.Second,
+		// No WriteTimeout — WebSocket connections need unlimited write time.
+		// Individual REST handlers are responsible for their own deadlines.
+		IdleTimeout: 120 * time.Second,
 		BaseContext: func(l net.Listener) context.Context {
 			return ctx
 		},
@@ -323,13 +403,18 @@ func (s *Server) handleServerStats(w http.ResponseWriter, r *http.Request) {
 		"uptime":          time.Since(startTime).String(),
 		"uptime_seconds":  int(time.Since(startTime).Seconds()),
 		// Enhanced status stats from peer map
-		"peers_online_live":   peerStats.Online,
-		"peers_degraded":      peerStats.Degraded,
-		"peers_critical":      peerStats.Critical,
-		"peers_udp":           peerStats.UDP,
-		"peers_tcp":           peerStats.TCP,
-		"peers_ws":            peerStats.WS,
-		"peers_banned":        peerStats.Banned,
+		"peers_online_live": peerStats.Online,
+		"peers_degraded":    peerStats.Degraded,
+		"peers_critical":    peerStats.Critical,
+		"peers_udp":         peerStats.UDP,
+		"peers_tcp":         peerStats.TCP,
+		"peers_ws":          peerStats.WS,
+		"peers_banned": func() int {
+			if n, err := s.db.GetBannedPeerCount(); err == nil {
+				return n
+			}
+			return peerStats.Banned
+		}(),
 		"peers_disabled":      peerStats.Disabled,
 		"avg_uptime_secs":     peerStats.AvgUptimeSecs,
 		"avg_beat_age_secs":   peerStats.AvgBeatAge,
@@ -443,15 +528,33 @@ func (s *Server) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleLinkedPeers returns all peers linked to the given peer ID.
+// GET /api/peers/{id}/linked
+func (s *Server) handleLinkedPeers(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	linked, err := s.db.GetLinkedPeers(id)
+	if err != nil {
+		writeInternalError(w, err, "GetLinkedPeers")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id": id,
+		"linked":  linked,
+		"total":   len(linked),
+	})
+}
+
 // handleUpdatePeerFields partially updates a peer's editable fields (note, user, tags).
 // PATCH /api/peers/{id}
 func (s *Server) handleUpdatePeerFields(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var body struct {
-		Note *string `json:"note"`
-		User *string `json:"user"`
-		Tags *string `json:"tags"`
+		Note        *string `json:"note"`
+		User        *string `json:"user"`
+		Tags        *string `json:"tags"`
+		DisplayName *string `json:"display_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
@@ -467,6 +570,9 @@ func (s *Server) handleUpdatePeerFields(w http.ResponseWriter, r *http.Request) 
 	}
 	if body.Tags != nil {
 		fields["tags"] = *body.Tags
+	}
+	if body.DisplayName != nil {
+		fields["display_name"] = *body.DisplayName
 	}
 
 	if len(fields) == 0 {
@@ -521,6 +627,14 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 		s.blocklist.BlockID(id, "revoked via panel")
 	}
 
+	// CDAP revocation: send revoke message and disconnect CDAP device.
+	if revoke && s.cdapGw != nil {
+		if err := s.cdapGw.SendRevoke(r.Context(), id, "revoked via panel"); err != nil {
+			// Not an error — device may not be CDAP-connected
+			_ = err
+		}
+	}
+
 	// Cascade: revoke linked devices (e.g., paired mobile→desktop).
 	var cascadedIDs []string
 	if cascade && len(linkedIDs) > 0 {
@@ -533,6 +647,9 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 			s.peers.Remove(lid)
 			if revoke && s.blocklist != nil {
 				s.blocklist.BlockID(lid, "revoked via cascade")
+			}
+			if revoke && s.cdapGw != nil {
+				s.cdapGw.SendRevoke(r.Context(), lid, "revoked via cascade")
 			}
 			cascadedIDs = append(cascadedIDs, lid)
 		}
@@ -1140,4 +1257,220 @@ func (s *Server) handleWSEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// POST /api/peers/{id}/wol — Send Wake-on-LAN magic packet (Phase 44)
+func (s *Server) handleWakeOnLan(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, `{"error":"missing peer id"}`, http.StatusBadRequest)
+		return
+	}
+
+	peer, err := s.db.GetPeer(id)
+	if err != nil || peer == nil {
+		http.Error(w, `{"error":"peer not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Try to get MAC from request body (operator may provide it)
+	var body struct {
+		MAC string `json:"mac"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	mac := body.MAC
+	if mac == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"success": false,
+			"error":   "MAC address required. Provide {\"mac\": \"AA:BB:CC:DD:EE:FF\"} in request body.",
+		})
+		return
+	}
+
+	if err := sendWOLPacket(mac); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"success": false,
+			"error":   fmt.Sprintf("Failed to send WOL packet: %v", err),
+		})
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionPeerUpdated, s.remoteIP(r), id, map[string]string{"action": "wol", "mac": mac})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "mac": mac})
+}
+
+// sendWOLPacket sends a Wake-on-LAN magic packet to the given MAC address.
+func sendWOLPacket(macStr string) error {
+	mac, err := net.ParseMAC(macStr)
+	if err != nil {
+		return fmt.Errorf("invalid MAC address %q: %w", macStr, err)
+	}
+
+	// Build magic packet: 6 bytes of 0xFF + 16 repetitions of MAC address
+	var packet [102]byte
+	for i := 0; i < 6; i++ {
+		packet[i] = 0xFF
+	}
+	for i := 0; i < 16; i++ {
+		copy(packet[6+i*6:], mac)
+	}
+
+	// Send via UDP broadcast
+	addr, err := net.ResolveUDPAddr("udp4", "255.255.255.255:9")
+	if err != nil {
+		return err
+	}
+	conn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(packet[:])
+	return err
+}
+
+// ============================================================
+// Access Policy Handlers (Unattended Access Management)
+// ============================================================
+
+func (s *Server) handleGetAccessPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "peer ID required"})
+		return
+	}
+
+	policy, err := s.db.GetAccessPolicy(id)
+	if err != nil {
+		// No policy = defaults (all disabled)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"peer_id":             id,
+			"unattended_enabled":  false,
+			"password_set":        false,
+			"schedule_enabled":    false,
+			"schedule_days":       "",
+			"schedule_start_time": "",
+			"schedule_end_time":   "",
+			"schedule_timezone":   "",
+			"allowed_operators":   "",
+			"updated_at":          "",
+			"updated_by":          "",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) handleSaveAccessPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "peer ID required"})
+		return
+	}
+
+	var body struct {
+		UnattendedEnabled bool   `json:"unattended_enabled"`
+		Password          string `json:"password,omitempty"`       // Plain text — will be hashed
+		ClearPassword     bool   `json:"clear_password,omitempty"` // If true, remove password
+		ScheduleEnabled   bool   `json:"schedule_enabled"`
+		ScheduleDays      string `json:"schedule_days"`
+		ScheduleStartTime string `json:"schedule_start_time"`
+		ScheduleEndTime   string `json:"schedule_end_time"`
+		ScheduleTimezone  string `json:"schedule_timezone"`
+		AllowedOperators  string `json:"allowed_operators"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request body"})
+		return
+	}
+
+	// Validate schedule time format (HH:MM)
+	timeRe := regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
+	if body.ScheduleEnabled {
+		if body.ScheduleStartTime != "" && !timeRe.MatchString(body.ScheduleStartTime) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid schedule_start_time format (HH:MM)"})
+			return
+		}
+		if body.ScheduleEndTime != "" && !timeRe.MatchString(body.ScheduleEndTime) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid schedule_end_time format (HH:MM)"})
+			return
+		}
+	}
+
+	// Validate schedule days
+	validDays := map[string]bool{"mon": true, "tue": true, "wed": true, "thu": true, "fri": true, "sat": true, "sun": true}
+	if body.ScheduleDays != "" {
+		for _, d := range strings.Split(body.ScheduleDays, ",") {
+			if !validDays[strings.TrimSpace(strings.ToLower(d))] {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid day in schedule_days: " + d})
+				return
+			}
+		}
+	}
+
+	policy := &db.AccessPolicy{
+		PeerID:            id,
+		UnattendedEnabled: body.UnattendedEnabled,
+		ScheduleEnabled:   body.ScheduleEnabled,
+		ScheduleDays:      body.ScheduleDays,
+		ScheduleStartTime: body.ScheduleStartTime,
+		ScheduleEndTime:   body.ScheduleEndTime,
+		ScheduleTimezone:  body.ScheduleTimezone,
+		AllowedOperators:  body.AllowedOperators,
+		UpdatedBy:         s.remoteIP(r),
+	}
+
+	// Hash password if provided
+	if body.Password != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to hash password"})
+			return
+		}
+		policy.PasswordHash = string(hash)
+	} else if body.ClearPassword {
+		policy.PasswordHash = "CLEAR"
+	}
+	// If PasswordHash is empty string, SaveAccessPolicy preserves existing hash
+
+	if err := s.db.SaveAccessPolicy(policy); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to save access policy"})
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionPeerUpdated, s.remoteIP(r), id, map[string]string{
+			"action":     "access_policy_updated",
+			"unattended": fmt.Sprintf("%v", body.UnattendedEnabled),
+			"schedule":   fmt.Sprintf("%v", body.ScheduleEnabled),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
+}
+
+func (s *Server) handleDeleteAccessPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "peer ID required"})
+		return
+	}
+
+	if err := s.db.DeleteAccessPolicy(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "failed to delete access policy"})
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionPeerUpdated, s.remoteIP(r), id, map[string]string{
+			"action": "access_policy_deleted",
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }

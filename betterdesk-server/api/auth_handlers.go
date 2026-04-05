@@ -5,12 +5,12 @@ package api
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/unitronix/betterdesk-server/audit"
@@ -616,7 +616,7 @@ func hashAPIKey(key string) string {
 
 // authenticateRequest extracts and validates credentials from a request.
 // Returns (username, role, ok). If ok is false, an error response has been written.
-// Auth order: Bearer JWT → X-API-Key (DB lookup) → legacy config api_key.
+// Auth order: Bearer JWT → X-API-Key (scoped DB lookup).
 func (s *Server) authenticateRequest(r *http.Request) (username, role string, ok bool) {
 	// 1. Bearer JWT
 	if bearer := r.Header.Get("Authorization"); len(bearer) > 7 && bearer[:7] == "Bearer " {
@@ -627,11 +627,8 @@ func (s *Server) authenticateRequest(r *http.Request) (username, role string, ok
 		}
 	}
 
-	// 2. X-API-Key header or query param → DB api_keys table
+	// 2. X-API-Key header (query param removed — BD-2026-005: query transport leaks keys in logs/proxies)
 	apiKey := r.Header.Get("X-API-Key")
-	if apiKey == "" {
-		apiKey = r.URL.Query().Get("api_key")
-	}
 	if apiKey != "" {
 		keyHash := hashAPIKey(apiKey)
 		if k, err := s.db.GetAPIKeyByHash(keyHash); err == nil && k != nil {
@@ -644,12 +641,6 @@ func (s *Server) authenticateRequest(r *http.Request) (username, role string, ok
 			// Update last_used in background
 			go func() { _ = s.db.TouchAPIKey(k.ID) }()
 			return "apikey:" + k.Name, k.Role, true
-		}
-
-		// 3. Legacy: match against config table's api_key value (full admin access)
-		storedKey, _ := s.db.GetConfig("api_key")
-		if storedKey != "" && subtle.ConstantTimeCompare([]byte(apiKey), []byte(storedKey)) == 1 {
-			return "legacy_apikey", auth.RoleAdmin, true
 		}
 	}
 
@@ -670,7 +661,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			path == "/api/auth/login" || path == "/api/auth/login/2fa" ||
 			path == "/api/server/pubkey" || path == "/api/server/stats" ||
 			path == "/api/login" || path == "/api/login-options" || path == "/api/logout" ||
-			path == "/api/heartbeat" || path == "/api/sysinfo" || path == "/api/sysinfo_ver" {
+			path == "/api/heartbeat" || path == "/api/sysinfo" || path == "/api/sysinfo_ver" ||
+			path == "/api/branding" ||
+			path == "/api/org/login" ||
+			strings.HasPrefix(path, "/ws/bd-mgmt/") ||
+			path == "/api/devices/register" || path == "/api/devices/register/status" {
 			next.ServeHTTP(w, r)
 			return
 		}

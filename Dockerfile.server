@@ -41,8 +41,8 @@ RUN apk add --no-cache \
     tini \
     || { sleep 2 && apk add --no-cache \
     ca-certificates curl sqlite tini; } \
-    && addgroup -S betterdesk \
-    && adduser -S -G betterdesk betterdesk
+    && addgroup -g 10001 -S betterdesk \
+    && adduser -u 10001 -S -G betterdesk betterdesk
 
 COPY --from=builder /betterdesk-server /usr/local/bin/betterdesk-server
 RUN chmod +x /usr/local/bin/betterdesk-server

@@ -15,13 +15,14 @@
     // Map device_type to Material Icons
     function getDeviceTypeIcon(type) {
         switch ((type || '').toLowerCase()) {
+            case 'betterdesk': return 'desktop_windows';
             case 'desktop':  return 'desktop_windows';
             case 'scada':    return 'precision_manufacturing';
             case 'iot':      return 'sensors';
             case 'os_agent': return 'terminal';
             case 'mobile':   return 'phone_android';
             case 'rustdesk': return 'connected_tv';
-            default:         return 'connected_tv';
+            default:         return 'devices';
         }
     }
     
@@ -77,6 +78,79 @@
             loadFolders();
             loadDevices();
         });
+
+        // Real-time device status push via WebSocket
+        initDeviceStatusWS();
+    }
+
+    /**
+     * Connect to WebSocket for real-time device status updates.
+     * Updates device status dots and badges without full page reload.
+     */
+    function initDeviceStatusWS() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${proto}//${location.host}/ws/device-status`;
+        let ws = null;
+        let retryDelay = 3000;
+
+        function connect() {
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                retryDelay = 3000;
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'device_status') {
+                        updateDeviceStatusInPlace(data.device_id, data.status);
+                    }
+                } catch (_) {}
+            };
+
+            ws.onclose = () => {
+                setTimeout(connect, retryDelay);
+                retryDelay = Math.min(retryDelay * 2, 60000);
+            };
+
+            ws.onerror = () => {
+                ws.close();
+            };
+        }
+
+        connect();
+    }
+
+    /**
+     * Update a single device's status indicator without reloading the entire table.
+     */
+    function updateDeviceStatusInPlace(deviceId, status) {
+        const row = tableBody?.querySelector(`tr[data-id="${deviceId}"]`);
+        if (!row) return;
+
+        const dot = row.querySelector('.device-status-dot');
+        if (dot) {
+            dot.className = 'device-status-dot';
+            if (status === 'online' || status === 'ONLINE') {
+                dot.classList.add('online');
+                dot.title = 'Online';
+            } else if (status === 'offline' || status === 'OFFLINE') {
+                dot.classList.add('offline');
+                dot.title = 'Offline';
+            } else {
+                dot.classList.add(status.toLowerCase());
+                dot.title = status;
+            }
+        }
+
+        // Also update the device in our local state
+        const dev = allDevices.find(d => d.id === deviceId);
+        if (dev) {
+            dev.status = status;
+            dev.live_status = status;
+            dev.live_online = (status === 'online' || status === 'ONLINE');
+        }
     }
 
     /**
@@ -93,12 +167,58 @@
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') closeAllKebabMenus();
         });
+
+        // Close on scroll (position:fixed menus don't follow scroll)
+        document.addEventListener('scroll', closeAllKebabMenus, true);
+        window.addEventListener('resize', closeAllKebabMenus);
     }
 
     function closeAllKebabMenus() {
-        document.querySelectorAll('.kebab-menu.open').forEach(m => m.classList.remove('open'));
+        document.querySelectorAll('.kebab-menu.open').forEach(m => {
+            m.classList.remove('open');
+            m.style.top = '';
+            m.style.left = '';
+        });
         const overlay = document.getElementById('kebab-overlay');
         if (overlay) overlay.classList.remove('open');
+    }
+
+    /**
+     * Position a fixed kebab menu relative to its trigger button.
+     * Flips upward if there is not enough space below.
+     * Skips on mobile (≤600px) where CSS bottom-sheet handles positioning.
+     */
+    function positionKebabMenu(btn, menu) {
+        if (window.innerWidth <= 600) return;
+
+        const rect = btn.getBoundingClientRect();
+        const menuHeight = menu.offsetHeight || 200;
+        const menuWidth = menu.offsetWidth || 180;
+        const spaceBelow = window.innerHeight - rect.bottom;
+
+        let top, left;
+
+        // Vertical: prefer below, flip above if not enough space
+        if (spaceBelow >= menuHeight + 8) {
+            top = rect.bottom + 4;
+        } else {
+            top = rect.top - menuHeight - 4;
+        }
+        // Clamp to viewport bounds
+        if (top < 8) top = 8;
+        if (top + menuHeight > window.innerHeight - 8) {
+            top = window.innerHeight - menuHeight - 8;
+        }
+
+        // Horizontal: align right edge to button right edge
+        left = rect.right - menuWidth;
+        if (left < 8) left = 8;
+        if (left + menuWidth > window.innerWidth - 8) {
+            left = window.innerWidth - menuWidth - 8;
+        }
+
+        menu.style.top = top + 'px';
+        menu.style.left = left + 'px';
     }
     
     /**
@@ -144,6 +264,7 @@
                 const q = searchQuery.toLowerCase();
                 const match = 
                     device.id?.toLowerCase().includes(q) ||
+                    device.display_name?.toLowerCase().includes(q) ||
                     device.hostname?.toLowerCase().includes(q) ||
                     device.username?.toLowerCase().includes(q) ||
                     device.platform?.toLowerCase().includes(q) ||
@@ -227,11 +348,11 @@
                         </button>
                     </div>
                 </td>
-                <td data-column="hostname">${Utils.escapeHtml(device.hostname || device.note || '-')}</td>
+                <td data-column="hostname">${Utils.escapeHtml(device.display_name || device.hostname || device.note || '-')}</td>
                 <td data-column="device_type">
                     <div class="platform-icon">
                         <span class="material-icons">${getDeviceTypeIcon(device.device_type)}</span>
-                        <span>${Utils.escapeHtml(device.device_type || 'rustdesk')}</span>
+                        <span>${Utils.escapeHtml(device.device_type || '-')}</span>
                     </div>
                 </td>
                 <td data-column="platform">
@@ -252,18 +373,22 @@
                             <span class="material-icons">more_vert</span>
                         </button>
                         <div class="kebab-menu">
-                            <button class="kebab-menu-item connect" data-action="connect" data-id="${eid}">
-                                <span class="material-icons">link</span>
-                                <span>${_('actions.connect')}</span>
+                            <button class="kebab-menu-item connect-desktop" data-action="web-remote" data-id="${eid}">
+                                <span class="material-icons">screen_share</span>
+                                <span>${_('actions.web_remote') || 'Web Remote'}</span>
                             </button>
-                            <button class="kebab-menu-item connect-desktop" data-action="connect-desktop" data-id="${eid}">
+                            <button class="kebab-menu-item" data-action="connect-desktop" data-id="${eid}">
                                 <span class="material-icons">computer</span>
-                                <span>${_('actions.connect_desktop')}</span>
+                                <span>${_('actions.connect_desktop') || 'Desktop Client'}</span>
                             </button>
                             <div class="kebab-divider"></div>
                             <button class="kebab-menu-item info" data-action="details" data-id="${eid}">
                                 <span class="material-icons">info</span>
                                 <span>${_('actions.details')}</span>
+                            </button>
+                            <button class="kebab-menu-item" data-action="access-policy" data-id="${eid}">
+                                <span class="material-icons">lock</span>
+                                <span>${_('devices.access_policy') || 'Access Policy'}</span>
                             </button>
                             <button class="kebab-menu-item ${device.banned ? 'unban' : 'ban'}" data-action="toggle-ban" data-id="${eid}" data-banned="${device.banned}">
                                 <span class="material-icons">${device.banned ? 'check_circle' : 'block'}</span>
@@ -312,6 +437,7 @@
                 closeAllKebabMenus();
                 if (!wasOpen) {
                     menu.classList.add('open');
+                    positionKebabMenu(btn, menu);
                     const overlay = document.getElementById('kebab-overlay');
                     if (overlay) overlay.classList.add('open');
                 }
@@ -343,16 +469,62 @@
     /**
      * Handle device actions
      */
+    /**
+     * Try to add a remote session tab in an existing RDClient window via BroadcastChannel.
+     * Falls back to opening a new browser tab if no RDClient page is listening.
+     */
+    function _tryAddRemoteTab(deviceId, data) {
+        if (typeof BroadcastChannel === 'undefined') {
+            window.open(`/remote/${encodeURIComponent(deviceId)}`, '_blank');
+            return;
+        }
+
+        const bc = new BroadcastChannel('betterdesk-remote');
+        let handled = false;
+
+        // Listen for acknowledgment from remote page
+        bc.onmessage = (ev) => {
+            if (ev.data && ev.data.type === 'pong') {
+                // Remote page exists — send the add-session command
+                handled = true;
+                bc.postMessage({
+                    type: 'add-session',
+                    deviceId: deviceId,
+                    deviceName: (data && data.deviceName) || ''
+                });
+                bc.close();
+            } else if (ev.data && ev.data.type === 'session-added') {
+                handled = true;
+                bc.close();
+            }
+        };
+
+        // Ping to check if a remote page is open
+        bc.postMessage({ type: 'ping' });
+
+        // Timeout: if no response within 300ms, open new tab
+        setTimeout(() => {
+            if (!handled) {
+                bc.close();
+                window.open(`/remote/${encodeURIComponent(deviceId)}`, '_blank');
+            }
+        }, 300);
+    }
+
     async function handleAction(action, deviceId, data) {
         switch (action) {
-            case 'connect':
-                connectToDevice(deviceId);
+            case 'web-remote':
+                _tryAddRemoteTab(deviceId, data);
                 break;
-                
+
             case 'connect-desktop':
                 connectDesktopClient(deviceId);
                 break;
-                
+
+            case 'remote-viewer':
+                window.open(`/remote-desktop/${encodeURIComponent(deviceId)}`, '_blank');
+                break;
+
             case 'details':
                 if (typeof DeviceDetail !== 'undefined') {
                     DeviceDetail.open(deviceId);
@@ -376,21 +548,18 @@
             case 'delete':
                 await deleteDevice(deviceId);
                 break;
+
+            case 'access-policy':
+                showAccessPolicyModal(deviceId);
+                break;
         }
     }
     
     /**
-     * Connect to device via web remote client
-     */
-    function connectToDevice(deviceId) {
-        window.location.href = '/remote/' + encodeURIComponent(deviceId);
-    }
-
-    /**
-     * Connect to device via RustDesk desktop client (rustdesk:// protocol)
+     * Connect to device via BetterDesk desktop client (betterdesk:// protocol)
      */
     function connectDesktopClient(deviceId) {
-        window.open('rustdesk://' + encodeURIComponent(deviceId), '_blank');
+        window.open('betterdesk://' + encodeURIComponent(deviceId), '_blank');
     }
     
     /**
@@ -408,7 +577,7 @@
                     </div>
                     <div class="detail-row">
                         <span class="detail-label">${_('devices.hostname')}:</span>
-                        <span class="detail-value">${Utils.escapeHtml(device.hostname || device.note || '-')}</span>
+                        <span class="detail-value">${Utils.escapeHtml(device.display_name || device.hostname || device.note || '-')}</span>
                     </div>
                     <div class="detail-row">
                         <span class="detail-label">${_('devices.platform')}:</span>
@@ -447,7 +616,135 @@
             Notifications.error(error.message || _('errors.load_device_failed'));
         }
     }
-    
+
+    /**
+     * Show Access Policy modal for unattended access management
+     */
+    async function showAccessPolicyModal(deviceId) {
+        try {
+            const resp = await Utils.api(`/api/devices/${deviceId}/access-policy`);
+            const policy = resp.data || resp;
+
+            const days = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+            const activeDays = (policy.schedule_days || '').split(',').map(d => d.trim().toLowerCase()).filter(Boolean);
+
+            const dayCheckboxes = days.map(d => {
+                const checked = activeDays.includes(d) ? 'checked' : '';
+                const label = _('days.' + d) || d.charAt(0).toUpperCase() + d.slice(1);
+                return `<label class="day-checkbox"><input type="checkbox" name="schedule_day" value="${d}" ${checked}> ${label}</label>`;
+            }).join('');
+
+            const content = `
+                <div class="access-policy-form">
+                    <div class="form-section">
+                        <h4><span class="material-icons">vpn_key</span> ${_('devices.unattended_access') || 'Unattended Access'}</h4>
+                        <label class="toggle-row">
+                            <input type="checkbox" id="ap-unattended" ${policy.unattended_enabled ? 'checked' : ''}>
+                            <span>${_('devices.enable_unattended') || 'Enable unattended access'}</span>
+                        </label>
+                    </div>
+                    <div class="form-section">
+                        <h4><span class="material-icons">lock</span> ${_('devices.access_password') || 'Access Password'}</h4>
+                        <p class="form-hint">${policy.password_set ? '<span class="badge badge-success">✓ ' + (_('devices.password_configured') || 'Password set') + '</span>' : '<span class="badge badge-warning">' + (_('devices.no_password') || 'No password') + '</span>'}</p>
+                        <div class="form-row">
+                            <input type="password" id="ap-password" class="form-input" placeholder="${_('devices.new_password') || 'New password (leave empty to keep current)'}">
+                        </div>
+                        <label class="toggle-row">
+                            <input type="checkbox" id="ap-clear-password">
+                            <span>${_('devices.clear_password') || 'Clear password'}</span>
+                        </label>
+                    </div>
+                    <div class="form-section">
+                        <h4><span class="material-icons">schedule</span> ${_('devices.access_schedule') || 'Access Schedule'}</h4>
+                        <label class="toggle-row">
+                            <input type="checkbox" id="ap-schedule" ${policy.schedule_enabled ? 'checked' : ''}>
+                            <span>${_('devices.enable_schedule') || 'Enable time-based access'}</span>
+                        </label>
+                        <div id="ap-schedule-fields" style="${policy.schedule_enabled ? '' : 'opacity:0.5;pointer-events:none'}">
+                            <div class="form-row">
+                                <label>${_('devices.allowed_days') || 'Allowed days'}:</label>
+                                <div class="day-checkboxes">${dayCheckboxes}</div>
+                            </div>
+                            <div class="form-row form-row-inline">
+                                <div>
+                                    <label>${_('devices.start_time') || 'Start time'}:</label>
+                                    <input type="time" id="ap-start-time" class="form-input" value="${policy.schedule_start_time || '08:00'}">
+                                </div>
+                                <div>
+                                    <label>${_('devices.end_time') || 'End time'}:</label>
+                                    <input type="time" id="ap-end-time" class="form-input" value="${policy.schedule_end_time || '18:00'}">
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <label>${_('devices.timezone') || 'Timezone'}:</label>
+                                <input type="text" id="ap-timezone" class="form-input" placeholder="Europe/Warsaw" value="${Utils.escapeHtml(policy.schedule_timezone || Intl.DateTimeFormat().resolvedOptions().timeZone)}">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="form-section">
+                        <h4><span class="material-icons">people</span> ${_('devices.allowed_operators') || 'Allowed Operators'}</h4>
+                        <div class="form-row">
+                            <input type="text" id="ap-operators" class="form-input" placeholder="${_('devices.all_operators') || 'All operators (leave empty)'}" value="${Utils.escapeHtml(policy.allowed_operators || '')}">
+                            <p class="form-hint">${_('devices.operators_hint') || 'Comma-separated usernames. Leave empty to allow all operators.'}</p>
+                        </div>
+                    </div>
+                    ${policy.updated_by ? `<p class="form-meta">${_('devices.last_updated_by') || 'Last updated by'}: ${Utils.escapeHtml(policy.updated_by)} ${policy.updated_at ? '(' + Utils.formatDate(policy.updated_at) + ')' : ''}</p>` : ''}
+                </div>
+            `;
+
+            Modal.show({
+                title: (_('devices.access_policy') || 'Access Policy') + ' — ' + deviceId,
+                content: content,
+                size: 'large',
+                buttons: [
+                    { label: _('actions.cancel'), class: 'btn-secondary', onClick: () => Modal.close() },
+                    {
+                        label: _('actions.save'), class: 'btn-primary', onClick: async () => {
+                            const scheduleCheckbox = document.getElementById('ap-schedule');
+                            const selectedDays = Array.from(document.querySelectorAll('input[name="schedule_day"]:checked')).map(cb => cb.value);
+                            const payload = {
+                                unattended_enabled: document.getElementById('ap-unattended').checked,
+                                password: document.getElementById('ap-password').value,
+                                clear_password: document.getElementById('ap-clear-password').checked,
+                                schedule_enabled: scheduleCheckbox ? scheduleCheckbox.checked : false,
+                                schedule_days: selectedDays.join(','),
+                                schedule_start_time: document.getElementById('ap-start-time') ? document.getElementById('ap-start-time').value : '',
+                                schedule_end_time: document.getElementById('ap-end-time') ? document.getElementById('ap-end-time').value : '',
+                                schedule_timezone: document.getElementById('ap-timezone') ? document.getElementById('ap-timezone').value : '',
+                                allowed_operators: document.getElementById('ap-operators') ? document.getElementById('ap-operators').value : ''
+                            };
+
+                            try {
+                                await Utils.api(`/api/devices/${deviceId}/access-policy`, {
+                                    method: 'PUT',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify(payload)
+                                });
+                                Notifications.success(_('devices.access_policy_saved') || 'Access policy saved');
+                                Modal.close();
+                            } catch (err) {
+                                Notifications.error(err.message || 'Failed to save access policy');
+                            }
+                        }
+                    }
+                ]
+            });
+
+            // Toggle schedule fields on checkbox change
+            const scheduleChk = document.getElementById('ap-schedule');
+            const scheduleFields = document.getElementById('ap-schedule-fields');
+            if (scheduleChk && scheduleFields) {
+                scheduleChk.addEventListener('change', () => {
+                    scheduleFields.style.opacity = scheduleChk.checked ? '1' : '0.5';
+                    scheduleFields.style.pointerEvents = scheduleChk.checked ? 'auto' : 'none';
+                });
+            }
+
+        } catch (error) {
+            Notifications.error(error.message || 'Failed to load access policy');
+        }
+    }
+
     /**
      * Toggle device ban status
      */
@@ -558,11 +855,14 @@
             let countdown = 3;
             const timer = setInterval(() => {
                 countdown--;
-                countdownEl.textContent = countdown;
+                if (countdownEl) {
+                    countdownEl.textContent = countdown;
+                }
                 if (countdown <= 0) {
                     clearInterval(timer);
                     confirmBtn.disabled = false;
-                    confirmBtn.querySelector('.btn-text').textContent = _('actions.delete');
+                    const btnText = confirmBtn.querySelector('.btn-text');
+                    if (btnText) btnText.textContent = _('actions.delete');
                 }
             }, 1000);
             
@@ -625,6 +925,17 @@
                         <label>${_('devices.hostname')}</label>
                         <span>${Utils.escapeHtml(device.hostname || '-')}</span>
                     </div>
+                    <div class="device-info-item full-width">
+                        <label for="edit-display-name">${_('devices.display_name')}</label>
+                        <input type="text" id="edit-display-name" class="form-input" 
+                               value="${Utils.escapeHtml(device.display_name || '')}" 
+                               placeholder="${_('devices.display_name_placeholder')}" maxlength="128" />
+                    </div>
+                    <div class="device-info-item full-width">
+                        <label for="edit-note">${_('devices.note')}</label>
+                        <textarea id="edit-note" class="form-input" rows="2" 
+                                  placeholder="${_('devices.note_placeholder')}" maxlength="512">${Utils.escapeHtml(device.note || '')}</textarea>
+                    </div>
                     <div class="device-info-item">
                         <label>${_('devices.username')}</label>
                         <span>${Utils.escapeHtml(device.username || '-')}</span>
@@ -648,6 +959,26 @@
                 </div>
             `,
             buttons: [
+                { label: _('actions.save'), class: 'btn-primary', onClick: async () => {
+                    const displayName = document.getElementById('edit-display-name').value.trim();
+                    const note = document.getElementById('edit-note').value.trim();
+                    try {
+                        const resp = await Utils.api(`/api/devices/${encodeURIComponent(device.id)}`, {
+                            method: 'PATCH',
+                            body: JSON.stringify({ display_name: displayName, note }),
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                        if (resp.success) {
+                            Toast.success(_('devices.display_name'), _('actions.saved'));
+                            Modal.close();
+                            loadDevices();
+                        } else {
+                            Toast.error(_('errors.error'), resp.error || _('errors.server_error'));
+                        }
+                    } catch (err) {
+                        Toast.error(_('errors.error'), err.message);
+                    }
+                }},
                 { label: _('actions.close'), class: 'btn-secondary', onClick: () => Modal.close() }
             ],
             size: 'medium'

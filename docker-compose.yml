@@ -61,7 +61,7 @@ services:
       - "5000:5000"             # Web console
       - "21121:21121"           # RustDesk Client API (WAN)
     volumes:
-      - rustdesk-data:/opt/rustdesk:ro    # Read-only access to server data (keys, db)
+      - rustdesk-data:/opt/rustdesk        # Shared server data (keys, db) — needs write for WAL mode
       - console-data:/app/data            # Console-specific data (auth.db, sessions)
     environment:
       - NODE_ENV=production

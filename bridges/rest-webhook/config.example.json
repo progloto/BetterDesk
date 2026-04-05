@@ -1,0 +1,63 @@
+{
+  "cdap": {
+    "server": "ws://192.168.0.110:21122/cdap",
+    "api_key": "YOUR_API_KEY",
+    "device_name": "REST Bridge",
+    "device_type": "bridge",
+    "bridge_name": "rest",
+    "heartbeat_sec": 15
+  },
+  "http": {
+    "webhook_port": 8090,
+    "webhook_path": "/webhook",
+    "poll_interval_sec": 10
+  },
+  "sources": [
+    {
+      "widget_id": "weather_temp",
+      "label": "Outside Temperature",
+      "url": "https://api.openweathermap.org/data/2.5/weather?q=Warsaw&appid=YOUR_KEY&units=metric",
+      "method": "GET",
+      "headers": {},
+      "jmespath": "main.temp",
+      "widget": "gauge",
+      "unit": "°C",
+      "min": -30,
+      "max": 50,
+      "poll_interval_sec": 300
+    },
+    {
+      "widget_id": "ha_light",
+      "label": "Living Room Light",
+      "url": "http://homeassistant.local:8123/api/states/light.living_room",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer HA_LONG_LIVED_TOKEN"
+      },
+      "jmespath": "state",
+      "widget": "toggle",
+      "write_url": "http://homeassistant.local:8123/api/services/light/{action}",
+      "write_method": "POST",
+      "write_headers": {
+        "Authorization": "Bearer HA_LONG_LIVED_TOKEN"
+      },
+      "write_body": {
+        "entity_id": "light.living_room"
+      },
+      "on_action": "turn_on",
+      "off_action": "turn_off"
+    }
+  ],
+  "webhooks": [
+    {
+      "widget_id": "doorbell",
+      "label": "Doorbell",
+      "match_field": "event",
+      "match_value": "ring",
+      "value_field": "timestamp",
+      "widget": "text",
+      "alert_severity": "info",
+      "alert_message": "Doorbell rang"
+    }
+  ]
+}

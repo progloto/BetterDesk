@@ -26,6 +26,7 @@ type Peer struct {
 	DeletedAt    *time.Time `json:"deleted_at,omitempty"`
 	Note         string     `json:"note,omitempty"`
 	Tags         string     `json:"tags,omitempty"`
+	DisplayName  string     `json:"display_name"`             // Admin-set alias (overrides hostname in UI)
 	DeviceType   string     `json:"device_type,omitempty"`    // CDAP: desktop, mobile, headless, kiosk, etc.
 	LinkedPeerID string     `json:"linked_peer_id,omitempty"` // CDAP: paired device (e.g., mobile→desktop)
 	HeartbeatSeq int64      `json:"-"`                        // internal heartbeat counter
@@ -107,6 +108,116 @@ const (
 	TokenStatusExpired = "expired" // Past expiration date
 )
 
+// ChatMessage represents a persisted chat message between devices/operators.
+type ChatMessage struct {
+	ID             int64     `json:"id"`
+	ConversationID string    `json:"conversation_id"` // "operator", device_id, or group:<id>
+	FromID         string    `json:"from_id"`         // sender device_id or "operator:<name>"
+	FromName       string    `json:"from_name"`       // display name
+	ToID           string    `json:"to_id,omitempty"` // recipient device_id or group ID
+	Text           string    `json:"text"`
+	Read           bool      `json:"read"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// ChatGroup represents a multi-device chat group.
+type ChatGroup struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Members   string    `json:"members"`    // comma-separated device IDs
+	CreatedBy string    `json:"created_by"` // device_id or operator name
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ChatContact represents a peer visible for chat (derived from peers table).
+type ChatContact struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Hostname    string `json:"hostname"`
+	Online      bool   `json:"online"`
+	LastSeen    int64  `json:"last_seen"`
+	Unread      int    `json:"unread"`
+	AvatarColor string `json:"avatar_color"`
+}
+
+// Organization represents a customer/tenant entity.
+type Organization struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Slug      string    `json:"slug"`
+	LogoURL   string    `json:"logo_url,omitempty"`
+	Settings  string    `json:"settings,omitempty"` // JSON blob for org-level settings
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// OrgUser represents a user account within an organization.
+type OrgUser struct {
+	ID           string     `json:"id"`
+	OrgID        string     `json:"org_id"`
+	Username     string     `json:"username"`
+	DisplayName  string     `json:"display_name,omitempty"`
+	Email        string     `json:"email,omitempty"`
+	PasswordHash string     `json:"-"`
+	Role         string     `json:"role"` // owner, admin, operator, user
+	TOTPSecret   string     `json:"-"`
+	AvatarURL    string     `json:"avatar_url,omitempty"`
+	LastLogin    *time.Time `json:"last_login,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+}
+
+// OrgDevice binds a device to an organization with metadata.
+type OrgDevice struct {
+	OrgID          string `json:"org_id"`
+	DeviceID       string `json:"device_id"`
+	AssignedUserID string `json:"assigned_user_id,omitempty"`
+	Department     string `json:"department,omitempty"`
+	Location       string `json:"location,omitempty"`
+	Building       string `json:"building,omitempty"`
+	Tags           string `json:"tags,omitempty"`
+}
+
+// OrgInvitation represents a pending invitation to join an organization.
+type OrgInvitation struct {
+	ID        string     `json:"id"`
+	OrgID     string     `json:"org_id"`
+	Token     string     `json:"token"`
+	Email     string     `json:"email,omitempty"`
+	Role      string     `json:"role"` // default: "user"
+	ExpiresAt time.Time  `json:"expires_at"`
+	UsedAt    *time.Time `json:"used_at,omitempty"`
+}
+
+// OrgSetting stores a single key-value pair scoped to an organization.
+type OrgSetting struct {
+	OrgID string `json:"org_id"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// AccessPolicy controls unattended access for a peer device.
+type AccessPolicy struct {
+	PeerID            string `json:"peer_id"`
+	UnattendedEnabled bool   `json:"unattended_enabled"`            // Whether unattended access is allowed
+	PasswordHash      string `json:"-"`                             // bcrypt hash of unattended password
+	PasswordSet       bool   `json:"password_set"`                  // Whether a password is configured (computed, not stored)
+	ScheduleEnabled   bool   `json:"schedule_enabled"`              // Whether access schedule is active
+	ScheduleDays      string `json:"schedule_days,omitempty"`       // Comma-separated days: "mon,tue,wed,thu,fri"
+	ScheduleStartTime string `json:"schedule_start_time,omitempty"` // HH:MM (24h format)
+	ScheduleEndTime   string `json:"schedule_end_time,omitempty"`   // HH:MM (24h format)
+	ScheduleTimezone  string `json:"schedule_timezone,omitempty"`   // IANA timezone (e.g. "Europe/Warsaw")
+	AllowedOperators  string `json:"allowed_operators,omitempty"`   // Comma-separated operator usernames (empty = all)
+	UpdatedAt         string `json:"updated_at,omitempty"`
+	UpdatedBy         string `json:"updated_by,omitempty"` // Admin/operator who last changed the policy
+}
+
+// OrgRole constants
+const (
+	OrgRoleOwner    = "owner"
+	OrgRoleAdmin    = "admin"
+	OrgRoleOperator = "operator"
+	OrgRoleUser     = "user"
+)
+
 // Database is the interface for all database operations.
 // Designed to support SQLite (now) and PostgreSQL (future) as drop-in implementations.
 type Database interface {
@@ -122,6 +233,7 @@ type Database interface {
 	HardDeletePeer(id string) error // permanent delete
 	ListPeers(includeDeleted bool) ([]*Peer, error)
 	GetPeerCount() (total int, online int, err error)
+	GetBannedPeerCount() (int, error)
 
 	// Status tracking
 	UpdatePeerStatus(id string, status string, ip string) error
@@ -152,6 +264,7 @@ type Database interface {
 	GetConfig(key string) (string, error)
 	SetConfig(key, value string) error
 	DeleteConfig(key string) error
+	ListConfigByPrefix(prefix string) ([]ServerConfig, error)
 
 	// Users
 	CreateUser(u *User) error
@@ -192,4 +305,61 @@ type Database interface {
 	GetPeerMetrics(peerID string, limit int) ([]*PeerMetric, error)
 	GetLatestPeerMetric(peerID string) (*PeerMetric, error)
 	CleanupOldMetrics(maxAge time.Duration) (int64, error) // Delete metrics older than maxAge
+
+	// Chat Messages
+	SaveChatMessage(msg *ChatMessage) (int64, error) // Returns inserted ID
+	GetChatHistory(conversationID string, limit int) ([]*ChatMessage, error)
+	GetChatHistoryBefore(conversationID string, beforeID int64, limit int) ([]*ChatMessage, error)
+	MarkChatRead(conversationID, readerID string) error // Mark all messages as read for reader
+	GetUnreadCount(deviceID string) (int, error)        // Total unread messages for device
+	DeleteChatHistory(conversationID string) error
+
+	// Chat Groups
+	CreateChatGroup(g *ChatGroup) error
+	GetChatGroup(id string) (*ChatGroup, error)
+	ListChatGroups(memberID string) ([]*ChatGroup, error) // Groups containing memberID
+	UpdateChatGroup(g *ChatGroup) error
+	DeleteChatGroup(id string) error
+
+	// Organizations
+	CreateOrganization(o *Organization) error
+	GetOrganization(id string) (*Organization, error)
+	GetOrganizationBySlug(slug string) (*Organization, error)
+	ListOrganizations() ([]*Organization, error)
+	UpdateOrganization(o *Organization) error
+	DeleteOrganization(id string) error
+
+	// Org Users
+	CreateOrgUser(u *OrgUser) error
+	GetOrgUser(id string) (*OrgUser, error)
+	GetOrgUserByUsername(orgID, username string) (*OrgUser, error)
+	ListOrgUsers(orgID string) ([]*OrgUser, error)
+	UpdateOrgUser(u *OrgUser) error
+	DeleteOrgUser(id string) error
+	UpdateOrgUserLogin(id string) error
+
+	// Org Devices
+	AssignDeviceToOrg(d *OrgDevice) error
+	UnassignDeviceFromOrg(orgID, deviceID string) error
+	GetOrgDevice(orgID, deviceID string) (*OrgDevice, error)
+	ListOrgDevices(orgID string) ([]*OrgDevice, error)
+	UpdateOrgDevice(d *OrgDevice) error
+
+	// Org Invitations
+	CreateOrgInvitation(inv *OrgInvitation) error
+	GetOrgInvitationByToken(token string) (*OrgInvitation, error)
+	ListOrgInvitations(orgID string) ([]*OrgInvitation, error)
+	UseOrgInvitation(token string) error
+	DeleteOrgInvitation(id string) error
+
+	// Org Settings
+	GetOrgSetting(orgID, key string) (string, error)
+	SetOrgSetting(orgID, key, value string) error
+	DeleteOrgSetting(orgID, key string) error
+	ListOrgSettings(orgID string) ([]*OrgSetting, error)
+
+	// Access Policies (unattended access management)
+	GetAccessPolicy(peerID string) (*AccessPolicy, error)
+	SaveAccessPolicy(p *AccessPolicy) error
+	DeleteAccessPolicy(peerID string) error
 }

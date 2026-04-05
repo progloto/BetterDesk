@@ -1,0 +1,597 @@
+/**
+ * BetterDesk Web Remote Client - File Transfer Module
+ * Handles RustDesk file transfer protocol: browse, download, upload, manage
+ *
+ * Protocol flow:
+ *   Browse:   FileAction.read_dir → FileResponse.dir
+ *   Download: FileAction.receive → FileResponse.digest → FileAction.send_confirm → FileResponse.block* → FileResponse.done
+ *   Upload:   FileAction.send → FileResponse.digest → FileResponse.block* → FileResponse.done
+ *   Cancel:   FileAction.cancel
+ */
+
+/* global RDProtocol */
+
+// eslint-disable-next-line no-unused-vars
+class RDFileTransfer {
+    /**
+     * @param {Object} opts
+     * @param {RDProtocol} opts.proto - Protocol handler
+     * @param {Function} opts.sendMessage - Function to send peer message: (msgObj) => void
+     * @param {Function} opts.emit - Event emitter: (event, ...args) => void
+     */
+    constructor(opts) {
+        this._proto = opts.proto;
+        this._sendMessage = opts.sendMessage;
+        this._emit = opts.emit;
+
+        /** @type {string} Current remote directory path */
+        this._currentPath = '';
+
+        /** @type {Array<Object>} Current directory entries */
+        this._entries = [];
+
+        /** @type {Map<number, Object>} Active transfers by ID */
+        this._transfers = new Map();
+
+        /** @type {number} Transfer ID counter */
+        this._nextId = 1;
+
+        /** @type {boolean} Whether file transfer is enabled */
+        this._enabled = false;
+
+        /** @type {boolean} Show hidden files */
+        this._showHidden = false;
+
+        // File type constants from proto
+        this.FILE_TYPE = {
+            DIR: 0,
+            DIR_LINK: 2,
+            DIR_DRIVE: 3,
+            FILE: 4,
+            FILE_LINK: 5
+        };
+
+        // Block size for uploads (64KB, matching RustDesk default)
+        this.BLOCK_SIZE = 65536;
+    }
+
+    /**
+     * Enable file transfer (called after successful login)
+     */
+    enable() {
+        this._enabled = true;
+    }
+
+    /**
+     * Disable file transfer
+     */
+    disable() {
+        this._enabled = false;
+        this.cancelAll();
+    }
+
+    get enabled() { return this._enabled; }
+    get currentPath() { return this._currentPath; }
+    get entries() { return this._entries; }
+
+    /**
+     * Browse a directory on the remote machine
+     * @param {string} [path=''] - Path to browse (empty = root/drives)
+     */
+    browseDir(path) {
+        if (!this._enabled) return;
+        const dir = path != null ? path : '';
+        this._sendMessage(this._proto.buildReadDir(dir, this._showHidden));
+        this._emit('file_browsing', { path: dir });
+    }
+
+    /**
+     * Navigate up to parent directory
+     */
+    browseParent() {
+        if (!this._currentPath) return;
+        // Handle both Windows and Unix paths
+        let parent = this._currentPath.replace(/[\\/]+$/, '');
+        const sep = parent.includes('\\') ? '\\' : '/';
+        const lastSep = parent.lastIndexOf(sep);
+        if (lastSep > 0) {
+            parent = parent.substring(0, lastSep);
+        } else if (lastSep === 0) {
+            parent = sep; // Unix root
+        } else {
+            parent = ''; // Drive list on Windows
+        }
+        this.browseDir(parent);
+    }
+
+    /**
+     * Toggle hidden file visibility
+     * @param {boolean} show
+     */
+    setShowHidden(show) {
+        this._showHidden = !!show;
+        // Refresh current directory
+        if (this._enabled && this._currentPath !== undefined) {
+            this.browseDir(this._currentPath);
+        }
+    }
+
+    /**
+     * Download a file from remote
+     * @param {string} remotePath - Remote directory path
+     * @param {Object} fileEntry - FileEntry { name, size, modified_time, entry_type }
+     * @returns {number} Transfer ID
+     */
+    downloadFile(remotePath, fileEntry) {
+        if (!this._enabled) return -1;
+
+        const id = this._nextId++;
+        const transfer = {
+            id: id,
+            type: 'download',
+            remotePath: remotePath,
+            fileName: fileEntry.name,
+            fileSize: Number(fileEntry.size || 0),
+            receivedBytes: 0,
+            blocks: [],
+            startTime: Date.now(),
+            status: 'pending', // pending → transferring → complete → error
+            fileNum: 0
+        };
+        this._transfers.set(id, transfer);
+
+        // Send receive request
+        const files = [{
+            entryType: fileEntry.entryType || fileEntry.entry_type || this.FILE_TYPE.FILE,
+            name: fileEntry.name,
+            size: fileEntry.size || 0,
+            modifiedTime: fileEntry.modifiedTime || fileEntry.modified_time || 0
+        }];
+        this._sendMessage(this._proto.buildFileReceiveRequest(
+            id, remotePath, files, 0, Number(fileEntry.size || 0)
+        ));
+
+        this._emit('file_transfer_start', {
+            id: id,
+            type: 'download',
+            fileName: fileEntry.name,
+            fileSize: transfer.fileSize
+        });
+
+        return id;
+    }
+
+    /**
+     * Upload a file to remote
+     * @param {File} file - Browser File object
+     * @param {string} remotePath - Remote destination directory
+     * @returns {number} Transfer ID
+     */
+    uploadFile(file, remotePath) {
+        if (!this._enabled) return -1;
+
+        const id = this._nextId++;
+        const transfer = {
+            id: id,
+            type: 'upload',
+            remotePath: remotePath,
+            fileName: file.name,
+            fileSize: file.size,
+            sentBytes: 0,
+            file: file,
+            startTime: Date.now(),
+            status: 'pending',
+            fileNum: 0,
+            currentBlk: 0
+        };
+        this._transfers.set(id, transfer);
+
+        // Request to send file to remote
+        this._sendMessage(this._proto.buildFileSendRequest(
+            id, remotePath, this._showHidden, 0
+        ));
+
+        this._emit('file_transfer_start', {
+            id: id,
+            type: 'upload',
+            fileName: file.name,
+            fileSize: file.size
+        });
+
+        return id;
+    }
+
+    /**
+     * Cancel a transfer
+     * @param {number} id
+     */
+    cancelTransfer(id) {
+        const transfer = this._transfers.get(id);
+        if (!transfer) return;
+
+        transfer.status = 'cancelled';
+        this._sendMessage(this._proto.buildFileCancel(id));
+        this._transfers.delete(id);
+
+        this._emit('file_transfer_cancelled', { id: id, fileName: transfer.fileName });
+    }
+
+    /**
+     * Cancel all active transfers
+     */
+    cancelAll() {
+        for (const [id] of this._transfers) {
+            this.cancelTransfer(id);
+        }
+    }
+
+    /**
+     * Create directory on remote
+     * @param {string} path
+     */
+    createDir(path) {
+        if (!this._enabled) return;
+        const id = this._nextId++;
+        this._sendMessage(this._proto.buildFileDirCreate(id, path));
+        this._emit('file_action', { action: 'create_dir', path: path });
+    }
+
+    /**
+     * Delete file on remote
+     * @param {string} path
+     */
+    removeFile(path) {
+        if (!this._enabled) return;
+        const id = this._nextId++;
+        this._sendMessage(this._proto.buildFileRemove(id, path, 0));
+        this._emit('file_action', { action: 'remove_file', path: path });
+    }
+
+    /**
+     * Delete directory on remote
+     * @param {string} path
+     * @param {boolean} recursive
+     */
+    removeDir(path, recursive) {
+        if (!this._enabled) return;
+        const id = this._nextId++;
+        this._sendMessage(this._proto.buildFileRemoveDir(id, path, recursive));
+        this._emit('file_action', { action: 'remove_dir', path: path });
+    }
+
+    /**
+     * Rename file/directory on remote
+     * @param {string} path
+     * @param {string} newName
+     */
+    rename(path, newName) {
+        if (!this._enabled) return;
+        const id = this._nextId++;
+        this._sendMessage(this._proto.buildFileRename(id, path, newName));
+        this._emit('file_action', { action: 'rename', path: path, newName: newName });
+    }
+
+    // ---- Incoming message handlers ----
+
+    /**
+     * Handle FileResponse from peer
+     * @param {Object} resp - Decoded FileResponse protobuf
+     */
+    handleFileResponse(resp) {
+        if (resp.dir) {
+            this._handleDir(resp.dir);
+        } else if (resp.block) {
+            this._handleBlock(resp.block);
+        } else if (resp.digest) {
+            this._handleDigest(resp.digest);
+        } else if (resp.done) {
+            this._handleDone(resp.done);
+        } else if (resp.error) {
+            this._handleError(resp.error);
+        }
+    }
+
+    /**
+     * Handle directory listing response
+     * @param {Object} dir - FileDirectory { id, path, entries[] }
+     */
+    _handleDir(dir) {
+        this._currentPath = dir.path || '';
+        this._entries = (dir.entries || []).map(e => ({
+            name: e.name,
+            entryType: e.entryType != null ? e.entryType : (e.entry_type != null ? e.entry_type : 0),
+            isHidden: !!e.isHidden,
+            size: Number(e.size || 0),
+            modifiedTime: Number(e.modifiedTime || e.modified_time || 0),
+            isDir: (e.entryType || e.entry_type || 0) <= 3
+        }));
+
+        // Sort: directories first, then by name
+        this._entries.sort((a, b) => {
+            if (a.isDir && !b.isDir) return -1;
+            if (!a.isDir && b.isDir) return 1;
+            return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+        });
+
+        this._emit('file_dir', {
+            path: this._currentPath,
+            entries: this._entries
+        });
+    }
+
+    /**
+     * Handle transfer digest (file metadata before data blocks)
+     * @param {Object} digest - FileTransferDigest
+     */
+    _handleDigest(digest) {
+        const transfer = this._transfers.get(digest.id);
+        if (!transfer) return;
+
+        transfer.fileSize = Number(digest.fileSize || 0);
+        transfer.status = 'transferring';
+
+        if (transfer.type === 'download') {
+            // Confirm download — accept from block 0
+            this._sendMessage(this._proto.buildFileSendConfirm(
+                digest.id, digest.fileNum, false, 0
+            ));
+        } else if (transfer.type === 'upload') {
+            // Start sending data blocks
+            this._sendUploadBlocks(transfer);
+        }
+
+        this._emit('file_transfer_progress', {
+            id: digest.id,
+            fileName: transfer.fileName,
+            fileSize: transfer.fileSize,
+            transferred: 0,
+            percent: 0,
+            type: transfer.type
+        });
+    }
+
+    /**
+     * Handle data block (download)
+     * @param {Object} block - FileTransferBlock { id, file_num, data, compressed, blk_id }
+     */
+    _handleBlock(block) {
+        const transfer = this._transfers.get(block.id);
+        if (!transfer || transfer.type !== 'download') return;
+
+        // Accumulate blocks
+        if (block.data && block.data.length > 0) {
+            transfer.blocks.push(block.data);
+            transfer.receivedBytes += block.data.length;
+        }
+
+        const percent = transfer.fileSize > 0
+            ? Math.min(100, Math.round((transfer.receivedBytes / transfer.fileSize) * 100))
+            : 0;
+
+        this._emit('file_transfer_progress', {
+            id: block.id,
+            fileName: transfer.fileName,
+            fileSize: transfer.fileSize,
+            transferred: transfer.receivedBytes,
+            percent: percent,
+            type: 'download'
+        });
+    }
+
+    /**
+     * Handle transfer done
+     * @param {Object} done - FileTransferDone { id, file_num }
+     */
+    _handleDone(done) {
+        const transfer = this._transfers.get(done.id);
+        if (!transfer) return;
+
+        transfer.status = 'complete';
+        const elapsed = (Date.now() - transfer.startTime) / 1000;
+
+        if (transfer.type === 'download') {
+            // Assemble and trigger browser download
+            this._triggerDownload(transfer);
+        }
+
+        this._emit('file_transfer_complete', {
+            id: done.id,
+            fileName: transfer.fileName,
+            fileSize: transfer.fileSize,
+            type: transfer.type,
+            elapsed: elapsed
+        });
+
+        this._transfers.delete(done.id);
+
+        // Refresh directory listing after upload
+        if (transfer.type === 'upload') {
+            this.browseDir(this._currentPath);
+        }
+    }
+
+    /**
+     * Handle transfer error
+     * @param {Object} error - FileTransferError { id, error, file_num }
+     */
+    _handleError(error) {
+        const transfer = this._transfers.get(error.id);
+        const fileName = transfer ? transfer.fileName : 'unknown';
+
+        if (transfer) {
+            transfer.status = 'error';
+            this._transfers.delete(error.id);
+        }
+
+        this._emit('file_transfer_error', {
+            id: error.id,
+            fileName: fileName,
+            error: error.error || 'Unknown error'
+        });
+    }
+
+    // ---- Upload block streaming ----
+
+    /**
+     * Stream file blocks for upload
+     * @param {Object} transfer
+     */
+    async _sendUploadBlocks(transfer) {
+        const file = transfer.file;
+        if (!file) return;
+
+        try {
+            let offset = 0;
+            let blkId = 0;
+
+            while (offset < file.size && transfer.status === 'transferring') {
+                const end = Math.min(offset + this.BLOCK_SIZE, file.size);
+                const slice = file.slice(offset, end);
+                const data = new Uint8Array(await slice.arrayBuffer());
+
+                this._sendMessage(this._proto.buildFileBlock(
+                    transfer.id, transfer.fileNum, data, false, blkId
+                ));
+
+                transfer.sentBytes = end;
+                blkId++;
+                offset = end;
+
+                const percent = Math.min(100, Math.round((end / file.size) * 100));
+                this._emit('file_transfer_progress', {
+                    id: transfer.id,
+                    fileName: transfer.fileName,
+                    fileSize: transfer.fileSize,
+                    transferred: end,
+                    percent: percent,
+                    type: 'upload'
+                });
+
+                // Yield to event loop every 16 blocks to avoid blocking UI
+                if (blkId % 16 === 0) {
+                    await new Promise(r => setTimeout(r, 0));
+                }
+            }
+
+            // Send done
+            if (transfer.status === 'transferring') {
+                this._sendMessage(this._proto.buildFileDone(transfer.id, transfer.fileNum));
+            }
+        } catch (err) {
+            transfer.status = 'error';
+            this._emit('file_transfer_error', {
+                id: transfer.id,
+                fileName: transfer.fileName,
+                error: err.message || 'Upload failed'
+            });
+            this._transfers.delete(transfer.id);
+        }
+    }
+
+    // ---- Browser download trigger ----
+
+    /**
+     * Assemble received blocks into a Blob and trigger download
+     * @param {Object} transfer
+     */
+    _triggerDownload(transfer) {
+        if (!transfer.blocks.length) return;
+
+        try {
+            const blob = new Blob(transfer.blocks, { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = transfer.fileName;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            // Cleanup
+            setTimeout(() => {
+                URL.revokeObjectURL(url);
+                a.remove();
+            }, 5000);
+        } catch (err) {
+            this._emit('file_transfer_error', {
+                id: transfer.id,
+                fileName: transfer.fileName,
+                error: 'Failed to save file: ' + (err.message || 'unknown error')
+            });
+        }
+    }
+
+    // ---- Utility ----
+
+    /**
+     * Format file size for display
+     * @param {number} bytes
+     * @returns {string}
+     */
+    static formatSize(bytes) {
+        if (bytes === 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+    }
+
+    /**
+     * Format timestamp to locale string
+     * @param {number} ts - Unix timestamp in seconds
+     * @returns {string}
+     */
+    static formatTime(ts) {
+        if (!ts) return '';
+        return new Date(ts * 1000).toLocaleString();
+    }
+
+    /**
+     * Get icon name for file entry type
+     * @param {Object} entry
+     * @returns {string} Material Icons name
+     */
+    static getFileIcon(entry) {
+        if (entry.isDir) {
+            if (entry.entryType === 3) return 'storage'; // Drive
+            return 'folder';
+        }
+        const ext = (entry.name || '').split('.').pop().toLowerCase();
+        const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'ico'];
+        const videoExts = ['mp4', 'avi', 'mkv', 'mov', 'wmv', 'flv', 'webm'];
+        const audioExts = ['mp3', 'wav', 'ogg', 'flac', 'aac', 'wma', 'm4a'];
+        const docExts = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv'];
+        const codeExts = ['js', 'ts', 'py', 'go', 'rs', 'java', 'c', 'cpp', 'h', 'css', 'html', 'json', 'xml', 'yml', 'yaml', 'toml', 'sh', 'bat', 'ps1'];
+        const archiveExts = ['zip', 'tar', 'gz', 'rar', '7z', 'bz2', 'xz'];
+
+        if (imageExts.includes(ext)) return 'image';
+        if (videoExts.includes(ext)) return 'movie';
+        if (audioExts.includes(ext)) return 'music_note';
+        if (docExts.includes(ext)) return 'description';
+        if (codeExts.includes(ext)) return 'code';
+        if (archiveExts.includes(ext)) return 'archive';
+        if (ext === 'exe' || ext === 'msi') return 'apps';
+        return 'insert_drive_file';
+    }
+
+    /**
+     * Get transfer statistics
+     * @returns {Object}
+     */
+    getStats() {
+        const active = [];
+        for (const [, t] of this._transfers) {
+            const transferred = t.type === 'download' ? t.receivedBytes : (t.sentBytes || 0);
+            const elapsed = (Date.now() - t.startTime) / 1000;
+            active.push({
+                id: t.id,
+                type: t.type,
+                fileName: t.fileName,
+                fileSize: t.fileSize,
+                transferred: transferred,
+                percent: t.fileSize > 0 ? Math.round((transferred / t.fileSize) * 100) : 0,
+                speed: elapsed > 0 ? transferred / elapsed : 0,
+                status: t.status
+            });
+        }
+        return { active: active, count: active.length };
+    }
+}

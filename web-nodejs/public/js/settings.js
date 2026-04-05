@@ -13,6 +13,7 @@
         initTotpSection();
         initBrandingSection();
         initBackupSection();
+        initUpdateSection();
         loadAuditLog();
         loadServerInfo();
         
@@ -39,7 +40,7 @@
         
         // Check URL hash for direct tab navigation
         const hash = window.location.hash.replace('#', '');
-        if (['branding', 'server', 'backup'].includes(hash)) {
+        if (['branding', 'server', 'backup', 'updates'].includes(hash)) {
             const tab = document.querySelector(`[data-tab="${hash}"]`);
             if (tab) tab.click();
         }
@@ -146,14 +147,19 @@
                 return;
             }
             
-            tbody.innerHTML = logs.map(log => `
+            tbody.innerHTML = logs.map(log => {
+                var actionKey = 'audit.action_' + (log.action || '').replace(/[^a-z0-9_]/gi, '_');
+                var actionLabel = typeof _ === 'function' ? _(actionKey) : log.action;
+                if (actionLabel === actionKey) actionLabel = log.action;
+                return `
                 <tr>
                     <td>${Utils.formatDate(log.created_at)}</td>
                     <td>${Utils.escapeHtml(log.username || '-')}</td>
-                    <td><span class="audit-action ${log.action}">${Utils.escapeHtml(log.action)}</span></td>
+                    <td><span class="audit-action ${log.action}">${Utils.escapeHtml(actionLabel)}</span></td>
                     <td>${Utils.escapeHtml(log.details || '-')}</td>
                 </tr>
-            `).join('');
+            `;
+            }).join('');
             
         } catch (error) {
             tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">${_('errors.load_audit_failed')}</td></tr>`;
@@ -290,7 +296,7 @@
                     <div class="totp-manual-key">
                         <p class="totp-manual-label">${_('settings.totp_manual_key')}:</p>
                         <code class="totp-secret-code">${data.secret}</code>
-                        <button class="btn btn-sm btn-ghost" onclick="navigator.clipboard.writeText('${data.secret}')">
+                        <button class="btn btn-sm btn-ghost" id="totp-copy-secret-btn">
                             <span class="material-icons" style="font-size: 16px;">content_copy</span>
                         </button>
                     </div>
@@ -343,6 +349,10 @@
             // Cancel
             document.getElementById('totp-cancel-btn')?.addEventListener('click', () => {
                 initTotpSection();
+            });
+
+            document.getElementById('totp-copy-secret-btn')?.addEventListener('click', () => {
+                navigator.clipboard.writeText(data.secret).catch(() => {});
             });
             
         } catch (error) {
@@ -941,6 +951,225 @@
         }
         html += '</div>';
         el.innerHTML = html;
+    }
+    
+    // ==================== Self-Update ====================
+    
+    let _updateState = { remoteVersion: null, changedFiles: [] };
+    
+    function initUpdateSection() {
+        const checkBtn = document.getElementById('update-check-btn');
+        const installBtn = document.getElementById('update-install-btn');
+        
+        if (!checkBtn) return;
+        
+        checkBtn.addEventListener('click', checkForUpdates);
+        installBtn?.addEventListener('click', installUpdate);
+        
+        loadUpdateBackups();
+    }
+    
+    async function checkForUpdates() {
+        const btn = document.getElementById('update-check-btn');
+        const statusRow = document.getElementById('update-status-row');
+        const statusBadge = document.getElementById('update-status-badge');
+        const remoteEl = document.getElementById('update-remote-version');
+        const detailsSection = document.getElementById('update-details-section');
+        const installBtn = document.getElementById('update-install-btn');
+        
+        if (!btn) return;
+        btn.disabled = true;
+        btn.innerHTML = `<span class="material-icons spinning">sync</span> ${_('updates.checking')}`;
+        
+        try {
+            const data = await Utils.api('/api/settings/updates/check');
+            
+            if (remoteEl) remoteEl.textContent = 'v' + (data.remoteVersion || '?');
+            if (statusRow) statusRow.style.display = '';
+            
+            if (data.updateAvailable) {
+                if (statusBadge) statusBadge.innerHTML = `<span class="badge badge-warning">${_('updates.update_available')}</span>`;
+                
+                // Fetch changed files
+                const localVer = data.localVersion;
+                const remoteVer = data.remoteVersion;
+                _updateState.remoteVersion = remoteVer;
+                
+                try {
+                    const changes = await Utils.api(`/api/settings/updates/changes?local=v${localVer}&remote=v${remoteVer}`);
+                    _updateState.changedFiles = changes.files || [];
+                    
+                    const changelogEl = document.getElementById('update-changelog');
+                    const summaryEl = document.getElementById('update-files-summary');
+                    
+                    if (changelogEl) {
+                        if (data.releaseNotes) {
+                            changelogEl.innerHTML = Utils.escapeHtml(data.releaseNotes).replace(/\n/g, '<br>');
+                        } else {
+                            changelogEl.innerHTML = `<p class="text-muted">${_('updates.no_changelog')}</p>`;
+                        }
+                    }
+                    
+                    if (summaryEl) {
+                        const added = _updateState.changedFiles.filter(f => f.status === 'added').length;
+                        const modified = _updateState.changedFiles.filter(f => f.status === 'modified').length;
+                        const removed = _updateState.changedFiles.filter(f => f.status === 'removed' || f.status === 'renamed').length;
+                        summaryEl.innerHTML = `<p><span class="material-icons" style="font-size:16px;vertical-align:middle;">folder</span> ` +
+                            `${_('updates.files_changed')}: <strong>${_updateState.changedFiles.length}</strong> ` +
+                            `<span class="text-muted">(+${added} / ~${modified} / -${removed})</span></p>`;
+                    }
+                    
+                    if (installBtn) installBtn.disabled = false;
+                } catch (e) {
+                    if (detailsSection) {
+                        const changelogEl = document.getElementById('update-changelog');
+                        if (changelogEl) changelogEl.innerHTML = `<p class="text-muted">${_('updates.changes_unavailable')}</p>`;
+                    }
+                    if (installBtn) installBtn.disabled = false;
+                }
+                
+                if (detailsSection) detailsSection.style.display = '';
+            } else {
+                if (statusBadge) statusBadge.innerHTML = `<span class="badge badge-success">${_('updates.up_to_date')}</span>`;
+                if (detailsSection) detailsSection.style.display = 'none';
+                if (installBtn) installBtn.disabled = true;
+            }
+        } catch (error) {
+            Notifications.error(error.message || _('errors.server_error'));
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = `<span class="material-icons">refresh</span> ${_('updates.check_now')}`;
+        }
+    }
+    
+    async function installUpdate() {
+        const installBtn = document.getElementById('update-install-btn');
+        const progressEl = document.getElementById('update-progress');
+        const progressFill = document.getElementById('update-progress-fill');
+        const progressText = document.getElementById('update-progress-text');
+        
+        if (!_updateState.remoteVersion) {
+            Notifications.error(_('updates.no_version'));
+            return;
+        }
+        
+        if (!confirm(_('updates.install_confirm'))) return;
+        
+        if (installBtn) installBtn.disabled = true;
+        if (progressEl) progressEl.style.display = '';
+        if (progressFill) progressFill.style.width = '10%';
+        if (progressText) progressText.textContent = _('updates.installing');
+        
+        try {
+            const createBackup = document.getElementById('update-backup-toggle')?.checked ?? true;
+            
+            if (progressFill) progressFill.style.width = '30%';
+            if (progressText) progressText.textContent = createBackup ? _('updates.creating_backup') : _('updates.downloading');
+            
+            const result = await Utils.api('/api/settings/updates/install', {
+                method: 'POST',
+                body: {
+                    remoteVersion: _updateState.remoteVersion,
+                    createBackup: createBackup
+                }
+            });
+            
+            if (progressFill) progressFill.style.width = '100%';
+            if (progressText) progressText.textContent = _('updates.restarting');
+            
+            Notifications.success(_('updates.install_success'));
+            
+            // Server will restart — poll until it comes back
+            setTimeout(() => {
+                pollServerRestart();
+            }, 3000);
+            
+        } catch (error) {
+            Notifications.error(error.message || _('updates.install_failed'));
+            if (progressEl) progressEl.style.display = 'none';
+            if (installBtn) installBtn.disabled = false;
+        }
+    }
+    
+    function pollServerRestart() {
+        const progressText = document.getElementById('update-progress-text');
+        let attempts = 0;
+        const maxAttempts = 30;
+        
+        const interval = setInterval(async () => {
+            attempts++;
+            if (progressText) progressText.textContent = `${_('updates.restarting')} (${attempts}/${maxAttempts})`;
+            
+            try {
+                const resp = await fetch('/api/settings/info', { credentials: 'same-origin' });
+                if (resp.ok) {
+                    clearInterval(interval);
+                    Notifications.success(_('updates.restart_complete'));
+                    setTimeout(() => window.location.reload(), 1000);
+                }
+            } catch {
+                // Server still down, keep polling
+            }
+            
+            if (attempts >= maxAttempts) {
+                clearInterval(interval);
+                if (progressText) progressText.textContent = _('updates.restart_timeout');
+            }
+        }, 2000);
+    }
+    
+    async function loadUpdateBackups() {
+        const listEl = document.getElementById('update-backups-list');
+        if (!listEl) return;
+        
+        try {
+            const data = await Utils.api('/api/settings/updates/backups');
+            const backups = data.backups || [];
+            
+            if (!backups.length) {
+                listEl.innerHTML = `<p class="text-muted">${_('updates.no_backups')}</p>`;
+                return;
+            }
+            
+            let html = '<div class="update-backups">';
+            for (const b of backups) {
+                const date = new Date(b.timestamp).toLocaleString();
+                html += `<div class="update-backup-item">
+                    <div class="update-backup-info">
+                        <strong>${Utils.escapeHtml(b.name)}</strong>
+                        <span class="text-muted">${date} &middot; ${b.fileCount} ${_('updates.files')}</span>
+                    </div>
+                    <button class="btn btn-sm btn-outline" data-backup="${Utils.escapeHtml(b.name)}">
+                        <span class="material-icons">restore</span> ${_('updates.restore')}
+                    </button>
+                </div>`;
+            }
+            html += '</div>';
+            listEl.innerHTML = html;
+            
+            // Attach restore handlers
+            listEl.querySelectorAll('[data-backup]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    const name = btn.dataset.backup;
+                    if (!confirm(_('updates.restore_confirm'))) return;
+                    
+                    btn.disabled = true;
+                    try {
+                        await Utils.api('/api/settings/updates/restore', {
+                            method: 'POST',
+                            body: { backupName: name }
+                        });
+                        Notifications.success(_('updates.restore_success'));
+                        setTimeout(() => window.location.reload(), 2000);
+                    } catch (error) {
+                        Notifications.error(error.message || _('errors.server_error'));
+                        btn.disabled = false;
+                    }
+                });
+            });
+        } catch {
+            listEl.innerHTML = `<p class="text-muted">${_('updates.no_backups')}</p>`;
+        }
     }
     
 })();

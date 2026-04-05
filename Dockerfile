@@ -71,8 +71,8 @@ RUN apk add --no-cache \
     && mkdir -p /var/log/supervisor; }
 
 # Create betterdesk user and directories
-RUN addgroup -S betterdesk && \
-    adduser -S -G betterdesk betterdesk && \
+RUN addgroup -g 10001 -S betterdesk && \
+    adduser -u 10001 -S -G betterdesk betterdesk && \
     mkdir -p /opt/rustdesk /app/data /var/log/betterdesk && \
     chown -R betterdesk:betterdesk /opt/rustdesk /app/data /var/log/betterdesk
 

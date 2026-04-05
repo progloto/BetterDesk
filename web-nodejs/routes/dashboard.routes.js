@@ -115,6 +115,7 @@ router.get('/api/server/status', requireAuth, async (req, res) => {
             success: true,
             data: {
                 backend: isBD ? 'betterdesk' : 'rustdesk',
+                uptime: Math.floor(process.uptime()),
                 // Main status indicators
                 hbbs: apiRunning ? { status: 'running' } : { status: 'stopped' },
                 hbbr: relayStatus,
@@ -140,6 +141,33 @@ router.get('/api/server/status', requireAuth, async (req, res) => {
 });
 
 /**
+ * GET /api/server/bandwidth - Get relay/bandwidth metrics from Go server
+ */
+router.get('/api/server/bandwidth', requireAuth, async (req, res) => {
+    try {
+        const betterdeskApi = require('../services/betterdeskApi');
+        const stats = await betterdeskApi.getServerStats();
+        if (!stats || !stats.success) {
+            return res.json({ success: true, data: { relay_active: 0, total_relayed: 0, bytes_transferred: 0, active_sessions: 0, throttle_hits: 0 } });
+        }
+        const d = stats.data || {};
+        res.json({
+            success: true,
+            data: {
+                relay_active: d.relay_active_sessions || 0,
+                total_relayed: d.relay_total_relayed || 0,
+                bytes_transferred: d.bandwidth_bytes_transferred || 0,
+                active_sessions: d.bandwidth_active_sessions || 0,
+                throttle_hits: d.bandwidth_throttle_hits || 0
+            }
+        });
+    } catch (err) {
+        console.error('Bandwidth stats error:', err);
+        res.json({ success: true, data: { relay_active: 0, total_relayed: 0, bytes_transferred: 0, active_sessions: 0, throttle_hits: 0 } });
+    }
+});
+
+/**
  * POST /api/sync-status - Sync online status from HBBS API
  */
 router.post('/api/sync-status', requireAuth, async (req, res) => {
@@ -156,6 +184,53 @@ router.post('/api/sync-status', requireAuth, async (req, res) => {
             success: false,
             error: req.t('errors.server_error')
         });
+    }
+});
+
+/**
+ * GET /api/dashboard/activity - Recent activity feed for dashboard
+ * Returns last 10 events from audit log (connections, logins, bans)
+ */
+router.get('/api/dashboard/activity', requireAuth, async (req, res) => {
+    try {
+        const events = [];
+        
+        // Try Go server audit endpoint
+        try {
+            const betterdeskApi = require('../services/betterdeskApi');
+            const audit = await betterdeskApi.getAuditEvents(10);
+            const entries = audit?.data?.entries || audit?.entries || (Array.isArray(audit?.data) ? audit.data : []);
+            for (const entry of entries.slice(0, 10)) {
+                events.push({
+                    action: entry.action || 'info',
+                    action_label: entry.action || 'Event',
+                    device_id: entry.peer_id || entry.details?.peer_id || '',
+                    details: entry.details?.message || '',
+                    timestamp: entry.timestamp || entry.created_at
+                });
+            }
+        } catch {}
+        
+        // Fallback: recent connections from local DB
+        if (events.length === 0) {
+            try {
+                const conns = await db.getRecentConnections(10);
+                for (const c of (conns || [])) {
+                    events.push({
+                        action: 'conn_start',
+                        action_label: 'Connection',
+                        device_id: c.peer_id || c.host_id || '',
+                        details: '',
+                        timestamp: c.created_at || c.timestamp
+                    });
+                }
+            } catch {}
+        }
+        
+        res.json({ success: true, events });
+    } catch (err) {
+        console.error('Dashboard activity error:', err);
+        res.json({ success: true, events: [] });
     }
 });
 

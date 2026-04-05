@@ -3,9 +3,10 @@
     pageScripts: [],
     body: `
 
-<!-- WIP Banner -->
-<div style="position: fixed; top: 0; left: 0; right: 0; z-index: 9999; background: linear-gradient(90deg, #f59e0b, #d97706); color: #fff; text-align: center; padding: 10px 15px; font-weight: 600; font-size: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
-    🚧 Web Remote Client is under active development and may not function correctly. 🚧
+<!-- Beta Banner -->
+<div class="bdv-beta-banner" id="bdv-beta-banner">
+    <span>🔧 Web Remote Client — Beta</span>
+    <button id="bdv-beta-dismiss" class="bdv-beta-dismiss">&times;</button>
 </div>
 
 <!-- BetterDesk Native Remote Desktop Viewer -->
@@ -46,17 +47,44 @@
             <span class="bdv-toolbar-sep"></span>
             <span class="bdv-badge" id="bdv-fps-badge">—</span>
         </div>
+        <div class="bdv-toolbar-center">
+            <!-- Scale mode selector -->
+            <select class="bdv-select" id="bdvScaleMode" title="Scale Mode">
+                <option value="fit" selected>Fit</option>
+                <option value="fill">Fill</option>
+                <option value="1:1">1:1</option>
+                <option value="stretch">Stretch</option>
+            </select>
+            <!-- Monitor selector (hidden until multi-monitor detected) -->
+            <select class="bdv-select bdv-hidden" id="bdvMonitor" title="Monitor"></select>
+        </div>
         <div class="bdv-toolbar-right">
+            <button class="bdv-btn" id="btnClipboard" title="Clipboard Sync">
+                <span class="material-icons">content_paste</span>
+            </button>
+            <button class="bdv-btn" id="btnSpecialKeys" title="Special Keys">
+                <span class="material-icons">keyboard</span>
+            </button>
             <button class="bdv-btn" id="btnChat" title="Open Chat">
                 <span class="material-icons">chat</span>
             </button>
-            <button class="bdv-btn" id="btnFullscreen" title="Fullscreen">
+            <button class="bdv-btn" id="btnFullscreen" title="Fullscreen (F11)">
                 <span class="material-icons">fullscreen</span>
             </button>
             <button class="bdv-btn bdv-btn--danger" id="btnStop" title="Stop session">
                 <span class="material-icons">stop_circle</span>
             </button>
         </div>
+    </div>
+
+    <!-- Special Keys dropdown menu -->
+    <div class="bdv-dropdown bdv-hidden" id="bdv-special-keys-menu">
+        <button class="bdv-dropdown-item" data-keys="ctrl+alt+delete">Ctrl+Alt+Del</button>
+        <button class="bdv-dropdown-item" data-keys="meta">Win / Super</button>
+        <button class="bdv-dropdown-item" data-keys="printscreen">Print Screen</button>
+        <button class="bdv-dropdown-item" data-keys="alt+tab">Alt+Tab</button>
+        <button class="bdv-dropdown-item" data-keys="alt+f4">Alt+F4</button>
+        <button class="bdv-dropdown-item" data-keys="ctrl+shift+escape">Task Manager</button>
     </div>
 
     <!-- Chat sidebar -->
@@ -78,7 +106,7 @@
 
 </div>
 
-<script>
+<script nonce="<%= cspNonce %>">
 (function() {
     'use strict';
 
@@ -180,6 +208,25 @@
                 overlay.style.display = 'flex';
                 showActions();
                 break;
+            case 'clipboard':
+                // Receive clipboard text from remote device
+                if (frame.text && navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(frame.text).catch(() => {});
+                }
+                break;
+            case 'monitors':
+                // Populate monitor selector when remote reports multiple displays
+                if (frame.list && frame.list.length > 1) {
+                    monitorSelect.innerHTML = '';
+                    frame.list.forEach((m, i) => {
+                        const opt = document.createElement('option');
+                        opt.value = i;
+                        opt.textContent = m.name || ('Monitor ' + (i + 1));
+                        monitorSelect.appendChild(opt);
+                    });
+                    monitorSelect.classList.remove('bdv-hidden');
+                }
+                break;
         }
     }
 
@@ -265,6 +312,10 @@
     function setStatus(msg) { statusTxt.textContent = msg; }
     function showActions() { actions.style.display = 'flex'; }
 
+    document.getElementById('bdv-beta-dismiss')?.addEventListener('click', () => {
+        document.getElementById('bdv-beta-banner').style.display = 'none';
+    });
+
     document.getElementById('btnReconnect').onclick = () => {
         actions.style.display = 'none';
         if (remoteWs) remoteWs.close();
@@ -288,6 +339,54 @@
         const icon = document.getElementById('btnFullscreen').querySelector('span');
         icon.textContent = document.fullscreenElement ? 'fullscreen_exit' : 'fullscreen';
     });
+
+    // F11 shortcut for fullscreen
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'F11') {
+            e.preventDefault();
+            document.getElementById('btnFullscreen').click();
+        }
+    });
+
+    // ---- Scale Mode ----
+    const scaleSelect = document.getElementById('bdvScaleMode');
+    scaleSelect.addEventListener('change', () => {
+        sendRemote({ type: 'scale_mode', mode: scaleSelect.value });
+    });
+
+    // ---- Monitor Selector ----
+    const monitorSelect = document.getElementById('bdvMonitor');
+    monitorSelect.addEventListener('change', () => {
+        const idx = parseInt(monitorSelect.value, 10);
+        sendRemote({ type: 'switch_monitor', index: idx });
+    });
+
+    // ---- Special Keys ----
+    const specialKeysMenu = document.getElementById('bdv-special-keys-menu');
+    document.getElementById('btnSpecialKeys').onclick = (e) => {
+        e.stopPropagation();
+        specialKeysMenu.classList.toggle('bdv-hidden');
+    };
+    document.addEventListener('click', () => specialKeysMenu.classList.add('bdv-hidden'));
+    specialKeysMenu.addEventListener('click', (e) => {
+        const item = e.target.closest('[data-keys]');
+        if (!item) return;
+        sendRemote({ type: 'special_key', combo: item.dataset.keys });
+        specialKeysMenu.classList.add('bdv-hidden');
+    });
+
+    // ---- Clipboard Sync ----
+    document.getElementById('btnClipboard').onclick = async () => {
+        try {
+            const text = await navigator.clipboard.readText();
+            if (text) sendRemote({ type: 'clipboard', text });
+        } catch {
+            try {
+                const text = await navigator.clipboard.readText();
+                sendRemote({ type: 'clipboard_request' });
+            } catch { /* Clipboard API not available */ }
+        }
+    };
 
     // Toolbar auto-hide
     let hideTimer;
@@ -425,10 +524,56 @@
 .bdv-toolbar-left, .bdv-toolbar-right {
     display: flex; align-items: center; gap: 8px; color: #e8e8f0;
 }
-.bdv-toolbar-right { margin-left: auto; }
+.bdv-toolbar-center {
+    display: flex; align-items: center; gap: 8px; margin: 0 auto;
+}
+.bdv-toolbar-right { margin-left: 0; }
 
 .bdv-toolbar-sep { width: 1px; height: 16px; background: #444; }
 .bdv-badge { background: rgba(255,255,255,.1); border-radius: 4px; padding: 2px 8px; font-size: 0.75rem; color: #ccc; }
+
+.bdv-select {
+    background: rgba(255,255,255,.1);
+    border: 1px solid rgba(255,255,255,.15);
+    border-radius: 4px;
+    color: #e8e8f0;
+    font-size: 0.75rem;
+    padding: 3px 6px;
+    cursor: pointer;
+    outline: none;
+}
+.bdv-select:hover { background: rgba(255,255,255,.2); }
+.bdv-select option { background: #1a1a2e; color: #e8e8f0; }
+.bdv-hidden { display: none !important; }
+
+.bdv-beta-banner {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+    background: linear-gradient(90deg, #3b82f6, #2563eb);
+    color: #fff; text-align: center; padding: 6px 15px;
+    font-size: 12px; font-weight: 500;
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+}
+.bdv-beta-dismiss {
+    background: none; border: none; color: rgba(255,255,255,.7);
+    cursor: pointer; font-size: 16px; line-height: 1;
+}
+.bdv-beta-dismiss:hover { color: #fff; }
+
+.bdv-dropdown {
+    position: absolute; top: 52px; right: 200px;
+    background: #1a1a2e; border: 1px solid #2d2d4a;
+    border-radius: 8px; z-index: 25;
+    padding: 4px 0; min-width: 180px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5);
+}
+.bdv-dropdown-item {
+    display: block; width: 100%;
+    background: none; border: none; cursor: pointer;
+    color: #e8e8f0; font-size: 0.85rem;
+    padding: 8px 16px; text-align: left;
+    transition: background .15s;
+}
+.bdv-dropdown-item:hover { background: rgba(255,255,255,.1); }
 
 .bdv-btn {
     background: none; border: none; cursor: pointer; color: #e8e8f0;

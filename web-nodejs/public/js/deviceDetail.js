@@ -486,24 +486,6 @@ const DeviceDetail = (function () {
         <div class="device-panel-section">
             <div class="device-panel-section-title"><span class="material-icons">link</span> ${_('device_detail.section_connect')}</div>
             <div class="device-panel-actions-grid">
-                <div class="device-panel-action-card" data-action="connect-web">
-                    <div class="device-panel-action-icon green">
-                        <span class="material-icons">language</span>
-                    </div>
-                    <div class="device-panel-action-text">
-                        <div class="device-panel-action-title">${_('device_detail.action_connect_web')}</div>
-                        <div class="device-panel-action-desc">${_('device_detail.action_connect_web_desc')}</div>
-                    </div>
-                </div>
-                <div class="device-panel-action-card" data-action="connect-native-remote">
-                    <div class="device-panel-action-icon teal" style="background:rgba(20,184,166,.15);color:#14b8a6">
-                        <span class="material-icons">connected_tv</span>
-                    </div>
-                    <div class="device-panel-action-text">
-                        <div class="device-panel-action-title">${_('device_detail.action_native_remote') || 'BetterDesk Remote'}</div>
-                        <div class="device-panel-action-desc">${_('device_detail.action_native_remote_desc') || 'Native JPEG stream viewer'}</div>
-                    </div>
-                </div>
                 <div class="device-panel-action-card" data-action="connect-desktop">
                     <div class="device-panel-action-icon purple">
                         <span class="material-icons">computer</span>
@@ -511,6 +493,15 @@ const DeviceDetail = (function () {
                     <div class="device-panel-action-text">
                         <div class="device-panel-action-title">${_('device_detail.action_connect_desktop')}</div>
                         <div class="device-panel-action-desc">${_('device_detail.action_connect_desktop_desc')}</div>
+                    </div>
+                </div>
+                <div class="device-panel-action-card" data-action="connect-web">
+                    <div class="device-panel-action-icon blue">
+                        <span class="material-icons">screen_share</span>
+                    </div>
+                    <div class="device-panel-action-text">
+                        <div class="device-panel-action-title">${_('device_detail.action_connect_web')}</div>
+                        <div class="device-panel-action-desc">${_('device_detail.action_connect_web_desc')}</div>
                     </div>
                 </div>
             </div>
@@ -695,7 +686,7 @@ const DeviceDetail = (function () {
         // Footer buttons
         panel.querySelector('#dp-close-btn')?.addEventListener('click', close);
         panel.querySelector('#dp-connect-btn')?.addEventListener('click', function () {
-            if (device) window.location.href = '/remote/' + encodeURIComponent(device.id);
+            if (device) window.open('/remote-desktop/' + encodeURIComponent(device.id), '_blank');
         });
 
         // Tabs
@@ -822,16 +813,12 @@ const DeviceDetail = (function () {
         if (!device) return;
 
         switch (action) {
-            case 'connect-web':
-                window.location.href = '/remote/' + encodeURIComponent(device.id);
-                break;
-
-            case 'connect-native-remote':
-                window.location.href = '/remote-desktop/' + encodeURIComponent(device.id);
-                break;
-
             case 'connect-desktop':
-                window.open('rustdesk://' + encodeURIComponent(device.id), '_blank');
+                window.open('betterdesk://' + encodeURIComponent(device.id), '_blank');
+                break;
+
+            case 'connect-web':
+                window.open('/remote-desktop/' + encodeURIComponent(device.id), '_blank');
                 break;
 
             case 'change-id':

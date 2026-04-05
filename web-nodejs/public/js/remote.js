@@ -1,6 +1,7 @@
 /**
- * BetterDesk Console - Remote Desktop Viewer Page Controller
- * Initializes RDClient and manages the viewer UI interactions
+ * BetterDesk Console - Remote Desktop Session Manager
+ * Multi-tab remote desktop viewer with shared toolbar
+ * Supports multiple concurrent RDClient sessions
  */
 
 /* global RDClient, RDVideo */
@@ -8,30 +9,51 @@
 (function () {
     'use strict';
 
-    // ---- DOM References ----
-    const viewerContainer = document.getElementById('viewer-container');
-    const canvas = document.getElementById('remote-canvas');
-    const connectionOverlay = document.getElementById('connection-overlay');
-    const passwordOverlay = document.getElementById('password-overlay');
-    const statusText = document.getElementById('status-text');
-    const overlayActions = document.getElementById('overlay-actions');
-    const passwordInput = document.getElementById('device-password');
-    const loginError = document.getElementById('login-error');
-    const toolbarStatus = document.getElementById('toolbar-status');
-    const toolbarStats = document.getElementById('toolbar-stats');
-    const toolbar = document.getElementById('viewer-toolbar');
+    // ---- Session storage ----
+    const sessions = new Map(); // deviceId → SessionInfo
+    let activeSessionId = null;
 
-    // Extract device ID from URL
-    const pathParts = window.location.pathname.split('/');
-    const deviceId = pathParts[pathParts.length - 1];
-
-    if (!deviceId) {
-        window.location.href = '/devices';
-        return;
+    /**
+     * Session info wrapper for a single remote connection
+     */
+    class SessionInfo {
+        constructor(deviceId, deviceName, panel) {
+            this.deviceId = deviceId;
+            this.deviceName = deviceName || '';
+            this.panel = panel;
+            this.canvas = panel.querySelector('.session-canvas');
+            this.connectionOverlay = panel.querySelector('.session-connection-overlay');
+            this.passwordOverlay = panel.querySelector('.session-password-overlay');
+            this.passwordInput = panel.querySelector('.session-password-input');
+            this.loginError = panel.querySelector('.session-login-error');
+            this.statusText = panel.querySelector('.session-status-text');
+            this.overlayActions = panel.querySelector('.session-overlay-actions');
+            this.chatPanel = panel.querySelector('.session-chat-panel');
+            this.chatMessages = panel.querySelector('.session-chat-messages');
+            this.chatInput = panel.querySelector('.session-chat-input');
+            this.filePanel = panel.querySelector('.session-file-panel');
+            this.fileList = panel.querySelector('.session-file-list');
+            this.filePathText = panel.querySelector('.session-file-path-text');
+            this.fileTransfersPanel = panel.querySelector('.session-file-transfers');
+            this.fileTransfersList = panel.querySelector('.session-file-transfers-list');
+            this.fileUploadInput = panel.querySelector('.session-file-upload-input');
+            this.client = null;
+            this.state = 'idle';
+            this.latency = 0;
+            this.lastStats = null;
+            this.audioMuted = false;
+            this.mediaRecorder = null;
+            this.recordedChunks = [];
+        }
     }
 
-    // ---- Client Instance ----
-    let client = null;
+    // ---- DOM References (shared) ----
+    const viewerContainer = document.getElementById('viewer-container');
+    const toolbar = document.getElementById('viewer-toolbar');
+    const toolbarStatus = document.getElementById('toolbar-status');
+    const toolbarStats = document.getElementById('toolbar-stats');
+    const toolbarDeviceId = document.getElementById('toolbar-device-id');
+    const tabBar = document.getElementById('session-tabs');
 
     // ---- Auto-hide toolbar ----
     let toolbarTimeout = null;
@@ -49,20 +71,21 @@
 
     function hideToolbar() {
         if (toolbarPinned) return;
-        if (client && client.state === 'streaming') {
+        if (document.querySelector('.toolbar-dropdown-menu.open')) return;
+        const session = getActiveSession();
+        if (session && session.state === 'streaming') {
             toolbar.classList.remove('visible');
             toolbarVisible = false;
         }
     }
 
-    // Show toolbar on mouse move near top
-    viewerContainer.addEventListener('mousemove', (e) => {
-        if (e.clientY < 60 || toolbarVisible) {
+    document.body.addEventListener('mousemove', (e) => {
+        // Show toolbar when mouse near top (below tab bar)
+        if (e.clientY < 80 || toolbarVisible) {
             showToolbar();
         }
     });
 
-    // Always show toolbar when not streaming
     function setToolbarAutoHide(enable) {
         if (enable) {
             showToolbar();
@@ -73,65 +96,606 @@
         }
     }
 
-    // ---- Initialize ----
+    // ---- Tab Bar ----
 
-    async function init() {
-        // Show warning if WebCodecs not available (requires HTTPS or localhost)
-        if (!RDVideo.isSupported()) {
-            const isInsecure = window.location.protocol === 'http:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
-            if (isInsecure) {
-                console.warn('[Remote] WebCodecs unavailable: insecure context (HTTP). Video will use software fallback.');
-            } else {
-                console.warn('[Remote] WebCodecs unavailable. Video will use software fallback.');
-            }
+    function createTab(deviceId, deviceName) {
+        const tab = document.createElement('div');
+        tab.className = 'session-tab';
+        tab.dataset.sessionId = CSS.escape(deviceId);
+
+        const dot = document.createElement('span');
+        dot.className = 'session-tab-dot';
+        tab.appendChild(dot);
+
+        const label = document.createElement('span');
+        label.className = 'session-tab-label';
+        label.textContent = deviceName || deviceId;
+        label.title = deviceId;
+        tab.appendChild(label);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'session-tab-close';
+        closeBtn.innerHTML = '<span class="material-icons" style="font-size:14px">close</span>';
+        closeBtn.title = _('actions.close');
+        closeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closeSession(deviceId);
+        });
+        tab.appendChild(closeBtn);
+
+        tab.addEventListener('click', () => switchSession(deviceId));
+        tabBar.appendChild(tab);
+    }
+
+    function updateTabState(deviceId, state) {
+        const tab = findTab(deviceId);
+        if (!tab) return;
+        const dot = tab.querySelector('.session-tab-dot');
+        if (!dot) return;
+        dot.className = 'session-tab-dot';
+        switch (state) {
+        case 'streaming': dot.classList.add('dot-online'); break;
+        case 'connecting':
+        case 'authenticating':
+        case 'waiting_password': dot.classList.add('dot-connecting'); break;
+        case 'error': dot.classList.add('dot-error'); break;
+        default: dot.classList.add('dot-offline'); break;
+        }
+    }
+
+    function setActiveTab(deviceId) {
+        tabBar.querySelectorAll('.session-tab').forEach(t => t.classList.remove('active'));
+        const tab = findTab(deviceId);
+        if (tab) tab.classList.add('active');
+    }
+
+    function findTab(deviceId) {
+        return tabBar.querySelector('[data-session-id="' + CSS.escape(deviceId) + '"]');
+    }
+
+    // ---- Session Lifecycle ----
+
+    function createSession(deviceId, deviceName) {
+        if (sessions.has(deviceId)) {
+            switchSession(deviceId);
+            return;
         }
 
-        // Create client instance
-        client = new RDClient(canvas, {
+        // Clone template
+        const template = document.getElementById('session-panel-template');
+        const panel = template.content.firstElementChild.cloneNode(true);
+
+        // Fill device labels
+        panel.querySelector('.session-device-label').textContent = deviceId;
+        panel.querySelector('.session-device-name').textContent = deviceName || '';
+        panel.querySelector('.session-password-label').textContent =
+            (_('remote.enter_password_for') || 'Enter password for') + ' ' + deviceId;
+
+        viewerContainer.appendChild(panel);
+
+        const session = new SessionInfo(deviceId, deviceName, panel);
+
+        // Show HTTP / WebCodecs warning once
+        if (!RDVideo.isSupported()) {
+            const isInsecure = window.location.protocol === 'http:' &&
+                window.location.hostname !== 'localhost' &&
+                window.location.hostname !== '127.0.0.1';
+            if (isInsecure) showHttpWarningBanner();
+        }
+
+        // Create RDClient
+        session.client = new RDClient(session.canvas, {
             deviceId: deviceId,
             serverPubKey: window.BetterDesk.serverPubKey || '',
             scaleMode: 'fit',
             fps: 60,
+            imageQuality: 'Best',
             disableAudio: false
         });
 
-        // Wire up events
-        client.on('state', handleStateChange);
-        client.on('log', handleLog);
-        client.on('error', handleError);
-        client.on('disconnected', handleDisconnected);
-        client.on('password_required', showPasswordPrompt);
-        client.on('login_error', handleLoginError);
-        client.on('login_success', handleLoginSuccess);
-        client.on('session_start', handleSessionStart);
-        client.on('stats', updateStats);
-        client.on('latency', updateLatency);
+        wireSessionEvents(session);
+        wireSessionDomEvents(session);
+        wireFileTransferEvents(session);
+        sessions.set(deviceId, session);
+        createTab(deviceId, deviceName);
+        switchSession(deviceId);
 
-        // Chat messages from remote
-        client.on('chat', (text) => addChatMessage(text, 'received'));
-
-        // Handle window resize
-        window.addEventListener('resize', () => {
-            if (client && client.renderer) {
-                client.renderer.resize();
-            }
+        session.client.renderer.resize();
+        session.client.connect().catch(err => {
+            setSessionStatus(session, 'error', err.message);
+            showSessionActions(session);
         });
+    }
 
-        // Initial canvas resize
-        client.renderer.resize();
+    function switchSession(deviceId) {
+        if (!sessions.has(deviceId)) return;
+        activeSessionId = deviceId;
+        const session = sessions.get(deviceId);
 
-        // Start connection
-        try {
-            await client.connect();
-        } catch (err) {
-            setStatus('error', err.message);
-            showOverlayActions();
+        // Hide all, show active
+        viewerContainer.querySelectorAll('.session-panel').forEach(p => {
+            p.style.display = 'none';
+        });
+        session.panel.style.display = '';
+
+        setActiveTab(deviceId);
+        toolbarDeviceId.textContent = deviceId;
+
+        // Sync toolbar state
+        syncToolbarToSession(session);
+
+        if (session.state === 'streaming') {
+            session.canvas.focus();
+            session.client.renderer.resize();
+            setToolbarAutoHide(true);
+        } else {
+            setToolbarAutoHide(false);
         }
     }
 
-    // ---- Event Handlers ----
+    function closeSession(deviceId) {
+        const session = sessions.get(deviceId);
+        if (!session) return;
 
-    function handleStateChange(state, prev) {
+        if (session.client) session.client.disconnect();
+        if (session.mediaRecorder && session.mediaRecorder.state === 'recording') {
+            session.mediaRecorder.stop();
+        }
+
+        session.panel.remove();
+        const tab = findTab(deviceId);
+        if (tab) tab.remove();
+        sessions.delete(deviceId);
+
+        if (activeSessionId === deviceId) {
+            activeSessionId = null;
+            if (sessions.size > 0) {
+                switchSession(sessions.keys().next().value);
+            } else {
+                window.location.href = '/devices';
+            }
+        }
+    }
+
+    function reconnectSession(session) {
+        if (session.client) session.client.disconnect();
+        session.connectionOverlay.style.display = 'flex';
+        session.passwordOverlay.style.display = 'none';
+        session.overlayActions.style.display = 'none';
+        const spinner = session.connectionOverlay.querySelector('.spinner');
+        if (spinner) spinner.style.display = 'block';
+        session.statusText.textContent = _('remote.connecting');
+
+        session.client = new RDClient(session.canvas, {
+            deviceId: session.deviceId,
+            serverPubKey: window.BetterDesk.serverPubKey || '',
+            scaleMode: 'fit',
+            fps: 60,
+            imageQuality: 'Best',
+            disableAudio: false
+        });
+        wireSessionEvents(session);
+        wireFileTransferEvents(session);
+        session.client.renderer.resize();
+        session.client.connect().catch(err => {
+            setSessionStatus(session, 'error', err.message);
+            showSessionActions(session);
+        });
+    }
+
+    function getActiveSession() {
+        return activeSessionId ? sessions.get(activeSessionId) : null;
+    }
+
+    // ---- Wire session events ----
+
+    function wireSessionEvents(session) {
+        const c = session.client;
+
+        c.on('state', (state) => {
+            session.state = state;
+            updateTabState(session.deviceId, state);
+            if (isActive(session)) syncToolbarToSession(session);
+            handleSessionState(session, state);
+        });
+
+        c.on('log', (msg) => {
+            if (isActive(session) && (session.state === 'connecting' || session.state === 'authenticating')) {
+                session.statusText.textContent = msg;
+            }
+        });
+
+        c.on('error', (msg) => {
+            setSessionStatus(session, 'error', msg);
+            showSessionActions(session);
+            if (isActive(session)) setToolbarAutoHide(false);
+        });
+
+        c.on('disconnected', (reason) => {
+            setSessionStatus(session, 'info', reason || _('remote.disconnected'));
+            showSessionActions(session);
+            if (isActive(session)) setToolbarAutoHide(false);
+        });
+
+        c.on('password_required', () => {
+            session.connectionOverlay.style.display = 'none';
+            session.passwordOverlay.style.display = 'flex';
+            session.loginError.style.display = 'none';
+            session.passwordInput.value = '';
+            if (isActive(session)) session.passwordInput.focus();
+        });
+
+        c.on('login_error', (error) => {
+            session.loginError.textContent = error;
+            session.loginError.style.display = 'block';
+            session.passwordInput.value = '';
+            if (isActive(session)) session.passwordInput.focus();
+        });
+
+        c.on('login_success', () => {
+            session.passwordOverlay.style.display = 'none';
+            session.passwordInput.blur();
+        });
+
+        c.on('session_start', () => {
+            session.connectionOverlay.style.display = 'none';
+            session.passwordOverlay.style.display = 'none';
+            session.client.renderer.resize();
+            if (isActive(session)) {
+                session.canvas.focus();
+                setToolbarAutoHide(true);
+            }
+            if (session.client.video) {
+                session.client.video.onAutoplayBlocked = () => {
+                    if (isActive(session)) showAutoplayOverlay(session);
+                };
+            }
+        });
+
+        c.on('stats', (stats) => {
+            session.lastStats = stats;
+            if (isActive(session)) updateStats(stats, session.latency);
+        });
+
+        c.on('latency', (rtt) => { session.latency = rtt; });
+
+        c.on('chat', (text) => addChatMessage(session, text, 'received'));
+
+        // Security events: show warnings for E2E encryption issues
+        c.on('signature_warning', (msg) => {
+            console.warn('[Remote] Signature warning:', msg);
+            showSecurityWarning(session, msg, 'warning');
+        });
+        c.on('encryption_warning', (msg) => {
+            console.warn('[Remote] Encryption warning:', msg);
+            showSecurityWarning(session, msg, 'error');
+        });
+    }
+
+    /**
+     * Show a security warning banner in the session panel
+     */
+    function showSecurityWarning(session, message, level) {
+        let banner = session.panel.querySelector('.security-warning-banner');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.className = 'security-warning-banner security-' + level;
+            banner.innerHTML = '<span class="material-icons">'
+                + (level === 'error' ? 'lock_open' : 'warning')
+                + '</span> <span class="security-warning-text"></span>'
+                + '<button class="security-warning-dismiss" title="Dismiss">&times;</button>';
+            banner.querySelector('.security-warning-dismiss').addEventListener('click', () => banner.remove());
+            session.panel.appendChild(banner);
+        }
+        banner.querySelector('.security-warning-text').textContent = message;
+    }
+
+    function wireSessionDomEvents(session) {
+        session.panel.querySelector('.session-btn-reconnect')
+            ?.addEventListener('click', () => reconnectSession(session));
+
+        session.panel.querySelector('.session-btn-authenticate')
+            ?.addEventListener('click', () => {
+                const pw = session.passwordInput.value;
+                if (!pw) { session.passwordInput.focus(); return; }
+                if (session.client) session.client.authenticate(pw);
+            });
+
+        session.passwordInput?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                session.panel.querySelector('.session-btn-authenticate')?.click();
+            }
+        });
+
+        session.panel.querySelector('.session-btn-chat-close')
+            ?.addEventListener('click', () => {
+                session.chatPanel.style.display = 'none';
+                document.getElementById('btn-chat')?.classList.remove('active');
+            });
+
+        session.panel.querySelector('.session-btn-chat-send')
+            ?.addEventListener('click', () => sendChat(session));
+
+        session.chatInput?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendChat(session);
+            e.stopPropagation();
+        });
+
+        // File transfer panel listeners
+        session.panel.querySelector('.session-file-btn-close')
+            ?.addEventListener('click', () => {
+                session.filePanel.style.display = 'none';
+                document.getElementById('btn-file-transfer')?.classList.remove('active');
+            });
+
+        session.panel.querySelector('.session-file-btn-up')
+            ?.addEventListener('click', () => {
+                if (session.client) session.client.fileTransfer.browseParent();
+            });
+
+        session.panel.querySelector('.session-file-btn-home')
+            ?.addEventListener('click', () => {
+                if (session.client) session.client.fileTransfer.browseDir('');
+            });
+
+        session.panel.querySelector('.session-file-btn-hidden')
+            ?.addEventListener('click', function () {
+                if (!session.client) return;
+                const ft = session.client.fileTransfer;
+                ft._showHidden = !ft._showHidden;
+                this.classList.toggle('active', ft._showHidden);
+                ft.browseDir(ft.currentPath);
+            });
+
+        session.panel.querySelector('.session-file-btn-newdir')
+            ?.addEventListener('click', () => {
+                if (!session.client) return;
+                const name = prompt(_('remote.file_new_folder_prompt') || 'Enter folder name:');
+                if (name && name.trim()) {
+                    const ft = session.client.fileTransfer;
+                    const sep = ft.currentPath.includes('\\') ? '\\' : '/';
+                    ft.createDir(ft.currentPath + sep + name.trim());
+                    setTimeout(() => ft.browseDir(ft.currentPath), 500);
+                }
+            });
+
+        session.panel.querySelector('.session-file-btn-upload')
+            ?.addEventListener('click', () => {
+                session.fileUploadInput?.click();
+            });
+
+        session.fileUploadInput?.addEventListener('change', (e) => {
+            if (!session.client || !e.target.files.length) return;
+            const ft = session.client.fileTransfer;
+            for (const file of e.target.files) {
+                ft.uploadFile(file, ft.currentPath);
+            }
+            e.target.value = '';
+        });
+    }
+
+    /**
+     * Wire file transfer events from RDClient to UI
+     */
+    function wireFileTransferEvents(session) {
+        const client = session.client;
+        if (!client) return;
+
+        client.on('file_dir', (data) => {
+            renderFileList(session, data.path, data.entries);
+        });
+
+        client.on('file_transfer_start', (data) => {
+            showTransferEntry(session, data);
+        });
+
+        client.on('file_transfer_progress', (data) => {
+            updateTransferProgress(session, data);
+        });
+
+        client.on('file_transfer_complete', (data) => {
+            completeTransferEntry(session, data);
+        });
+
+        client.on('file_transfer_error', (data) => {
+            errorTransferEntry(session, data);
+        });
+
+        client.on('file_transfer_cancelled', (data) => {
+            removeTransferEntry(session, data.id);
+        });
+    }
+
+    /**
+     * Render file list in file panel
+     */
+    function renderFileList(session, path, entries) {
+        session.filePathText.textContent = path || '/';
+        session.fileList.innerHTML = '';
+
+        if (!entries || entries.length === 0) {
+            session.fileList.innerHTML = '<div class="file-empty">' + (_('remote.file_empty') || 'No files') + '</div>';
+            return;
+        }
+
+        entries.forEach((entry) => {
+            const row = document.createElement('div');
+            row.className = 'file-entry' + (entry.isDir ? ' file-entry-dir' : '');
+            row.innerHTML =
+                '<span class="material-icons file-entry-icon">' + RDFileTransfer.getFileIcon(entry) + '</span>' +
+                '<span class="file-entry-name" title="' + escapeHtml(entry.name) + '">' + escapeHtml(entry.name) + '</span>' +
+                '<span class="file-entry-size">' + (entry.isDir ? '' : RDFileTransfer.formatSize(entry.size)) + '</span>' +
+                '<span class="file-entry-time">' + RDFileTransfer.formatTime(entry.modifiedTime) + '</span>' +
+                '<div class="file-entry-actions">' +
+                    (entry.isDir ? '' : '<button class="file-btn-icon file-btn-download" title="' + (_('remote.file_download') || 'Download') + '"><span class="material-icons">download</span></button>') +
+                    '<button class="file-btn-icon file-btn-rename" title="' + (_('remote.file_rename') || 'Rename') + '"><span class="material-icons">edit</span></button>' +
+                    '<button class="file-btn-icon file-btn-delete" title="' + (_('actions.delete') || 'Delete') + '"><span class="material-icons">delete</span></button>' +
+                '</div>';
+
+            // Double click / click on directory → navigate
+            if (entry.isDir) {
+                row.addEventListener('dblclick', () => {
+                    const ft = session.client?.fileTransfer;
+                    if (!ft) return;
+                    const sep = path.includes('\\') ? '\\' : '/';
+                    ft.browseDir(path + sep + entry.name);
+                });
+            }
+
+            // Download button
+            row.querySelector('.file-btn-download')?.addEventListener('click', (e) => {
+                e.stopPropagation();
+                session.client?.fileTransfer?.downloadFile(path, entry);
+            });
+
+            // Rename button
+            row.querySelector('.file-btn-rename')?.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const newName = prompt(_('remote.file_rename_prompt') || 'New name:', entry.name);
+                if (newName && newName.trim() && newName !== entry.name) {
+                    const ft = session.client?.fileTransfer;
+                    if (!ft) return;
+                    const sep = path.includes('\\') ? '\\' : '/';
+                    ft.rename(path + sep + entry.name, newName.trim());
+                    setTimeout(() => ft.browseDir(ft.currentPath), 500);
+                }
+            });
+
+            // Delete button
+            row.querySelector('.file-btn-delete')?.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (!confirm((_('remote.file_delete_confirm') || 'Delete') + ' "' + entry.name + '"?')) return;
+                const ft = session.client?.fileTransfer;
+                if (!ft) return;
+                const sep = path.includes('\\') ? '\\' : '/';
+                const fullPath = path + sep + entry.name;
+                if (entry.isDir) {
+                    ft.removeDir(fullPath, true);
+                } else {
+                    ft.removeFile(fullPath);
+                }
+                setTimeout(() => ft.browseDir(ft.currentPath), 500);
+            });
+
+            session.fileList.appendChild(row);
+        });
+    }
+
+    function escapeHtml(text) {
+        const el = document.createElement('span');
+        el.textContent = text;
+        return el.innerHTML;
+    }
+
+    /**
+     * Show new transfer entry in transfers panel
+     */
+    function showTransferEntry(session, data) {
+        session.fileTransfersPanel.style.display = 'block';
+        const entry = document.createElement('div');
+        entry.className = 'file-transfer-entry';
+        entry.id = 'ft-' + data.id;
+        entry.innerHTML =
+            '<span class="material-icons file-transfer-icon">' + (data.type === 'download' ? 'download' : 'upload') + '</span>' +
+            '<div class="file-transfer-info">' +
+                '<div class="file-transfer-name">' + escapeHtml(data.fileName) + '</div>' +
+                '<div class="file-transfer-bar"><div class="file-transfer-bar-fill" style="width:0%"></div></div>' +
+                '<div class="file-transfer-status">0%</div>' +
+            '</div>' +
+            '<button class="file-btn-icon file-transfer-cancel" title="Cancel"><span class="material-icons">close</span></button>';
+
+        entry.querySelector('.file-transfer-cancel')?.addEventListener('click', () => {
+            session.client?.fileTransfer?.cancelTransfer(data.id);
+        });
+        session.fileTransfersList.appendChild(entry);
+    }
+
+    function updateTransferProgress(session, data) {
+        const entry = session.fileTransfersList.querySelector('#ft-' + data.id);
+        if (!entry) return;
+        const fill = entry.querySelector('.file-transfer-bar-fill');
+        const status = entry.querySelector('.file-transfer-status');
+        if (fill) fill.style.width = data.percent + '%';
+        if (status) status.textContent = data.percent + '% — ' + RDFileTransfer.formatSize(data.transferred) + ' / ' + RDFileTransfer.formatSize(data.fileSize);
+    }
+
+    function completeTransferEntry(session, data) {
+        const entry = session.fileTransfersList.querySelector('#ft-' + data.id);
+        if (!entry) return;
+        entry.classList.add('complete');
+        const status = entry.querySelector('.file-transfer-status');
+        if (status) status.textContent = (_('remote.file_complete') || 'Complete') + ' — ' + RDFileTransfer.formatSize(data.fileSize);
+        const cancel = entry.querySelector('.file-transfer-cancel');
+        if (cancel) cancel.style.display = 'none';
+        // Auto-remove after 5s
+        setTimeout(() => {
+            entry.remove();
+            if (!session.fileTransfersList.children.length) {
+                session.fileTransfersPanel.style.display = 'none';
+            }
+        }, 5000);
+    }
+
+    function errorTransferEntry(session, data) {
+        const entry = session.fileTransfersList.querySelector('#ft-' + data.id);
+        if (!entry) return;
+        entry.classList.add('error');
+        const status = entry.querySelector('.file-transfer-status');
+        if (status) status.textContent = (_('remote.file_error') || 'Error') + ': ' + data.error;
+        const cancel = entry.querySelector('.file-transfer-cancel');
+        if (cancel) cancel.style.display = 'none';
+    }
+
+    function removeTransferEntry(id) {
+        const el = document.querySelector('#ft-' + id);
+        if (el) el.remove();
+    }
+
+    // ---- Session state helpers ----
+
+    function isActive(session) {
+        return session.deviceId === activeSessionId;
+    }
+
+    function handleSessionState(session, state) {
+        switch (state) {
+        case 'connecting':
+            session.connectionOverlay.style.display = 'flex';
+            session.passwordOverlay.style.display = 'none';
+            setSessionStatus(session, 'loading', _('remote.connecting'));
+            if (isActive(session)) setToolbarAutoHide(false);
+            break;
+        case 'streaming':
+            session.connectionOverlay.style.display = 'none';
+            session.passwordOverlay.style.display = 'none';
+            session.panel.classList.add('streaming');
+            if (isActive(session)) setToolbarAutoHide(true);
+            break;
+        case 'disconnected':
+        case 'error':
+            session.panel.classList.remove('streaming');
+            session.connectionOverlay.style.display = 'flex';
+            setSessionStatus(session, state === 'error' ? 'error' : 'info',
+                state === 'error' ? _('remote.error') : _('remote.disconnected'));
+            showSessionActions(session);
+            if (isActive(session)) setToolbarAutoHide(false);
+            break;
+        }
+    }
+
+    function setSessionStatus(session, type, text) {
+        session.statusText.textContent = text;
+        const statusEl = session.connectionOverlay.querySelector('.overlay-status');
+        if (statusEl) statusEl.className = 'overlay-status ' + type;
+    }
+
+    function showSessionActions(session) {
+        session.overlayActions.style.display = 'flex';
+        const spinner = session.connectionOverlay.querySelector('.spinner');
+        if (spinner) spinner.style.display = 'none';
+    }
+
+    function syncToolbarToSession(session) {
         const stateLabels = {
             'idle': _('remote.status_idle'),
             'connecting': _('remote.connecting'),
@@ -141,354 +705,326 @@
             'disconnected': _('remote.disconnected'),
             'error': _('remote.error')
         };
+        toolbarStatus.textContent = stateLabels[session.state] || session.state;
 
-        const label = stateLabels[state] || state;
-        toolbarStatus.textContent = label;
+        if (session.lastStats) {
+            updateStats(session.lastStats, session.latency);
+        } else {
+            toolbarStats.textContent = '';
+        }
 
-        switch (state) {
-        case 'connecting':
-            showConnectionOverlay();
-            setStatus('loading', label);
-            setToolbarAutoHide(false);
-            break;
+        // Audio icon
+        const audioBtn = document.getElementById('btn-audio');
+        if (audioBtn) {
+            audioBtn.querySelector('.material-icons').textContent =
+                session.audioMuted ? 'volume_off' : 'volume_up';
+        }
 
-        case 'waiting_password':
-            // Handled by password_required event
-            break;
-
-        case 'authenticating':
-            setStatus('loading', label);
-            break;
-
-        case 'streaming':
-            hideOverlays();
-            viewerContainer.classList.add('streaming');
-            setToolbarAutoHide(true);
-            break;
-
-        case 'disconnected':
-        case 'error':
-            viewerContainer.classList.remove('streaming');
-            showConnectionOverlay();
-            setStatus(state === 'error' ? 'error' : 'info', label);
-            showOverlayActions();
-            setToolbarAutoHide(false);
-            break;
+        // Recording icon
+        const recBtn = document.getElementById('btn-record');
+        if (recBtn) {
+            recBtn.classList.toggle('recording',
+                session.mediaRecorder && session.mediaRecorder.state === 'recording');
         }
     }
 
-    function handleLog(message) {
-        console.log('[Remote]', message);
-        // Update status text with latest log
-        if (client && (client.state === 'connecting' || client.state === 'authenticating')) {
-            statusText.textContent = message;
-        }
-    }
+    // ---- Stats display ----
 
-    function handleError(message) {
-        console.error('[Remote]', message);
-        setStatus('error', message);
-        showOverlayActions();
-    }
-
-    function handleDisconnected(reason) {
-        setStatus('info', reason || _('remote.disconnected'));
-        showOverlayActions();
-        setToolbarAutoHide(false);
-    }
-
-    function showPasswordPrompt() {
-        connectionOverlay.style.display = 'none';
-        passwordOverlay.style.display = 'flex';
-        loginError.style.display = 'none';
-        passwordInput.value = '';
-        passwordInput.focus();
-    }
-
-    function handleLoginError(error) {
-        loginError.textContent = error;
-        loginError.style.display = 'block';
-        passwordInput.value = '';
-        passwordInput.focus();
-    }
-
-    function handleLoginSuccess() {
-        passwordOverlay.style.display = 'none';
-        // Remove focus from password input so keyboard events reach the canvas
-        passwordInput.blur();
-    }
-
-    function handleSessionStart() {
-        hideOverlays();
-        client.renderer.resize();
-
-        // Explicitly focus canvas so mouse/keyboard events are captured
-        canvas.focus();
-
-        // Wire up autoplay-blocked callback from video decoder (JMuxer fallback)
-        if (client.video) {
-            client.video.onAutoplayBlocked = () => {
-                showAutoplayOverlay();
-            };
-        }
-    }
-
-    // ---- Autoplay Blocked Overlay ----
-
-    function showAutoplayOverlay() {
-        let overlay = document.getElementById('autoplay-overlay');
-        if (!overlay) {
-            overlay = document.createElement('div');
-            overlay.id = 'autoplay-overlay';
-            overlay.className = 'viewer-overlay autoplay-overlay';
-            overlay.innerHTML = `
-                <div class="overlay-card autoplay-card">
-                    <div class="overlay-icon">
-                        <span class="material-icons">play_circle</span>
-                    </div>
-                    <h2 class="overlay-title">${_('remote.click_to_start') || 'Click to Start'}</h2>
-                    <p class="overlay-hint">${_('remote.autoplay_blocked') || 'Browser requires user interaction to start video and audio playback.'}</p>
-                    <button class="btn btn-primary btn-full" id="btn-autoplay-start">
-                        <span class="material-icons">play_arrow</span>
-                        ${_('remote.start_playback') || 'Start Playback'}
-                    </button>
-                </div>
-            `;
-            viewerContainer.appendChild(overlay);
-        }
-        overlay.style.display = 'flex';
-
-        const startBtn = document.getElementById('btn-autoplay-start');
-        if (startBtn) {
-            startBtn.addEventListener('click', () => {
-                overlay.style.display = 'none';
-                if (client && client.video) {
-                    client.video.retryPlay();
-                }
-                // Also try to resume audio context
-                if (client && client.audio && client.audio.audioCtx && client.audio.audioCtx.state === 'suspended') {
-                    client.audio.audioCtx.resume();
-                }
-            }, { once: true });
-        }
-
-        // Also allow clicking anywhere on the overlay
-        overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) {
-                overlay.style.display = 'none';
-                if (client && client.video) {
-                    client.video.retryPlay();
-                }
-                if (client && client.audio && client.audio.audioCtx && client.audio.audioCtx.state === 'suspended') {
-                    client.audio.audioCtx.resume();
-                }
-            }
-        }, { once: true });
-    }
-
-    let lastLatency = 0;
-    function updateLatency(rtt) {
-        lastLatency = rtt;
-    }
-
-    function updateStats(stats) {
+    function updateStats(stats, latency) {
         if (!stats) return;
         const parts = [];
-        // Show actual video FPS from peer (not renderer RAF rate)
         if (stats.video) {
             const fps = stats.video.videoFps || 0;
-            parts.push(`${fps} FPS`);
-            // Show total frames for diagnostics
-            if (stats.video.frameCount !== undefined) {
-                parts.push(`${stats.video.frameCount} frames`);
-            }
+            parts.push(fps + ' FPS');
+            if (stats.video.frameCount !== undefined) parts.push(stats.video.frameCount + ' frames');
         }
         if (stats.video && stats.video.displayWidth && stats.video.displayHeight) {
-            parts.push(`${stats.video.displayWidth}x${stats.video.displayHeight}`);
+            parts.push(stats.video.displayWidth + 'x' + stats.video.displayHeight);
         } else if (stats.renderer && stats.renderer.remoteWidth && stats.renderer.remoteHeight) {
-            parts.push(`${stats.renderer.remoteWidth}x${stats.renderer.remoteHeight}`);
+            parts.push(stats.renderer.remoteWidth + 'x' + stats.renderer.remoteHeight);
         }
-        if (lastLatency > 0) {
-            parts.push(`${lastLatency}ms`);
-        }
-        if (stats.video && stats.video.codec) {
-            parts.push(stats.video.codec.toUpperCase());
-        }
+        if (latency > 0) parts.push(latency + 'ms');
+        if (stats.video && stats.video.codec) parts.push(stats.video.codec.toUpperCase());
         toolbarStats.textContent = parts.join(' | ');
     }
 
-    // ---- UI Helpers ----
+    // ---- Autoplay blocked overlay ----
 
-    function showConnectionOverlay() {
-        connectionOverlay.style.display = 'flex';
-        passwordOverlay.style.display = 'none';
-        overlayActions.style.display = 'none';
+    function showAutoplayOverlay(session) {
+        let overlay = session.panel.querySelector('.autoplay-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.className = 'viewer-overlay autoplay-overlay';
+            overlay.innerHTML = `
+                <div class="overlay-card autoplay-card">
+                    <div class="overlay-icon"><span class="material-icons">play_circle</span></div>
+                    <h2 class="overlay-title">${_('remote.click_to_start') || 'Click to Start'}</h2>
+                    <p class="overlay-hint">${_('remote.autoplay_blocked') || 'Browser requires user interaction to start video and audio playback.'}</p>
+                    <button class="btn btn-primary btn-full autoplay-start-btn">
+                        <span class="material-icons">play_arrow</span>
+                        ${_('remote.start_playback') || 'Start Playback'}
+                    </button>
+                </div>`;
+            session.panel.appendChild(overlay);
+        }
+        overlay.style.display = 'flex';
+        const dismiss = () => {
+            overlay.style.display = 'none';
+            if (session.client && session.client.video) session.client.video.retryPlay();
+            if (session.client && session.client.audio && session.client.audio.audioCtx &&
+                session.client.audio.audioCtx.state === 'suspended') {
+                session.client.audio.audioCtx.resume();
+            }
+        };
+        overlay.querySelector('.autoplay-start-btn')?.addEventListener('click', dismiss, { once: true });
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) dismiss(); }, { once: true });
     }
 
-    function hideOverlays() {
-        connectionOverlay.style.display = 'none';
-        passwordOverlay.style.display = 'none';
+    // ---- Chat ----
+
+    function sendChat(session) {
+        const text = session.chatInput?.value?.trim();
+        if (!text || !session.client) return;
+        session.client.sendChat(text);
+        addChatMessage(session, text, 'sent');
+        session.chatInput.value = '';
     }
 
-    function showOverlayActions() {
-        overlayActions.style.display = 'flex';
-        const spinner = connectionOverlay.querySelector('.spinner');
-        if (spinner) spinner.style.display = 'none';
+    function addChatMessage(session, text, type) {
+        const div = document.createElement('div');
+        div.className = 'chat-msg ' + type;
+        div.textContent = text;
+        session.chatMessages?.appendChild(div);
+        if (session.chatMessages) session.chatMessages.scrollTop = session.chatMessages.scrollHeight;
     }
 
-    function setStatus(type, text) {
-        statusText.textContent = text;
-        const statusEl = document.getElementById('connection-status');
-        statusEl.className = 'overlay-status ' + type;
+    // ---- Shared Toolbar Handlers ----
+    // All toolbar buttons delegate to the active session's client
+
+    function withClient(fn) {
+        const session = getActiveSession();
+        if (session && session.client) fn(session.client, session);
     }
 
-    // ---- Toolbar Button Handlers ----
-
-    // Reconnect
-    document.getElementById('btn-reconnect')?.addEventListener('click', () => {
-        if (client) {
-            client.disconnect();
-        }
-        overlayActions.style.display = 'none';
-        const spinner = connectionOverlay.querySelector('.spinner');
-        if (spinner) spinner.style.display = 'block';
-        init();
-    });
-
-    // Authenticate
-    document.getElementById('btn-authenticate')?.addEventListener('click', () => {
-        const password = passwordInput.value;
-        if (!password) {
-            passwordInput.focus();
-            return;
-        }
-        if (client) {
-            client.authenticate(password);
-        }
-    });
-
-    // Password input enter key
-    passwordInput?.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            document.getElementById('btn-authenticate')?.click();
-        }
+    // Disconnect
+    document.getElementById('btn-disconnect')?.addEventListener('click', () => {
+        withClient(c => c.disconnect());
     });
 
     // Fullscreen
     document.getElementById('btn-fullscreen')?.addEventListener('click', () => {
-        if (client) {
-            client.toggleFullscreen(viewerContainer);
-        }
-    });
-
-    // Disconnect
-    document.getElementById('btn-disconnect')?.addEventListener('click', () => {
-        if (client) {
-            client.disconnect();
-        }
+        withClient(c => c.toggleFullscreen(viewerContainer));
     });
 
     // Audio toggle
-    let audioMuted = false;
     document.getElementById('btn-audio')?.addEventListener('click', function () {
-        audioMuted = !audioMuted;
-        if (client) {
-            client.setAudioMuted(audioMuted);
-        }
+        const session = getActiveSession();
+        if (!session) return;
+        session.audioMuted = !session.audioMuted;
+        if (session.client) session.client.setAudioMuted(session.audioMuted);
         this.querySelector('.material-icons').textContent =
-            audioMuted ? 'volume_off' : 'volume_up';
+            session.audioMuted ? 'volume_off' : 'volume_up';
     });
 
     // Ctrl+Alt+Del
     document.getElementById('btn-cad')?.addEventListener('click', () => {
-        if (client) client.sendCtrlAltDel();
+        withClient(c => c.sendCtrlAltDel());
+        closeAllDropdowns();
     });
 
     // Lock Screen
     document.getElementById('btn-lock')?.addEventListener('click', () => {
-        if (client) client.sendLockScreen();
+        withClient(c => c.sendLockScreen());
+        closeAllDropdowns();
     });
 
-    // Restart Remote Device
+    // Restart Remote
     document.getElementById('btn-restart-remote')?.addEventListener('click', () => {
-        if (client && confirm(_('remote.confirm_restart'))) {
-            client.sendRestartRemoteDevice();
-        }
+        withClient((c) => {
+            if (confirm(_('remote.confirm_restart'))) c.sendRestartRemoteDevice();
+        });
+        closeAllDropdowns();
     });
 
     // Refresh Screen
     document.getElementById('btn-refresh-screen')?.addEventListener('click', () => {
-        if (client) client.sendRefreshScreen();
+        withClient(c => c.sendRefreshScreen());
+        closeAllDropdowns();
     });
 
     // Clipboard Paste
     document.getElementById('btn-clipboard-paste')?.addEventListener('click', async () => {
-        if (!client) return;
+        const session = getActiveSession();
+        if (!session || !session.client) return;
         try {
             const text = await navigator.clipboard.readText();
-            if (text) client.sendClipboard(text);
-        } catch {
-            // Clipboard read permission denied
-        }
+            if (text) session.client.sendClipboard(text);
+        } catch { /* clipboard permission denied */ }
+        closeAllDropdowns();
     });
 
     // Block Input toggle
-    setupToggle('btn-block-input', (on) => { if (client) client.setBlockInput(on); });
+    setupToggle('btn-block-input', (on) => withClient(c => c.setBlockInput(on)));
 
-    // Image Quality items
+    // Quality items
     document.querySelectorAll('.quality-item').forEach(btn => {
         btn.addEventListener('click', function () {
-            const quality = this.dataset.quality;
-            if (client) client.setImageQuality(quality);
+            withClient(c => c.setImageQuality(this.dataset.quality));
             document.querySelectorAll('.quality-item').forEach(b => b.classList.remove('active'));
             this.classList.add('active');
+            closeAllDropdowns();
         });
     });
 
-    // Scale Mode items
+    // Scale items
     document.querySelectorAll('.scale-item').forEach(btn => {
         btn.addEventListener('click', function () {
-            const mode = this.dataset.scale;
-            if (client) client.setScaleMode(mode);
+            withClient(c => c.setScaleMode(this.dataset.scale));
             document.querySelectorAll('.scale-item').forEach(b => b.classList.remove('active'));
             this.classList.add('active');
+            closeAllDropdowns();
         });
     });
 
-    // Show Remote Cursor toggle
-    setupToggle('btn-show-cursor', (on) => { if (client) client.setShowRemoteCursor(on); });
+    // Toggle helpers
+    setupToggle('btn-show-cursor', (on) => withClient(c => c.setShowRemoteCursor(on)));
+    setupToggle('btn-lock-session', (on) => withClient(c => c.setLockAfterSession(on)));
+    setupToggle('btn-privacy-mode', (on) => withClient(c => c.setPrivacyMode(on)));
+    setupToggle('btn-disable-clipboard', (on) => withClient(c => c.setDisableClipboard(on)));
 
-    // Lock After Session toggle
-    setupToggle('btn-lock-session', (on) => { if (client) client.setLockAfterSession(on); });
-
-    // Privacy Mode toggle
-    setupToggle('btn-privacy-mode', (on) => { if (client) client.setPrivacyMode(on); });
-
-    // Disable Clipboard toggle
-    setupToggle('btn-disable-clipboard', (on) => { if (client) client.setDisableClipboard(on); });
-
-    // Actions dropdown
+    // Dropdown toggles
     document.getElementById('btn-actions')?.addEventListener('click', (e) => {
         e.stopPropagation();
         closeAllDropdowns('actions-menu');
         document.getElementById('actions-menu')?.classList.toggle('open');
     });
 
-    // Display dropdown
     document.getElementById('btn-display')?.addEventListener('click', (e) => {
         e.stopPropagation();
         closeAllDropdowns('display-menu');
         document.getElementById('display-menu')?.classList.toggle('open');
     });
 
-    /** Close all dropdowns except the one with given ID */
+    document.getElementById('btn-monitors')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeAllDropdowns('monitors-menu');
+        updateMonitorMenu();
+        document.getElementById('monitors-menu')?.classList.toggle('open');
+    });
+
+    function updateMonitorMenu() {
+        const session = getActiveSession();
+        if (!session || !session.client) return;
+        const monitors = session.client.getMonitors();
+        const menu = document.getElementById('monitors-menu');
+        if (!menu || monitors.length < 2) return;
+
+        const btn = document.getElementById('btn-monitors');
+        if (btn) btn.style.display = '';
+
+        const label = menu.querySelector('.dropdown-label');
+        menu.innerHTML = '';
+        if (label) menu.appendChild(label);
+
+        monitors.forEach(m => {
+            const item = document.createElement('button');
+            item.className = 'dropdown-item monitor-item';
+            item.dataset.idx = m.idx;
+            item.innerHTML = '<span class="material-icons">' +
+                (m.primary ? 'desktop_windows' : 'monitor') +
+                '</span> ' + escapeHtml(m.name) +
+                (m.width ? ' (' + m.width + '\u00d7' + m.height + ')' : '');
+            item.addEventListener('click', () => {
+                session.client.switchMonitor(m.idx);
+                menu.querySelectorAll('.monitor-item').forEach(i => i.classList.remove('active'));
+                item.classList.add('active');
+            });
+            menu.appendChild(item);
+        });
+    }
+
+    // Chat toggle
+    document.getElementById('btn-chat')?.addEventListener('click', function () {
+        const session = getActiveSession();
+        if (!session) return;
+        const isOpen = session.chatPanel.style.display !== 'none';
+        session.chatPanel.style.display = isOpen ? 'none' : 'flex';
+        this.classList.toggle('active', !isOpen);
+        if (!isOpen && session.chatInput) session.chatInput.focus();
+    });
+
+    // File transfer toggle
+    document.getElementById('btn-file-transfer')?.addEventListener('click', function () {
+        const session = getActiveSession();
+        if (!session) return;
+        const isOpen = session.filePanel.style.display !== 'none';
+        session.filePanel.style.display = isOpen ? 'none' : 'flex';
+        this.classList.toggle('active', !isOpen);
+        if (!isOpen && session.client) {
+            session.client.fileTransfer.browseDir('');
+        }
+    });
+
+    // Recording
+    document.getElementById('btn-record')?.addEventListener('click', function () {
+        const session = getActiveSession();
+        if (!session) return;
+
+        if (session.mediaRecorder && session.mediaRecorder.state === 'recording') {
+            session.mediaRecorder.stop();
+            this.classList.remove('recording');
+        } else {
+            try {
+                const stream = session.canvas.captureStream(30);
+                session.recordedChunks = [];
+                const mimeTypes = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+                let mimeType = '';
+                for (const mt of mimeTypes) {
+                    if (MediaRecorder.isTypeSupported(mt)) { mimeType = mt; break; }
+                }
+                session.mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+                session.mediaRecorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) session.recordedChunks.push(e.data);
+                };
+                session.mediaRecorder.onstop = () => {
+                    const blob = new Blob(session.recordedChunks, { type: mimeType || 'video/webm' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'betterdesk-' + session.deviceId + '-' + Date.now() + '.webm';
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    session.mediaRecorder = null;
+                };
+                session.mediaRecorder.start(1000);
+                this.classList.add('recording');
+            } catch (err) {
+                console.warn('[Remote] Recording not supported:', err);
+            }
+        }
+    });
+
+    // View Only toggle
+    document.getElementById('btn-viewonly')?.addEventListener('click', function () {
+        const isViewOnly = !this.classList.contains('active');
+        this.classList.toggle('active', isViewOnly);
+        withClient(c => c.setViewOnly(isViewOnly));
+    });
+
+    // Pin Toolbar toggle
+    document.getElementById('btn-pin')?.addEventListener('click', function () {
+        toolbarPinned = !toolbarPinned;
+        toolbar.classList.toggle('pinned', toolbarPinned);
+        this.classList.toggle('active', toolbarPinned);
+        if (toolbarPinned) clearTimeout(toolbarTimeout);
+    });
+
     function closeAllDropdowns(exceptId) {
         document.querySelectorAll('.toolbar-dropdown-menu.open').forEach(m => {
             if (m.id !== exceptId) m.classList.remove('open');
         });
     }
 
-    /** Setup toggle button helper */
     function setupToggle(btnId, onChange) {
         document.getElementById(btnId)?.addEventListener('click', function () {
             const active = this.dataset.active !== 'true';
@@ -497,128 +1033,87 @@
         });
     }
 
-    // View Only toggle
-    document.getElementById('btn-viewonly')?.addEventListener('click', function () {
-        const isViewOnly = !this.classList.contains('active');
-        this.classList.toggle('active', isViewOnly);
-        if (client) client.setViewOnly(isViewOnly);
-    });
-
-    // Pin Toolbar toggle
-    document.getElementById('btn-pin')?.addEventListener('click', function () {
-        toolbarPinned = !toolbarPinned;
-        toolbar.classList.toggle('pinned', toolbarPinned);
-        this.classList.toggle('active', toolbarPinned);
-        if (toolbarPinned) {
-            clearTimeout(toolbarTimeout);
-        }
-    });
-
-    // Recording
-    let mediaRecorder = null;
-    let recordedChunks = [];
-
-    document.getElementById('btn-record')?.addEventListener('click', function () {
-        if (mediaRecorder && mediaRecorder.state === 'recording') {
-            mediaRecorder.stop();
-            this.classList.remove('recording');
-        } else {
-            try {
-                const stream = canvas.captureStream(30);
-                recordedChunks = [];
-                const mimeTypes = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
-                let mimeType = '';
-                for (const mt of mimeTypes) {
-                    if (MediaRecorder.isTypeSupported(mt)) { mimeType = mt; break; }
-                }
-                mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-                mediaRecorder.ondataavailable = (e) => {
-                    if (e.data.size > 0) recordedChunks.push(e.data);
-                };
-                mediaRecorder.onstop = () => {
-                    const blob = new Blob(recordedChunks, { type: mimeType || 'video/webm' });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'betterdesk-recording-' + Date.now() + '.webm';
-                    a.click();
-                    URL.revokeObjectURL(url);
-                    mediaRecorder = null;
-                };
-                mediaRecorder.start(1000);
-                this.classList.add('recording');
-            } catch (err) {
-                console.warn('[Remote] Recording not supported:', err);
-            }
-        }
-    });
-
-    // Chat panel
-    const chatPanel = document.getElementById('chat-panel');
-    const chatMessages = document.getElementById('chat-messages');
-    const chatInput = document.getElementById('chat-input');
-
-    document.getElementById('btn-chat')?.addEventListener('click', function () {
-        const isOpen = chatPanel.style.display !== 'none';
-        chatPanel.style.display = isOpen ? 'none' : 'flex';
-        this.classList.toggle('active', !isOpen);
-        if (!isOpen && chatInput) chatInput.focus();
-    });
-
-    document.getElementById('btn-chat-close')?.addEventListener('click', () => {
-        chatPanel.style.display = 'none';
-        document.getElementById('btn-chat')?.classList.remove('active');
-    });
-
-    document.getElementById('btn-chat-send')?.addEventListener('click', sendChatMessage);
-
-    chatInput?.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') sendChatMessage();
-        e.stopPropagation(); // Don't forward to remote
-    });
-
-    function sendChatMessage() {
-        const text = chatInput?.value?.trim();
-        if (!text || !client) return;
-        client.sendChat(text);
-        addChatMessage(text, 'sent');
-        chatInput.value = '';
-    }
-
-    function addChatMessage(text, type) {
+    function escapeHtml(str) {
         const div = document.createElement('div');
-        div.className = 'chat-msg ' + type;
-        div.textContent = text;
-        chatMessages?.appendChild(div);
-        if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+        div.textContent = str || '';
+        return div.innerHTML;
     }
 
     // Close dropdowns on outside click
     document.addEventListener('click', (e) => {
         if (!e.target.closest('.toolbar-dropdown')) {
-            document.querySelectorAll('.toolbar-dropdown-menu.open').forEach(m => m.classList.remove('open'));
+            closeAllDropdowns();
         }
     });
 
-    // Fullscreen change handler
+    // Fullscreen handler
     document.addEventListener('fullscreenchange', () => {
         const icon = document.getElementById('btn-fullscreen')?.querySelector('.material-icons');
-        if (icon) {
-            icon.textContent = document.fullscreenElement ? 'fullscreen_exit' : 'fullscreen';
-        }
+        if (icon) icon.textContent = document.fullscreenElement ? 'fullscreen_exit' : 'fullscreen';
         setTimeout(() => {
-            if (client && client.renderer) client.renderer.resize();
+            const session = getActiveSession();
+            if (session && session.client && session.client.renderer) session.client.renderer.resize();
         }, 100);
     });
 
-    // Keyboard shortcut: Escape to show toolbar / exit fullscreen
+    // Escape to show toolbar
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && !document.fullscreenElement) {
-            showToolbar();
-        }
+        if (e.key === 'Escape' && !document.fullscreenElement) showToolbar();
     });
 
-    // ---- Global translation helper (if not available) ----
+    // Window resize
+    window.addEventListener('resize', () => {
+        const session = getActiveSession();
+        if (session && session.client && session.client.renderer) session.client.renderer.resize();
+    });
+
+    // ---- Add Session Dialog ----
+
+    const addOverlay = document.getElementById('add-session-overlay');
+    const newSessionInput = document.getElementById('new-session-id');
+
+    document.getElementById('btn-add-session')?.addEventListener('click', () => {
+        addOverlay.style.display = 'flex';
+        newSessionInput.value = '';
+        newSessionInput.focus();
+    });
+
+    document.getElementById('btn-cancel-new')?.addEventListener('click', () => {
+        addOverlay.style.display = 'none';
+    });
+
+    document.getElementById('btn-connect-new')?.addEventListener('click', () => {
+        const id = newSessionInput.value.trim();
+        if (!id || !/^[A-Za-z0-9_-]{3,32}$/.test(id)) {
+            newSessionInput.classList.add('error');
+            setTimeout(() => newSessionInput.classList.remove('error'), 1500);
+            return;
+        }
+        addOverlay.style.display = 'none';
+        createSession(id, '');
+    });
+
+    newSessionInput?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') document.getElementById('btn-connect-new')?.click();
+        if (e.key === 'Escape') addOverlay.style.display = 'none';
+    });
+
+    // ---- HTTP Warning Banner ----
+
+    let httpWarningShown = false;
+    function showHttpWarningBanner() {
+        if (httpWarningShown) return;
+        httpWarningShown = true;
+        const banner = document.createElement('div');
+        banner.className = 'http-warning-banner';
+        banner.innerHTML = '<span class="material-icons">warning</span> ' +
+            '<span>' + (_('remote.http_warning') || 'HTTP mode: limited to H.264 software decode (~15 FPS). Use HTTPS for full performance (WebCodecs, VP9, 60 FPS).') + '</span>' +
+            '<button class="http-warning-dismiss" title="Dismiss">&times;</button>';
+        document.body.appendChild(banner);
+        banner.querySelector('.http-warning-dismiss').addEventListener('click', () => banner.remove());
+    }
+
+    // ---- Translation helper fallback ----
     if (typeof window._ === 'undefined') {
         window._ = function (key) {
             const parts = key.split('.');
@@ -631,6 +1126,47 @@
         };
     }
 
-    // ---- Start ----
+    // ---- Initialize ----
+
+    function init() {
+        const deviceId = window.__initialDeviceId;
+        const deviceName = window.__initialDeviceName || '';
+        if (deviceId) {
+            createSession(deviceId, deviceName);
+        }
+
+        // Support opening additional sessions via URL hash: #add=DEVICE_ID
+        if (window.location.hash) {
+            const match = window.location.hash.match(/add=([A-Za-z0-9_-]+)/);
+            if (match && match[1] && match[1] !== deviceId) {
+                createSession(match[1], '');
+            }
+        }
+
+        // ---- BroadcastChannel for cross-tab session adding ----
+        // Devices page can send {type:'add-session', deviceId, deviceName}
+        // to add a new tab here without opening a new browser tab.
+        try {
+            const bc = new BroadcastChannel('betterdesk-remote');
+            bc.onmessage = (ev) => {
+                const msg = ev.data;
+                if (!msg || typeof msg !== 'object') return;
+                if (msg.type === 'add-session' && msg.deviceId) {
+                    // Validate deviceId format (alphanumeric, hyphens, underscores)
+                    if (!/^[A-Za-z0-9_-]+$/.test(msg.deviceId)) return;
+                    createSession(msg.deviceId, msg.deviceName || '');
+                    // Acknowledge so the sender knows we handled it
+                    bc.postMessage({ type: 'session-added', deviceId: msg.deviceId });
+                    // Bring this window to front
+                    window.focus();
+                } else if (msg.type === 'ping') {
+                    bc.postMessage({ type: 'pong' });
+                }
+            };
+        } catch (_) {
+            // BroadcastChannel not supported — cross-tab disabled
+        }
+    }
+
     init();
 })();

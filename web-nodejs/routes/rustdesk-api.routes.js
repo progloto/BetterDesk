@@ -393,9 +393,14 @@ router.get('/api/ab', async (req, res) => {
     if (!user) {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
-    const abRecord = await db.getAddressBook(user.id, 'legacy');
-    const abData = (abRecord && abRecord.data) ? String(abRecord.data) : '{}';
-    return res.json({ data: abData, licensed_devices: 0 });
+    try {
+        const abRecord = await db.getAddressBook(user.id, 'legacy');
+        const abData = (abRecord && abRecord.data) ? String(abRecord.data) : '{}';
+        return res.json({ data: abData, licensed_devices: 0 });
+    } catch (err) {
+        console.error('[API:AB] Error reading legacy address book:', err.message);
+        return res.json({ data: '{}', licensed_devices: 0 });
+    }
 });
 
 /**
@@ -415,8 +420,12 @@ router.post('/api/ab', async (req, res) => {
     const { data } = req.body || {};
     if (data !== undefined) {
         const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
-        await db.saveAddressBook(user.id, dataStr, 'legacy');
-        console.log(`[API:AB] Saved legacy address book for user ${user.username} (${dataStr.length} bytes)`);
+        try {
+            await db.saveAddressBook(user.id, dataStr, 'legacy');
+            console.log(`[API:AB] Saved legacy address book for user ${user.username} (${dataStr.length} bytes)`);
+        } catch (err) {
+            console.error('[API:AB] Error saving legacy address book:', err.message);
+        }
     }
     return res.json({});
 });
@@ -434,9 +443,14 @@ router.get('/api/ab/personal', async (req, res) => {
     if (!user) {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
-    const abRecord = await db.getAddressBook(user.id, 'personal');
-    const abData = (abRecord && abRecord.data) ? String(abRecord.data) : '{}';
-    return res.json({ data: abData });
+    try {
+        const abRecord = await db.getAddressBook(user.id, 'personal');
+        const abData = (abRecord && abRecord.data) ? String(abRecord.data) : '{}';
+        return res.json({ data: abData });
+    } catch (err) {
+        console.error('[API:AB] Error reading personal address book:', err.message);
+        return res.json({ data: '{}' });
+    }
 });
 
 /**
@@ -482,8 +496,12 @@ router.post('/api/ab/personal', async (req, res) => {
     const { data } = req.body || {};
     if (data !== undefined) {
         const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
-        await db.saveAddressBook(user.id, dataStr, 'personal');
-        console.log(`[API:AB] Saved personal address book for user ${user.username} (${dataStr.length} bytes)`);
+        try {
+            await db.saveAddressBook(user.id, dataStr, 'personal');
+            console.log(`[API:AB] Saved personal address book for user ${user.username} (${dataStr.length} bytes)`);
+        } catch (err) {
+            console.error('[API:AB] Error saving personal address book:', err.message);
+        }
     }
     return res.json({});
 });
@@ -501,8 +519,13 @@ router.get('/api/ab/tags', async (req, res) => {
     if (!user) {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
-    const tags = await db.getAddressBookTags(user.id);
-    return res.json({ data: tags });
+    try {
+        const tags = await db.getAddressBookTags(user.id);
+        return res.json({ data: tags });
+    } catch (err) {
+        console.error('[API:AB] Error reading address book tags:', err.message);
+        return res.json({ data: [] });
+    }
 });
 
 /**
@@ -548,6 +571,11 @@ router.get('/api/peers', async (req, res, next) => {
     const user = await authService.validateAccessToken(token);
     if (!user) {
         return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    // Pro users cannot see the device list — only their own address book
+    if (user.role === 'pro') {
+        return res.json({ data: [], total: 0 });
     }
 
     try {
@@ -610,6 +638,10 @@ router.get('/api/peers', async (req, res, next) => {
  */
 router.get('/api/device-group/accessible', requireAuth, async (req, res) => {
     try {
+        // Pro users cannot see device groups
+        if (req.authUser && req.authUser.role === 'pro') {
+            return res.json({ data: [], total: 0 });
+        }
         const groups = await db.getAllDeviceGroups();
         return res.json({
             data: groups.map(g => ({
@@ -633,6 +665,10 @@ router.get('/api/device-group/accessible', requireAuth, async (req, res) => {
  */
 router.get('/api/device-group', requireAuth, async (req, res) => {
     try {
+        // Pro users cannot see device groups
+        if (req.authUser && req.authUser.role === 'pro') {
+            return res.json({ data: [], total: 0 });
+        }
         const groups = await db.getAllDeviceGroups();
         return res.json({
             data: groups.map(g => ({
@@ -1081,8 +1117,20 @@ router.post('/api/audit/conn', async (req, res) => {
  * GET /api/audit/conn
  * Query connection audit events.
  * Query params: host_id, peer_id, action, limit, offset
+ * Supports both Bearer token (RustDesk client) and session cookie (panel).
  */
-router.get('/api/audit/conn', requireAuth, async (req, res) => {
+router.get('/api/audit/conn', async (req, res) => {
+    // Check Bearer token first, then session cookie
+    const token = extractBearerToken(req);
+    if (token) {
+        const user = await authService.validateAccessToken(token);
+        if (!user) return res.status(401).json({ error: 'Invalid or expired token' });
+        req.authUser = user;
+    } else if (req.session && req.session.userId) {
+        // Session-based panel auth — allowed
+    } else {
+        return res.status(401).json({ error: 'Authorization required' });
+    }
     try {
         const filters = {
             host_id: req.query.host_id || '',
@@ -1222,6 +1270,10 @@ router.get('/api/audit/alarm', requireAuth, async (req, res) => {
  */
 router.get('/api/user-groups', requireAuth, async (req, res) => {
     try {
+        // Pro users cannot see user groups
+        if (req.authUser && req.authUser.role === 'pro') {
+            return res.json({ data: [], total: 0 });
+        }
         const groups = await db.getAllUserGroups();
         return res.json({
             data: groups.map(g => ({

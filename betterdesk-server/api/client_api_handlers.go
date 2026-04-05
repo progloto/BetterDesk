@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -311,6 +312,8 @@ func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
 			return
 		}
+		// Merge admin-set tags from peers table into AB (#76 TAG sync)
+		data = s.mergeAdminTagsIntoAB(data)
 		writeJSON(w, http.StatusOK, map[string]any{"data": data, "licensed_devices": 0})
 
 	case http.MethodPost:
@@ -369,6 +372,8 @@ func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
 			return
 		}
+		// Merge admin-set tags from peers table into AB (#76 TAG sync)
+		data = s.mergeAdminTagsIntoAB(data)
 		writeJSON(w, http.StatusOK, map[string]any{"data": data})
 
 	case http.MethodPost:
@@ -406,6 +411,114 @@ func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.
 	}
 }
 
+// mergeAdminTagsIntoAB merges admin-set tags from the peers table into the
+// address book data.  For each peer in the AB that also exists in the peers
+// table with non-empty tags, the admin tags are added to the peer's tag list.
+// The global tags[] array is also extended with any new admin tags.
+// This implements TAG sync (Issue #76).
+func (s *Server) mergeAdminTagsIntoAB(data string) string {
+	if data == "" || data == "{}" {
+		return data
+	}
+
+	var ab struct {
+		Peers []map[string]any `json:"peers"`
+		Tags  []string         `json:"tags"`
+	}
+	if err := json.Unmarshal([]byte(data), &ab); err != nil || len(ab.Peers) == 0 {
+		return data
+	}
+
+	// Collect all peer IDs from the AB
+	ids := make([]string, 0, len(ab.Peers))
+	for _, p := range ab.Peers {
+		if id, ok := p["id"].(string); ok && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return data
+	}
+
+	// Build a map of peer_id → admin tags from the peers table
+	adminTags := make(map[string][]string)
+	for _, id := range ids {
+		peer, err := s.db.GetPeer(id)
+		if err != nil || peer == nil || peer.Tags == "" {
+			continue
+		}
+		tags := strings.Split(peer.Tags, ",")
+		cleaned := make([]string, 0, len(tags))
+		for _, t := range tags {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				cleaned = append(cleaned, t)
+			}
+		}
+		if len(cleaned) > 0 {
+			adminTags[id] = cleaned
+		}
+	}
+	if len(adminTags) == 0 {
+		return data
+	}
+
+	// Build a set of existing global tags
+	tagSet := make(map[string]bool)
+	for _, t := range ab.Tags {
+		tagSet[t] = true
+	}
+
+	// Merge admin tags into each peer's tag list
+	for i, p := range ab.Peers {
+		id, ok := p["id"].(string)
+		if !ok || id == "" {
+			continue
+		}
+		atags, ok := adminTags[id]
+		if !ok {
+			continue
+		}
+		// Get existing peer tags
+		existing := make(map[string]bool)
+		if arr, ok := p["tags"].([]any); ok {
+			for _, v := range arr {
+				if s, ok := v.(string); ok {
+					existing[s] = true
+				}
+			}
+		}
+		// Add admin tags that aren't already present
+		merged := make([]string, 0, len(existing)+len(atags))
+		if arr, ok := p["tags"].([]any); ok {
+			for _, v := range arr {
+				if s, ok := v.(string); ok {
+					merged = append(merged, s)
+				}
+			}
+		}
+		for _, t := range atags {
+			if !existing[t] {
+				merged = append(merged, t)
+				existing[t] = true
+			}
+			// Add to global tags if new
+			if !tagSet[t] {
+				ab.Tags = append(ab.Tags, t)
+				tagSet[t] = true
+			}
+		}
+		ab.Peers[i]["tags"] = merged
+	}
+
+	// Re-serialize
+	out, err := json.Marshal(&ab)
+	if err != nil {
+		return data
+	}
+	return string(out)
+}
+
 // handleClientAddressBookTags returns tags from the legacy address book.
 // GET /api/ab/tags
 func (s *Server) handleClientAddressBookTags(w http.ResponseWriter, r *http.Request) {
@@ -440,6 +553,13 @@ func (s *Server) handleClientAddressBookTags(w http.ResponseWriter, r *http.Requ
 //
 //	{ "modified_at": "2026-..." }                   (normal ACK)
 func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
+	// BD-2026-001: Rate-limit heartbeat requests per IP
+	clientIP := s.remoteIP(r)
+	if !s.heartbeatLimiter.Allow(clientIP) {
+		writeJSON(w, http.StatusOK, map[string]string{"modified_at": time.Now().UTC().Format(time.RFC3339)})
+		return
+	}
+
 	var body struct {
 		ID     string  `json:"id"`
 		UUID   string  `json:"uuid"`
@@ -474,7 +594,6 @@ func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update peer status to ONLINE
-	clientIP := s.remoteIP(r)
 	_ = s.db.UpdatePeerStatus(deviceID, "ONLINE", clientIP)
 
 	// Save metrics if any values provided (values > 0)
@@ -503,6 +622,13 @@ func (s *Server) handleClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 //
 //	"ID_NOT_FOUND" (client retries), or "ERROR".
 func (s *Server) handleClientSysinfo(w http.ResponseWriter, r *http.Request) {
+	// BD-2026-001: Rate-limit sysinfo requests per IP
+	if !s.heartbeatLimiter.Allow(s.remoteIP(r)) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("ID_NOT_FOUND")) //nolint:errcheck
+		return
+	}
+
 	var body struct {
 		ID       string `json:"id"`
 		UUID     string `json:"uuid"`
@@ -573,6 +699,13 @@ func (s *Server) handleClientSysinfo(w http.ResponseWriter, r *http.Request) {
 // POST /api/sysinfo_ver
 // Returns a hash of existing sysinfo; empty response triggers full upload.
 func (s *Server) handleClientSysinfoVer(w http.ResponseWriter, r *http.Request) {
+	// BD-2026-001: Rate-limit sysinfo_ver requests per IP
+	if !s.heartbeatLimiter.Allow(s.remoteIP(r)) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("")) //nolint:errcheck
+		return
+	}
+
 	var body struct {
 		ID   string `json:"id"`
 		UUID string `json:"uuid"`

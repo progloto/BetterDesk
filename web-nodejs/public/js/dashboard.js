@@ -5,24 +5,48 @@
 (function() {
     'use strict';
     
+    const _ = window._ || (k => k);
+    
     document.addEventListener('DOMContentLoaded', init);
     
     let refreshInterval = null;
     
+    // Tips pool — rotated daily
+    const TIPS = [
+        'dashboard.tip_desktop_mode',
+        'dashboard.tip_keyboard_shortcuts',
+        'dashboard.tip_address_book',
+        'dashboard.tip_2fa',
+        'dashboard.tip_bulk_actions',
+        'dashboard.tip_theme',
+        'dashboard.tip_cdap',
+        'dashboard.tip_tutorials'
+    ];
+    
     function init() {
+        renderGreeting();
+        renderTip();
         loadStats();
         loadServerStatus();
+        loadActivityFeed();
+        loadHealthOverview();
         
         // Auto-refresh every 30 seconds
         refreshInterval = setInterval(() => {
             loadStats();
             loadServerStatus();
+            loadHealthOverview();
         }, 30000);
+        
+        // Activity feed refresh every 60 seconds
+        setInterval(loadActivityFeed, 60000);
         
         // Manual refresh
         window.addEventListener('app:refresh', () => {
             loadStats();
             loadServerStatus();
+            loadActivityFeed();
+            loadHealthOverview();
         });
         
         // Refresh status button
@@ -30,10 +54,63 @@
             loadServerStatus();
         });
         
+        // Tip dismiss
+        document.getElementById('tip-dismiss')?.addEventListener('click', () => {
+            const tip = document.getElementById('welcome-tip');
+            if (tip) {
+                tip.style.display = 'none';
+                try { localStorage.setItem('bd_tip_dismissed', new Date().toDateString()); } catch {}
+            }
+        });
+        
         // Cleanup on page leave
         window.addEventListener('beforeunload', () => {
             if (refreshInterval) clearInterval(refreshInterval);
         });
+    }
+    
+    /**
+     * Render time-based personalized greeting
+     */
+    function renderGreeting() {
+        const el = document.getElementById('welcome-greeting-text');
+        if (!el) return;
+        
+        const hour = new Date().getHours();
+        let greetingKey;
+        if (hour < 6) greetingKey = 'dashboard.greeting_night';
+        else if (hour < 12) greetingKey = 'dashboard.greeting_morning';
+        else if (hour < 18) greetingKey = 'dashboard.greeting_afternoon';
+        else greetingKey = 'dashboard.greeting_evening';
+        
+        // Get username from global config
+        const username = window.BetterDesk?.user?.username || 'Admin';
+        
+        const greeting = _(greetingKey);
+        el.textContent = greeting.replace('{name}', username);
+    }
+    
+    /**
+     * Show tip of the day
+     */
+    function renderTip() {
+        const tipEl = document.getElementById('welcome-tip');
+        const textEl = document.getElementById('tip-text');
+        if (!tipEl || !textEl) return;
+        
+        // Hide if already dismissed today
+        try {
+            if (localStorage.getItem('bd_tip_dismissed') === new Date().toDateString()) {
+                tipEl.style.display = 'none';
+                return;
+            }
+        } catch {}
+        
+        // Pick tip based on day of year
+        const now = new Date();
+        const dayOfYear = Math.floor((now - new Date(now.getFullYear(), 0, 0)) / 86400000);
+        const tip = TIPS[dayOfYear % TIPS.length];
+        textEl.textContent = _(tip);
     }
     
     /**
@@ -158,6 +235,112 @@
             element.classList.add('unknown');
             statusText.textContent = _('status.unknown');
         }
+    }
+    
+    /**
+     * Load activity feed from audit log
+     */
+    async function loadActivityFeed() {
+        const container = document.getElementById('activity-feed');
+        if (!container) return;
+        
+        try {
+            const data = await Utils.api('/api/dashboard/activity');
+            const events = data.events || data.data?.events || [];
+            
+            if (events.length === 0) {
+                container.innerHTML = `<div class="activity-empty">${_('dashboard.no_recent_activity')}</div>`;
+                return;
+            }
+            
+            container.innerHTML = events.slice(0, 10).map(ev => {
+                const iconMap = {
+                    'conn_start': { icon: 'link', cls: 'connect' },
+                    'conn_end': { icon: 'link_off', cls: 'disconnect' },
+                    'login': { icon: 'login', cls: 'login' },
+                    'login_failed': { icon: 'error', cls: 'ban' },
+                    'ban': { icon: 'block', cls: 'ban' },
+                    'unban': { icon: 'check_circle', cls: 'unban' },
+                    'file_transfer': { icon: 'upload_file', cls: 'file' },
+                    'alarm': { icon: 'warning', cls: 'alert' }
+                };
+                const info = iconMap[ev.action] || { icon: 'info', cls: 'connect' };
+                const timeAgo = formatTimeAgo(ev.timestamp || ev.created_at);
+                const detail = ev.device_id || ev.peer_id || ev.details || '';
+                
+                return `<div class="activity-item stagger-item">
+                    <div class="activity-icon ${info.cls}">
+                        <span class="material-icons">${info.icon}</span>
+                    </div>
+                    <div class="activity-content">
+                        <div class="activity-text">${escapeHtml(ev.action_label || ev.action)}${detail ? ' — <strong>' + escapeHtml(String(detail)) + '</strong>' : ''}</div>
+                        <div class="activity-time">${timeAgo}</div>
+                    </div>
+                </div>`;
+            }).join('');
+        } catch (err) {
+            console.error('Activity feed error:', err);
+            container.innerHTML = `<div class="activity-empty">${_('dashboard.no_recent_activity')}</div>`;
+        }
+    }
+    
+    /**
+     * Load health overview data
+     */
+    async function loadHealthOverview() {
+        try {
+            const data = await Utils.api('/api/stats');
+            const stats = data.devices || data.data?.devices || data;
+            
+            setText('health-online', stats.online ?? 0);
+            setText('health-alerts', stats.banned ?? 0);
+            setText('health-connections', stats.total ?? 0);
+            
+            // Server uptime from status
+            try {
+                const status = await Utils.api('/api/server/status');
+                const uptime = status.uptime || status.data?.uptime;
+                setText('health-uptime', uptime ? formatUptime(uptime) : '-');
+            } catch {
+                setText('health-uptime', '-');
+            }
+        } catch (err) {
+            console.error('Health overview error:', err);
+        }
+    }
+    
+    function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    }
+    
+    function formatUptime(seconds) {
+        if (typeof seconds !== 'number') return String(seconds);
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (d > 0) return `${d}d ${h}h`;
+        if (h > 0) return `${h}h ${m}m`;
+        return `${m}m`;
+    }
+    
+    function formatTimeAgo(timestamp) {
+        if (!timestamp) return '';
+        const diff = Date.now() - new Date(timestamp).getTime();
+        const secs = Math.floor(diff / 1000);
+        if (secs < 60) return _('dashboard.just_now');
+        const mins = Math.floor(secs / 60);
+        if (mins < 60) return `${mins}m ${_('dashboard.ago')}`;
+        const hours = Math.floor(mins / 60);
+        if (hours < 24) return `${hours}h ${_('dashboard.ago')}`;
+        const days = Math.floor(hours / 24);
+        return `${days}d ${_('dashboard.ago')}`;
+    }
+    
+    function escapeHtml(str) {
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
     }
     
 })();

@@ -1,85 +1,349 @@
-<!-- Sidebar Navigation -->
-<aside class="sidebar" id="sidebar">
-    <!-- Sidebar Header -->
-    <div class="sidebar-header">
-        <a href="/" class="sidebar-logo">
-            <% if (branding.logoType === 'svg' && branding.logoSvg) { %>
-            <span class="sidebar-logo-svg"><%- branding.logoSvg %></span>
-            <% } else if (branding.logoType === 'image' && branding.logoUrl) { %>
-            <img src="<%= branding.logoUrl %>" alt="<%= appName %>" class="sidebar-logo-img">
+<!-- Sidebar Navigation — TeamViewer-style icon rail + flyout -->
+<aside class="sidebar" id="sidebar" data-collapsed="true">
+    <!-- Icon rail (always visible) -->
+    <div class="sidebar-rail">
+        <!-- Logo -->
+        <div class="sidebar-rail-logo">
+            <a href="/" class="sidebar-logo" title="<%= appName %>">
+                <% if (branding.logoType === 'svg' && branding.logoSvg) { %>
+                <span class="sidebar-logo-svg"><%- branding.logoSvg %></span>
+                <% } else if (branding.logoType === 'image' && branding.logoUrl) { %>
+                <img src="<%= branding.logoUrl %>" alt="<%= appName %>" class="sidebar-logo-img">
+                <% } else { %>
+                <span class="material-icons"><%= branding.logoIcon || 'dns' %></span>
+                <% } %>
+            </a>
+        </div>
+
+        <!-- Category icons -->
+        <nav class="sidebar-rail-nav">
+            <button class="sidebar-rail-btn <%= ['dashboard','devices','registrations'].includes(currentPage) ? 'active' : '' %>"
+                    data-category="main" title="<%= _('nav.main') %>">
+                <span class="material-icons">home</span>
+            </button>
+            <button class="sidebar-rail-btn <%= ['inventory','tickets','help-requests','automation','network','activity','cdap','chat'].includes(currentPage) ? 'active' : '' %>"
+                    data-category="management" title="<%= _('nav.management') || 'Management' %>">
+                <span class="material-icons">business_center</span>
+            </button>
+            <button class="sidebar-rail-btn <%= ['reports','keys','generator','remote','cdap-studio'].includes(currentPage) ? 'active' : '' %>"
+                    data-category="tools" title="<%= _('nav.tools') %>">
+                <span class="material-icons">build</span>
+            </button>
+            <% if (user && user.role === 'admin') { %>
+            <button class="sidebar-rail-btn <%= ['tokens','organizations','policies','attestation','dataguard','users','settings'].includes(currentPage) ? 'active' : '' %>"
+                    data-category="system" title="<%= _('nav.system') %>">
+                <span class="material-icons">admin_panel_settings</span>
+            </button>
             <% } else { %>
-            <span class="material-icons"><%= branding.logoIcon || 'dns' %></span>
-            <span class="sidebar-logo-text"><%= appName %></span>
+            <button class="sidebar-rail-btn <%= currentPage === 'settings' ? 'active' : '' %>"
+                    data-category="system" title="<%= _('nav.system') %>">
+                <span class="material-icons">settings</span>
+            </button>
             <% } %>
-        </a>
+        </nav>
+
+        <!-- Bottom rail icons -->
+        <div class="sidebar-rail-bottom">
+            <button class="sidebar-rail-btn" id="sidebar-help-btn" title="<%= _('nav.help') || 'Help' %>">
+                <span class="material-icons">help_outline</span>
+            </button>
+            <button class="sidebar-rail-btn" id="sidebar-expand-btn" title="<%= _('nav.expand_sidebar') || 'Expand' %>">
+                <span class="material-icons">chevron_right</span>
+            </button>
+        </div>
     </div>
-    
-    <!-- Navigation -->
-    <nav class="sidebar-nav">
-        <!-- Main Section -->
-        <div class="sidebar-section">
-            <div class="sidebar-section-title"><%= _('nav.main') %></div>
-            
+
+    <!-- Flyout panel (shows on category click/hover) -->
+    <div class="sidebar-flyout" id="sidebar-flyout">
+        <div class="sidebar-flyout-header">
+            <span class="sidebar-flyout-title" id="sidebar-flyout-title"></span>
+            <span class="sidebar-logo-text"><%= appName %></span>
+        </div>
+
+        <!-- Main category links -->
+        <div class="sidebar-flyout-panel" data-panel="main">
             <a href="/" class="sidebar-link <%= currentPage === 'dashboard' ? 'active' : '' %>">
                 <span class="material-icons">dashboard</span>
                 <span class="sidebar-link-text"><%= _('nav.dashboard') %></span>
             </a>
-            
             <a href="/devices" class="sidebar-link <%= currentPage === 'devices' ? 'active' : '' %>">
                 <span class="material-icons">devices</span>
                 <span class="sidebar-link-text"><%= _('nav.devices') %></span>
             </a>
-            
             <a href="/registrations" class="sidebar-link <%= currentPage === 'registrations' ? 'active' : '' %>">
                 <span class="material-icons">how_to_reg</span>
                 <span class="sidebar-link-text"><%= _('nav.registrations') %></span>
                 <span class="badge-sidebar" id="reg-sidebar-badge" style="display: none;">0</span>
             </a>
         </div>
-        
-        <!-- Tools Section -->
-        <div class="sidebar-section">
-            <div class="sidebar-section-title"><%= _('nav.tools') %></div>
-            
+
+        <!-- Management category links -->
+        <div class="sidebar-flyout-panel" data-panel="management">
+            <a href="/inventory" class="sidebar-link <%= currentPage === 'inventory' ? 'active' : '' %>">
+                <span class="material-icons">inventory_2</span>
+                <span class="sidebar-link-text"><%= _('nav.inventory') %></span>
+            </a>
+            <a href="/tickets" class="sidebar-link <%= currentPage === 'tickets' ? 'active' : '' %>">
+                <span class="material-icons">confirmation_number</span>
+                <span class="sidebar-link-text"><%= _('nav.tickets') %></span>
+            </a>
+            <a href="/help-requests" class="sidebar-link <%= currentPage === 'help-requests' ? 'active' : '' %>">
+                <span class="material-icons">support_agent</span>
+                <span class="sidebar-link-text"><%= _('nav.help_requests') %></span>
+            </a>
+            <a href="/automation" class="sidebar-link <%= currentPage === 'automation' ? 'active' : '' %>">
+                <span class="material-icons">smart_toy</span>
+                <span class="sidebar-link-text"><%= _('nav.automation') %></span>
+            </a>
+            <a href="/network" class="sidebar-link <%= currentPage === 'network' ? 'active' : '' %>">
+                <span class="material-icons">lan</span>
+                <span class="sidebar-link-text"><%= _('nav.network') %></span>
+            </a>
+            <a href="/activity" class="sidebar-link <%= currentPage === 'activity' ? 'active' : '' %>">
+                <span class="material-icons">timeline</span>
+                <span class="sidebar-link-text"><%= _('nav.activity') %></span>
+            </a>
+            <a href="/cdap" class="sidebar-link <%= currentPage === 'cdap' ? 'active' : '' %>">
+                <span class="material-icons">developer_board</span>
+                <span class="sidebar-link-text"><%= _('nav.cdap') %></span>
+            </a>
+            <a href="/fleet" class="sidebar-link <%= currentPage === 'fleet' ? 'active' : '' %>">
+                <span class="material-icons">hub</span>
+                <span class="sidebar-link-text"><%= _('nav.fleet') || 'Fleet' %></span>
+            </a>
+            <a href="/scaling" class="sidebar-link <%= currentPage === 'scaling' ? 'active' : '' %>">
+                <span class="material-icons">cell_tower</span>
+                <span class="sidebar-link-text"><%= _('nav.scaling') || 'Scaling' %></span>
+            </a>
+            <a href="/cross-platform" class="sidebar-link <%= currentPage === 'cross-platform' ? 'active' : '' %>">
+                <span class="material-icons">devices</span>
+                <span class="sidebar-link-text"><%= _('nav.cross_platform') || 'Cross-Platform' %></span>
+            </a>
+            <a href="/chat" class="sidebar-link <%= currentPage === 'chat' ? 'active' : '' %>">
+                <span class="material-icons">chat</span>
+                <span class="sidebar-link-text"><%= _('nav.chat') %></span>
+            </a>
+        </div>
+
+        <!-- Tools category links -->
+        <div class="sidebar-flyout-panel" data-panel="tools">
+            <a href="/reports" class="sidebar-link <%= currentPage === 'reports' ? 'active' : '' %>">
+                <span class="material-icons">assessment</span>
+                <span class="sidebar-link-text"><%= _('nav.reports') %></span>
+            </a>
             <a href="/keys" class="sidebar-link <%= currentPage === 'keys' ? 'active' : '' %>">
                 <span class="material-icons">vpn_key</span>
                 <span class="sidebar-link-text"><%= _('nav.keys') %></span>
             </a>
-            
             <a href="/generator" class="sidebar-link <%= currentPage === 'generator' ? 'active' : '' %>">
                 <span class="material-icons">build</span>
                 <span class="sidebar-link-text"><%= _('nav.generator') %></span>
             </a>
+            <a href="/remote" class="sidebar-link <%= currentPage === 'remote' ? 'active' : '' %>">
+                <span class="material-icons">connected_tv</span>
+                <span class="sidebar-link-text"><%= _('nav.remote') || 'Remote Desktop' %></span>
+            </a>
+            <a href="/toolkit" class="sidebar-link <%= currentPage === 'toolkit' ? 'active' : '' %>">
+                <span class="material-icons">handyman</span>
+                <span class="sidebar-link-text"><%= _('nav.toolkit') || 'Toolkit' %></span>
+            </a>
+            <a href="/cdap-studio" class="sidebar-link <%= currentPage === 'cdap-studio' ? 'active' : '' %>">
+                <span class="material-icons">account_tree</span>
+                <span class="sidebar-link-text"><%= _('nav.sdk_studio') || 'SDK Studio' %></span>
+            </a>
         </div>
-        
-        <!-- System Section -->
-        <div class="sidebar-section">
-            <div class="sidebar-section-title"><%= _('nav.system') %></div>
-            
+
+        <!-- System category links -->
+        <div class="sidebar-flyout-panel" data-panel="system">
             <% if (user && user.role === 'admin') { %>
+            <a href="/tokens" class="sidebar-link <%= currentPage === 'tokens' ? 'active' : '' %>">
+                <span class="material-icons">token</span>
+                <span class="sidebar-link-text"><%= _('nav.tokens') %></span>
+            </a>
+            <a href="/organizations" class="sidebar-link <%= currentPage === 'organizations' ? 'active' : '' %>">
+                <span class="material-icons">corporate_fare</span>
+                <span class="sidebar-link-text"><%= _('nav.organizations') %></span>
+            </a>
+            <a href="/policies" class="sidebar-link <%= currentPage === 'policies' ? 'active' : '' %>">
+                <span class="material-icons">policy</span>
+                <span class="sidebar-link-text"><%= _('nav.policies') || 'Policies' %></span>
+            </a>
+            <a href="/attestation" class="sidebar-link <%= currentPage === 'attestation' ? 'active' : '' %>">
+                <span class="material-icons">fingerprint</span>
+                <span class="sidebar-link-text"><%= _('nav.attestation') || 'Attestation' %></span>
+            </a>
+            <a href="/dataguard" class="sidebar-link <%= currentPage === 'dataguard' ? 'active' : '' %>">
+                <span class="material-icons">shield</span>
+                <span class="sidebar-link-text"><%= _('nav.dataguard') %></span>
+            </a>
             <a href="/users" class="sidebar-link <%= currentPage === 'users' ? 'active' : '' %>">
                 <span class="material-icons">group</span>
                 <span class="sidebar-link-text"><%= _('nav.users') %></span>
             </a>
             <% } %>
-            
+            <% if (user && user.role === 'admin') { %>
+            <a href="/security-audit" class="sidebar-link <%= currentPage === 'security-audit' ? 'active' : '' %>">
+                <span class="material-icons">security</span>
+                <span class="sidebar-link-text"><%= _('nav.security_audit') %></span>
+            </a>
+            <a href="/languages" class="sidebar-link <%= currentPage === 'languages' ? 'active' : '' %>">
+                <span class="material-icons">translate</span>
+                <span class="sidebar-link-text"><%= _('nav.languages') %></span>
+            </a>
+            <a href="/resource-control" class="sidebar-link <%= currentPage === 'resource-control' ? 'active' : '' %>">
+                <span class="material-icons">tune</span>
+                <span class="sidebar-link-text"><%= _('nav.resource_control') %></span>
+            </a>
+            <% } %>
             <a href="/settings" class="sidebar-link <%= currentPage === 'settings' ? 'active' : '' %>">
                 <span class="material-icons">settings</span>
                 <span class="sidebar-link-text"><%= _('nav.settings') %></span>
             </a>
         </div>
-    </nav>
-    
-    <!-- Sidebar Footer - User -->
-    <div class="sidebar-footer">
-        <div class="sidebar-user" id="user-menu-trigger">
-            <div class="sidebar-user-avatar">
-                <%= user && user.username ? user.username.charAt(0).toUpperCase() : 'A' %>
-            </div>
-            <div class="sidebar-user-info">
-                <div class="sidebar-user-name"><%= user ? user.username : 'Admin' %></div>
-                <div class="sidebar-user-role"><%= user ? user.role : 'administrator' %></div>
+
+        <!-- Sidebar footer - Theme + User -->
+        <div class="sidebar-footer">
+            <button class="sidebar-theme-toggle" id="theme-toggle-btn" title="<%= _('nav.toggle_theme') %>">
+                <span class="material-icons" id="theme-toggle-icon">dark_mode</span>
+            </button>
+            <div class="sidebar-user" id="user-menu-trigger">
+                <div class="sidebar-user-avatar">
+                    <%= user && user.username ? user.username.charAt(0).toUpperCase() : 'A' %>
+                </div>
+                <div class="sidebar-user-info">
+                    <div class="sidebar-user-name"><%= user ? user.username : 'Admin' %></div>
+                    <div class="sidebar-user-role"><%= user ? user.role : 'administrator' %></div>
+                </div>
             </div>
         </div>
     </div>
 </aside>
+<script nonce="<%= cspNonce %>">
+// Sidebar rail navigation + flyout logic
+(function() {
+    var sidebar = document.getElementById('sidebar');
+    var flyout = document.getElementById('sidebar-flyout');
+    var flyoutTitle = document.getElementById('sidebar-flyout-title');
+    var expandBtn = document.getElementById('sidebar-expand-btn');
+    var helpBtn = document.getElementById('sidebar-help-btn');
+    var nav = flyout;
+    var STORAGE_COLLAPSED = 'bd_sidebar_collapsed';
+    var STORAGE_SCROLL = 'bd_sidebar_scroll';
+    var activeCategory = null;
+
+    // Determine initial state
+    var savedCollapsed = localStorage.getItem(STORAGE_COLLAPSED);
+    var isCollapsed = savedCollapsed === null ? true : savedCollapsed === 'true';
+    sidebar.dataset.collapsed = String(isCollapsed);
+    document.documentElement.style.setProperty('--sidebar-current-width',
+        isCollapsed ? 'var(--sidebar-width-collapsed)' : 'var(--sidebar-width)');
+
+    // Auto-show the panel for the current page's category
+    var activeRail = sidebar.querySelector('.sidebar-rail-btn.active');
+    if (activeRail) {
+        activeCategory = activeRail.dataset.category;
+        showPanel(activeCategory);
+    }
+
+    function showPanel(category) {
+        // Hide all panels
+        flyout.querySelectorAll('.sidebar-flyout-panel').forEach(function(p) {
+            p.classList.remove('visible');
+        });
+        // Show target
+        var panel = flyout.querySelector('[data-panel="' + category + '"]');
+        if (panel) panel.classList.add('visible');
+
+        // Update rail active state
+        sidebar.querySelectorAll('.sidebar-rail-btn[data-category]').forEach(function(b) {
+            b.classList.toggle('selected', b.dataset.category === category);
+        });
+
+        // Title mapping
+        var titles = {
+            main: '<%= _("nav.main") %>',
+            management: '<%= _("nav.management") || "Management" %>',
+            tools: '<%= _("nav.tools") %>',
+            system: '<%= _("nav.system") %>'
+        };
+        if (flyoutTitle) flyoutTitle.textContent = titles[category] || '';
+        activeCategory = category;
+    }
+
+    // Rail button clicks
+    sidebar.querySelectorAll('.sidebar-rail-btn[data-category]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+            var cat = btn.dataset.category;
+            if (!isCollapsed && activeCategory === cat) {
+                toggleCollapse();
+            } else {
+                showPanel(cat);
+                if (isCollapsed) toggleCollapse();
+            }
+        });
+    });
+
+    // Expand/collapse toggle
+    function toggleCollapse() {
+        isCollapsed = !isCollapsed;
+        sidebar.dataset.collapsed = String(isCollapsed);
+        document.documentElement.style.setProperty('--sidebar-current-width',
+            isCollapsed ? 'var(--sidebar-width-collapsed)' : 'var(--sidebar-width)');
+        localStorage.setItem(STORAGE_COLLAPSED, String(isCollapsed));
+        if (expandBtn) {
+            expandBtn.querySelector('.material-icons').textContent =
+                isCollapsed ? 'chevron_right' : 'chevron_left';
+        }
+    }
+
+    if (expandBtn) {
+        expandBtn.addEventListener('click', toggleCollapse);
+        expandBtn.querySelector('.material-icons').textContent =
+            isCollapsed ? 'chevron_right' : 'chevron_left';
+    }
+
+    // Help button — start tutorial
+    if (helpBtn) {
+        helpBtn.addEventListener('click', function() {
+            if (typeof Tutorial !== 'undefined') Tutorial.start('console');
+        });
+    }
+
+    // Scroll preservation
+    if (nav) {
+        try {
+            var saved = sessionStorage.getItem(STORAGE_SCROLL);
+            if (saved) nav.scrollTop = parseInt(saved, 10) || 0;
+        } catch(e) {}
+        var activeLink = nav.querySelector('.sidebar-link.active');
+        if (activeLink) {
+            var rect = activeLink.getBoundingClientRect();
+            var navRect = nav.getBoundingClientRect();
+            if (rect.top < navRect.top || rect.bottom > navRect.bottom) {
+                activeLink.scrollIntoView({ block: 'center' });
+            }
+        }
+        window.addEventListener('beforeunload', function() {
+            try { sessionStorage.setItem(STORAGE_SCROLL, String(nav.scrollTop)); } catch(e) {}
+        });
+    }
+
+    // Theme toggle
+    var themeBtn = document.getElementById('theme-toggle-btn');
+    var themeIcon = document.getElementById('theme-toggle-icon');
+    function applyTheme(t) {
+        document.documentElement.setAttribute('data-theme', t);
+        try { localStorage.setItem('bd_theme', t); } catch(e) {}
+        if (themeIcon) themeIcon.textContent = t === 'light' ? 'light_mode' : 'dark_mode';
+    }
+    function getStoredTheme() {
+        try { return localStorage.getItem('bd_theme') || 'dark'; } catch(e) { return 'dark'; }
+    }
+    applyTheme(getStoredTheme());
+    if (themeBtn) {
+        themeBtn.addEventListener('click', function() {
+            applyTheme(getStoredTheme() === 'dark' ? 'light' : 'dark');
+        });
+    }
+})();
+</script>

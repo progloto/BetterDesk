@@ -90,12 +90,13 @@
     font-size: var(--font-size-xs, 0.75rem);
     cursor: pointer;
     white-space: nowrap;
-    transition: all 0.15s ease;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
     flex-shrink: 0;
     -webkit-appearance: none;
     appearance: none;
     position: relative;
     font-family: inherit;
+    overflow: hidden;
 }
 
 .folder-chip:hover {
@@ -126,6 +127,7 @@
     padding: 0 5px;
     border-radius: var(--radius-full);
     line-height: 16px;
+    transition: opacity 0.15s ease;
 }
 
 .folder-chip.active .chip-count {
@@ -134,18 +136,29 @@
 
 /* Chip actions (edit/delete) — shown on hover for custom folders */
 .chip-actions {
-    display: none;
+    display: inline-flex;
     align-items: center;
     gap: 2px;
     margin-left: 2px;
+    opacity: 0;
+    visibility: hidden;
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    transition: opacity 0.15s ease, visibility 0.15s ease;
+    background: inherit;
+    padding: 0 2px;
+    border-radius: var(--radius-sm);
 }
 
 .folder-chip:hover .chip-actions {
-    display: inline-flex;
+    opacity: 1;
+    visibility: visible;
 }
 
 .folder-chip:hover .chip-count {
-    display: none;
+    opacity: 0;
 }
 
 .chip-action {
@@ -527,11 +540,11 @@ td.column-hidden {
 
 .kebab-menu {
     display: none;
-    position: absolute;
-    top: 100%;
-    right: 0;
-    z-index: 200;
+    position: fixed;
+    z-index: 9999;
     min-width: 180px;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
     background: var(--bg-elevated, #2d333b);
     border: 1px solid var(--border-primary);
     border-radius: var(--radius-md, 8px);
@@ -728,6 +741,7 @@ td.column-hidden {
     border: 2px solid transparent;
     cursor: pointer;
     transition: transform 0.15s, border-color 0.15s;
+    transform: scale(1);
     flex-shrink: 0;
     -webkit-appearance: none;
     appearance: none;
@@ -796,6 +810,34 @@ td.column-hidden {
 .device-info-item span {
     font-family: var(--font-mono);
     font-size: var(--font-size-sm);
+}
+
+.device-info-item.full-width {
+    grid-column: 1 / -1;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.device-info-item .form-input {
+    width: 100%;
+    padding: var(--space-sm) var(--space-md);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-family: var(--font-sans);
+    transition: border-color 0.15s ease;
+}
+
+.device-info-item .form-input:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+}
+
+.device-info-item textarea.form-input {
+    resize: vertical;
+    min-height: 48px;
 }
 
 /* ID change warning */
@@ -1169,4 +1211,147 @@ td.column-hidden {
         opacity: 1;
         transform: translateY(0) scale(1);
     }
+}
+
+/* ============ Access Policy Modal ============ */
+
+.access-policy-form .form-section {
+    margin-bottom: 20px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.access-policy-form .form-section:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+}
+
+.access-policy-form .form-section h4 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary, #e6edf3);
+    margin: 0 0 12px 0;
+}
+
+.access-policy-form .form-section h4 .material-icons {
+    font-size: 18px;
+    color: var(--accent, #58a6ff);
+}
+
+.access-policy-form .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    padding: 6px 0;
+    font-size: 13px;
+    color: var(--text-secondary, #8b949e);
+}
+
+.access-policy-form .toggle-row input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent, #58a6ff);
+}
+
+.access-policy-form .form-row {
+    margin: 10px 0;
+}
+
+.access-policy-form .form-row label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-secondary, #8b949e);
+    margin-bottom: 4px;
+}
+
+.access-policy-form .form-row-inline {
+    display: flex;
+    gap: 12px;
+}
+
+.access-policy-form .form-row-inline > div {
+    flex: 1;
+}
+
+.access-policy-form .form-input {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary, #e6edf3);
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s;
+    box-sizing: border-box;
+}
+
+.access-policy-form .form-input:focus {
+    border-color: var(--accent, #58a6ff);
+}
+
+.access-policy-form .form-hint {
+    font-size: 11px;
+    color: var(--text-muted, #6e7681);
+    margin: 4px 0 0;
+}
+
+.access-policy-form .form-meta {
+    font-size: 11px;
+    color: var(--text-muted, #6e7681);
+    margin-top: 12px;
+    text-align: right;
+}
+
+.access-policy-form .day-checkboxes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.access-policy-form .day-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    font-size: 12px;
+    color: var(--text-secondary, #8b949e);
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+}
+
+.access-policy-form .day-checkbox:has(input:checked) {
+    background: rgba(88, 166, 255, 0.12);
+    border-color: rgba(88, 166, 255, 0.4);
+    color: var(--text-primary, #e6edf3);
+}
+
+.access-policy-form .day-checkbox input {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent, #58a6ff);
+}
+
+.access-policy-form .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.access-policy-form .badge-success {
+    background: rgba(63, 185, 80, 0.15);
+    color: #3fb950;
+}
+
+.access-policy-form .badge-warning {
+    background: rgba(210, 153, 34, 0.15);
+    color: #d29922;
 }

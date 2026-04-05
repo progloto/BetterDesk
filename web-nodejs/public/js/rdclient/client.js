@@ -40,6 +40,11 @@ class RDClient {
         this.audio = new RDAudio();
         this.renderer = new RDRenderer(canvas);
         this.input = new RDInput(canvas, this.renderer, (msg) => this._sendPeerMessage(msg));
+        this.fileTransfer = new RDFileTransfer({
+            proto: this.proto,
+            sendMessage: (msg) => this._sendPeerMessage(msg),
+            emit: (event, ...args) => this._emit(event, ...args)
+        });
 
         // State
         this._state = 'idle'; // idle | connecting | waiting_password | authenticating | streaming | disconnected | error
@@ -138,13 +143,60 @@ class RDClient {
             // Store peer's server-signed pk for SignedId verification (from RelayResponse.pk)
             this._peerSignedPk = rendezvousResponse.pk || null;
 
-            // Step 7: Close rendezvous, connect to relay
+            // Step 7: Determine relay UUID.
+            //
+            // PunchHoleResponse does NOT contain a UUID — only natType and relayServer.
+            // The signal server expects us to send RequestRelay{uuid} back on the SAME
+            // rendezvous connection so it can forward the UUID to the target device.
+            // Both sides then connect to hbbr with the same UUID → relay pairs them.
+            //
+            // If we already received a RelayResponse (which has a UUID), skip this step.
+            let relayUUID = rendezvousResponse.uuid || '';
+            let relayServer = rendezvousResponse.relayServer || '';
+
+            if (!relayUUID) {
+                // Generate UUID for relay pairing (crypto.randomUUID requires
+                // secure context HTTPS — use fallback for HTTP)
+                relayUUID = (window.crypto && window.crypto.randomUUID
+                    ? window.crypto.randomUUID()
+                    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                        const r = Math.random() * 16 | 0;
+                        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+                    }));
+
+                // Step 8: Send RequestRelay back to hbbs (signal server) via rendezvous
+                // so it can tell the target device to connect to relay with our UUID.
+                this._emit('log', `Requesting relay (uuid: ${relayUUID.substring(0, 8)}...)...`);
+                const requestRelaySignal = this.proto.buildRequestRelay(
+                    this.deviceId,
+                    relayUUID,
+                    relayServer,
+                    this.opts.serverPubKey
+                );
+                const signalData = this.proto.encodeRendezvous(requestRelaySignal);
+                this.conn.sendRendezvous(signalData);
+
+                // Step 9: Wait for RelayResponse from hbbs confirming the relay setup
+                const relayConfirm = await this._waitForSignalRelayResponse();
+                if (relayConfirm.error) {
+                    throw new Error(`Relay refused: ${relayConfirm.error}`);
+                }
+                // Use the confirmed UUID and relay server from hbbs
+                relayUUID = relayConfirm.uuid || relayUUID;
+                relayServer = relayConfirm.relayServer || relayServer;
+                if (relayConfirm.pk) {
+                    this._peerSignedPk = relayConfirm.pk;
+                }
+                console.log(`[RDClient] RelayResponse confirmed: uuid=${relayUUID.substring(0, 8)}... relay=${relayServer}`);
+            }
+
+            // Step 10: Close rendezvous, connect to relay
             this.conn.closeRendezvous();
 
             this._emit('log', 'Connecting to relay server...');
             await this.conn.connectRelay();
 
-            // Step 8: Setup relay message handler BEFORE sending anything
+            // Step 11: Setup relay message handler BEFORE sending anything
             this.conn.on('relay:message', (data) => this._handleRelayData(data));
             this.conn.on('relay:close', () => {
                 if (this._state !== 'disconnected' && this._state !== 'error') {
@@ -153,18 +205,18 @@ class RDClient {
             });
             this.conn.on('relay:error', (e) => this._handleDisconnect('Relay error: ' + e.message));
 
-            // Step 9: Send RequestRelay to hbbr (with licence_key - hbbr validates this!)
-            this._emit('log', `Requesting relay (uuid: ${(rendezvousResponse.uuid || '').substring(0, 8)}...)...`);
+            // Step 12: Send RequestRelay to hbbr (relay expects this as first message for pairing)
+            this._emit('log', `Connecting to relay (uuid: ${relayUUID.substring(0, 8)}...)...`);
             const requestRelay = this.proto.buildRequestRelay(
                 this.deviceId,
-                rendezvousResponse.uuid || '',
-                rendezvousResponse.relayServer || '',
+                relayUUID,
+                relayServer,
                 this.opts.serverPubKey
             );
             const relayData = this.proto.encodeRendezvous(requestRelay);
             this.conn.sendRelay(relayData);
 
-            // Step 10: Wait for target's SignedId (first message from relay)
+            // Step 13: Wait for target's SignedId (first message from relay)
             // Target sends SignedId FIRST (unencrypted, signed with their Ed25519 key).
             // We do NOT send anything until we process SignedId and perform key exchange.
             this._emit('log', 'Waiting for peer handshake...');
@@ -201,7 +253,8 @@ class RDClient {
                 myId: 'betterdesk-web-' + Date.now().toString(36),
                 myName: 'BetterDesk Web',
                 disableAudio: this.opts.disableAudio || false,
-                fps: this.opts.fps || 30
+                fps: this.opts.fps || 60,
+                imageQuality: this.opts.imageQuality || 'Best'
             });
 
             console.log('[RDClient] Auth: sending LoginRequest, crypto.enabled=' + this.crypto.enabled
@@ -348,6 +401,75 @@ class RDClient {
     }
 
     /**
+     * Wait for RelayResponse from signal server (hbbs) after sending RequestRelay.
+     *
+     * After PunchHoleResponse (natType=SYMMETRIC), we send RequestRelay{uuid} back
+     * to hbbs on the same rendezvous connection. hbbs forwards the request to the
+     * target device (tells it to connect to relay with our UUID) and sends back a
+     * RelayResponse confirming the UUID and relay server.
+     *
+     * @returns {Promise<{uuid: string, relayServer: string, pk: Uint8Array|null, error?: string}>}
+     */
+    _waitForSignalRelayResponse() {
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this.conn.off('rendezvous:message', handler);
+                reject(new Error('RelayResponse timeout (15s) — target device may be unreachable'));
+            }, 15000);
+
+            const handler = (rawData) => {
+                const frames = this._rendezvousDecoder.feed(rawData);
+                if (frames.length === 0) return;
+
+                for (const frame of frames) {
+                    try {
+                        const msg = this.proto.decodeRendezvous(frame);
+
+                        // Skip KeyExchange, HealthCheck, and other housekeeping
+                        if (msg.keyExchange || msg.hc) continue;
+
+                        if (msg.relayResponse) {
+                            clearTimeout(timeout);
+                            this.conn.off('rendezvous:message', handler);
+                            const rr = msg.relayResponse;
+                            console.log('[RDClient] Signal RelayResponse:', JSON.stringify({
+                                relayServer: rr.relayServer || '',
+                                uuid: (rr.uuid || '').substring(0, 8) + '...',
+                                hasPk: !!(rr.pk && rr.pk.length),
+                                refuseReason: rr.refuseReason || ''
+                            }));
+                            if (rr.refuseReason && rr.refuseReason.length > 0) {
+                                resolve({ error: rr.refuseReason });
+                            } else {
+                                resolve({
+                                    uuid: rr.uuid || '',
+                                    relayServer: rr.relayServer || '',
+                                    pk: rr.pk || null
+                                });
+                            }
+                            return;
+                        }
+
+                        // PunchHoleSent may arrive from target — it's just an update,
+                        // not what we are waiting for. Log and continue.
+                        if (msg.punchHoleResponse || msg.punchHoleSent) {
+                            console.log('[RDClient] Skipping late PunchHoleResponse/Sent while waiting for RelayResponse');
+                            continue;
+                        }
+
+                        const fieldNames = Object.keys(msg).filter(k => msg[k] != null && k !== 'union');
+                        console.log('[RDClient] Skipping signal message while waiting for RelayResponse:', fieldNames.join(', '));
+                    } catch (err) {
+                        console.warn('[RDClient] Failed to decode signal frame:', err.message);
+                    }
+                }
+            };
+
+            this.conn.on('rendezvous:message', handler);
+        });
+    }
+
+    /**
      * Handle raw incoming relay data (TCP chunks via WebSocket)
      * Uses stream decoder for frame reassembly, then dispatches each complete message.
      *
@@ -437,9 +559,10 @@ class RDClient {
                 if (isPlaintext) {
                     // Peer is NOT encrypting.  Abandon the key exchange — do NOT
                     // send PublicKey.  All communication stays in plaintext.
-                    console.log(`[RDClient] Frame #${idx}: peer sent plaintext → skipping key exchange`);
+                    console.warn(`[RDClient] Frame #${idx}: peer sent plaintext → connection NOT encrypted`);
                     this._keyExchangePending = false;
                     this._keyExchangeDone = false;
+                    this._emit('encryption_warning', 'Connection is not encrypted — peer did not use encryption.');
                     // Fall through to process this frame as plaintext
                 } else {
                     // Frame doesn't decode as plaintext Message — peer might be
@@ -581,6 +704,12 @@ class RDClient {
             return;
         }
 
+        // File response (directory listing, transfer blocks, digest, done, error)
+        if (msg.fileResponse) {
+            this.fileTransfer.handleFileResponse(msg.fileResponse);
+            return;
+        }
+
         // Signed ID from peer
         if (msg.signedId) {
             this._handleSignedId(msg.signedId);
@@ -633,6 +762,23 @@ class RDClient {
         const peerPkHex = Array.from(parsed.peerPk.slice(0, 8))
             .map(b => b.toString(16).padStart(2, '0')).join('');
         console.log(`[RDClient] Peer ephemeral pk: ${parsed.peerPk.length} bytes [${peerPkHex}...]`);
+
+        // Verify Ed25519 signature against server public key (MITM protection)
+        const serverPubKey = this.opts.serverPubKey || '';
+        if (serverPubKey && serverPubKey.length >= 64) {
+            const verified = RDCrypto.verifySignedId(parsed.signature, parsed.payload, serverPubKey);
+            parsed.signatureVerified = verified;
+            if (verified) {
+                console.log('[RDClient] Ed25519 signature VERIFIED — peer identity authenticated');
+                this._emit('log', 'Peer identity verified (Ed25519)');
+            } else {
+                console.warn('[RDClient] Ed25519 signature FAILED — possible MITM attack!');
+                this._emit('signature_warning', 'Ed25519 signature verification failed. Connection may be intercepted.');
+                this._emit('log', 'WARNING: Peer signature verification failed');
+            }
+        } else {
+            console.log('[RDClient] No server public key available — signature not verified');
+        }
 
         // Prepare key material but DO NOT send PublicKey yet.
         // We defer the decision until we see the next peer frame.
@@ -716,15 +862,17 @@ class RDClient {
     }
 
     async _handleVideoFrame(videoFrame) {
+        // Send video_received ack IMMEDIATELY before any decoding
+        // Without this, RustDesk peer throttles down to 1-5 FPS
+        // Sending before decode ensures the ack goes out even if decode is slow
+        this._sendPeerMessage(this.proto.buildMisc('videoReceived', true));
+
         // Track total video frames from peer for diagnostics
         this._peerFrameCount = (this._peerFrameCount || 0) + 1;
-        if (this._peerFrameCount <= 3 || this._peerFrameCount % 100 === 0) {
+        this._lastVideoFrameTime = Date.now();
+        if (this._peerFrameCount <= 3 || this._peerFrameCount % 300 === 0) {
             console.log('[RDClient] VideoFrame #' + this._peerFrameCount + ' from peer');
         }
-
-        // Send video_received ack so the peer knows we are consuming frames
-        // Without this, RustDesk server throttles down to 1-5 FPS
-        this._sendPeerMessage(this.proto.buildMisc('videoReceived', true));
 
         const codec = this.proto.detectVideoCodec(videoFrame);
         if (!codec || codec === 'rgb' || codec === 'yuv') return;
@@ -815,9 +963,25 @@ class RDClient {
         this._setState('streaming');
         this.conn.setConnected();
 
+        // Enable file transfer
+        this.fileTransfer.enable();
+
         // Initialize video decoder callbacks
         this.video.onFrame = (frame) => this.renderer.pushFrame(frame);
         this.video.onError = (err) => this._emit('log', 'Video error: ' + err.message);
+
+        // Request keyframe on resize/fullscreen to fix blur
+        this.renderer.onResizeRefresh = () => {
+            this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
+        };
+
+        // Signal CSS when remote cursor data is available (hide local crosshair)
+        this.renderer.onCursorReady = (ready) => {
+            const container = this.canvas.parentElement;
+            if (container) {
+                container.classList.toggle('has-remote-cursor', !!ready);
+            }
+        };
 
         // Start render loop
         this.renderer.startRenderLoop();
@@ -832,9 +996,13 @@ class RDClient {
             });
         }
 
-        // Tell peer our desired FPS to avoid unnecessary throttling
-        const fps = this.opts.fps || 30;
-        this._sendPeerMessage(this.proto.buildOptionMisc({ customFps: fps }));
+        // Tell peer our desired FPS and image quality after session establishment
+        const fps = this.opts.fps || 60;
+        const quality = this.opts.imageQuality || 'Best';
+        this._sendPeerMessage(this.proto.buildOptionMisc({
+            customFps: fps,
+            imageQuality: quality
+        }));
 
         // Start ping interval
         this._pingInterval = setInterval(() => {
@@ -850,6 +1018,20 @@ class RDClient {
                 this._emit('stats', this.getStats());
             }
         }, 1000);
+
+        // Stall recovery: if no video frames arrive for 3 seconds, request a keyframe
+        this._stallCheckInterval = setInterval(() => {
+            if (this._state !== 'streaming') return;
+            const now = Date.now();
+            const lastFrame = this._lastVideoFrameTime || 0;
+            if (lastFrame > 0 && now - lastFrame > 3000) {
+                this._emit('log', 'Video stall detected, requesting keyframe');
+                this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
+                this._lastVideoFrameTime = now; // prevent rapid retries
+            }
+        }, 1500);
+
+        this._lastVideoFrameTime = Date.now();
 
         this._emit('session_start');
     }
@@ -912,11 +1094,16 @@ class RDClient {
             clearInterval(this._statsInterval);
             this._statsInterval = null;
         }
+        if (this._stallCheckInterval) {
+            clearInterval(this._stallCheckInterval);
+            this._stallCheckInterval = null;
+        }
 
         this.input.stop();
         this.renderer.stopRenderLoop();
         this.video.close();
         this.audio.close();
+        this.fileTransfer.disable();
         this.conn.close();
     }
 
@@ -958,6 +1145,167 @@ class RDClient {
     sendRefreshScreen() {
         if (this._state !== 'streaming') return;
         this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
+    }
+
+    // ---- Session Recording (WebM via MediaRecorder) ----
+
+    /**
+     * Start recording the remote session as WebM video.
+     * @returns {boolean} True if recording started
+     */
+    startRecording() {
+        if (this._recorder) return false;
+        if (this._state !== 'streaming') return false;
+
+        try {
+            var canvas = this.renderer.canvas;
+            var stream = canvas.captureStream(15); // 15fps recording
+
+            // Add audio if available
+            if (this.audio && this.audio._audioCtx && this.audio._audioCtx.state === 'running') {
+                try {
+                    var dest = this.audio._audioCtx.createMediaStreamDestination();
+                    if (this.audio._gainNode) this.audio._gainNode.connect(dest);
+                    stream.addTrack(dest.stream.getAudioTracks()[0]);
+                } catch (_) { /* audio capture optional */ }
+            }
+
+            var mimeType = 'video/webm;codecs=vp9,opus';
+            if (!MediaRecorder.isTypeSupported(mimeType)) {
+                mimeType = 'video/webm;codecs=vp8,opus';
+            }
+            if (!MediaRecorder.isTypeSupported(mimeType)) {
+                mimeType = 'video/webm';
+            }
+
+            this._recordedChunks = [];
+            this._recorder = new MediaRecorder(stream, {
+                mimeType: mimeType,
+                videoBitsPerSecond: 2500000 // 2.5 Mbps
+            });
+
+            this._recorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) {
+                    this._recordedChunks.push(e.data);
+                }
+            };
+
+            this._recorder.onstop = () => {
+                this._emit('recording_stopped', this._recordedChunks);
+            };
+
+            this._recorder.start(1000); // 1 second chunks
+            this._recordingStartTime = Date.now();
+            this._emit('recording_started');
+            return true;
+        } catch (err) {
+            console.warn('[RDClient] Recording failed:', err.message);
+            return false;
+        }
+    }
+
+    /**
+     * Stop recording and return the WebM blob.
+     * @returns {Promise<Blob|null>}
+     */
+    stopRecording() {
+        return new Promise((resolve) => {
+            if (!this._recorder || this._recorder.state === 'inactive') {
+                resolve(null);
+                return;
+            }
+
+            this._recorder.onstop = () => {
+                var blob = new Blob(this._recordedChunks, { type: this._recorder.mimeType });
+                this._recordedChunks = [];
+                this._recorder = null;
+                this._emit('recording_stopped');
+                resolve(blob);
+            };
+
+            this._recorder.stop();
+        });
+    }
+
+    /**
+     * Download recorded session as a file.
+     */
+    async downloadRecording() {
+        var blob = await this.stopRecording();
+        if (!blob) return;
+
+        var ts = new Date().toISOString().replace(/[:.]/g, '-');
+        var filename = 'session_' + this.deviceId + '_' + ts + '.webm';
+
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    /** @returns {boolean} Whether recording is active */
+    get isRecording() {
+        return this._recorder && this._recorder.state === 'recording';
+    }
+
+    /** @returns {number} Recording duration in seconds */
+    get recordingDuration() {
+        if (!this._recordingStartTime || !this.isRecording) return 0;
+        return Math.floor((Date.now() - this._recordingStartTime) / 1000);
+    }
+
+    // ---- Monitor Switching ----
+
+    /**
+     * Get list of available remote monitors.
+     * @returns {Array<{idx:number, name:string, width:number, height:number}>}
+     */
+    getMonitors() {
+        if (!this._peerInfo || !this._peerInfo.displays) return [];
+        return this._peerInfo.displays.map(function (d, i) {
+            return {
+                idx: i,
+                name: d.name || ('Monitor ' + (i + 1)),
+                width: d.width || 0,
+                height: d.height || 0,
+                primary: d.is_primary || false
+            };
+        });
+    }
+
+    /**
+     * Switch to a specific monitor.
+     * @param {number} monitorIdx - Monitor index
+     */
+    switchMonitor(monitorIdx) {
+        if (this._state !== 'streaming') return;
+        this._sendPeerMessage(this.proto.buildMisc('switchDisplay', monitorIdx));
+        this.sendRefreshScreen();
+    }
+
+    // ---- Image Quality Control ----
+
+    /**
+     * Set image quality preset.
+     * @param {'speed'|'balanced'|'quality'|'best'} preset
+     */
+    setQualityPreset(preset) {
+        if (this._state !== 'streaming') return;
+
+        var config = {
+            speed:    { imageQuality: 'Low',      customFps: 60 },
+            balanced: { imageQuality: 'Balanced', customFps: 30 },
+            quality:  { imageQuality: 'Best',     customFps: 30 },
+            best:     { imageQuality: 'Best',     customFps: 60 }
+        };
+
+        var c = config[preset] || config.balanced;
+        this._sendPeerMessage(this.proto.buildMisc('imageQuality', c.imageQuality));
+        this._sendPeerMessage(this.proto.buildMisc('customFps', c.customFps));
+        this.opts.qualityPreset = preset;
+        this._emit('quality_changed', preset);
     }
 
     /**

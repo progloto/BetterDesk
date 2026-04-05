@@ -12,8 +12,31 @@ const { loginLimiter, passwordChangeLimiter } = require('../middleware/rateLimit
 
 /**
  * GET /login - Login page
+ * Serves desktop-style login when user previously had desktop mode active
+ * (detected via localStorage preference or explicit ?desktop=1 query param).
  */
-router.get('/login', guestOnly, (req, res) => {
+router.get('/login', guestOnly, async (req, res) => {
+    const useDesktop = req.query.desktop === '1' || req.cookies.betterdesk_desktop_mode === 'true';
+
+    if (useDesktop) {
+        // Fetch user list for multi-user selector (usernames + roles only, no secrets)
+        let loginUsers = [];
+        try {
+            const users = typeof db.getAllUsersForBackup === 'function'
+                ? await db.getAllUsersForBackup() : [];
+            loginUsers = (Array.isArray(users) ? users : []).map(u => ({
+                username: u.username,
+                role: u.role || 'operator'
+            }));
+        } catch (_) { /* empty list is fine */ }
+
+        return res.render('desktop-login', {
+            title: req.t('nav.login'),
+            activePage: 'login',
+            loginUsers
+        });
+    }
+
     res.render('login', {
         title: req.t('nav.login'),
         activePage: 'login'
@@ -51,6 +74,14 @@ router.post('/api/auth/login', loginLimiter, async (req, res) => {
             return res.status(401).json({
                 success: false,
                 error: req.t('auth.invalid_credentials')
+            });
+        }
+        
+        // Block pro-only accounts from web panel login
+        if (user.role === 'pro') {
+            return res.status(403).json({
+                success: false,
+                error: req.t('auth.pro_only_account')
             });
         }
         
@@ -116,7 +147,9 @@ router.post('/api/auth/logout', async (req, res) => {
         if (err) {
             console.error('Session destroy error:', err);
         }
+        res.clearCookie(req.sessionID ? req.session?.cookie?.name : 'betterdesk.sid');
         res.clearCookie('betterdesk.sid');
+        res.clearCookie('bd.sid');
         res.json({ success: true });
     });
 });
@@ -184,6 +217,7 @@ router.post('/api/auth/password', requireAuth, passwordChangeLimiter, async (req
 router.get('/logout', (req, res) => {
     req.session.destroy(() => {
         res.clearCookie('betterdesk.sid');
+        res.clearCookie('bd.sid');
         res.redirect('/login');
     });
 });

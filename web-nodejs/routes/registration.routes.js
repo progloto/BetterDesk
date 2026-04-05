@@ -28,6 +28,7 @@ const fs = require('fs');
 const db = require('../services/database');
 const config = require('../config/config');
 const { requireAuth, requireRole } = require('../middleware/auth');
+const betterdeskApi = require('../services/betterdeskApi');
 
 // ---------------------------------------------------------------------------
 //  Helpers
@@ -321,6 +322,77 @@ router.delete('/api/registrations/:id', requireAuth, requireRole('admin'), async
         res.json({ success: true });
     } catch (err) {
         console.error('Delete registration error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+// ===========================================================================
+//  Go Server Enrollment Proxy — pending devices managed by Go server
+// ===========================================================================
+
+/**
+ * GET /api/enrollment/pending — List pending enrollment requests from Go server.
+ */
+router.get('/api/enrollment/pending', requireAuth, requireRole('operator'), async (req, res) => {
+    try {
+        const result = await betterdeskApi.getEnrollmentPending();
+        res.json(result);
+    } catch (err) {
+        console.error('Get enrollment pending error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/enrollment/approve/:id — Approve a pending enrollment on Go server.
+ * Body: { display_name, sync_mode }
+ */
+router.post('/api/enrollment/approve/:id', requireAuth, requireRole('operator'), async (req, res) => {
+    try {
+        const deviceId = req.params.id;
+        const { display_name, sync_mode } = req.body;
+        const result = await betterdeskApi.approveEnrollment(deviceId, display_name, sync_mode);
+
+        if (result.success) {
+            try {
+                await db.logAction(
+                    req.session?.user?.id || 0,
+                    'enrollment_approved',
+                    `Approved enrollment for device ${deviceId} (mode: ${sync_mode || 'standard'})`,
+                    getClientIp(req)
+                );
+            } catch (_) { /* audit log optional */ }
+        }
+
+        res.json(result);
+    } catch (err) {
+        console.error('Approve enrollment error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/enrollment/reject/:id — Reject a pending enrollment on Go server.
+ */
+router.post('/api/enrollment/reject/:id', requireAuth, requireRole('operator'), async (req, res) => {
+    try {
+        const deviceId = req.params.id;
+        const result = await betterdeskApi.rejectEnrollment(deviceId);
+
+        if (result.success) {
+            try {
+                await db.logAction(
+                    req.session?.user?.id || 0,
+                    'enrollment_rejected',
+                    `Rejected enrollment for device ${deviceId}`,
+                    getClientIp(req)
+                );
+            } catch (_) { /* audit log optional */ }
+        }
+
+        res.json(result);
+    } catch (err) {
+        console.error('Reject enrollment error:', err);
         res.status(500).json({ success: false, error: req.t('errors.server_error') });
     }
 });

@@ -19,6 +19,15 @@ const apiLimiter = rateLimit({
     },
     keyGenerator: (req) => {
         return req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    },
+    skip: (req) => {
+        // Skip rate limiting for widget data endpoints from same-origin panel requests
+        // These are internal dashboard/widget refresh calls, not external abuse
+        const widgetPaths = ['/api/stats', '/api/server/status', '/api/devices', '/api/audit/conn'];
+        if (widgetPaths.some(p => req.path.startsWith(p)) && req.headers.referer && req.session && req.session.userId) {
+            return true;
+        }
+        return false;
     }
 });
 

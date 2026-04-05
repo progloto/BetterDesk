@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 
 	"github.com/coder/websocket"
 	"github.com/unitronix/betterdesk-server/codec"
@@ -48,6 +49,9 @@ func (s *Server) serveWS() {
 			log.Printf("[relay] WSS server error: %v", err)
 		}
 	} else {
+		if len(s.cfg.GetAllowedWSOrigins()) == 0 {
+			log.Printf("[relay] WS origin allowlist not configured — only localhost browser origins are accepted by default")
+		}
 		log.Printf("[relay] WS listening on %s", addr)
 		if err := s.wsHTTP.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[relay] WS server error: %v", err)
@@ -61,12 +65,16 @@ func (s *Server) serveWS() {
 func (s *Server) handleWSRelayUpgrade(w http.ResponseWriter, r *http.Request) {
 	opts := &websocket.AcceptOptions{}
 
-	// M3: Validate WebSocket origin if configured.
+	// Secure-by-default origin validation:
+	// - if WS_ALLOWED_ORIGINS is set, use the explicit allowlist
+	// - otherwise, only allow browser origins from localhost/127.0.0.1
+	// - non-browser/native clients without Origin are still accepted
 	allowed := s.cfg.GetAllowedWSOrigins()
 	if len(allowed) > 0 {
 		opts.OriginPatterns = allowed
-	} else {
-		opts.InsecureSkipVerify = true
+	} else if origin := r.Header.Get("Origin"); origin != "" && !isLoopbackOrigin(origin) {
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return
 	}
 
 	ws, err := websocket.Accept(w, r, opts)
@@ -120,6 +128,15 @@ func (s *Server) handleWSRelayUpgrade(w http.ResponseWriter, r *http.Request) {
 	// First, send the initial message as a framed packet so handleConn sees it.
 	// Actually, we can directly call the pairing logic here.
 	s.pairWSConn(netConn, uuid)
+}
+
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // pairWSConn pairs a WebSocket-derived net.Conn using the same UUID logic as TCP.

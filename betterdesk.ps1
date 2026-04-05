@@ -1,11 +1,12 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    BetterDesk Console Manager v2.4.0 - All-in-One Interactive Tool for Windows
+    BetterDesk Console Manager v3.0.0 - All-in-One Interactive Tool for Windows
 
 .DESCRIPTION
     Features:
       - Fresh installation (Node.js web console)
+      - Minimal installation (Go server only, no web console)
       - Update existing installation
       - Repair/fix issues (enhanced with graceful shutdown)
       - Validate installation
@@ -21,8 +22,9 @@
       - RustDesk Client API (login, address book sync)
       - TOTP Two-Factor Authentication
       - SSL/TLS certificate configuration
-      - PostgreSQL database support (new in v2.4.0)
+      - PostgreSQL database support
       - SQLite to PostgreSQL migration
+      - CDAP (Custom Device API Protocol) support
 
 .PARAMETER Auto
     Run installation in automatic mode (non-interactive)
@@ -59,6 +61,7 @@
 param(
     [switch]$Auto,
     [switch]$SkipVerify,
+    [switch]$Minimal,
     [switch]$NodeJs,
     [switch]$PostgreSQL,
     [string]$PgUri = "",
@@ -69,12 +72,13 @@ param(
 # Configuration
 #===============================================================================
 
-$script:VERSION = "2.4.0"
+$script:VERSION = "3.0.0"
 $script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Auto mode flags
 $script:AUTO_MODE = $Auto
 $script:SKIP_VERIFY = $SkipVerify
+$script:MINIMAL_MODE = $Minimal
 
 # Console type preference
 $script:PREFERRED_CONSOLE_TYPE = "nodejs"  # Always Node.js (Flask removed in v2.3.0)
@@ -2198,6 +2202,181 @@ function Start-ServicesWithVerification {
 }
 
 #=============================================================================
+# Minimal Installation Function (Go server only, no web console)
+#===============================================================================
+
+function Do-InstallMinimal {
+    Print-Header
+    Write-Host "========== MINIMAL INSTALLATION (Server Only) ==========" -ForegroundColor White
+    Write-Host ""
+    
+    Print-Info "BetterDesk Minimal installs the Go server binary only."
+    Print-Info "No web console, no Node.js, no npm dependencies."
+    Print-Info "Manage via REST API on port 21114 or TCP admin console."
+    Write-Host ""
+    
+    Detect-Installation
+    
+    if ($script:INSTALL_STATUS -eq "complete") {
+        Print-Warning "BetterDesk is already installed!"
+        if (-not $script:AUTO_MODE) {
+            if (-not (Confirm-Action "Do you want to reinstall in Minimal mode?")) {
+                return
+            }
+        }
+        Do-BackupSilent
+    }
+    
+    # Choose database type (SQLite or PostgreSQL)
+    Choose-DatabaseType
+    
+    # Gracefully stop existing services
+    Graceful-StopServices
+    
+    # Create installation directory
+    $installDir = $script:INSTALL_DIR
+    if (-not (Test-Path $installDir)) {
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
+    
+    # Setup PostgreSQL if selected
+    if ($script:USE_POSTGRESQL) {
+        if (-not (Setup-PostgreSQLDatabase)) {
+            Print-Error "PostgreSQL setup failed"
+            return
+        }
+    }
+    
+    # Install Go server binary
+    Detect-Architecture
+    if (-not (Install-Binaries)) {
+        Print-Error "Binary installation failed"
+        return
+    }
+    
+    # Skip console installation entirely
+    Print-Info "Skipping web console (Minimal mode)"
+    
+    # Generate self-signed TLS certificates
+    Generate-SSLCertificates
+    
+    # Setup only the Go server service (no console service)
+    Setup-ServicesMinimal
+    
+    # Configure firewall rules (server ports only)
+    Print-Step "Configuring firewall rules..."
+    $ports = @(21114, 21115, 21116, 21117, 21118, 21119)
+    foreach ($port in $ports) {
+        try {
+            New-NetFirewallRule -DisplayName "BetterDesk Port $port" -Direction Inbound -LocalPort $port -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
+        } catch {}
+    }
+    # UDP for signal port
+    try {
+        New-NetFirewallRule -DisplayName "BetterDesk Signal UDP 21116" -Direction Inbound -LocalPort 21116 -Protocol UDP -Action Allow -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+    
+    # Start server
+    Print-Step "Starting BetterDesk server..."
+    $svcName = "BetterDeskServer"
+    if (Get-Service $svcName -ErrorAction SilentlyContinue) {
+        Start-Service $svcName -ErrorAction SilentlyContinue
+    } elseif (Get-Command nssm -ErrorAction SilentlyContinue) {
+        nssm start $svcName 2>$null
+    }
+    
+    Start-Sleep -Seconds 3
+    
+    # Verify
+    $svc = Get-Service $svcName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") {
+        Print-Success "BetterDesk server is running"
+    } else {
+        Print-Warning "BetterDesk server may not have started correctly"
+    }
+    
+    Write-Host ""
+    Print-Success "===== BETTERDESK MINIMAL INSTALLATION COMPLETE ====="
+    Write-Host ""
+    
+    $serverIP = Get-PublicIP
+    Write-Host "Server: $serverIP" -ForegroundColor Green
+    Write-Host "API: http://${serverIP}:21114" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Ports: 21114 (API), 21115-21117 (Signal/Relay), 21118-21119 (WS)" -ForegroundColor Yellow
+    Write-Host "No web console installed. Use REST API or TCP admin for management." -ForegroundColor Yellow
+    Write-Host ""
+    
+    Press-Enter
+}
+
+function Setup-ServicesMinimal {
+    Print-Step "Setting up BetterDesk server service (Minimal mode)..."
+    
+    $goBinary = Join-Path $script:INSTALL_DIR "betterdesk-server.exe"
+    $keyDir = $script:INSTALL_DIR
+    $dbDir = $script:INSTALL_DIR
+    
+    # Build arguments
+    $serverArgs = "-key `"$keyDir`" -db `"$dbDir`""
+    
+    # Add relay servers
+    $serverIP = Get-PublicIP
+    if ($serverIP) {
+        $serverArgs += " -relay-servers $serverIP"
+    }
+    
+    # TLS configuration
+    $tlsCert = Join-Path $script:INSTALL_DIR "cert.pem"
+    $tlsKey = Join-Path $script:INSTALL_DIR "key.pem"
+    if ((Test-Path $tlsCert) -and (Test-Path $tlsKey)) {
+        $serverArgs += " -tls-cert `"$tlsCert`" -tls-key `"$tlsKey`" -tls-signal -tls-relay"
+    }
+    
+    # Remove old services
+    foreach ($oldSvc in @("RustDeskSignal", "RustDeskRelay", "BetterDeskAPI", "BetterDeskGo", "BetterDeskConsole")) {
+        if (Get-Service $oldSvc -ErrorAction SilentlyContinue) {
+            Stop-Service $oldSvc -Force -ErrorAction SilentlyContinue
+            if (Get-Command nssm -ErrorAction SilentlyContinue) {
+                nssm remove $oldSvc confirm 2>$null
+            } else {
+                sc.exe delete $oldSvc 2>$null
+            }
+        }
+    }
+    
+    # Install NSSM if not present
+    if (-not (Get-Command nssm -ErrorAction SilentlyContinue)) {
+        Install-NSSM
+    }
+    
+    # Create server service via NSSM
+    $svcName = "BetterDeskServer"
+    if (Get-Service $svcName -ErrorAction SilentlyContinue) {
+        nssm remove $svcName confirm 2>$null
+    }
+    
+    nssm install $svcName $goBinary $serverArgs
+    nssm set $svcName AppDirectory $script:INSTALL_DIR
+    nssm set $svcName DisplayName "BetterDesk Server (Minimal)"
+    nssm set $svcName Description "BetterDesk Go server - signal, relay, and API"
+    nssm set $svcName Start SERVICE_AUTO_START
+    nssm set $svcName AppStdout (Join-Path $script:INSTALL_DIR "server.log")
+    nssm set $svcName AppStderr (Join-Path $script:INSTALL_DIR "server-error.log")
+    nssm set $svcName AppRotateFiles 1
+    nssm set $svcName AppRotateBytes 10485760
+    
+    # Database environment
+    $envExtra = "SIGNAL_PORT=21116"
+    if ($script:USE_POSTGRESQL -and $script:POSTGRESQL_URI) {
+        $envExtra += "`nDB_URL=$($script:POSTGRESQL_URI)"
+    }
+    nssm set $svcName AppEnvironmentExtra $envExtra
+    
+    Print-Success "BetterDesk server service created (Minimal mode)"
+}
+
+#=============================================================================
 # Main Installation Function
 #===============================================================================
 
@@ -4115,6 +4294,7 @@ function Show-Menu {
     Write-Host "  8. DIAGNOSTICS"
     Write-Host "  9. UNINSTALL"
     Write-Host ""
+    Write-Host "  L. MINIMAL INSTALLATION (server only)"
     Write-Host "  C. Configure SSL certificates"
     Write-Host "  M. Database migration"
     Write-Host "  S. Settings (paths)"
@@ -4132,7 +4312,11 @@ function Main {
     # Auto mode - run installation directly
     if ($script:AUTO_MODE) {
         Print-Info "Running in AUTO mode..."
-        Do-Install
+        if ($script:MINIMAL_MODE) {
+            Do-InstallMinimal
+        } else {
+            Do-Install
+        }
         exit 0
     }
     
@@ -4150,6 +4334,8 @@ function Main {
             "7" { Do-Build }
             "8" { Do-Diagnostics }
             "9" { Do-Uninstall }
+            "L" { Do-InstallMinimal }
+            "l" { Do-InstallMinimal }
             "C" { Do-ConfigureSSL }
             "c" { Do-ConfigureSSL }
             "M" { Do-MigrateDatabase }

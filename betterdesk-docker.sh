@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v2.4.0
+#   BetterDesk Console Manager v3.0.0
 #   All-in-One Interactive Tool for Docker
 #
 #   Features:
@@ -14,8 +14,9 @@
 #     - Build custom images
 #     - Full diagnostics
 #     - Migrate from existing RustDesk Docker
-#     - PostgreSQL database support (new in v2.4.0)
+#     - PostgreSQL database support
 #     - SQLite to PostgreSQL migration
+#     - CDAP (Custom Device API Protocol) support
 #
 #   Usage: ./betterdesk-docker.sh
 #
@@ -24,7 +25,7 @@
 set -e
 
 # Version
-VERSION="2.4.0"
+VERSION="3.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default paths (can be overridden by environment variables)

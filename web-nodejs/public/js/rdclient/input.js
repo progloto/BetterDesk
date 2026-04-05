@@ -116,19 +116,36 @@ class RDInput {
     // ---- Mouse Event Handlers ----
 
     /**
-     * RustDesk mouse button mask values:
-     * 1 = left button press
-     * 2 = left button release
-     * 4 = right button press
-     * 8 = right button release
-     * 16 = middle button press
-     * 32 = middle button release
-     * 64 = scroll up
-     * 128 = scroll down
-     * 256 = scroll left
-     * 512 = scroll right
-     * MOVE = 0 (just position update)
+     * RustDesk mouse event mask encoding:
+     *   mask = EVENT_TYPE | (BUTTON << 3)
+     *
+     * Event types (bits 0-2):
+     *   0 = move, 1 = down, 2 = up, 3 = wheel
+     *
+     * Button IDs (bits 3+):
+     *   1 = left, 2 = right, 4 = middle, 8 = back, 16 = forward
+     *
+     * Scroll directions (encoded in button bits for wheel type):
+     *   0 = up, 1 = down, 2 = right, 3 = left
+     *
+     * Examples:
+     *   move          = 0
+     *   left down     = 1 | (1 << 3) = 9
+     *   left up       = 2 | (1 << 3) = 10
+     *   right down    = 1 | (2 << 3) = 17
+     *   right up      = 2 | (2 << 3) = 18
+     *   middle down   = 1 | (4 << 3) = 33
+     *   middle up     = 2 | (4 << 3) = 34
+     *   scroll up     = 3 | (0 << 3) = 3
+     *   scroll down   = 3 | (1 << 3) = 11
      */
+    static MOUSE_TYPE_DOWN  = 1;
+    static MOUSE_TYPE_UP    = 2;
+    static MOUSE_TYPE_WHEEL = 3;
+
+    static MOUSE_BUTTON_LEFT   = 1;
+    static MOUSE_BUTTON_RIGHT  = 2;
+    static MOUSE_BUTTON_MIDDLE = 4;
 
     _handleMouseMove(e) {
         if (!this.enabled) return;
@@ -162,15 +179,16 @@ class RDInput {
         const pos = this._getRemotePosition(e);
         if (!pos) return;
 
-        let mask = 0;
+        let button = 0;
         switch (e.button) {
-        case 0: mask = 1; break;   // Left press
-        case 1: mask = 16; break;  // Middle press
-        case 2: mask = 4; break;   // Right press
+        case 0: button = RDInput.MOUSE_BUTTON_LEFT; break;
+        case 1: button = RDInput.MOUSE_BUTTON_MIDDLE; break;
+        case 2: button = RDInput.MOUSE_BUTTON_RIGHT; break;
         }
 
-        if (mask) {
-            this.buttonMask |= mask;
+        if (button) {
+            const mask = RDInput.MOUSE_TYPE_DOWN | (button << 3);
+            this.buttonMask |= button;
             this.sendMessage({
                 mouseEvent: {
                     mask: mask,
@@ -189,15 +207,16 @@ class RDInput {
         const pos = this._getRemotePosition(e);
         if (!pos) return;
 
-        let mask = 0;
+        let button = 0;
         switch (e.button) {
-        case 0: mask = 2; break;   // Left release
-        case 1: mask = 32; break;  // Middle release
-        case 2: mask = 8; break;   // Right release
+        case 0: button = RDInput.MOUSE_BUTTON_LEFT; break;
+        case 1: button = RDInput.MOUSE_BUTTON_MIDDLE; break;
+        case 2: button = RDInput.MOUSE_BUTTON_RIGHT; break;
         }
 
-        if (mask) {
-            this.buttonMask &= ~mask;
+        if (button) {
+            const mask = RDInput.MOUSE_TYPE_UP | (button << 3);
+            this.buttonMask &= ~button;
             this.sendMessage({
                 mouseEvent: {
                     mask: mask,
@@ -216,13 +235,15 @@ class RDInput {
         const pos = this._getRemotePosition(e);
         if (!pos) return;
 
-        let mask = 0;
-        if (e.deltaY < 0) mask = 64;       // Scroll up
-        else if (e.deltaY > 0) mask = 128;  // Scroll down
-        else if (e.deltaX < 0) mask = 256;  // Scroll left
-        else if (e.deltaX > 0) mask = 512;  // Scroll right
+        // Scroll direction encoded in button bits: 0=up, 1=down, 2=right, 3=left
+        let direction = -1;
+        if (e.deltaY < 0) direction = 0;        // Scroll up
+        else if (e.deltaY > 0) direction = 1;   // Scroll down
+        else if (e.deltaX > 0) direction = 2;   // Scroll right
+        else if (e.deltaX < 0) direction = 3;   // Scroll left
 
-        if (mask) {
+        if (direction >= 0) {
+            const mask = RDInput.MOUSE_TYPE_WHEEL | (direction << 3);
             this.sendMessage({
                 mouseEvent: {
                     mask: mask,
@@ -415,12 +436,17 @@ class RDInput {
     }
 
     /**
-     * Check if an input-like element has focus
+     * Check if a visible input-like element has focus (not the remote canvas)
      * @returns {boolean}
      */
     _isInputFocused() {
-        const tag = document.activeElement?.tagName?.toLowerCase();
-        return tag === 'input' || tag === 'textarea' || tag === 'select';
+        const el = document.activeElement;
+        if (!el) return false;
+        const tag = el.tagName?.toLowerCase();
+        if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return false;
+        // Ignore hidden inputs (e.g. password field after login)
+        if (el.type === 'hidden' || el.offsetParent === null) return false;
+        return true;
     }
 
     /**

@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,18 +19,18 @@ import (
 
 const testAPIKey = "test-api-key-12345"
 
-// testAuthURL appends the legacy API key as a query parameter for testing.
-func testAuthURL(base string) string {
-	if strings.Contains(base, "?") {
-		return base + "&api_key=" + testAPIKey
-	}
-	return base + "?api_key=" + testAPIKey
-}
-
 // testAuthReq adds the X-API-Key header for authenticated test requests.
 func testAuthReq(req *http.Request) *http.Request {
 	req.Header.Set("X-API-Key", testAPIKey)
 	return req
+}
+
+func testAuthGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(testAuthReq(req))
 }
 
 // testSetupDB creates a temp database with migration and API key configured.
@@ -40,7 +42,15 @@ func testSetupDB(t *testing.T) db.Database {
 		t.Fatal(err)
 	}
 	database.Migrate()
-	database.SetConfig("api_key", testAPIKey)
+	hash := sha256.Sum256([]byte(testAPIKey))
+	if err := database.CreateAPIKey(&db.APIKey{
+		KeyHash:   hex.EncodeToString(hash[:]),
+		KeyPrefix: testAPIKey[:8],
+		Name:      "test-key",
+		Role:      "admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	return database
 }
 
@@ -105,7 +115,7 @@ func TestServerStatsEndpoint(t *testing.T) {
 	defer srv.Stop()
 	time.Sleep(100 * time.Millisecond)
 
-	resp, err := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/server/stats", cfg.APIPort)))
+	resp, err := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/server/stats", cfg.APIPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +148,7 @@ func TestListPeersEndpoint(t *testing.T) {
 	defer srv.Stop()
 	time.Sleep(100 * time.Millisecond)
 
-	resp, err := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/peers", cfg.APIPort)))
+	resp, err := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/peers", cfg.APIPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +281,7 @@ func TestStatusSummaryEndpoint(t *testing.T) {
 	defer srv.Stop()
 	time.Sleep(100 * time.Millisecond)
 
-	resp, err := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/peers/status/summary", cfg.APIPort)))
+	resp, err := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/peers/status/summary", cfg.APIPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +325,7 @@ func TestOnlinePeersEndpoint(t *testing.T) {
 	defer srv.Stop()
 	time.Sleep(100 * time.Millisecond)
 
-	resp, err := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/peers/online", cfg.APIPort)))
+	resp, err := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/peers/online", cfg.APIPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +361,7 @@ func TestPeerStatusEndpoint(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Test live peer
-	resp, err := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/peers/LIVE1/status", cfg.APIPort)))
+	resp, err := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/peers/LIVE1/status", cfg.APIPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +382,7 @@ func TestPeerStatusEndpoint(t *testing.T) {
 	}
 
 	// Test offline peer (DB only)
-	resp2, err := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/peers/DBONLY/status", cfg.APIPort)))
+	resp2, err := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/peers/DBONLY/status", cfg.APIPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +399,7 @@ func TestPeerStatusEndpoint(t *testing.T) {
 	}
 
 	// Test nonexistent peer
-	resp3, err := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/peers/NOPE/status", cfg.APIPort)))
+	resp3, err := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/peers/NOPE/status", cfg.APIPort))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +427,7 @@ func TestBlocklistEndpoints(t *testing.T) {
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", cfg.APIPort)
 
 	// List (initially empty)
-	resp, _ := http.Get(testAuthURL(baseURL + "/api/blocklist"))
+	resp, _ := testAuthGet(baseURL + "/api/blocklist")
 	var body map[string]any
 	json.NewDecoder(resp.Body).Decode(&body)
 	resp.Body.Close()
@@ -476,7 +486,7 @@ func TestServerStatsWithBandwidthAndBlocklist(t *testing.T) {
 	defer srv.Stop()
 	time.Sleep(100 * time.Millisecond)
 
-	resp, _ := http.Get(testAuthURL(fmt.Sprintf("http://127.0.0.1:%d/api/server/stats", cfg.APIPort)))
+	resp, _ := testAuthGet(fmt.Sprintf("http://127.0.0.1:%d/api/server/stats", cfg.APIPort))
 	var body map[string]any
 	json.NewDecoder(resp.Body).Decode(&body)
 	resp.Body.Close()

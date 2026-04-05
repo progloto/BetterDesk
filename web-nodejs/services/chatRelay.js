@@ -1,61 +1,52 @@
 /**
- * BetterDesk Console — Instant Chat WebSocket Relay
+ * BetterDesk Console — Instant Chat WebSocket Relay (v2)
  *
- * Bridges the BetterDesk desktop agent (Rust/Tauri) and the operator
- * browser session via a server-side message queue + WebSocket rooms.
+ * Bridges agent WebSocket connections with server-side persistent storage.
+ * Messages are persisted via the Go server REST API so they survive restarts.
  *
  * Endpoints:
  *   WS /ws/chat/<device_id>              — agent connection
  *   WS /ws/chat-operator/<device_id>     — operator browser connection
  *
  * Protocol (JSON text frames):
- *   Agent → Server:
- *     { "type": "hello", "device_id": "ABC" }
- *     { "type": "message", "text": "hello", "timestamp": 1234 }
+ *   Agent/Operator → Server:
+ *     { "type": "hello",        "device_id": "ABC", "capabilities": [...] }
+ *     { "type": "message",      "text": "hello", "conversation_id": "..." }
+ *     { "type": "typing",       "conversation_id": "..." }
+ *     { "type": "get_contacts", "device_id": "ABC" }
+ *     { "type": "get_history",  "device_id": "ABC", "conversation_id": "..." }
+ *     { "type": "mark_read",    "conversation_id": "..." }
+ *     { "type": "create_group", "name": "...", "member_ids": [...] }
  *
- *   Operator → Server:
- *     { "type": "message", "text": "hello", "operator": "admin" }
- *     { "type": "typing" }
- *
- *   Server → Both:
- *     { "type": "message", "from": "agent"|"operator", "text": "...", "timestamp": 1234 }
- *     { "type": "status", "agent_connected": true|false }
- *     { "type": "typing", "from": "agent"|"operator" }
- *     { "type": "history", "messages": [ ... ] }
- *
- * Messages are stored in-memory (ring buffer, last 500 per device).
- * The history is sent when a new participant joins.
+ *   Server → Client:
+ *     { "type": "message",  "id": N, "from": "...", "text": "...", "timestamp": N }
+ *     { "type": "history",  "conversation_id": "...", "messages": [...] }
+ *     { "type": "contacts", "contacts": [...] }
+ *     { "type": "groups",   "groups": [...] }
+ *     { "type": "status",   "agent_connected": true|false }
+ *     { "type": "typing",   "from": "..." }
+ *     { "type": "presence", "device_id": "...", "online": true|false }
  */
 
 'use strict';
 
 const WebSocket = require('ws');
 
-// Simple console logger helpers matching project conventions
 const log = {
     info:  (...a) => console.log('[Chat]', ...a),
     warn:  (...a) => console.warn('[Chat]', ...a),
     error: (...a) => console.error('[Chat]', ...a),
 };
 
-// ---------------------------------------------------------------------------
-//  Constants
-// ---------------------------------------------------------------------------
+const MAX_TEXT_BYTES = 8192;
+const PING_INTERVAL = 30000;
+const HISTORY_LIMIT = 500; // in-memory fallback
 
-const HISTORY_LIMIT   = 500;   // max messages stored per device
-const MAX_TEXT_BYTES  = 8192;  // max text frame size
-const PING_INTERVAL   = 30000; // ms
-
-// ---------------------------------------------------------------------------
-//  State
-// ---------------------------------------------------------------------------
-
-// device_id → { agentWs: WebSocket|null, operatorWss: Set<WebSocket>, messages: Array }
+// device_id → { agentWs, operatorWss, messages (fallback ring buffer) }
 const rooms = new Map();
 
-// ---------------------------------------------------------------------------
-//  Helpers
-// ---------------------------------------------------------------------------
+// Reference to betterdeskApi for Go server calls
+let goApi = null;
 
 function getRoom(deviceId) {
     if (!rooms.has(deviceId)) {
@@ -96,55 +87,274 @@ function setupPing(ws) {
     ws.on('close', () => clearInterval(timer));
 }
 
-// ---------------------------------------------------------------------------
-//  Agent connection handler (/ws/chat/:device_id)
-// ---------------------------------------------------------------------------
+// Persist message to Go server
+async function persistMessage(msg) {
+    if (!goApi) return;
+    try {
+        await goApi.post('/api/chat/messages', {
+            conversation_id: msg.conversation_id || msg.from || 'operator',
+            from_id: msg.from || 'unknown',
+            from_name: msg.from_name || msg.from || '',
+            to_id: msg.to_id || '',
+            text: msg.text || '',
+        });
+    } catch (e) {
+        log.warn('Failed to persist chat message:', e.message);
+    }
+}
+
+// Load history from Go server
+async function loadHistory(conversationId) {
+    if (!goApi) return null;
+    try {
+        const resp = await goApi.get(`/api/chat/history/${encodeURIComponent(conversationId)}?limit=100`);
+        return resp.data;
+    } catch (e) {
+        log.warn('Failed to load chat history:', e.message);
+        return null;
+    }
+}
+
+// Load contacts from Go server
+async function loadContacts(deviceId) {
+    if (!goApi) return null;
+    try {
+        const resp = await goApi.get(`/api/chat/contacts/${encodeURIComponent(deviceId)}`);
+        return resp.data;
+    } catch (e) {
+        log.warn('Failed to load chat contacts:', e.message);
+        return null;
+    }
+}
+
+// Load groups from Go server
+async function loadGroups(deviceId) {
+    if (!goApi) return null;
+    try {
+        const resp = await goApi.get(`/api/chat/groups/${encodeURIComponent(deviceId)}`);
+        return resp.data;
+    } catch (e) {
+        log.warn('Failed to load chat groups:', e.message);
+        return null;
+    }
+}
+
+// --- Agent handler ---
 
 function handleAgentConnection(ws, deviceId) {
     const room = getRoom(deviceId);
 
-    // Disconnect any previous agent
     if (room.agentWs && room.agentWs.readyState !== WebSocket.CLOSED) {
         room.agentWs.close(1001, 'New agent connected');
     }
     room.agentWs = ws;
 
-    log.info(`Chat: agent connected for device ${deviceId}`);
-
-    // Notify operators
+    log.info(`Agent connected: ${deviceId}`);
     broadcast(room, { type: 'status', agent_connected: true }, ws);
+    broadcast(room, { type: 'presence', device_id: deviceId, online: true }, ws);
 
-    // Send history to agent
-    sendTo(ws, { type: 'history', messages: room.messages });
+    // Send history from DB
+    loadHistory(deviceId).then(data => {
+        if (data && data.messages) {
+            sendTo(ws, { type: 'history', conversation_id: deviceId, messages: data.messages });
+        } else {
+            sendTo(ws, { type: 'history', messages: room.messages });
+        }
+    });
+
+    // Send contacts
+    loadContacts(deviceId).then(data => {
+        if (data && data.contacts && data.contacts.length > 0) {
+            sendTo(ws, { type: 'contacts', contacts: data.contacts });
+        } else {
+            // Fallback: at least show operator support contact
+            sendTo(ws, { type: 'contacts', contacts: [{
+                id: 'operator',
+                name: 'Support',
+                hostname: '',
+                online: true,
+                last_seen: Date.now(),
+                unread: 0,
+                avatar_color: '#4f6ef7',
+                role: 'operator',
+            }] });
+        }
+    });
+
+    // Send groups
+    loadGroups(deviceId).then(data => {
+        if (data && data.groups) {
+            sendTo(ws, { type: 'groups', groups: data.groups });
+        }
+    });
 
     setupPing(ws);
 
     ws.on('message', (data, isBinary) => {
         if (isBinary || data.length > MAX_TEXT_BYTES) return;
-
         let frame;
         try { frame = JSON.parse(data.toString()); } catch { return; }
 
         switch (frame.type) {
             case 'hello':
-                // Already handled via URL
+                // Acknowledge the hello so the client knows the connection is alive
+                sendTo(ws, {
+                    type: 'welcome',
+                    device_id: deviceId,
+                    server_time: Date.now(),
+                    capabilities: ['multi_conversation', 'contacts', 'groups', 'history', 'e2e_encryption', 'read_receipts', 'typing', 'presence', 'file_share'],
+                });
                 break;
 
             case 'message': {
                 const msg = {
                     type: 'message',
                     id: Date.now(),
-                    from: 'agent',
+                    from: deviceId,
+                    from_name: frame.from_name || deviceId,
+                    conversation_id: frame.conversation_id || 'operator',
                     text: String(frame.text || '').slice(0, 2048),
                     timestamp: frame.timestamp || Date.now(),
                 };
                 appendMessage(room, msg);
                 broadcast(room, msg, ws);
+                persistMessage(msg);
                 break;
             }
 
             case 'typing':
-                broadcast(room, { type: 'typing', from: 'agent' }, ws);
+                broadcast(room, {
+                    type: 'typing',
+                    from: deviceId,
+                    conversation_id: frame.conversation_id || 'operator',
+                }, ws);
+                break;
+
+            case 'get_contacts':
+                loadContacts(frame.device_id || deviceId).then(data => {
+                    if (data && data.contacts && data.contacts.length > 0) {
+                        sendTo(ws, { type: 'contacts', contacts: data.contacts });
+                    } else {
+                        // Fallback: return at least the operator contact and any connected agents
+                        const fallbackContacts = [{
+                            id: 'operator',
+                            name: 'Support',
+                            hostname: '',
+                            online: true,
+                            last_seen: Date.now(),
+                            unread: 0,
+                            avatar_color: '#4f6ef7',
+                            role: 'operator',
+                        }];
+                        // Add other connected agents as contacts
+                        for (const [did, room] of rooms) {
+                            if (did !== deviceId && room.agentWs && room.agentWs.readyState === WebSocket.OPEN) {
+                                fallbackContacts.push({
+                                    id: did,
+                                    name: did,
+                                    hostname: '',
+                                    online: true,
+                                    last_seen: Date.now(),
+                                    unread: 0,
+                                    avatar_color: '',
+                                });
+                            }
+                        }
+                        sendTo(ws, { type: 'contacts', contacts: fallbackContacts });
+                    }
+                });
+                break;
+
+            case 'get_history':
+                loadHistory(frame.conversation_id || deviceId).then(data => {
+                    if (data && data.messages) {
+                        sendTo(ws, {
+                            type: 'history',
+                            conversation_id: frame.conversation_id,
+                            messages: data.messages,
+                        });
+                    }
+                });
+                break;
+
+            case 'mark_read':
+                if (goApi && frame.conversation_id) {
+                    goApi.post('/api/chat/read', {
+                        conversation_id: frame.conversation_id,
+                        reader_id: deviceId,
+                    }).catch(() => {});
+                }
+                break;
+
+            case 'create_group':
+                if (goApi && frame.name && frame.member_ids) {
+                    goApi.post('/api/chat/groups', {
+                        name: frame.name,
+                        members: frame.member_ids,
+                        created_by: deviceId,
+                    }).then(resp => {
+                        sendTo(ws, { type: 'group_created', ...resp.data });
+                        loadGroups(deviceId).then(data => {
+                            if (data && data.groups) {
+                                sendTo(ws, { type: 'groups', groups: data.groups });
+                            }
+                        });
+                    }).catch(() => {});
+                }
+                break;
+
+            // E2E key exchange: relay public key to operators
+            case 'key_exchange':
+                broadcast(room, {
+                    type: 'key_exchange',
+                    from: deviceId,
+                    public_key: frame.public_key,
+                    conversation_id: frame.conversation_id || deviceId,
+                }, ws);
+                break;
+
+            // Read receipts
+            case 'read_receipt':
+                broadcast(room, {
+                    type: 'read_receipt',
+                    from: deviceId,
+                    message_ids: frame.message_ids || [],
+                    conversation_id: frame.conversation_id || deviceId,
+                    timestamp: Date.now(),
+                }, ws);
+                if (goApi && frame.conversation_id) {
+                    goApi.post('/api/chat/read', {
+                        conversation_id: frame.conversation_id,
+                        reader_id: deviceId,
+                        message_ids: frame.message_ids || [],
+                    }).catch(() => {});
+                }
+                break;
+
+            // Online presence broadcast
+            case 'presence_update':
+                broadcast(room, {
+                    type: 'presence',
+                    device_id: deviceId,
+                    online: frame.online !== false,
+                    status: frame.status || 'available',
+                    timestamp: Date.now(),
+                }, ws);
+                break;
+
+            // Encrypted file share: relay encrypted file metadata
+            case 'file_share':
+                broadcast(room, {
+                    type: 'file_share',
+                    from: deviceId,
+                    from_name: frame.from_name || deviceId,
+                    conversation_id: frame.conversation_id || 'operator',
+                    file_id: frame.file_id || ('file_' + Date.now()),
+                    file_name_encrypted: frame.file_name_encrypted || '',
+                    file_size: frame.file_size || 0,
+                    encrypted_metadata: frame.encrypted_metadata || '',
+                    timestamp: Date.now(),
+                }, ws);
                 break;
 
             default:
@@ -155,35 +365,43 @@ function handleAgentConnection(ws, deviceId) {
     ws.on('close', () => {
         if (room.agentWs === ws) {
             room.agentWs = null;
-            log.info(`Chat: agent disconnected for device ${deviceId}`);
+            log.info(`Agent disconnected: ${deviceId}`);
             broadcast(room, { type: 'status', agent_connected: false });
+            broadcast(room, { type: 'presence', device_id: deviceId, online: false });
         }
     });
 
     ws.on('error', (err) => {
-        log.warn(`Chat agent WS error for ${deviceId}: ${err.message}`);
+        log.warn(`Agent WS error ${deviceId}: ${err.message}`);
     });
 }
 
-// ---------------------------------------------------------------------------
-//  Operator connection handler (/ws/chat-operator/:device_id)
-// ---------------------------------------------------------------------------
+// --- Operator handler ---
 
 function handleOperatorConnection(ws, deviceId, operatorName) {
     const room = getRoom(deviceId);
     room.operatorWss.add(ws);
 
-    log.info(`Chat: operator ${operatorName} connected to device ${deviceId}`);
+    log.info(`Operator ${operatorName} connected to ${deviceId}`);
 
-    // Send history and current agent status
-    sendTo(ws, { type: 'history', messages: room.messages });
-    sendTo(ws, { type: 'status', agent_connected: !!room.agentWs && room.agentWs.readyState === WebSocket.OPEN });
+    // Send DB history
+    loadHistory(deviceId).then(data => {
+        if (data && data.messages) {
+            sendTo(ws, { type: 'history', conversation_id: deviceId, messages: data.messages });
+        } else {
+            sendTo(ws, { type: 'history', messages: room.messages });
+        }
+    });
+
+    sendTo(ws, {
+        type: 'status',
+        agent_connected: !!room.agentWs && room.agentWs.readyState === WebSocket.OPEN,
+    });
 
     setupPing(ws);
 
     ws.on('message', (data, isBinary) => {
         if (isBinary || data.length > MAX_TEXT_BYTES) return;
-
         let frame;
         try { frame = JSON.parse(data.toString()); } catch { return; }
 
@@ -193,18 +411,63 @@ function handleOperatorConnection(ws, deviceId, operatorName) {
                     type: 'message',
                     id: Date.now(),
                     from: 'operator',
+                    from_name: operatorName,
+                    conversation_id: frame.conversation_id || deviceId,
                     operator: operatorName,
                     text: String(frame.text || '').slice(0, 2048),
                     timestamp: Date.now(),
                 };
                 appendMessage(room, msg);
-                // Send to agent + all other operators
                 broadcast(room, msg, ws);
+                persistMessage(msg);
                 break;
             }
 
             case 'typing':
-                broadcast(room, { type: 'typing', from: 'operator', operator: operatorName }, ws);
+                broadcast(room, {
+                    type: 'typing',
+                    from: 'operator',
+                    operator: operatorName,
+                    conversation_id: frame.conversation_id || deviceId,
+                }, ws);
+                break;
+
+            // E2E key exchange: relay operator public key to agents
+            case 'key_exchange':
+                broadcast(room, {
+                    type: 'key_exchange',
+                    from: 'operator',
+                    operator: operatorName,
+                    public_key: frame.public_key,
+                    conversation_id: frame.conversation_id || deviceId,
+                }, ws);
+                break;
+
+            // Read receipts from operator
+            case 'read_receipt':
+                broadcast(room, {
+                    type: 'read_receipt',
+                    from: 'operator',
+                    operator: operatorName,
+                    message_ids: frame.message_ids || [],
+                    conversation_id: frame.conversation_id || deviceId,
+                    timestamp: Date.now(),
+                }, ws);
+                break;
+
+            // Encrypted file share from operator
+            case 'file_share':
+                broadcast(room, {
+                    type: 'file_share',
+                    from: 'operator',
+                    from_name: operatorName,
+                    conversation_id: frame.conversation_id || deviceId,
+                    file_id: frame.file_id || ('file_' + Date.now()),
+                    file_name_encrypted: frame.file_name_encrypted || '',
+                    file_size: frame.file_size || 0,
+                    encrypted_metadata: frame.encrypted_metadata || '',
+                    timestamp: Date.now(),
+                }, ws);
                 break;
 
             default:
@@ -214,26 +477,29 @@ function handleOperatorConnection(ws, deviceId, operatorName) {
 
     ws.on('close', () => {
         room.operatorWss.delete(ws);
-        log.info(`Chat: operator ${operatorName} disconnected from device ${deviceId}`);
+        log.info(`Operator ${operatorName} left ${deviceId}`);
     });
 
     ws.on('error', (err) => {
-        log.warn(`Chat operator WS error for ${deviceId}: ${err.message}`);
+        log.warn(`Operator WS error ${deviceId}: ${err.message}`);
     });
 }
 
-// ---------------------------------------------------------------------------
-//  Init — attach to existing HTTP server
-// ---------------------------------------------------------------------------
+// --- Init ---
 
-function initChatRelay(server, sessionMiddleware) {
+function initChatRelay(server, sessionMiddleware, betterdeskApi) {
+    // Store API reference for persistence
+    if (betterdeskApi) {
+        goApi = betterdeskApi;
+        log.info('Chat persistence enabled via Go server API');
+    }
+
     const wss = new WebSocket.Server({ noServer: true });
 
     server.on('upgrade', (req, socket, head) => {
         const url = new URL(req.url, `http://${req.headers.host}`);
         const pathname = url.pathname;
 
-        // Agent endpoint: /ws/chat/<device_id>
         const agentMatch = pathname.match(/^\/ws\/chat\/([^/]+)$/);
         if (agentMatch) {
             wss.handleUpgrade(req, socket, head, (ws) => {
@@ -242,10 +508,8 @@ function initChatRelay(server, sessionMiddleware) {
             return;
         }
 
-        // Operator endpoint: /ws/chat-operator/<device_id>
         const opMatch = pathname.match(/^\/ws\/chat-operator\/([^/]+)$/);
         if (opMatch) {
-            // Require session authentication for operators
             sessionMiddleware(req, {}, () => {
                 if (!req.session || !req.session.userId) {
                     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -264,7 +528,6 @@ function initChatRelay(server, sessionMiddleware) {
         if (role === 'agent') {
             handleAgentConnection(ws, deviceId);
         } else {
-            // Extract operator name from session
             sessionMiddleware(req, {}, () => {
                 const operatorName = req.session?.username || 'operator';
                 handleOperatorConnection(ws, deviceId, operatorName);
@@ -272,17 +535,12 @@ function initChatRelay(server, sessionMiddleware) {
         }
     });
 
-    log.info('Chat WebSocket relay initialized (/ws/chat/:id, /ws/chat-operator/:id)');
+    log.info('Chat relay v2 initialized (persistent via Go API)');
     return wss;
 }
 
-// ---------------------------------------------------------------------------
-//  Exports
-// ---------------------------------------------------------------------------
-
 module.exports = {
     initChatRelay,
-    /** Get chat room state (for admin REST API) */
     getRoomState(deviceId) {
         const room = rooms.get(deviceId);
         if (!room) return null;

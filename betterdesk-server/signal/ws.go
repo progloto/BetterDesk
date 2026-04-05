@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/coder/websocket"
@@ -36,7 +37,6 @@ func (s *Server) serveWS() {
 		},
 	}
 
-	// Phase 3: Enable WSS if TLS is configured for signal server.
 	if s.cfg.SignalTLSEnabled() {
 		tlsCfg, err := config.LoadTLSConfig(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
 		if err != nil {
@@ -49,6 +49,9 @@ func (s *Server) serveWS() {
 			log.Printf("[signal] WSS server error: %v", err)
 		}
 	} else {
+		if len(s.cfg.GetAllowedWSOrigins()) == 0 {
+			log.Printf("[signal] WS origin allowlist not configured — only localhost browser origins are accepted by default")
+		}
 		log.Printf("[signal] WS listening on %s", addr)
 		if err := s.wsHTTP.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[signal] WS server error: %v", err)
@@ -61,13 +64,16 @@ func (s *Server) serveWS() {
 func (s *Server) handleWSUpgrade(w http.ResponseWriter, r *http.Request) {
 	opts := &websocket.AcceptOptions{}
 
-	// M3: Validate WebSocket origin if configured. When AllowedWSOrigins is
-	// empty, accept all origins for backward compatibility with web clients.
+	// Secure-by-default origin validation:
+	// - if WS_ALLOWED_ORIGINS is set, use the explicit allowlist
+	// - otherwise, only allow browser origins from localhost/127.0.0.1
+	// - non-browser/native clients without Origin are still accepted
 	allowed := s.cfg.GetAllowedWSOrigins()
 	if len(allowed) > 0 {
 		opts.OriginPatterns = allowed
-	} else {
-		opts.InsecureSkipVerify = true
+	} else if origin := r.Header.Get("Origin"); origin != "" && !isLoopbackOrigin(origin) {
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return
 	}
 
 	ws, err := websocket.Accept(w, r, opts)
@@ -84,6 +90,15 @@ func (s *Server) handleWSUpgrade(w http.ResponseWriter, r *http.Request) {
 
 	// Persistent connection — read messages in a loop until close or error.
 	s.wsSignalLoop(wsc)
+}
+
+func isLoopbackOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // wsSignalLoop reads protobuf messages from a WS connection and dispatches them.

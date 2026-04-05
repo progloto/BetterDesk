@@ -1,0 +1,22 @@
+{
+  "name": "betterdesk-cdap",
+  "version": "1.0.0",
+  "description": "Node.js SDK for BetterDesk CDAP (Connected Device Automation Protocol)",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./widgets": "./src/widgets.js",
+    "./protocol": "./src/protocol.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["betterdesk", "cdap", "iot", "scada", "bridge", "remote-management"],
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -11,12 +11,18 @@
 const { doubleCsrf } = require('csrf-csrf');
 const config = require('../config/config');
 
+// Use a different cookie name in HTTP mode to avoid collision with stale
+// Secure cookies left over from a previous HTTPS configuration.  Browsers
+// refuse to send Secure cookies over HTTP and also refuse to let HTTP
+// overwrite an existing Secure cookie of the same name (RFC 6265bis §5.4.6).
+const CSRF_COOKIE = config.httpsEnabled ? '__csrf' : '__csrf_h';
+
 const {
     generateToken,
     doubleCsrfProtection
 } = doubleCsrf({
     getSecret: () => config.sessionSecret,
-    cookieName: '__csrf',
+    cookieName: CSRF_COOKIE,
     cookieOptions: {
         httpOnly: true,
         sameSite: 'lax',
@@ -61,8 +67,8 @@ function csrfTokenProvider(req, res, next) {
         // Cookie exists but is invalid (e.g. secret changed after reinstall).
         // Clear the corrupt cookie so the browser forgets it, then generate
         // a fresh token+cookie pair.
-        if (req.cookies) delete req.cookies['__csrf'];
-        res.clearCookie('__csrf', {
+        if (req.cookies) delete req.cookies[CSRF_COOKIE];
+        res.clearCookie(CSRF_COOKIE, {
             httpOnly: true,
             sameSite: 'lax',
             secure: config.httpsEnabled,
@@ -90,13 +96,13 @@ function safeCsrfProtection(req, res, next) {
         if (err && SAFE_METHODS.has(req.method)) {
             // Corrupt cookie on a safe method — clear and continue.
             // clearCookie must use identical options for the browser to match.
-            res.clearCookie('__csrf', {
+            res.clearCookie(CSRF_COOKIE, {
                 httpOnly: true,
                 sameSite: 'lax',
                 secure: config.httpsEnabled,
                 path: '/'
             });
-            if (req.cookies) delete req.cookies['__csrf'];
+            if (req.cookies) delete req.cookies[CSRF_COOKIE];
             return next();
         }
         // For state-changing methods (POST/PUT/DELETE/PATCH) propagate normally

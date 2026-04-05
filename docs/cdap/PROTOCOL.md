@@ -1,0 +1,178 @@
+# CDAP Protocol Specification
+
+> Version 0.3.0 — Last updated with audio, clipboard, multi-monitor, codec negotiation
+
+## Transport
+
+- **WebSocket** on port `21122`, path `/cdap`
+- Subprotocol: `cdap-v1`
+- Text frames: JSON messages
+- Binary frames: audio/video data with 1-byte type prefix
+
+## Authentication
+
+```json
+{
+  "type": "auth",
+  "device_id": "CDAP-6A9A5452",
+  "auth_method": "api_key",
+  "credentials": "your-api-key-here",
+  "protocol_version": "0.3.0"
+}
+```
+
+Server responds with:
+
+```json
+{
+  "type": "auth_response",
+  "success": true,
+  "server_version": "3.0.0"
+}
+```
+
+### Auth Methods
+| Method | Credentials field |
+|--------|-------------------|
+| `api_key` | API key string |
+| `device_token` | Device-specific token |
+| `user_password` | `"username:password"` |
+
+## Manifest Registration
+
+After auth, agent sends its manifest:
+
+```json
+{
+  "type": "manifest",
+  "device": {
+    "id": "CDAP-6A9A5452",
+    "name": "Office Sensor Hub",
+    "type": "os_agent",
+    "version": "1.0.0",
+    "platform": "linux/amd64"
+  },
+  "capabilities": ["telemetry", "commands", "terminal", "file_transfer", "clipboard"],
+  "widgets": [
+    {
+      "id": "sys_cpu",
+      "type": "gauge",
+      "label": "CPU Usage",
+      "group": "System",
+      "unit": "%",
+      "min": 0,
+      "max": 100,
+      "danger": 90,
+      "warning": 70
+    },
+    {
+      "id": "sys_memory",
+      "type": "gauge",
+      "label": "Memory Usage",
+      "group": "System",
+      "unit": "%",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "id": "reboot_btn",
+      "type": "button",
+      "label": "Reboot",
+      "group": "Actions",
+      "command": "system_reboot",
+      "confirm": true
+    }
+  ],
+  "heartbeat_interval": 15
+}
+```
+
+## Message Types
+
+### Agent → Server
+
+| Type | Description | Payload |
+|------|-------------|---------|
+| `auth` | Authentication request | `device_id`, `auth_method`, `credentials` |
+| `manifest` | Device manifest + widgets | `device`, `capabilities`, `widgets` |
+| `heartbeat` | Periodic health check | `metrics: { cpu, memory, disk }`, `widget_values: {...}` |
+| `state_update` | Single widget value change | `widget_id`, `value` |
+| `bulk_update` | Multiple widget values | `values: { widget_id: value, ... }` |
+| `command_response` | Command execution result | `command_id`, `success`, `result`, `error` |
+| `terminal_output` | Terminal PTY output | `session_id`, `data` (base64) |
+| `terminal_end` | Terminal session ended | `session_id`, `exit_code` |
+| `file_list_response` | Directory listing | `request_id`, `entries: [{ name, size, is_dir, modified }]` |
+| `file_read_response` | File content chunk | `request_id`, `data` (base64), `offset`, `total` |
+| `file_write_response` | Write confirmation | `request_id`, `success`, `bytes_written` |
+| `file_delete_response` | Delete confirmation | `request_id`, `success` |
+| `clipboard_update` | Clipboard content from device | `format`, `data` |
+| `audio_frame` | Audio data | `codec`, `data` (base64), `timestamp`, `sequence` |
+| `audio_end` | Audio session ended | `session_id` |
+| `cursor_update` | Cursor image data | `format`, `width`, `height`, `hotspot_x`, `hotspot_y`, `data` |
+| `codec_answer` | Codec negotiation response | `codec`, `parameters` |
+| `monitor_list` | Available monitors | `monitors: [{ id, name, width, height, primary }]` |
+| `key_exchange` | Encryption key relay | `public_key`, `algorithm` |
+| `alert` | Device-initiated alert | `severity`, `message`, `source` |
+| `pong` | Keepalive response | — |
+
+### Server → Agent
+
+| Type | Description | Payload |
+|------|-------------|---------|
+| `auth_response` | Auth result | `success`, `error` |
+| `command` | Execute command | `command_id`, `command`, `args` |
+| `terminal_start` | Start terminal session | `session_id`, `shell`, `cols`, `rows` |
+| `terminal_input` | Terminal input data | `session_id`, `data` (base64) |
+| `terminal_resize` | Resize terminal | `session_id`, `cols`, `rows` |
+| `terminal_kill` | Kill terminal session | `session_id` |
+| `file_list` | Request directory listing | `request_id`, `path` |
+| `file_read` | Request file content | `request_id`, `path`, `offset`, `length` |
+| `file_write` | Write file content | `request_id`, `path`, `data` (base64), `offset` |
+| `file_delete` | Delete file/directory | `request_id`, `path` |
+| `clipboard_set` | Set device clipboard | `format`, `data` |
+| `screenshot_capture` | Request screenshot | `request_id` |
+| `state_request` | Request current state | — |
+| `config_update` | Push config changes | `config: {...}` |
+| `alert_ack` | Acknowledge alert | `alert_id` |
+| `codec_offer` | Codec negotiation offer | `codecs: [...]` |
+| `monitor_select` | Select active monitor | `monitor_id` |
+| `keyframe_request` | Request video keyframe | — |
+| `quality_report` | Quality metrics from browser | `bandwidth_kb`, `latency_ms`, `frame_loss`, `fps` |
+| `ping` | Keepalive request | — |
+
+## Widget Types
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `gauge` | `min`, `max`, `unit`, `danger`, `warning` | Horizontal bar gauge |
+| `toggle` | `on_command`, `off_command` | On/off switch |
+| `button` | `command`, `confirm` | Action button |
+| `led` | `on_color`, `off_color` | Status LED indicator |
+| `text` | — | Read-only text display |
+| `slider` | `min`, `max`, `step`, `command` | Adjustable slider |
+| `select` | `options`, `command` | Dropdown selector |
+| `chart` | `max_points` | Time-series bar chart |
+
+## Error Handling
+
+Error messages use the `error` type:
+
+```json
+{
+  "type": "error",
+  "code": "AUTH_FAILED",
+  "message": "Invalid API key"
+}
+```
+
+| Code | Description |
+|------|-------------|
+| `AUTH_FAILED` | Authentication failure |
+| `INVALID_MESSAGE` | Malformed message |
+| `UNKNOWN_COMMAND` | Unrecognized command |
+| `RATE_LIMITED` | Too many messages |
+| `SESSION_EXPIRED` | Session timed out |
+
+## Keepalive
+
+Server sends `ping` every 30 seconds. Agent must respond with `pong` within 10 seconds or connection is closed.

@@ -1,0 +1,149 @@
+/**
+ * BetterDesk Console — Real-time Device Status Push
+ *
+ * Connects to Go server's WebSocket event bus and pushes device status
+ * changes to browser clients in real time.
+ *
+ * Go server endpoint: GET /api/ws/events?filter=peer_online
+ * Browser endpoint:   WS /ws/device-status
+ */
+
+'use strict';
+
+const WebSocket = require('ws');
+
+const log = {
+    info:  (...a) => console.log('[DeviceStatus]', ...a),
+    warn:  (...a) => console.warn('[DeviceStatus]', ...a),
+    error: (...a) => console.error('[DeviceStatus]', ...a),
+};
+
+const PING_INTERVAL = 30000;
+const RECONNECT_BASE = 3000;
+const RECONNECT_MAX = 60000;
+
+/**
+ * Initialize real-time device status push.
+ * @param {import('http').Server} httpServer - The HTTP server to attach WS to
+ * @param {Function} sessionMiddleware - Express session middleware for auth
+ * @param {string} goApiUrl - Go server base URL (e.g. http://localhost:21114/api)
+ * @param {string} apiKey - API key for Go server authentication
+ */
+function initDeviceStatusPush(httpServer, sessionMiddleware, goApiUrl, apiKey) {
+    // Browser-facing WebSocket server
+    const wss = new WebSocket.Server({ noServer: true });
+    const clients = new Set();
+
+    // Handle upgrade requests
+    httpServer.on('upgrade', (req, socket, head) => {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        if (url.pathname !== '/ws/device-status') return;
+
+        // Authenticate via session
+        sessionMiddleware(req, {}, () => {
+            if (!req.session || !req.session.userId) {
+                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                socket.destroy();
+                return;
+            }
+            wss.handleUpgrade(req, socket, head, (ws) => {
+                wss.emit('connection', ws, req);
+            });
+        });
+    });
+
+    wss.on('connection', (ws) => {
+        clients.add(ws);
+
+        // Ping to keep alive
+        const pingTimer = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) ws.ping();
+            else clearInterval(pingTimer);
+        }, PING_INTERVAL);
+
+        ws.on('close', () => {
+            clients.delete(ws);
+            clearInterval(pingTimer);
+        });
+
+        ws.on('error', () => {
+            clients.delete(ws);
+            clearInterval(pingTimer);
+        });
+    });
+
+    // Broadcast to all connected browser clients
+    function broadcast(data) {
+        const text = JSON.stringify(data);
+        for (const ws of clients) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(text);
+            }
+        }
+    }
+
+    // Connect to Go server event bus
+    let retryDelay = RECONNECT_BASE;
+
+    function connectToGoEventBus() {
+        const wsUrl = goApiUrl
+            .replace(/^http:/, 'ws:')
+            .replace(/^https:/, 'wss:')
+            .replace(/\/api$/, '');
+
+        const url = `${wsUrl}/api/ws/events?filter=peer_online&api_key=${encodeURIComponent(apiKey)}`;
+
+        log.info('Connecting to Go event bus...');
+
+        const goWs = new WebSocket(url, {
+            headers: { 'X-API-Key': apiKey },
+        });
+
+        goWs.on('open', () => {
+            log.info('Connected to Go event bus');
+            retryDelay = RECONNECT_BASE;
+        });
+
+        goWs.on('message', (data) => {
+            try {
+                const event = JSON.parse(data.toString());
+                // Forward peer status events to browser clients
+                if (event.type === 'peer_online' || event.type === 'peer_offline' ||
+                    event.type === 'peer_status_changed' || event.type === 'peer_registered') {
+                    broadcast({
+                        type: 'device_status',
+                        device_id: event.peer_id || event.id || event.device_id,
+                        status: event.status || (event.type === 'peer_online' ? 'online' : 'offline'),
+                        timestamp: event.timestamp || Date.now(),
+                        details: event,
+                    });
+                }
+            } catch (_) {
+                // Ignore unparseable frames
+            }
+        });
+
+        goWs.on('close', () => {
+            log.warn('Go event bus disconnected, retrying in ' + retryDelay + 'ms');
+            setTimeout(connectToGoEventBus, retryDelay);
+            retryDelay = Math.min(retryDelay * 2, RECONNECT_MAX);
+        });
+
+        goWs.on('error', (err) => {
+            log.error('Go event bus error:', err.message);
+            goWs.close();
+        });
+    }
+
+    // Only connect if we have the Go API URL
+    if (goApiUrl && apiKey) {
+        connectToGoEventBus();
+    } else {
+        log.warn('Go API URL or API key not configured, device status push disabled');
+    }
+
+    log.info('Device status push initialized');
+    return wss;
+}
+
+module.exports = { initDeviceStatusPush };

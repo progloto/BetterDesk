@@ -21,7 +21,7 @@ const apiClient = axios.create({
         'Content-Type': 'application/json',
         'X-API-Key': config.betterdeskApiKey
     },
-    httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    httpsAgent: new https.Agent({ rejectUnauthorized: !config.allowSelfSignedCerts })
 });
 
 // Retry once on 401 by reloading API key from file (handles race condition
@@ -402,6 +402,7 @@ function normalisePeer(peer) {
     return {
         id: peer.id || '',
         hostname: peer.hostname || '',
+        display_name: peer.display_name || '',
         username: peer.user || '',
         platform: peer.os || '',
         os: peer.os || '',
@@ -486,6 +487,254 @@ async function sendCDAPCommand(id, widgetId, action, value, reason) {
     }
 }
 
+async function getCDAPAlerts(deviceId) {
+    try {
+        const params = deviceId ? { device_id: deviceId } : {};
+        const { data } = await apiClient.get('/cdap/alerts', { params });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message, alerts: [], total: 0 };
+    }
+}
+
+async function getLinkedPeers(id) {
+    try {
+        const { data } = await apiClient.get(`/peers/${encodeURIComponent(id)}/linked`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message, linked: [], total: 0 };
+    }
+}
+
+async function linkDevice(id, linkedPeerId) {
+    try {
+        const { data } = await apiClient.patch(`/peers/${encodeURIComponent(id)}`, {
+            linked_peer_id: linkedPeerId || ''
+        });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+// ========================== Device Tokens ====================================
+
+/**
+ * GET /api/tokens
+ */
+async function listDeviceTokens(includeRevoked) {
+    try {
+        const params = includeRevoked ? { include_revoked: 'true' } : {};
+        const { data } = await apiClient.get('/tokens', { params });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * POST /api/tokens
+ */
+async function createDeviceToken(body) {
+    try {
+        const { data } = await apiClient.post('/tokens', body);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * GET /api/tokens/:id
+ */
+async function getDeviceToken(id) {
+    try {
+        const { data } = await apiClient.get(`/tokens/${id}`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * PUT /api/tokens/:id
+ */
+async function updateDeviceToken(id, body) {
+    try {
+        const { data } = await apiClient.put(`/tokens/${id}`, body);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * DELETE /api/tokens/:id
+ */
+async function revokeDeviceToken(id) {
+    try {
+        const { data } = await apiClient.delete(`/tokens/${id}`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * POST /api/tokens/generate-bulk
+ */
+async function bulkGenerateTokens(body) {
+    try {
+        const { data } = await apiClient.post('/tokens/generate-bulk', body);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * POST /api/tokens/:id/bind
+ */
+async function bindTokenToPeer(id, peerId) {
+    try {
+        const { data } = await apiClient.post(`/tokens/${id}/bind`, { peer_id: peerId });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * GET /api/enrollment/mode
+ */
+async function getEnrollmentMode() {
+    try {
+        const { data } = await apiClient.get('/enrollment/mode');
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * PUT /api/enrollment/mode
+ */
+async function setEnrollmentMode(mode) {
+    try {
+        const { data } = await apiClient.put('/enrollment/mode', { mode });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment — pending device management (proxied from Go server)
+// ---------------------------------------------------------------------------
+
+/**
+ * Get list of pending enrollment requests from Go server.
+ */
+async function getEnrollmentPending() {
+    try {
+        const { data } = await apiClient.get('/enrollment/pending');
+        return { success: true, data: data.devices || [], count: data.count || 0 };
+    } catch (e) {
+        return { success: false, error: e.message, data: [], count: 0 };
+    }
+}
+
+/**
+ * Approve a pending enrollment request on Go server.
+ * @param {string} deviceId - Device ID to approve
+ * @param {string} displayName - Operator-assigned display name
+ * @param {string} syncMode - Sync mode: silent, standard, turbo
+ */
+async function approveEnrollment(deviceId, displayName, syncMode) {
+    try {
+        const { data } = await apiClient.post(`/enrollment/approve/${encodeURIComponent(deviceId)}`, {
+            display_name: displayName || '',
+            sync_mode: syncMode || 'standard'
+        });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Reject a pending enrollment request on Go server.
+ * @param {string} deviceId - Device ID to reject
+ */
+async function rejectEnrollment(deviceId) {
+    try {
+        const { data } = await apiClient.post(`/enrollment/reject/${encodeURIComponent(deviceId)}`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Get branding configuration from Go server (public endpoint).
+ */
+async function getBranding() {
+    try {
+        const { data } = await apiClient.get('/branding');
+        return { success: true, data };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Save branding configuration to Go server.
+ */
+async function saveBranding(brandingData) {
+    try {
+        const { data } = await apiClient.post('/branding', brandingData);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Get unattended access policy for a peer device.
+ */
+async function getAccessPolicy(id) {
+    try {
+        const { data } = await apiClient.get(`/peers/${id}/access-policy`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Save unattended access policy for a peer device.
+ */
+async function saveAccessPolicy(id, policy) {
+    try {
+        const { data } = await apiClient.put(`/peers/${id}/access-policy`, policy);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Delete unattended access policy for a peer device.
+ */
+async function deleteAccessPolicy(id) {
+    try {
+        const { data } = await apiClient.delete(`/peers/${id}/access-policy`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
 module.exports = {
     // Health / Stats
     getHealth,
@@ -525,6 +774,32 @@ module.exports = {
     getCDAPDeviceManifest,
     getCDAPDeviceState,
     sendCDAPCommand,
+    getCDAPAlerts,
+    getLinkedPeers,
+    linkDevice,
+    // Device Tokens
+    listDeviceTokens,
+    createDeviceToken,
+    getDeviceToken,
+    updateDeviceToken,
+    revokeDeviceToken,
+    bulkGenerateTokens,
+    bindTokenToPeer,
+    getEnrollmentMode,
+    setEnrollmentMode,
+    // Enrollment — pending devices
+    getEnrollmentPending,
+    approveEnrollment,
+    rejectEnrollment,
+    // Branding (Go server)
+    getBranding: getBranding,
+    saveBranding: saveBranding,
+    // Access Policies (Unattended Access)
+    getAccessPolicy,
+    saveAccessPolicy,
+    deleteAccessPolicy,
     // Helpers
-    normalisePeer
+    normalisePeer,
+    // Raw axios client (for services that need direct API access)
+    apiClient,
 };

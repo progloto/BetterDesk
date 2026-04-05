@@ -24,6 +24,10 @@
                 <span class="material-icons">backup</span>
                 ${_('settings.tab_backup')}
             </button>
+            <button class="settings-tab" data-tab="updates">
+                <span class="material-icons">system_update</span>
+                ${_('updates.tab_title')}
+            </button>
         </div>
         
         <!-- General Tab -->
@@ -541,6 +545,92 @@
                         </label>
                     </div>
                     <div class="restore-result" id="restore-result" style="display:none;"></div>
+                </div>
+            </div>
+        </div>
+        </div>
+        
+        <!-- Updates Tab -->
+        <div class="settings-tab-content" id="tab-updates">
+        <div class="settings-sections">
+            <!-- Version Check -->
+            <div class="settings-section">
+                <div class="settings-section-header">
+                    <h2 class="settings-section-title">
+                        <span class="material-icons">system_update</span>
+                        ${_('updates.title')}
+                    </h2>
+                    <p class="settings-section-desc">${_('updates.desc')}</p>
+                </div>
+                <div class="settings-section-body">
+                    <div class="update-version-info">
+                        <div class="update-version-row">
+                            <span class="update-label">${_('updates.current_version')}</span>
+                            <span class="update-value" id="update-local-version">v${appVersion}</span>
+                        </div>
+                        <div class="update-version-row">
+                            <span class="update-label">${_('updates.latest_version')}</span>
+                            <span class="update-value" id="update-remote-version">
+                                <span class="text-muted">—</span>
+                            </span>
+                        </div>
+                        <div class="update-version-row" id="update-status-row" style="display:none;">
+                            <span class="update-label">${_('updates.status')}</span>
+                            <span class="update-value" id="update-status-badge"></span>
+                        </div>
+                    </div>
+                    <div class="update-actions" style="margin-top: 16px;">
+                        <button class="btn btn-primary" id="update-check-btn">
+                            <span class="material-icons">refresh</span>
+                            ${_('updates.check_now')}
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Update Details (hidden until check completes) -->
+            <div class="settings-section" id="update-details-section" style="display:none;">
+                <div class="settings-section-header">
+                    <h2 class="settings-section-title">
+                        <span class="material-icons">description</span>
+                        ${_('updates.changelog')}
+                    </h2>
+                </div>
+                <div class="settings-section-body">
+                    <div class="update-changelog" id="update-changelog"></div>
+                    <div class="update-files-summary" id="update-files-summary" style="margin-top:12px;"></div>
+                    <div class="update-actions" style="margin-top: 16px;">
+                        <label class="restore-option" style="margin-bottom: 12px;">
+                            <input type="checkbox" id="update-backup-toggle" checked>
+                            <span>${_('updates.create_backup')}</span>
+                        </label>
+                        <button class="btn btn-primary btn-lg" id="update-install-btn" disabled>
+                            <span class="material-icons">download</span>
+                            ${_('updates.install')}
+                        </button>
+                    </div>
+                    <div class="update-progress" id="update-progress" style="display:none;">
+                        <div class="update-progress-bar">
+                            <div class="update-progress-fill" id="update-progress-fill"></div>
+                        </div>
+                        <p class="update-progress-text" id="update-progress-text">${_('updates.installing')}</p>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Update Backups -->
+            <div class="settings-section">
+                <div class="settings-section-header">
+                    <h2 class="settings-section-title">
+                        <span class="material-icons">history</span>
+                        ${_('updates.backups_title')}
+                    </h2>
+                    <p class="settings-section-desc">${_('updates.backups_desc')}</p>
+                </div>
+                <div class="settings-section-body">
+                    <div id="update-backups-list">
+                        <p class="text-muted">${_('common.loading')}</p>
+                    </div>
                 </div>
             </div>
         </div>

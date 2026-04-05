@@ -19,16 +19,17 @@ type Manifest struct {
 
 // ManifestDevice describes the physical/virtual device identity.
 type ManifestDevice struct {
-	Name        string   `json:"name"`
-	Type        string   `json:"type"` // scada, iot, os_agent, network, camera, desktop, custom
-	Vendor      string   `json:"vendor,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Firmware    string   `json:"firmware,omitempty"`
-	Serial      string   `json:"serial,omitempty"`
-	Location    string   `json:"location,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	Icon        string   `json:"icon,omitempty"`
-	Description string   `json:"description,omitempty"`
+	Name         string   `json:"name"`
+	Type         string   `json:"type"` // scada, iot, os_agent, network, camera, desktop, custom
+	Vendor       string   `json:"vendor,omitempty"`
+	Model        string   `json:"model,omitempty"`
+	Firmware     string   `json:"firmware,omitempty"`
+	Serial       string   `json:"serial,omitempty"`
+	Location     string   `json:"location,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	Icon         string   `json:"icon,omitempty"`
+	Description  string   `json:"description,omitempty"`
+	LinkedPeerID string   `json:"linked_peer_id,omitempty"` // RustDesk peer ID to link this CDAP device with
 }
 
 // ManifestBridge describes the bridge software connecting the device to CDAP.
@@ -78,6 +79,9 @@ type Widget struct {
 	Columns  []TableColumn `json:"columns,omitempty"`
 	MaxRows  int           `json:"max_rows,omitempty"`
 	Sortable bool          `json:"sortable,omitempty"`
+
+	// RBAC permissions (optional, defaults applied if nil)
+	Permissions *WidgetPermissions `json:"permissions,omitempty"`
 }
 
 // WidgetOption for select widgets.
@@ -99,6 +103,15 @@ type TableColumn struct {
 	ID    string `json:"id"`
 	Label string `json:"label"`
 	Type  string `json:"type,omitempty"` // string, number, boolean, date
+}
+
+// WidgetPermissions defines per-widget RBAC rules.
+// Each field names the minimum role required for that operation class.
+// Valid roles: "admin", "operator", "viewer".  Empty string means unrestricted.
+type WidgetPermissions struct {
+	Read    string `json:"read,omitempty"`    // required role to see widget state (default: viewer)
+	Control string `json:"control,omitempty"` // required role for set/trigger/reset (default: operator)
+	Execute string `json:"execute,omitempty"` // required role for execute action (default: admin)
 }
 
 // AlertDef defines a threshold-based alert.
@@ -154,6 +167,101 @@ var allowedCapabilities = map[string]bool{
 
 // maxWidgets is the hard limit on widget count per device.
 const maxWidgets = 200
+
+// roleLevel maps a role name to a numeric authority level.
+// Higher number = more privilege.
+var roleLevel = map[string]int{
+	"viewer":   1,
+	"operator": 2,
+	"admin":    3,
+}
+
+// RoleLevel returns the numeric authority level for a role name.
+// Returns 0 for unknown roles.
+func RoleLevel(role string) int {
+	return roleLevel[role]
+}
+
+// allowedRoles is used for validation of permission fields.
+var allowedRoles = map[string]bool{
+	"admin":    true,
+	"operator": true,
+	"viewer":   true,
+}
+
+// dangerousWidgetTypes default to admin-level execute permission.
+var dangerousWidgetTypes = map[string]bool{
+	"terminal":     true,
+	"desktop":      true,
+	"file_browser": true,
+}
+
+// DefaultPermissions returns the default RBAC permissions for a widget type.
+func DefaultPermissions(widgetType string) *WidgetPermissions {
+	p := &WidgetPermissions{
+		Read:    "viewer",
+		Control: "operator",
+		Execute: "operator",
+	}
+	if dangerousWidgetTypes[widgetType] {
+		p.Control = "admin"
+		p.Execute = "admin"
+	}
+	return p
+}
+
+// EffectivePermissions returns the permissions for a widget,
+// using explicit values when set and defaults otherwise.
+func EffectivePermissions(w *Widget) *WidgetPermissions {
+	def := DefaultPermissions(w.Type)
+	if w.Permissions == nil {
+		return def
+	}
+	p := *w.Permissions
+	if p.Read == "" {
+		p.Read = def.Read
+	}
+	if p.Control == "" {
+		p.Control = def.Control
+	}
+	if p.Execute == "" {
+		p.Execute = def.Execute
+	}
+	return &p
+}
+
+// actionPermissionType maps a command action to the permission class it requires.
+func actionPermissionType(action string) string {
+	switch action {
+	case "query":
+		return "read"
+	case "execute":
+		return "execute"
+	default: // set, trigger, reset
+		return "control"
+	}
+}
+
+// CheckWidgetPermission returns true if the given role has sufficient
+// privilege to perform the specified action on the widget.
+func CheckWidgetPermission(role, action string, w *Widget) bool {
+	perm := EffectivePermissions(w)
+	permType := actionPermissionType(action)
+
+	var requiredRole string
+	switch permType {
+	case "read":
+		requiredRole = perm.Read
+	case "execute":
+		requiredRole = perm.Execute
+	default:
+		requiredRole = perm.Control
+	}
+
+	userLevel := roleLevel[role]
+	requiredLevel := roleLevel[requiredRole]
+	return userLevel >= requiredLevel
+}
 
 // ParseManifest parses and validates a CDAP device manifest from raw JSON.
 func ParseManifest(data json.RawMessage) (*Manifest, error) {
@@ -236,6 +344,19 @@ func ValidateManifest(m *Manifest) error {
 		w.Label = strings.TrimSpace(w.Label)
 		if w.Label == "" {
 			w.Label = w.ID
+		}
+
+		// Permission field validation
+		if w.Permissions != nil {
+			for _, rv := range []struct{ name, val string }{
+				{"read", w.Permissions.Read},
+				{"control", w.Permissions.Control},
+				{"execute", w.Permissions.Execute},
+			} {
+				if rv.val != "" && !allowedRoles[rv.val] {
+					return fmt.Errorf("widget %s: invalid permission role for %s: %s", w.ID, rv.name, rv.val)
+				}
+			}
 		}
 	}
 

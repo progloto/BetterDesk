@@ -8,9 +8,9 @@
     <title><%= _('auth.login') %> - <%= appName %></title>
     
     <link rel="icon" type="image/svg+xml" href="/branding/favicon.svg">
-    <link rel="stylesheet" href="/css/main.css">
-    <link rel="stylesheet" href="/css/theme.css">
-    <link rel="stylesheet" href="/css/login.css">
+    <link rel="stylesheet" href="/css/main.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/theme.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/login.css?v=<%= cacheVersion %>">
 </head>
 <body class="login-page">
     <div class="login-container">
@@ -155,7 +155,7 @@
         </div>
     </div>
     
-    <script>
+    <script nonce="<%= cspNonce %>">
         window.BetterDesk = {
             csrfToken: '<%= csrfToken || "" %>',
             lang: '<%= lang || "en" %>',
@@ -163,7 +163,7 @@
             branding: <%- JSON.stringify(branding || {}) %>
         };
     </script>
-    <script src="/js/utils.js"></script>
-    <script src="/js/login.js"></script>
+    <script src="/js/utils.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/login.js?v=<%= cacheVersion %>"></script>
 </body>
 </html>

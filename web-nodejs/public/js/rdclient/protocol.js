@@ -57,6 +57,26 @@ class RDProtocol {
         this.types.TogglePrivacyMode = this.protoRoot.lookupType('hbb.TogglePrivacyMode');
         this.types.SwitchDisplay = this.protoRoot.lookupType('hbb.SwitchDisplay');
 
+        // File transfer types
+        this.types.FileAction = this.protoRoot.lookupType('hbb.FileAction');
+        this.types.FileResponse = this.protoRoot.lookupType('hbb.FileResponse');
+        this.types.FileDirectory = this.protoRoot.lookupType('hbb.FileDirectory');
+        this.types.FileEntry = this.protoRoot.lookupType('hbb.FileEntry');
+        this.types.ReadDir = this.protoRoot.lookupType('hbb.ReadDir');
+        this.types.FileTransferSendRequest = this.protoRoot.lookupType('hbb.FileTransferSendRequest');
+        this.types.FileTransferReceiveRequest = this.protoRoot.lookupType('hbb.FileTransferReceiveRequest');
+        this.types.FileTransferBlock = this.protoRoot.lookupType('hbb.FileTransferBlock');
+        this.types.FileTransferDigest = this.protoRoot.lookupType('hbb.FileTransferDigest');
+        this.types.FileTransferDone = this.protoRoot.lookupType('hbb.FileTransferDone');
+        this.types.FileTransferCancel = this.protoRoot.lookupType('hbb.FileTransferCancel');
+        this.types.FileTransferSendConfirmRequest = this.protoRoot.lookupType('hbb.FileTransferSendConfirmRequest');
+        this.types.FileTransferError = this.protoRoot.lookupType('hbb.FileTransferError');
+        this.types.FileDirCreate = this.protoRoot.lookupType('hbb.FileDirCreate');
+        this.types.FileRemoveDir = this.protoRoot.lookupType('hbb.FileRemoveDir');
+        this.types.FileRemoveFile = this.protoRoot.lookupType('hbb.FileRemoveFile');
+        this.types.FileRename = this.protoRoot.lookupType('hbb.FileRename');
+        this.types.FileTransfer = this.protoRoot.lookupType('hbb.FileTransfer');
+
         // Enums
         this.enums = {};
         this.enums.ConnType = this.protoRoot.lookupEnum('hbb.ConnType');
@@ -65,6 +85,7 @@ class RDProtocol {
         this.enums.KeyboardMode = this.protoRoot.lookupEnum('hbb.KeyboardMode');
         this.enums.ImageQuality = this.protoRoot.lookupEnum('hbb.ImageQuality');
         this.enums.ClipboardFormat = this.protoRoot.lookupEnum('hbb.ClipboardFormat');
+        this.enums.FileType = this.protoRoot.lookupEnum('hbb.FileType');
 
         this.loaded = true;
     }
@@ -187,6 +208,9 @@ class RDProtocol {
         const hasWebCodecs = typeof VideoDecoder !== 'undefined';
         const hasJMuxer = typeof JMuxer !== 'undefined';
 
+        // Default to Best quality for sharpest image
+        const quality = opts.imageQuality || 'Best';
+
         return {
             loginRequest: {
                 username: opts.username || '',
@@ -197,7 +221,7 @@ class RDProtocol {
                 version: 'BetterDesk-Web/1.0',
                 sessionId: Date.now(),
                 option: {
-                    imageQuality: this.enums.ImageQuality.values.Balanced,
+                    imageQuality: this.enums.ImageQuality.values[quality] || this.enums.ImageQuality.values.Best,
                     supportedDecoding: {
                         abilityVp9: hasWebCodecs ? 1 : 0,
                         abilityH264: (hasWebCodecs || hasJMuxer) ? 1 : 0,
@@ -205,7 +229,7 @@ class RDProtocol {
                         abilityVp8: hasWebCodecs ? 1 : 0,
                         prefer: hasWebCodecs ? 0 : 2 // Auto when WebCodecs, H264 when fallback
                     },
-                    customFps: opts.fps || 30,
+                    customFps: opts.fps || 60,
                     showRemoteCursor: 2, // Yes
                     disableAudio: opts.disableAudio ? 2 : 1,
                     disableClipboard: 1, // No
@@ -337,6 +361,198 @@ class RDProtocol {
                     implKey: 'privacy_mode_impl_virtual_display',
                     on: on
                 }
+            }
+        };
+    }
+
+    // ---- File Transfer builders ----
+
+    /**
+     * Build FileAction.read_dir message
+     * @param {string} path - Directory path to read
+     * @param {boolean} [includeHidden=false]
+     * @returns {Object} Message object for _sendPeerMessage
+     */
+    buildReadDir(path, includeHidden) {
+        return {
+            fileAction: {
+                readDir: {
+                    path: path || '',
+                    includeHidden: !!includeHidden
+                }
+            }
+        };
+    }
+
+    /**
+     * Build FileAction.receive (request download from remote)
+     * @param {number} id - Transfer ID
+     * @param {string} path - Remote directory path
+     * @param {Array<Object>} files - Array of { name, size, modified_time, entry_type }
+     * @param {number} fileNum - File sequence number in transfer
+     * @param {number} totalSize - Total bytes
+     * @returns {Object}
+     */
+    buildFileReceiveRequest(id, path, files, fileNum, totalSize) {
+        return {
+            fileAction: {
+                receive: {
+                    id: id,
+                    path: path,
+                    files: files || [],
+                    fileNum: fileNum || 0,
+                    totalSize: totalSize || 0
+                }
+            }
+        };
+    }
+
+    /**
+     * Build FileAction.send (request upload to remote)
+     * @param {number} id - Transfer ID
+     * @param {string} path - Remote destination path
+     * @param {boolean} [includeHidden]
+     * @param {number} [fileNum]
+     * @returns {Object}
+     */
+    buildFileSendRequest(id, path, includeHidden, fileNum) {
+        return {
+            fileAction: {
+                send: {
+                    id: id,
+                    path: path,
+                    includeHidden: !!includeHidden,
+                    fileNum: fileNum || 0
+                }
+            }
+        };
+    }
+
+    /**
+     * Build FileAction.send_confirm (confirm/skip download after digest)
+     * @param {number} id - Transfer ID
+     * @param {number} fileNum - File number
+     * @param {boolean} skip - Whether to skip this file
+     * @param {number} [offsetBlk] - Block offset for resume
+     * @returns {Object}
+     */
+    buildFileSendConfirm(id, fileNum, skip, offsetBlk) {
+        const confirm = { id: id, fileNum: fileNum };
+        if (skip) {
+            confirm.skip = true;
+        } else {
+            confirm.offsetBlk = offsetBlk || 0;
+        }
+        return {
+            fileAction: { sendConfirm: confirm }
+        };
+    }
+
+    /**
+     * Build FileAction.cancel
+     * @param {number} id - Transfer ID to cancel
+     * @returns {Object}
+     */
+    buildFileCancel(id) {
+        return {
+            fileAction: {
+                cancel: { id: id }
+            }
+        };
+    }
+
+    /**
+     * Build FileAction.create (create directory)
+     * @param {number} id
+     * @param {string} path
+     * @returns {Object}
+     */
+    buildFileDirCreate(id, path) {
+        return {
+            fileAction: {
+                create: { id: id, path: path }
+            }
+        };
+    }
+
+    /**
+     * Build FileAction.remove_file
+     * @param {number} id
+     * @param {string} path
+     * @param {number} fileNum
+     * @returns {Object}
+     */
+    buildFileRemove(id, path, fileNum) {
+        return {
+            fileAction: {
+                removeFile: { id: id, path: path, fileNum: fileNum || 0 }
+            }
+        };
+    }
+
+    /**
+     * Build FileAction.remove_dir
+     * @param {number} id
+     * @param {string} path
+     * @param {boolean} recursive
+     * @returns {Object}
+     */
+    buildFileRemoveDir(id, path, recursive) {
+        return {
+            fileAction: {
+                removeDir: { id: id, path: path, recursive: !!recursive }
+            }
+        };
+    }
+
+    /**
+     * Build FileAction.rename
+     * @param {number} id
+     * @param {string} path
+     * @param {string} newName
+     * @returns {Object}
+     */
+    buildFileRename(id, path, newName) {
+        return {
+            fileAction: {
+                rename: { id: id, path: path, newName: newName }
+            }
+        };
+    }
+
+    /**
+     * Build FileResponse.block (upload data block)
+     * @param {number} id
+     * @param {number} fileNum
+     * @param {Uint8Array} data
+     * @param {boolean} compressed
+     * @param {number} blkId
+     * @returns {Object}
+     */
+    buildFileBlock(id, fileNum, data, compressed, blkId) {
+        return {
+            fileResponse: {
+                block: {
+                    id: id,
+                    fileNum: fileNum,
+                    data: data,
+                    compressed: !!compressed,
+                    blkId: blkId || 0
+                }
+            }
+        };
+    }
+
+    /**
+     * Build FileResponse.done (upload complete)
+     * @param {number} id
+     * @param {number} fileNum
+     * @returns {Object}
+     */
+    buildFileDone(id, fileNum) {
+        return {
+            fileResponse: {
+                done: { id: id, fileNum: fileNum }
             }
         };
     }

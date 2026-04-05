@@ -3,67 +3,90 @@
  * Configures Helmet and custom security headers
  */
 
+const crypto = require('crypto');
 const helmet = require('helmet');
 const config = require('../config/config');
 
 /**
  * Build CSP connect-src based on HTTPS mode
- * When HTTPS is enabled, also allow wss:// for future WebSocket connections
+ * Allow WebSocket connections (ws:// or wss:// depending on mode)
  */
 const connectSources = config.httpsEnabled
     ? ["'self'", "wss:"]
-    : ["'self'"];
+    : ["'self'", "ws:"];
+
+function buildHelmetMiddleware(req, res) {
+    const nonce = crypto.randomBytes(16).toString('base64');
+    const isRemoteViewerPage = req.path.startsWith('/remote');
+
+    res.locals.cspNonce = nonce;
+
+    const scriptSources = ["'self'", `'nonce-${nonce}'`];
+    if (isRemoteViewerPage) {
+        // The remote viewer still depends on protobuf.js runtime code generation.
+        scriptSources.push("'unsafe-eval'");
+    }
+
+    return helmet({
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                scriptSrc: scriptSources,
+                // scriptSrcAttr intentionally omitted — blocks inline event handlers
+                styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+                fontSrc: ["'self'", "https://fonts.gstatic.com"],
+                imgSrc: ["'self'", "data:", "blob:"],
+                mediaSrc: ["'self'", "blob:"],
+                connectSrc: connectSources,
+                frameSrc: ["'self'"],
+                objectSrc: ["'none'"],
+                childSrc: ["'self'"],
+                workerSrc: ["'self'", "blob:"],
+                baseUri: ["'self'"],
+                formAction: ["'self'"],
+                frameAncestors: ["'self'"],
+                upgradeInsecureRequests: config.httpsEnabled ? [] : null
+            }
+        },
+        crossOriginEmbedderPolicy: false,
+        crossOriginResourcePolicy: { policy: 'same-origin' },
+        crossOriginOpenerPolicy: config.httpsEnabled ? { policy: 'same-origin' } : false,
+        originAgentCluster: config.httpsEnabled,
+        strictTransportSecurity: config.httpsEnabled
+            ? { maxAge: 31536000, includeSubDomains: true, preload: false }
+            : false,
+        dnsPrefetchControl: { allow: false },
+        referrerPolicy: { policy: 'strict-origin-when-cross-origin' }
+    });
+}
 
 /**
- * Configure Helmet with appropriate CSP for our app
- * Security policies adjust automatically based on HTTPS mode
- */
-const helmetMiddleware = helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // unsafe-eval required by protobuf.js codegen
-            scriptSrcAttr: ["'unsafe-inline'"], // Allow inline event handlers (onclick etc.)
-            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-            fontSrc: ["'self'", "https://fonts.gstatic.com"],
-            imgSrc: ["'self'", "data:", "blob:"],
-            mediaSrc: ["'self'", "blob:"], // blob: required by JMuxer MSE video decoding
-            connectSrc: connectSources,
-            frameSrc: ["'self'"],
-            objectSrc: ["'none'"],
-            baseUri: ["'self'"],
-            formAction: ["'self'"],
-            upgradeInsecureRequests: config.httpsEnabled ? [] : null
-        }
-    },
-    crossOriginEmbedderPolicy: false,
-    crossOriginResourcePolicy: false,
-    crossOriginOpenerPolicy: config.httpsEnabled ? { policy: 'same-origin' } : false,
-    originAgentCluster: config.httpsEnabled,
-    strictTransportSecurity: config.httpsEnabled
-        ? { maxAge: 31536000, includeSubDomains: true, preload: false }
-        : false
-});
-
-/**
- * Custom security headers
+ * Custom security headers beyond what Helmet provides
  */
 function customSecurityHeaders(req, res, next) {
-    // Prevent clickjacking
-    res.setHeader('X-Frame-Options', 'DENY');
-    
+    // Prevent clickjacking (belt + suspenders with CSP frame-ancestors)
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+
     // Prevent MIME type sniffing
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    
-    // XSS Protection (disabled for modern browsers, can cause issues in legacy)
+
+    // XSS Protection (disabled — CSP is the modern replacement)
     res.setHeader('X-XSS-Protection', '0');
-    
-    // Referrer policy
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    
-    // Permissions policy (includes browsing-topics to suppress Chrome warnings)
-    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(), browsing-topics=()');
-    
+
+    // Permissions policy — restrict powerful APIs
+    res.setHeader('Permissions-Policy',
+        'geolocation=(), microphone=(self), camera=(), ' +
+        'browsing-topics=(), payment=(), usb=(), ' +
+        'accelerometer=(), gyroscope=(), magnetometer=()');
+
+    // Prevent cross-site leak via cache timing
+    res.setHeader('Cache-Control', 'no-store');
+    // Allow static assets to be cached (overridden in express.static options)
+    if (req.path.startsWith('/css/') || req.path.startsWith('/js/') ||
+        req.path.startsWith('/img/') || req.path.startsWith('/fonts/')) {
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+    }
+
     next();
 }
 
@@ -71,7 +94,7 @@ function customSecurityHeaders(req, res, next) {
  * Combined security middleware
  */
 function securityMiddleware(req, res, next) {
-    helmetMiddleware(req, res, () => {
+    buildHelmetMiddleware(req, res)(req, res, () => {
         customSecurityHeaders(req, res, next);
     });
 }

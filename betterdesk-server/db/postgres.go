@@ -93,6 +93,8 @@ func (pg *PostgresDB) Migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_peers_uuid ON peers(uuid)`,
 		`CREATE INDEX IF NOT EXISTS idx_peers_status ON peers(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_peers_banned ON peers(banned) WHERE banned = TRUE`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_soft_deleted ON peers(soft_deleted) WHERE soft_deleted = FALSE`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_linked_peer ON peers(linked_peer_id) WHERE linked_peer_id != ''`,
 
 		`CREATE TABLE IF NOT EXISTS server_config (
 			key   TEXT PRIMARY KEY,
@@ -172,6 +174,104 @@ func (pg *PostgresDB) Migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_peer_id ON peer_metrics(peer_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_created_at ON peer_metrics(created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_peer_created ON peer_metrics(peer_id, created_at DESC)`,
+
+		// Chat messages
+		`CREATE TABLE IF NOT EXISTS chat_messages (
+			id              BIGSERIAL PRIMARY KEY,
+			conversation_id TEXT NOT NULL,
+			from_id         TEXT NOT NULL,
+			from_name       TEXT NOT NULL DEFAULT '',
+			to_id           TEXT NOT NULL DEFAULT '',
+			text            TEXT NOT NULL,
+			read            BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_messages_conv ON chat_messages(conversation_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_messages_from ON chat_messages(from_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at)`,
+
+		// Chat groups
+		`CREATE TABLE IF NOT EXISTS chat_groups (
+			id         TEXT PRIMARY KEY,
+			name       TEXT NOT NULL,
+			members    TEXT NOT NULL DEFAULT '',
+			created_by TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+
+		// Organizations (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS organizations (
+			id         TEXT PRIMARY KEY,
+			name       TEXT NOT NULL,
+			slug       TEXT UNIQUE NOT NULL,
+			logo_url   TEXT NOT NULL DEFAULT '',
+			settings   JSONB NOT NULL DEFAULT '{}',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+
+		// Organization users (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_users (
+			id            TEXT PRIMARY KEY,
+			org_id        TEXT NOT NULL REFERENCES organizations(id),
+			username      TEXT NOT NULL,
+			display_name  TEXT NOT NULL DEFAULT '',
+			email         TEXT NOT NULL DEFAULT '',
+			password_hash TEXT NOT NULL,
+			role          TEXT NOT NULL DEFAULT 'user',
+			totp_secret   TEXT NOT NULL DEFAULT '',
+			avatar_url    TEXT NOT NULL DEFAULT '',
+			last_login    TIMESTAMPTZ DEFAULT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE(org_id, username)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_org_users_org ON org_users(org_id)`,
+
+		// Organization devices (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_devices (
+			org_id           TEXT NOT NULL REFERENCES organizations(id),
+			device_id        TEXT NOT NULL,
+			assigned_user_id TEXT NOT NULL DEFAULT '',
+			department       TEXT NOT NULL DEFAULT '',
+			location         TEXT NOT NULL DEFAULT '',
+			building         TEXT NOT NULL DEFAULT '',
+			tags             TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(org_id, device_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_org_devices_org ON org_devices(org_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_org_devices_device ON org_devices(device_id)`,
+
+		// Organization invitations (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_invitations (
+			id         TEXT PRIMARY KEY,
+			org_id     TEXT NOT NULL REFERENCES organizations(id),
+			token      TEXT UNIQUE NOT NULL,
+			email      TEXT NOT NULL DEFAULT '',
+			role       TEXT NOT NULL DEFAULT 'user',
+			expires_at TIMESTAMPTZ NOT NULL,
+			used_at    TIMESTAMPTZ DEFAULT NULL
+		)`,
+
+		// Organization settings (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_settings (
+			org_id TEXT NOT NULL REFERENCES organizations(id),
+			key    TEXT NOT NULL,
+			value  TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY(org_id, key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_policies (
+			peer_id TEXT PRIMARY KEY,
+			unattended_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			password_hash TEXT NOT NULL DEFAULT '',
+			schedule_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			schedule_days TEXT NOT NULL DEFAULT '',
+			schedule_start_time TEXT NOT NULL DEFAULT '',
+			schedule_end_time TEXT NOT NULL DEFAULT '',
+			schedule_timezone TEXT NOT NULL DEFAULT '',
+			allowed_operators TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ,
+			updated_by TEXT NOT NULL DEFAULT ''
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -198,6 +298,8 @@ func (pg *PostgresDB) Migrate() error {
 		// peers: CDAP device type and linked peer (added in v2.5.0)
 		`ALTER TABLE peers ADD COLUMN IF NOT EXISTS device_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE peers ADD COLUMN IF NOT EXISTS linked_peer_id TEXT NOT NULL DEFAULT ''`,
+		// peers: display_name alias (added in v2.6.0)
+		`ALTER TABLE peers ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`,
 	}
 
 	for _, ddl := range columnMigrations {
@@ -216,7 +318,7 @@ const peerColumns = `id, uuid, pk, ip, "user", hostname, os, version,
 	status, nat_type, last_online, created_at,
 	disabled, banned, ban_reason, banned_at,
 	soft_deleted, deleted_at, note, tags, heartbeat_seq,
-	device_type, linked_peer_id`
+	device_type, linked_peer_id, display_name`
 
 // scanPeer scans a row into a Peer struct using nullable types.
 func scanPeer(row pgx.Row) (*Peer, error) {
@@ -229,7 +331,7 @@ func scanPeer(row pgx.Row) (*Peer, error) {
 		&lastOnline, &p.CreatedAt, &p.Disabled, &p.Banned,
 		&p.BanReason, &bannedAt, &p.SoftDeleted, &deletedAt,
 		&p.Note, &p.Tags, &p.HeartbeatSeq,
-		&p.DeviceType, &p.LinkedPeerID,
+		&p.DeviceType, &p.LinkedPeerID, &p.DisplayName,
 	)
 	if err != nil {
 		return nil, err
@@ -357,6 +459,14 @@ func (pg *PostgresDB) GetPeerCount() (total int, online int, err error) {
 	return total, online, err
 }
 
+// GetBannedPeerCount returns the number of banned peers in the database.
+func (pg *PostgresDB) GetBannedPeerCount() (int, error) {
+	var count int
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT COUNT(*) FROM peers WHERE banned = TRUE AND soft_deleted = FALSE`).Scan(&count)
+	return count, err
+}
+
 // UpdatePeerStatus updates a peer's status and IP, plus last_online timestamp.
 func (pg *PostgresDB) UpdatePeerStatus(id string, status string, ip string) error {
 	_, err := pg.pool.Exec(pg.ctx,
@@ -427,7 +537,7 @@ func (pg *PostgresDB) IsPeerSoftDeleted(id string) (bool, error) {
 // Only provided keys are updated; others are left unchanged.
 // Allowed keys: "note", "user", "tags", "device_type", "linked_peer_id".
 func (pg *PostgresDB) UpdatePeerFields(id string, fields map[string]string) error {
-	allowed := map[string]string{"note": "note", "user": `"user"`, "tags": "tags", "device_type": "device_type", "linked_peer_id": "linked_peer_id"}
+	allowed := map[string]string{"note": "note", "user": `"user"`, "tags": "tags", "device_type": "device_type", "linked_peer_id": "linked_peer_id", "display_name": "display_name"}
 	setClauses := []string{}
 	args := []interface{}{}
 	idx := 1
@@ -477,12 +587,12 @@ func (pg *PostgresDB) ChangePeerID(oldID, newID string) error {
 		                    status, nat_type, last_online, created_at,
 		                    disabled, banned, ban_reason, banned_at,
 		                    soft_deleted, deleted_at, note, tags, heartbeat_seq,
-		                    device_type, linked_peer_id)
+		                    device_type, linked_peer_id, display_name)
 		SELECT $1, uuid, pk, ip, "user", hostname, os, version,
 		       status, nat_type, last_online, created_at,
 		       disabled, banned, ban_reason, banned_at,
 		       soft_deleted, deleted_at, note, tags, heartbeat_seq,
-		       device_type, linked_peer_id
+		       device_type, linked_peer_id, display_name
 		FROM peers WHERE id = $2 FOR UPDATE`, newID, oldID)
 	if err != nil {
 		return fmt.Errorf("db: ChangePeerID insert: %w", err)
@@ -613,6 +723,27 @@ func (pg *PostgresDB) SetConfig(key, value string) error {
 func (pg *PostgresDB) DeleteConfig(key string) error {
 	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM server_config WHERE key = $1`, key)
 	return err
+}
+
+// ListConfigByPrefix returns all configuration entries whose key starts with the given prefix.
+func (pg *PostgresDB) ListConfigByPrefix(prefix string) ([]ServerConfig, error) {
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT key, value FROM server_config WHERE key LIKE $1`,
+		prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var configs []ServerConfig
+	for rows.Next() {
+		var c ServerConfig
+		if err := rows.Scan(&c.Key, &c.Value); err != nil {
+			return nil, err
+		}
+		configs = append(configs, c)
+	}
+	return configs, rows.Err()
 }
 
 // ── User Operations ───────────────────────────────────────────────────
@@ -1074,6 +1205,148 @@ func (pg *PostgresDB) CleanupOldMetrics(maxAge time.Duration) (int64, error) {
 	return result.RowsAffected(), nil
 }
 
+// ── Chat Messages ─────────────────────────────────────────────────────
+
+func (pg *PostgresDB) SaveChatMessage(msg *ChatMessage) (int64, error) {
+	var id int64
+	err := pg.pool.QueryRow(pg.ctx,
+		`INSERT INTO chat_messages (conversation_id, from_id, from_name, to_id, text, read)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		msg.ConversationID, msg.FromID, msg.FromName, msg.ToID, msg.Text, msg.Read,
+	).Scan(&id)
+	return id, err
+}
+
+func (pg *PostgresDB) GetChatHistory(conversationID string, limit int) ([]*ChatMessage, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT id, conversation_id, from_id, from_name, to_id, text, read, created_at
+		 FROM chat_messages WHERE conversation_id = $1
+		 ORDER BY id DESC LIMIT $2`, conversationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*ChatMessage
+	for rows.Next() {
+		var m ChatMessage
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.FromID, &m.FromName, &m.ToID, &m.Text, &m.Read, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, &m)
+	}
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
+func (pg *PostgresDB) GetChatHistoryBefore(conversationID string, beforeID int64, limit int) ([]*ChatMessage, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT id, conversation_id, from_id, from_name, to_id, text, read, created_at
+		 FROM chat_messages WHERE conversation_id = $1 AND id < $2
+		 ORDER BY id DESC LIMIT $3`, conversationID, beforeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*ChatMessage
+	for rows.Next() {
+		var m ChatMessage
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.FromID, &m.FromName, &m.ToID, &m.Text, &m.Read, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, &m)
+	}
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
+func (pg *PostgresDB) MarkChatRead(conversationID, readerID string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE chat_messages SET read = TRUE
+		 WHERE conversation_id = $1 AND from_id != $2 AND read = FALSE`,
+		conversationID, readerID)
+	return err
+}
+
+func (pg *PostgresDB) GetUnreadCount(deviceID string) (int, error) {
+	var count int
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT COUNT(*) FROM chat_messages
+		 WHERE (conversation_id = $1 OR to_id = $1) AND from_id != $1 AND read = FALSE`,
+		deviceID).Scan(&count)
+	return count, err
+}
+
+func (pg *PostgresDB) DeleteChatHistory(conversationID string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`DELETE FROM chat_messages WHERE conversation_id = $1`, conversationID)
+	return err
+}
+
+// ── Chat Groups ───────────────────────────────────────────────────────
+
+func (pg *PostgresDB) CreateChatGroup(g *ChatGroup) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`INSERT INTO chat_groups (id, name, members, created_by) VALUES ($1, $2, $3, $4)`,
+		g.ID, g.Name, g.Members, g.CreatedBy)
+	return err
+}
+
+func (pg *PostgresDB) GetChatGroup(id string) (*ChatGroup, error) {
+	var g ChatGroup
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT id, name, members, created_by, created_at FROM chat_groups WHERE id = $1`, id,
+	).Scan(&g.ID, &g.Name, &g.Members, &g.CreatedBy, &g.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &g, nil
+}
+
+func (pg *PostgresDB) ListChatGroups(memberID string) ([]*ChatGroup, error) {
+	pattern := "%" + memberID + "%"
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT id, name, members, created_by, created_at FROM chat_groups WHERE members LIKE $1`, pattern)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*ChatGroup
+	for rows.Next() {
+		var g ChatGroup
+		if err := rows.Scan(&g.ID, &g.Name, &g.Members, &g.CreatedBy, &g.CreatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, &g)
+	}
+	return groups, nil
+}
+
+func (pg *PostgresDB) UpdateChatGroup(g *ChatGroup) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE chat_groups SET name = $1, members = $2 WHERE id = $3`,
+		g.Name, g.Members, g.ID)
+	return err
+}
+
+func (pg *PostgresDB) DeleteChatGroup(id string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`DELETE FROM chat_groups WHERE id = $1`, id)
+	return err
+}
+
 // ── LISTEN/NOTIFY ─────────────────────────────────────────────────────
 
 // OnNotify registers a callback for PostgreSQL LISTEN/NOTIFY events.
@@ -1177,4 +1450,59 @@ func scanPeerRows(rows pgx.Rows) ([]*Peer, error) {
 // (e.g., migration tools, raw queries). Not part of the Database interface.
 func (pg *PostgresDB) Pool() *pgxpool.Pool {
 	return pg.pool
+}
+
+// ============================================================
+// Access Policies (unattended access management)
+// ============================================================
+
+// GetAccessPolicy retrieves the access policy for a peer device.
+func (pg *PostgresDB) GetAccessPolicy(peerID string) (*AccessPolicy, error) {
+	row := pg.pool.QueryRow(pg.ctx,
+		`SELECT peer_id, unattended_enabled, password_hash, schedule_enabled,
+				schedule_days, schedule_start_time, schedule_end_time, schedule_timezone,
+				allowed_operators, COALESCE(updated_at, NOW()), updated_by
+		 FROM access_policies WHERE peer_id = $1`, peerID)
+
+	var p AccessPolicy
+	var updatedAt time.Time
+	err := row.Scan(&p.PeerID, &p.UnattendedEnabled, &p.PasswordHash, &p.ScheduleEnabled,
+		&p.ScheduleDays, &p.ScheduleStartTime, &p.ScheduleEndTime, &p.ScheduleTimezone,
+		&p.AllowedOperators, &updatedAt, &p.UpdatedBy)
+	if err != nil {
+		return nil, err
+	}
+	p.UpdatedAt = updatedAt.Format(time.RFC3339)
+	p.PasswordSet = p.PasswordHash != ""
+	return &p, nil
+}
+
+// SaveAccessPolicy creates or updates the access policy for a peer device.
+func (pg *PostgresDB) SaveAccessPolicy(p *AccessPolicy) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`INSERT INTO access_policies (peer_id, unattended_enabled, password_hash,
+			schedule_enabled, schedule_days, schedule_start_time, schedule_end_time,
+			schedule_timezone, allowed_operators, updated_at, updated_by)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10)
+		 ON CONFLICT(peer_id) DO UPDATE SET
+			unattended_enabled = EXCLUDED.unattended_enabled,
+			password_hash = CASE WHEN EXCLUDED.password_hash = '' THEN access_policies.password_hash WHEN EXCLUDED.password_hash = 'CLEAR' THEN '' ELSE EXCLUDED.password_hash END,
+			schedule_enabled = EXCLUDED.schedule_enabled,
+			schedule_days = EXCLUDED.schedule_days,
+			schedule_start_time = EXCLUDED.schedule_start_time,
+			schedule_end_time = EXCLUDED.schedule_end_time,
+			schedule_timezone = EXCLUDED.schedule_timezone,
+			allowed_operators = EXCLUDED.allowed_operators,
+			updated_at = NOW(),
+			updated_by = EXCLUDED.updated_by`,
+		p.PeerID, p.UnattendedEnabled, p.PasswordHash,
+		p.ScheduleEnabled, p.ScheduleDays, p.ScheduleStartTime, p.ScheduleEndTime,
+		p.ScheduleTimezone, p.AllowedOperators, p.UpdatedBy)
+	return err
+}
+
+// DeleteAccessPolicy removes the access policy for a peer device.
+func (pg *PostgresDB) DeleteAccessPolicy(peerID string) error {
+	_, err := pg.pool.Exec(pg.ctx, `DELETE FROM access_policies WHERE peer_id = $1`, peerID)
+	return err
 }

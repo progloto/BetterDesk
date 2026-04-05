@@ -21,6 +21,18 @@ function requireAuth(req, res, next) {
         return res.redirect('/login');
     }
     
+    // Block pro-only users from web panel (API-only role)
+    if (req.session.user && req.session.user.role === 'pro') {
+        req.session.destroy();
+        if (req.path.startsWith('/api/')) {
+            return res.status(403).json({
+                success: false,
+                error: 'Pro accounts can only access the RustDesk desktop client API'
+            });
+        }
+        return res.redirect('/login');
+    }
+    
     // Add user info to locals for templates
     res.locals.user = req.session.user;
     

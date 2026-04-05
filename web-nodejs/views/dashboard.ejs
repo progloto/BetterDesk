@@ -4,9 +4,18 @@
     pageScripts: ['dashboard'],
     currentPage: 'dashboard',
     body: `
-        <div class="dashboard-header">
-            <h1>${_('dashboard.title')}</h1>
-            <p>${_('dashboard.subtitle')}</p>
+        <div class="dashboard-welcome" id="welcome-section">
+            <div class="welcome-greeting">
+                <h1 id="welcome-greeting-text"><span class="skeleton skeleton-text" style="width:260px;display:inline-block"></span></h1>
+                <p class="welcome-subtitle">${_('dashboard.subtitle')}</p>
+            </div>
+            <div class="welcome-tip" id="welcome-tip">
+                <span class="material-icons tip-icon">lightbulb</span>
+                <span class="tip-text" id="tip-text"></span>
+                <button class="tip-dismiss" id="tip-dismiss" title="${_('actions.dismiss')}">
+                    <span class="material-icons">close</span>
+                </button>
+            </div>
         </div>
         
         <!-- Stats Cards -->
@@ -199,5 +208,59 @@
                 </a>
             </div>
         </section>
+        
+        <!-- Health Overview + Activity Feed -->
+        <div class="dashboard-bottom-grid">
+            <!-- Health Overview -->
+            <section class="health-overview-section">
+                <div class="section-header">
+                    <h2 class="section-title">
+                        <span class="material-icons">monitor_heart</span>
+                        ${_('dashboard.health_overview')}
+                    </h2>
+                </div>
+                <div class="health-cards">
+                    <div class="health-card health-online">
+                        <span class="material-icons">cloud_done</span>
+                        <div class="health-card-value" id="health-online">-</div>
+                        <div class="health-card-label">${_('dashboard.devices_online')}</div>
+                    </div>
+                    <div class="health-card health-alerts">
+                        <span class="material-icons">warning</span>
+                        <div class="health-card-value" id="health-alerts">-</div>
+                        <div class="health-card-label">${_('dashboard.active_alerts')}</div>
+                    </div>
+                    <div class="health-card health-connections">
+                        <span class="material-icons">sync_alt</span>
+                        <div class="health-card-value" id="health-connections">-</div>
+                        <div class="health-card-label">${_('dashboard.recent_connections')}</div>
+                    </div>
+                    <div class="health-card health-uptime">
+                        <span class="material-icons">schedule</span>
+                        <div class="health-card-value" id="health-uptime">-</div>
+                        <div class="health-card-label">${_('dashboard.server_uptime')}</div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Activity Feed -->
+            <section class="activity-feed-section">
+                <div class="section-header">
+                    <h2 class="section-title">
+                        <span class="material-icons">history</span>
+                        ${_('dashboard.activity_feed')}
+                    </h2>
+                    <a href="/security-audit" class="btn btn-secondary btn-sm">
+                        <span class="material-icons">open_in_new</span>
+                        ${_('actions.view_all')}
+                    </a>
+                </div>
+                <div class="activity-list" id="activity-feed">
+                    <div class="activity-empty">
+                        <span class="skeleton skeleton-text" style="width:200px;display:inline-block"></span>
+                    </div>
+                </div>
+            </section>
+        </div>
     `
 }) %>

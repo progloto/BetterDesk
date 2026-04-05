@@ -154,6 +154,105 @@ func (s *SQLiteDB) Migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_peer ON peer_metrics(peer_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_created ON peer_metrics(created_at)`,
+
+		// Chat messages table
+		`CREATE TABLE IF NOT EXISTS chat_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			conversation_id TEXT NOT NULL,
+			from_id TEXT NOT NULL,
+			from_name TEXT DEFAULT '',
+			to_id TEXT DEFAULT '',
+			text TEXT NOT NULL,
+			read INTEGER DEFAULT 0,
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_messages_conv ON chat_messages(conversation_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_messages_from ON chat_messages(from_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at)`,
+
+		// Chat groups table
+		`CREATE TABLE IF NOT EXISTS chat_groups (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			members TEXT DEFAULT '',
+			created_by TEXT DEFAULT '',
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+
+		// Organizations (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS organizations (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			slug TEXT UNIQUE NOT NULL,
+			logo_url TEXT DEFAULT '',
+			settings TEXT DEFAULT '{}',
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_slug ON organizations(slug)`,
+
+		// Organization users (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_users (
+			id TEXT PRIMARY KEY,
+			org_id TEXT NOT NULL REFERENCES organizations(id),
+			username TEXT NOT NULL,
+			display_name TEXT DEFAULT '',
+			email TEXT DEFAULT '',
+			password_hash TEXT NOT NULL,
+			role TEXT DEFAULT 'user',
+			totp_secret TEXT DEFAULT '',
+			avatar_url TEXT DEFAULT '',
+			last_login TEXT DEFAULT NULL,
+			created_at TEXT DEFAULT (datetime('now')),
+			UNIQUE(org_id, username)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_org_users_org ON org_users(org_id)`,
+
+		// Organization devices (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_devices (
+			org_id TEXT NOT NULL REFERENCES organizations(id),
+			device_id TEXT NOT NULL,
+			assigned_user_id TEXT DEFAULT '',
+			department TEXT DEFAULT '',
+			location TEXT DEFAULT '',
+			building TEXT DEFAULT '',
+			tags TEXT DEFAULT '',
+			PRIMARY KEY(org_id, device_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_org_devices_org ON org_devices(org_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_org_devices_device ON org_devices(device_id)`,
+
+		// Organization invitations (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_invitations (
+			id TEXT PRIMARY KEY,
+			org_id TEXT NOT NULL REFERENCES organizations(id),
+			token TEXT UNIQUE NOT NULL,
+			email TEXT DEFAULT '',
+			role TEXT DEFAULT 'user',
+			expires_at TEXT NOT NULL,
+			used_at TEXT DEFAULT NULL
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_org_invitations_token ON org_invitations(token)`,
+
+		// Organization settings (v3.0.0)
+		`CREATE TABLE IF NOT EXISTS org_settings (
+			org_id TEXT NOT NULL REFERENCES organizations(id),
+			key TEXT NOT NULL,
+			value TEXT DEFAULT '',
+			PRIMARY KEY(org_id, key)
+		)`,
+		`CREATE TABLE IF NOT EXISTS access_policies (
+			peer_id TEXT PRIMARY KEY,
+			unattended_enabled INTEGER DEFAULT 0,
+			password_hash TEXT DEFAULT '',
+			schedule_enabled INTEGER DEFAULT 0,
+			schedule_days TEXT DEFAULT '',
+			schedule_start_time TEXT DEFAULT '',
+			schedule_end_time TEXT DEFAULT '',
+			schedule_timezone TEXT DEFAULT '',
+			allowed_operators TEXT DEFAULT '',
+			updated_at TEXT DEFAULT '',
+			updated_by TEXT DEFAULT ''
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -184,6 +283,8 @@ func (s *SQLiteDB) Migrate() error {
 		// peers: CDAP device type and linked peer (added in v2.5.0)
 		{"peers", "device_type", `ALTER TABLE peers ADD COLUMN device_type TEXT DEFAULT ''`},
 		{"peers", "linked_peer_id", `ALTER TABLE peers ADD COLUMN linked_peer_id TEXT DEFAULT ''`},
+		// peers: display_name alias (added in v2.6.0)
+		{"peers", "display_name", `ALTER TABLE peers ADD COLUMN display_name TEXT DEFAULT ''`},
 	}
 
 	for _, m := range columnMigrations {
@@ -201,6 +302,9 @@ func (s *SQLiteDB) Migrate() error {
 	// "no such column" errors on legacy databases.
 	deferredIndexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_peers_banned ON peers(banned)`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_soft_deleted ON peers(soft_deleted)`,
+		`CREATE INDEX IF NOT EXISTS idx_peers_linked_peer ON peers(linked_peer_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_peer_metrics_peer_created ON peer_metrics(peer_id, created_at DESC)`,
 	}
 	for _, idx := range deferredIndexes {
 		if _, err := s.db.Exec(idx); err != nil {
@@ -263,14 +367,14 @@ func (s *SQLiteDB) GetPeer(id string) (*Peer, error) {
 		       status, nat_type, last_online, created_at,
 		       disabled, banned, ban_reason, banned_at,
 		       soft_deleted, deleted_at, note, tags, heartbeat_seq,
-		       device_type, linked_peer_id
+		       device_type, linked_peer_id, display_name
 		FROM peers WHERE id = ?`, id).Scan(
 		&p.ID, &p.UUID, &p.PK, &p.IP, &p.User, &p.Hostname,
 		&p.OS, &p.Version, &p.Status, &p.NATType,
 		&lastOnline, &createdAt, &p.Disabled, &p.Banned,
 		&p.BanReason, &bannedAt, &p.SoftDeleted, &deletedAt,
 		&p.Note, &p.Tags, &p.HeartbeatSeq,
-		&p.DeviceType, &p.LinkedPeerID,
+		&p.DeviceType, &p.LinkedPeerID, &p.DisplayName,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -366,7 +470,7 @@ func (s *SQLiteDB) ListPeers(includeDeleted bool) ([]*Peer, error) {
 	                  status, nat_type, last_online, created_at,
 	                  disabled, banned, ban_reason, banned_at,
 	                  soft_deleted, deleted_at, note, tags, heartbeat_seq,
-	                  device_type, linked_peer_id
+	                  device_type, linked_peer_id, display_name
 	           FROM peers`
 	if !includeDeleted {
 		query += ` WHERE soft_deleted = 0`
@@ -389,7 +493,7 @@ func (s *SQLiteDB) ListPeers(includeDeleted bool) ([]*Peer, error) {
 			&lastOnline, &createdAt, &p.Disabled, &p.Banned,
 			&p.BanReason, &bannedAt, &p.SoftDeleted, &deletedAt,
 			&p.Note, &p.Tags, &p.HeartbeatSeq,
-			&p.DeviceType, &p.LinkedPeerID,
+			&p.DeviceType, &p.LinkedPeerID, &p.DisplayName,
 		); err != nil {
 			return nil, fmt.Errorf("db: ListPeers scan: %w", err)
 		}
@@ -415,6 +519,16 @@ func (s *SQLiteDB) GetPeerCount() (total int, online int, err error) {
 	err = s.db.QueryRow(
 		`SELECT COUNT(*) FROM peers WHERE soft_deleted = 0 AND status = 'ONLINE'`).Scan(&online)
 	return total, online, err
+}
+
+// GetBannedPeerCount returns the number of banned peers in the database.
+func (s *SQLiteDB) GetBannedPeerCount() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM peers WHERE banned = 1 AND soft_deleted = 0`).Scan(&count)
+	return count, err
 }
 
 // UpdatePeerStatus updates a peer's status and IP, plus last_online timestamp.
@@ -500,14 +614,14 @@ func (s *SQLiteDB) IsPeerSoftDeleted(id string) (bool, error) {
 	return deleted, err
 }
 
-// UpdatePeerFields updates specific peer fields (note, user, tags, device_type, linked_peer_id).
+// UpdatePeerFields updates specific peer fields (note, user, tags, device_type, linked_peer_id, display_name).
 // Only provided keys are updated; others are left unchanged.
 // Allowed keys: "note", "user", "tags", "device_type", "linked_peer_id".
 func (s *SQLiteDB) UpdatePeerFields(id string, fields map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	allowed := map[string]bool{"note": true, "user": true, "tags": true, "device_type": true, "linked_peer_id": true}
+	allowed := map[string]bool{"note": true, "user": true, "tags": true, "device_type": true, "linked_peer_id": true, "display_name": true}
 	setClauses := []string{}
 	args := []interface{}{}
 	for k, v := range fields {
@@ -552,12 +666,12 @@ func (s *SQLiteDB) ChangePeerID(oldID, newID string) error {
 		                    status, nat_type, last_online, created_at,
 		                    disabled, banned, ban_reason, banned_at,
 		                    soft_deleted, deleted_at, note, tags, heartbeat_seq,
-		                    device_type, linked_peer_id)
+		                    device_type, linked_peer_id, display_name)
 		SELECT ?, uuid, pk, ip, user, hostname, os, version,
 		       status, nat_type, last_online, created_at,
 		       disabled, banned, ban_reason, banned_at,
 		       soft_deleted, deleted_at, note, tags, heartbeat_seq,
-		       device_type, linked_peer_id
+		       device_type, linked_peer_id, display_name
 		FROM peers WHERE id = ?`, newID, oldID)
 	if err != nil {
 		return fmt.Errorf("db: ChangePeerID insert: %w", err)
@@ -613,7 +727,7 @@ func (s *SQLiteDB) GetLinkedPeers(id string) ([]*Peer, error) {
 		SELECT id, uuid, pk, ip, user, hostname, os, version, status, nat_type,
 		       last_online, created_at, disabled, banned, ban_reason, banned_at,
 		       soft_deleted, deleted_at, note, tags, heartbeat_seq,
-		       device_type, linked_peer_id
+		       device_type, linked_peer_id, display_name
 		FROM peers
 		WHERE soft_deleted = 0 AND linked_peer_id = ?
 		ORDER BY id`, id)
@@ -632,7 +746,7 @@ func (s *SQLiteDB) GetLinkedPeers(id string) ([]*Peer, error) {
 			&lastOnline, &createdAt, &p.Disabled, &p.Banned,
 			&p.BanReason, &bannedAt, &p.SoftDeleted, &deletedAt,
 			&p.Note, &p.Tags, &p.HeartbeatSeq,
-			&p.DeviceType, &p.LinkedPeerID,
+			&p.DeviceType, &p.LinkedPeerID, &p.DisplayName,
 		); err != nil {
 			return nil, fmt.Errorf("db: GetLinkedPeers scan: %w", err)
 		}
@@ -678,6 +792,29 @@ func (s *SQLiteDB) DeleteConfig(key string) error {
 	return err
 }
 
+// ListConfigByPrefix returns all configuration entries whose key starts with the given prefix.
+func (s *SQLiteDB) ListConfigByPrefix(prefix string) ([]ServerConfig, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`SELECT key, value FROM server_config WHERE key LIKE ?`,
+		prefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var configs []ServerConfig
+	for rows.Next() {
+		var c ServerConfig
+		if err := rows.Scan(&c.Key, &c.Value); err != nil {
+			return nil, err
+		}
+		configs = append(configs, c)
+	}
+	return configs, rows.Err()
+}
+
 // UpdatePeerTags updates the tags field for a peer.
 func (s *SQLiteDB) UpdatePeerTags(id, tags string) error {
 	s.mu.Lock()
@@ -708,7 +845,7 @@ func (s *SQLiteDB) ListPeersByTag(tag string) ([]*Peer, error) {
 		SELECT id, uuid, pk, ip, user, hostname, os, version, status, nat_type,
 		       last_online, created_at, disabled, banned, ban_reason, banned_at,
 		       soft_deleted, deleted_at, note, tags, heartbeat_seq,
-		       device_type, linked_peer_id
+		       device_type, linked_peer_id, display_name
 		FROM peers
 		WHERE soft_deleted = 0 AND tags LIKE ? ESCAPE '\'
 		ORDER BY id`, pattern)
@@ -727,7 +864,7 @@ func (s *SQLiteDB) ListPeersByTag(tag string) ([]*Peer, error) {
 			&lastOnline, &createdAt, &p.Disabled, &p.Banned,
 			&p.BanReason, &bannedAt, &p.SoftDeleted, &deletedAt,
 			&p.Note, &p.Tags, &p.HeartbeatSeq,
-			&p.DeviceType, &p.LinkedPeerID,
+			&p.DeviceType, &p.LinkedPeerID, &p.DisplayName,
 		); err != nil {
 			return nil, fmt.Errorf("db: ListPeersByTag scan: %w", err)
 		}
@@ -1279,4 +1416,278 @@ func (s *SQLiteDB) CleanupOldMetrics(maxAge time.Duration) (int64, error) {
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// ---------------------------------------------------------------------------
+//  Chat Messages
+// ---------------------------------------------------------------------------
+
+// SaveChatMessage inserts a new chat message and returns its ID.
+func (s *SQLiteDB) SaveChatMessage(msg *ChatMessage) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(
+		`INSERT INTO chat_messages (conversation_id, from_id, from_name, to_id, text, read)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		msg.ConversationID, msg.FromID, msg.FromName, msg.ToID, msg.Text, msg.Read,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// GetChatHistory returns the most recent messages for a conversation.
+func (s *SQLiteDB) GetChatHistory(conversationID string, limit int) ([]*ChatMessage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	rows, err := s.db.Query(
+		`SELECT id, conversation_id, from_id, from_name, to_id, text, read, created_at
+		 FROM chat_messages WHERE conversation_id = ?
+		 ORDER BY id DESC LIMIT ?`,
+		conversationID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*ChatMessage
+	for rows.Next() {
+		var m ChatMessage
+		var createdAt string
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.FromID, &m.FromName, &m.ToID, &m.Text, &m.Read, &createdAt); err != nil {
+			return nil, err
+		}
+		m.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		msgs = append(msgs, &m)
+	}
+	// Reverse so oldest is first
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
+// GetChatHistoryBefore returns messages before a given ID (for pagination).
+func (s *SQLiteDB) GetChatHistoryBefore(conversationID string, beforeID int64, limit int) ([]*ChatMessage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	rows, err := s.db.Query(
+		`SELECT id, conversation_id, from_id, from_name, to_id, text, read, created_at
+		 FROM chat_messages WHERE conversation_id = ? AND id < ?
+		 ORDER BY id DESC LIMIT ?`,
+		conversationID, beforeID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*ChatMessage
+	for rows.Next() {
+		var m ChatMessage
+		var createdAt string
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.FromID, &m.FromName, &m.ToID, &m.Text, &m.Read, &createdAt); err != nil {
+			return nil, err
+		}
+		m.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		msgs = append(msgs, &m)
+	}
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
+// MarkChatRead marks all messages in a conversation as read for a given reader.
+func (s *SQLiteDB) MarkChatRead(conversationID, readerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`UPDATE chat_messages SET read = 1
+		 WHERE conversation_id = ? AND from_id != ? AND read = 0`,
+		conversationID, readerID,
+	)
+	return err
+}
+
+// GetUnreadCount returns total unread messages for a device across all conversations.
+func (s *SQLiteDB) GetUnreadCount(deviceID string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM chat_messages
+		 WHERE (conversation_id = ? OR to_id = ?) AND from_id != ? AND read = 0`,
+		deviceID, deviceID, deviceID,
+	).Scan(&count)
+	return count, err
+}
+
+// DeleteChatHistory removes all messages for a conversation.
+func (s *SQLiteDB) DeleteChatHistory(conversationID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`DELETE FROM chat_messages WHERE conversation_id = ?`, conversationID)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+//  Chat Groups
+// ---------------------------------------------------------------------------
+
+// CreateChatGroup inserts a new chat group.
+func (s *SQLiteDB) CreateChatGroup(g *ChatGroup) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`INSERT INTO chat_groups (id, name, members, created_by) VALUES (?, ?, ?, ?)`,
+		g.ID, g.Name, g.Members, g.CreatedBy,
+	)
+	return err
+}
+
+// GetChatGroup returns a chat group by ID.
+func (s *SQLiteDB) GetChatGroup(id string) (*ChatGroup, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var g ChatGroup
+	var createdAt string
+	err := s.db.QueryRow(
+		`SELECT id, name, members, created_by, created_at FROM chat_groups WHERE id = ?`, id,
+	).Scan(&g.ID, &g.Name, &g.Members, &g.CreatedBy, &createdAt)
+	if err != nil {
+		return nil, err
+	}
+	g.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+	return &g, nil
+}
+
+// ListChatGroups returns all groups where memberID is in the members list.
+func (s *SQLiteDB) ListChatGroups(memberID string) ([]*ChatGroup, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Use LIKE with escaped wildcards for comma-separated member search
+	pattern := "%" + memberID + "%"
+	rows, err := s.db.Query(
+		`SELECT id, name, members, created_by, created_at FROM chat_groups
+		 WHERE members LIKE ?`, pattern,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*ChatGroup
+	for rows.Next() {
+		var g ChatGroup
+		var createdAt string
+		if err := rows.Scan(&g.ID, &g.Name, &g.Members, &g.CreatedBy, &createdAt); err != nil {
+			return nil, err
+		}
+		g.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		groups = append(groups, &g)
+	}
+	return groups, nil
+}
+
+// UpdateChatGroup updates a chat group's name or members.
+func (s *SQLiteDB) UpdateChatGroup(g *ChatGroup) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`UPDATE chat_groups SET name = ?, members = ? WHERE id = ?`,
+		g.Name, g.Members, g.ID,
+	)
+	return err
+}
+
+// DeleteChatGroup removes a chat group.
+func (s *SQLiteDB) DeleteChatGroup(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`DELETE FROM chat_groups WHERE id = ?`, id)
+	return err
+}
+
+// ============================================================
+// Access Policies (unattended access management)
+// ============================================================
+
+// GetAccessPolicy retrieves the access policy for a peer device.
+func (s *SQLiteDB) GetAccessPolicy(peerID string) (*AccessPolicy, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	row := s.db.QueryRow(
+		`SELECT peer_id, unattended_enabled, password_hash, schedule_enabled,
+				schedule_days, schedule_start_time, schedule_end_time, schedule_timezone,
+				allowed_operators, updated_at, updated_by
+		 FROM access_policies WHERE peer_id = ?`, peerID)
+
+	var p AccessPolicy
+	err := row.Scan(&p.PeerID, &p.UnattendedEnabled, &p.PasswordHash, &p.ScheduleEnabled,
+		&p.ScheduleDays, &p.ScheduleStartTime, &p.ScheduleEndTime, &p.ScheduleTimezone,
+		&p.AllowedOperators, &p.UpdatedAt, &p.UpdatedBy)
+	if err != nil {
+		return nil, err
+	}
+	p.PasswordSet = p.PasswordHash != ""
+	return &p, nil
+}
+
+// SaveAccessPolicy creates or updates the access policy for a peer device.
+func (s *SQLiteDB) SaveAccessPolicy(p *AccessPolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`INSERT INTO access_policies (peer_id, unattended_enabled, password_hash,
+			schedule_enabled, schedule_days, schedule_start_time, schedule_end_time,
+			schedule_timezone, allowed_operators, updated_at, updated_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(peer_id) DO UPDATE SET
+			unattended_enabled = excluded.unattended_enabled,
+			password_hash = CASE WHEN excluded.password_hash = '' THEN access_policies.password_hash WHEN excluded.password_hash = 'CLEAR' THEN '' ELSE excluded.password_hash END,
+			schedule_enabled = excluded.schedule_enabled,
+			schedule_days = excluded.schedule_days,
+			schedule_start_time = excluded.schedule_start_time,
+			schedule_end_time = excluded.schedule_end_time,
+			schedule_timezone = excluded.schedule_timezone,
+			allowed_operators = excluded.allowed_operators,
+			updated_at = excluded.updated_at,
+			updated_by = excluded.updated_by`,
+		p.PeerID, p.UnattendedEnabled, p.PasswordHash,
+		p.ScheduleEnabled, p.ScheduleDays, p.ScheduleStartTime, p.ScheduleEndTime,
+		p.ScheduleTimezone, p.AllowedOperators, p.UpdatedAt, p.UpdatedBy)
+	return err
+}
+
+// DeleteAccessPolicy removes the access policy for a peer device.
+func (s *SQLiteDB) DeleteAccessPolicy(peerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`DELETE FROM access_policies WHERE peer_id = ?`, peerID)
+	return err
 }

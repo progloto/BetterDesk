@@ -164,10 +164,11 @@ async function setBanStatus(id, banned, reason = '') {
 }
 
 async function updateDevice(id, data) {
-    // Route through Go API PATCH /api/peers/:id for note/user fields
+    // Route through Go API PATCH /api/peers/:id for note/user/display_name fields
     const fields = {};
     if (data.note !== undefined) fields.note = String(data.note);
     if (data.user !== undefined) fields.user = String(data.user);
+    if (data.display_name !== undefined) fields.display_name = String(data.display_name);
 
     if (Object.keys(fields).length > 0) {
         const result = await betterdeskApi.updatePeer(id, fields);

@@ -11,14 +11,19 @@
     <link rel="icon" type="image/svg+xml" href="/branding/favicon.svg">
     
     <!-- Stylesheets -->
-    <link rel="stylesheet" href="/css/main.css">
-    <link rel="stylesheet" href="/css/theme.css">
+    <link rel="stylesheet" href="/css/main.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/theme.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/transitions.css?v=<%= cacheVersion %>">
     <% if (!embed) { %>
-    <link rel="stylesheet" href="/css/desktop-mode.css">
+    <link rel="stylesheet" href="/css/desktop-mode.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/desktop-widgets.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/tutorial.css?v=<%= cacheVersion %>">
+    <% } else { %>
+    <link rel="stylesheet" href="/css/desktop-widget-overrides.css?v=<%= cacheVersion %>">
     <% } %>
     <% if (typeof pageStyles !== 'undefined' && pageStyles.length) { %>
         <% pageStyles.forEach(style => { %>
-    <link rel="stylesheet" href="/css/<%= style %>.css">
+    <link rel="stylesheet" href="/css/<%= style %>.css?v=<%= cacheVersion %>">
         <% }); %>
     <% } %>
 </head>
@@ -49,22 +54,69 @@
     <% if (!embed) { %>
     <!-- Desktop Mode Shell (hidden by default, activated via toggle) -->
     <div id="desktop-shell" class="desktop-shell">
+        <!-- Top bar with logo + app drawer + clock -->
+        <div class="desktop-topbar" id="desktop-topbar">
+            <div class="topbar-left">
+                <button class="topbar-btn topbar-app-drawer-btn" id="topbar-app-drawer-btn" title="<%= _('desktop.app_drawer') || 'Applications' %>">
+                    <span class="material-icons">apps</span>
+                </button>
+                <span class="topbar-brand"><%= appName %></span>
+                <div class="topbar-shortcuts" id="topbar-shortcuts"></div>
+                <button class="topbar-btn topbar-edit-btn" id="topbar-edit-btn" title="<%= _('desktop.edit_shortcuts') || 'Edit shortcuts' %>">
+                    <span class="material-icons">edit</span>
+                </button>
+            </div>
+            <div class="topbar-center" id="topbar-clock"></div>
+            <div class="topbar-right">
+                <button class="topbar-btn" id="topbar-add-widget-btn" title="<%= _('desktop.add_widget') || 'Add Widget' %>">
+                    <span class="material-icons">add_circle_outline</span>
+                </button>
+                <button class="topbar-btn" id="topbar-snap-layout-btn" title="<%= _('desktop.label_snap_layout') || 'Window Layout' %>">
+                    <span class="material-icons">grid_view</span>
+                </button>
+                <button class="topbar-btn" id="topbar-wallpaper-btn" title="<%= _('desktop.wallpaper') || 'Wallpaper' %>">
+                    <span class="material-icons">wallpaper</span>
+                </button>
+                <button class="topbar-btn" id="topbar-fullscreen-btn" title="<%= _('desktop.fullscreen') || 'Fullscreen' %>">
+                    <span class="material-icons">fullscreen</span>
+                </button>
+                <button class="topbar-btn" id="topbar-widgets-btn" title="<%= _('desktop.widgets') || 'Widgets' %>">
+                    <span class="material-icons">widgets</span>
+                </button>
+                <button class="topbar-btn" id="topbar-theme-btn" title="<%= _('desktop.theme') || 'Theme' %>">
+                    <span class="material-icons">dark_mode</span>
+                </button>
+                <button class="topbar-btn" id="topbar-help-btn" title="<%= _('desktop.help') || 'Help' %>">
+                    <span class="material-icons">help_outline</span>
+                </button>
+                <button class="topbar-btn" id="topbar-exit-btn" title="<%= _('desktop.exit_desktop') %>">
+                    <span class="material-icons">logout</span>
+                </button>
+            </div>
+        </div>
+        <!-- App drawer overlay -->
+        <div class="app-drawer-overlay" id="app-drawer-overlay" style="display:none">
+            <div class="app-drawer" id="app-drawer">
+                <div class="app-drawer-header">
+                    <input type="text" class="app-drawer-search" id="app-drawer-search" placeholder="<%= _('desktop.search_apps') || 'Search apps...' %>">
+                </div>
+                <div class="app-drawer-grid" id="app-drawer-grid"></div>
+            </div>
+        </div>
         <div class="desktop-wallpaper"></div>
+        <div class="widget-canvas" id="widget-canvas"></div>
         <div class="desktop-icons" id="desktop-icons"></div>
         <div class="desktop-windows" id="desktop-windows"></div>
         <div class="desktop-taskbar" id="desktop-taskbar">
-            <div class="taskbar-start">
-                <button class="taskbar-start-btn" id="taskbar-start-btn" title="<%= appName %>">
-                    <span class="material-icons">grid_view</span>
-                </button>
-            </div>
             <div class="taskbar-apps" id="taskbar-apps"></div>
-            <div class="taskbar-right">
-                <button class="taskbar-btn taskbar-console-btn" id="taskbar-console-btn" title="<%= _('desktop.console_mode') %>">
-                    <span class="material-icons">view_sidebar</span>
-                </button>
-                <div class="taskbar-clock" id="taskbar-clock"></div>
-            </div>
+        </div>
+        <!-- Desktop right-click context menu -->
+        <div class="desktop-context-menu" id="desktop-context-menu" style="display:none">
+            <button class="ctx-item" data-action="wallpaper"><span class="material-icons">wallpaper</span><%= _('desktop.wallpaper') %></button>
+            <button class="ctx-item" data-action="layout"><span class="material-icons">grid_view</span><%= _('desktop.label_snap_layout') || 'Window Layout' %></button>
+            <button class="ctx-item" data-action="refresh"><span class="material-icons">refresh</span><%= _('desktop.refresh') || 'Refresh' %></button>
+            <div class="ctx-divider"></div>
+            <button class="ctx-item" data-action="exit"><span class="material-icons">view_sidebar</span><%= _('desktop.exit_desktop') %></button>
         </div>
     </div>
     <% } %>
@@ -76,7 +128,7 @@
     <div id="toast-container" class="toast-container"></div>
     
     <!-- Scripts -->
-    <script>
+    <script nonce="<%= cspNonce %>">
         // Global config
         window.BetterDesk = {
             lang: '<%= lang || "en" %>',
@@ -87,17 +139,21 @@
             embed: <%= embed ? 'true' : 'false' %>
         };
     </script>
-    <script src="/js/utils.js"></script>
-    <script src="/js/i18n-client.js?v=<%= Date.now() %>"></script>
-    <script src="/js/notifications.js?v=<%= Date.now() %>"></script>
-    <script src="/js/modal.js?v=<%= Date.now() %>"></script>
-    <script src="/js/app.js?v=<%= Date.now() %>"></script>
+    <script src="/js/utils.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/i18n-client.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/notifications.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/modal.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/app.js?v=<%= cacheVersion %>"></script>
     <% if (!embed) { %>
-    <script src="/js/desktop-mode.js?v=<%= Date.now() %>"></script>
+    <script src="/js/widget-plugins.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/desktop-widgets.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/desktop-mode.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/tutorial.js?v=<%= cacheVersion %>"></script>
+    <script nonce="<%= cspNonce %>">if (typeof Tutorial !== 'undefined') Tutorial.autoStart('console');</script>
     <% } %>
     <% if (typeof pageScripts !== 'undefined' && pageScripts.length) { %>
         <% pageScripts.forEach(script => { %>
-    <script src="/js/<%= script %>.js?v=<%= Date.now() %>"></script>
+    <script src="/js/<%= script %>.js?v=<%= cacheVersion %>"></script>
         <% }); %>
     <% } %>
 </body>

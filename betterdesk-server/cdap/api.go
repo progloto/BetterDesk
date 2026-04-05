@@ -110,7 +110,23 @@ func (g *Gateway) IsConnected(id string) bool {
 	return g.GetDeviceConn(id) != nil
 }
 
+// GetWidget looks up a widget by ID from a connected device's manifest.
+// Returns nil if the device is not connected or widget not found.
+func (g *Gateway) GetWidget(deviceID, widgetID string) *Widget {
+	dc := g.GetDeviceConn(deviceID)
+	if dc == nil || dc.Manifest == nil {
+		return nil
+	}
+	for i := range dc.Manifest.Widgets {
+		if dc.Manifest.Widgets[i].ID == widgetID {
+			return &dc.Manifest.Widgets[i]
+		}
+	}
+	return nil
+}
+
 // SendCommandJSON builds and sends a command to a connected CDAP device.
+// The caller must perform RBAC checks before invoking this method.
 func (g *Gateway) SendCommandJSON(ctx context.Context, deviceID, commandID, widgetID, action string, value any, operator, reason string) error {
 	payload := CommandPayload{
 		CommandID: commandID,
@@ -153,4 +169,13 @@ func (g *Gateway) ListConnectedDevices() []string {
 		return true
 	})
 	return ids
+}
+
+// GetActiveAlerts returns all currently firing CDAP alerts.
+// If deviceID is non-empty, only alerts for that device are returned.
+func (g *Gateway) GetActiveAlerts(deviceID string) []*AlertState {
+	if g.alertEngine == nil {
+		return nil
+	}
+	return g.alertEngine.GetActiveAlerts(deviceID)
 }

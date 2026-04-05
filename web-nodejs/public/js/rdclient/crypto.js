@@ -91,7 +91,7 @@ class RDCrypto {
      *
      * @param {Uint8Array} signedIdBytes - The raw id field from SignedId message
      * @param {Object} idPkType - protobufjs IdPk message type for decoding
-     * @returns {{ peerId: string, peerPk: Uint8Array, signature: Uint8Array, payload: Uint8Array }|null}
+     * @returns {{ peerId: string, peerPk: Uint8Array, signature: Uint8Array, payload: Uint8Array, signatureVerified: boolean|null }|null}
      */
     parseSignedId(signedIdBytes, idPkType) {
         if (!signedIdBytes || signedIdBytes.length < 64 + 4) {
@@ -117,12 +117,60 @@ class RDCrypto {
                 peerId,
                 peerPk: new Uint8Array(peerPk),
                 signature: new Uint8Array(signature),
-                payload: new Uint8Array(payload)
+                payload: new Uint8Array(payload),
+                signatureVerified: null // set by verifySignedId()
             };
         } catch (err) {
             console.warn('[RDCrypto] Failed to decode IdPk:', err.message);
             return null;
         }
+    }
+
+    /**
+     * Verify Ed25519 signature on SignedId payload against the server's public key.
+     * Prevents MITM attacks: the signal server signs (IdPk) with its Ed25519 key.
+     * Without verification, an attacker could substitute their own ephemeral key.
+     *
+     * @param {Uint8Array} signature - 64-byte Ed25519 signature
+     * @param {Uint8Array} payload - Signed protobuf payload (IdPk bytes after the 64-byte sig)
+     * @param {string} serverPubKeyHex - Server Ed25519 public key as hex string (64 hex chars = 32 bytes)
+     * @returns {boolean} True if signature is valid, false otherwise
+     */
+    static verifySignedId(signature, payload, serverPubKeyHex) {
+        if (!serverPubKeyHex || serverPubKeyHex.length < 64) {
+            console.warn('[RDCrypto] No server public key for Ed25519 verification');
+            return false;
+        }
+        if (!signature || signature.length !== 64) {
+            console.warn('[RDCrypto] Invalid Ed25519 signature length:', signature?.length);
+            return false;
+        }
+
+        try {
+            const serverPubKey = RDCrypto._hexToBytes(serverPubKeyHex);
+            if (serverPubKey.length !== 32) {
+                console.warn('[RDCrypto] Server public key must be 32 bytes, got:', serverPubKey.length);
+                return false;
+            }
+            return nacl.sign.detached.verify(payload, signature, serverPubKey);
+        } catch (err) {
+            console.warn('[RDCrypto] Ed25519 verification error:', err.message);
+            return false;
+        }
+    }
+
+    /**
+     * Convert hex string to Uint8Array
+     * @param {string} hex
+     * @returns {Uint8Array}
+     */
+    static _hexToBytes(hex) {
+        const clean = hex.replace(/^0x/i, '');
+        const bytes = new Uint8Array(clean.length / 2);
+        for (let i = 0; i < bytes.length; i++) {
+            bytes[i] = parseInt(clean.substr(i * 2, 2), 16);
+        }
+        return bytes;
     }
 
     /**

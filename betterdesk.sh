@@ -1,11 +1,12 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v2.4.0
+#   BetterDesk Console Manager v3.0.0
 #   All-in-One Interactive Tool for Linux
 #
 #   Features:
 #     - Fresh installation (Node.js web console)
+#     - Minimal installation (Go server only, no web console)
 #     - Update existing installation  
 #     - Repair/fix issues (enhanced with graceful shutdown)
 #     - Validate installation
@@ -21,8 +22,9 @@
 #     - RustDesk Client API (login, address book sync)
 #     - TOTP Two-Factor Authentication
 #     - SSL/TLS certificate configuration
-#     - PostgreSQL database support (new in v2.4.0)
+#     - PostgreSQL database support
 #     - SQLite to PostgreSQL migration
+#     - CDAP (Custom Device API Protocol) support
 #
 #   Usage: 
 #     Interactive: sudo ./betterdesk.sh
@@ -34,12 +36,13 @@
 set -e
 
 # Version
-VERSION="2.4.0"
+VERSION="3.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Auto mode flag
 AUTO_MODE=false
 SKIP_VERIFY=false
+MINIMAL_MODE=false
 PREFERRED_CONSOLE_TYPE="nodejs"  # Always Node.js (Flask removed in v2.3.0)
 
 # Parse command line arguments
@@ -51,6 +54,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-verify)
             SKIP_VERIFY=true
+            shift
+            ;;
+        --minimal)
+            MINIMAL_MODE=true
             shift
             ;;
         --nodejs)
@@ -80,6 +87,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --auto, -a       Run in automatic mode (non-interactive)"
             echo "  --skip-verify    Skip SHA256 verification of binaries"
+            echo "  --minimal        Install Go server only (no web console)"
             echo "  --nodejs         Install Node.js web console (default)"
             echo "  --postgresql     Use PostgreSQL instead of SQLite"
             echo "  --pg-uri URI     PostgreSQL connection URI (implies --postgresql)"
@@ -2093,6 +2101,188 @@ start_services() {
     start_services_with_verification
 }
 
+#===============================================================================
+# BetterDesk Minimal Installation (Go server only, no web console)
+#===============================================================================
+
+do_install_minimal() {
+    print_header
+    echo -e "${WHITE}${BOLD}══════════ MINIMAL INSTALLATION (Server Only) ══════════${NC}"
+    echo ""
+    
+    print_info "BetterDesk Minimal installs the Go server binary only."
+    print_info "No web console, no Node.js, no npm dependencies."
+    print_info "Manage via REST API on port 21114 or TCP admin console."
+    echo ""
+    
+    detect_installation
+    
+    if [ "$INSTALL_STATUS" = "complete" ]; then
+        print_warning "BetterDesk is already installed!"
+        if [ "$AUTO_MODE" = false ]; then
+            if ! confirm "Do you want to reinstall in Minimal mode?"; then
+                return
+            fi
+        fi
+        do_backup_silent
+    fi
+    
+    # Choose database type (SQLite or PostgreSQL)
+    choose_database_type
+    
+    # Stop services if running
+    graceful_stop_services
+    
+    # Minimal: no Node.js dependencies needed
+    print_step "Checking system dependencies..."
+    command -v curl >/dev/null 2>&1 || apt-get install -y curl
+    
+    # Install and configure PostgreSQL if selected
+    if [ "$USE_POSTGRESQL" = "true" ]; then
+        install_postgresql || { print_error "PostgreSQL installation failed"; return 1; }
+        setup_postgresql_database || { print_error "PostgreSQL setup failed"; return 1; }
+    fi
+    
+    detect_architecture
+    install_binaries || { print_error "Binary installation failed"; return 1; }
+    
+    # Skip console installation entirely
+    print_info "Skipping web console (Minimal mode)"
+    
+    # Generate self-signed TLS certificates (default for fresh installs)
+    generate_ssl_certificates
+    
+    # Migrate existing SQLite data to PostgreSQL if applicable
+    if [ "$USE_POSTGRESQL" = "true" ]; then
+        migrate_sqlite_to_postgresql
+    fi
+    
+    # Setup only the Go server service (no console service)
+    setup_services_minimal
+    
+    # Configure firewall rules (signal + relay + API only, no console ports)
+    print_step "Configuring firewall rules..."
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 21114/tcp comment "BetterDesk API" 2>/dev/null || true
+        ufw allow 21115/tcp comment "BetterDesk NAT" 2>/dev/null || true
+        ufw allow 21116/tcp comment "BetterDesk Signal TCP" 2>/dev/null || true
+        ufw allow 21116/udp comment "BetterDesk Signal UDP" 2>/dev/null || true
+        ufw allow 21117/tcp comment "BetterDesk Relay" 2>/dev/null || true
+        ufw allow 21118/tcp comment "BetterDesk WS Signal" 2>/dev/null || true
+        ufw allow 21119/tcp comment "BetterDesk WS Relay" 2>/dev/null || true
+    fi
+    
+    # Start server
+    print_step "Starting BetterDesk server..."
+    systemctl daemon-reload
+    systemctl start betterdesk-server.service 2>/dev/null || true
+    systemctl enable betterdesk-server.service 2>/dev/null || true
+    
+    sleep 3
+    
+    # Verify
+    if systemctl is-active --quiet betterdesk-server.service; then
+        print_success "BetterDesk server is running"
+    else
+        print_error "BetterDesk server failed to start"
+        journalctl -u betterdesk-server.service --no-pager -n 20
+        return 1
+    fi
+    
+    echo ""
+    print_success "===== BETTERDESK MINIMAL INSTALLATION COMPLETE ====="
+    echo ""
+    
+    local SERVER_IP
+    SERVER_IP=$(get_public_ip)
+    
+    echo -e "${GREEN}Server: ${SERVER_IP}${NC}"
+    echo -e "${GREEN}API: http://${SERVER_IP}:21114${NC}"
+    echo ""
+    echo -e "${YELLOW}Ports: 21114 (API), 21115-21117 (Signal/Relay), 21118-21119 (WS)${NC}"
+    echo -e "${YELLOW}No web console installed. Use REST API or TCP admin for management.${NC}"
+    echo ""
+    
+    press_enter
+}
+
+setup_services_minimal() {
+    print_step "Setting up BetterDesk server service (Minimal mode)..."
+    
+    local GO_BINARY_PATH="$INSTALL_DIR/betterdesk-server"
+    local KEY_DIR="$INSTALL_DIR"
+    local DB_DIR="$INSTALL_DIR"
+    
+    # Build server arguments
+    local SERVER_ARGS="-key $KEY_DIR"
+    SERVER_ARGS="$SERVER_ARGS -db $DB_DIR"
+    
+    # Add relay servers argument
+    local SERVER_IP
+    SERVER_IP=$(get_public_ip)
+    if [ -n "$SERVER_IP" ]; then
+        SERVER_ARGS="$SERVER_ARGS -relay-servers $SERVER_IP"
+    fi
+    
+    # Database configuration for Go server
+    local GO_ENV=""
+    if [ "$USE_POSTGRESQL" = "true" ] && [ -n "$POSTGRESQL_URI" ]; then
+        GO_ENV="Environment=\"DB_URL=$POSTGRESQL_URI\""
+    fi
+    
+    # TLS configuration
+    local TLS_CERT_PATH="$INSTALL_DIR/cert.pem"
+    local TLS_KEY_PATH="$INSTALL_DIR/key.pem"
+    if [ -f "$TLS_CERT_PATH" ] && [ -f "$TLS_KEY_PATH" ]; then
+        SERVER_ARGS="$SERVER_ARGS -tls-cert $TLS_CERT_PATH -tls-key $TLS_KEY_PATH -tls-signal -tls-relay"
+    fi
+    
+    # Remove old services (cleanup)
+    for old_svc in rustdesksignal rustdeskrelay betterdesk-api betterdesk-go betterdesk-console; do
+        if systemctl is-active --quiet "$old_svc.service" 2>/dev/null; then
+            systemctl stop "$old_svc.service" 2>/dev/null || true
+        fi
+        if [ -f "/etc/systemd/system/$old_svc.service" ]; then
+            systemctl disable "$old_svc.service" 2>/dev/null || true
+            rm -f "/etc/systemd/system/$old_svc.service"
+        fi
+    done
+    
+    cat > /etc/systemd/system/betterdesk-server.service <<EOF
+[Unit]
+Description=BetterDesk Server (Minimal)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$GO_BINARY_PATH $SERVER_ARGS
+Restart=always
+RestartSec=5
+$GO_ENV
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=$INSTALL_DIR $DB_DIR
+ProtectHome=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=betterdesk-server
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    print_success "BetterDesk server service created (Minimal mode)"
+}
+
 do_install() {
     print_header
     echo -e "${WHITE}${BOLD}══════════ FRESH INSTALLATION ══════════${NC}"
@@ -3292,9 +3482,11 @@ do_diagnostics() {
     echo ""
     
     if [ -f "$DB_PATH" ]; then
-        local device_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE is_deleted = 0" 2>/dev/null || \
+        local device_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE soft_deleted = 0" 2>/dev/null || \
+                            sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE is_deleted = 0" 2>/dev/null || \
                             sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE is_deleted = 0" 2>/dev/null || echo "0")
-        local online_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE status = 1 AND is_deleted = 0" 2>/dev/null || \
+        local online_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE soft_deleted = 0 AND status = 'ONLINE'" 2>/dev/null || \
+                            sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE status = 1 AND is_deleted = 0" 2>/dev/null || \
                             sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE status = 1 AND is_deleted = 0" 2>/dev/null || echo "0")
         local user_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users" 2>/dev/null || echo "0")
         
@@ -3315,7 +3507,7 @@ do_diagnostics() {
         if [ "$diag_db_type" = "postgres" ] && [ -n "$diag_pg_uri" ]; then
             echo -e "  Database type:     ${CYAN}PostgreSQL${NC}"
             if command -v psql &>/dev/null; then
-                local device_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM peers WHERE is_deleted = FALSE" 2>/dev/null || echo "0")
+                local device_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM peers WHERE soft_deleted = FALSE" 2>/dev/null || echo "0")
                 local user_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM users" 2>/dev/null || echo "0")
                 echo "  Devices:           ${device_count:-0}"
                 echo "  Users:             ${user_count:-0}"
@@ -3795,10 +3987,6 @@ do_configure_ssl() {
             # Ensure API URLs stay HTTP in systemd service too
             sed -i "s|Environment=HBBS_API_URL=https://localhost|Environment=HBBS_API_URL=http://localhost|" "$svc_file"
             sed -i "s|Environment=BETTERDESK_API_URL=https://localhost|Environment=BETTERDESK_API_URL=http://localhost|" "$svc_file"
-            else
-                sed -i "s|Environment=HBBS_API_URL=https://localhost|Environment=HBBS_API_URL=http://localhost|" "$svc_file"
-                sed -i "s|Environment=BETTERDESK_API_URL=https://localhost|Environment=BETTERDESK_API_URL=http://localhost|" "$svc_file"
-            fi
             # Sync HTTPS_ENABLED in systemd (overrides .env value)
             if grep -q 'Environment=HTTPS_ENABLED=' "$svc_file"; then
                 sed -i "s|Environment=HTTPS_ENABLED=.*|Environment=HTTPS_ENABLED=true|" "$svc_file"
@@ -4119,6 +4307,7 @@ show_menu() {
     echo "  8. 📊 DIAGNOSTICS"
     echo "  9. 🗑️  UNINSTALL"
     echo ""
+    echo "  L. 📦 MINIMAL INSTALLATION (server only)"
     echo "  C. 🔒 Configure SSL certificates"
     echo "  M. 🔄 Database migration"
     echo "  S. ⚙️  Settings (paths)"
@@ -4143,7 +4332,11 @@ main() {
     # Auto mode - run installation directly
     if [ "$AUTO_MODE" = true ]; then
         print_info "Running in AUTO mode..."
-        do_install
+        if [ "$MINIMAL_MODE" = true ]; then
+            do_install_minimal
+        else
+            do_install
+        fi
         exit $?
     fi
     
@@ -4161,6 +4354,7 @@ main() {
             7) do_build ;;
             8) do_diagnostics ;;
             9) do_uninstall ;;
+            [Ll]) do_install_minimal ;;
             [Cc]) do_configure_ssl ;;
             [Mm]) do_migrate_database ;;
             [Ss]) configure_paths ;;

@@ -1,0 +1,128 @@
+# =============================================================================
+# BetterDesk Go Server — Cross-Compile & Release
+# =============================================================================
+# Builds Go server binary for Linux (amd64, arm64) and Windows (amd64).
+# Triggers on version tag push (v*) or manual dispatch.
+# Attaches binaries + SHA256 checksums to GitHub Release.
+# =============================================================================
+
+name: Build & Release Go Server
+
+on:
+  push:
+    tags: ['v*']
+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v3.0.0)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.23'
+  SERVER_DIR: betterdesk-server
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64.exe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ env.SERVER_DIR }}/go.sum
+
+      - name: Install Protobuf Compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: Build binary
+        working-directory: ${{ env.SERVER_DIR }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "betterdesk-server-${{ matrix.suffix }}" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: betterdesk-server-${{ matrix.suffix }}
+          path: ${{ env.SERVER_DIR }}/betterdesk-server-${{ matrix.suffix }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Migration tool
+  # ---------------------------------------------------------------------------
+  build-migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ env.SERVER_DIR }}/go.sum
+
+      - name: Build migration tool (linux-amd64)
+        working-directory: ${{ env.SERVER_DIR }}/tools/migrate
+        env:
+          CGO_ENABLED: 1
+        run: go build -trimpath -ldflags="-s -w" -o migrate-linux-amd64 .
+
+      - name: Upload migration tool
+        uses: actions/upload-artifact@v4
+        with:
+          name: migrate-linux-amd64
+          path: ${{ env.SERVER_DIR }}/tools/migrate/migrate-linux-amd64
+
+  # ---------------------------------------------------------------------------
+  # Release
+  # ---------------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, build-migrate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Generate checksums
+        run: |
+          find . -type f -name "betterdesk-server-*" -o -name "migrate-*" | while read f; do
+            sha256sum "$f" >> SERVER_CHECKSUMS.sha256
+          done
+          cat SERVER_CHECKSUMS.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            betterdesk-server-linux-amd64/betterdesk-server-linux-amd64
+            betterdesk-server-linux-arm64/betterdesk-server-linux-arm64
+            betterdesk-server-windows-amd64.exe/betterdesk-server-windows-amd64.exe
+            migrate-linux-amd64/migrate-linux-amd64
+            SERVER_CHECKSUMS.sha256

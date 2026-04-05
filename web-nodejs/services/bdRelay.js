@@ -165,12 +165,8 @@ function initBdRelay(server) {
     const relayWss  = new WebSocket.Server({ noServer: true, maxPayload: MAX_FRAME_BYTES });
     const signalWss = new WebSocket.Server({ noServer: true, maxPayload: 64 * 1024 });
 
-    // Attach to server upgrade alongside existing wsRelay handler
-    const existingListeners = server.listeners('upgrade').slice();
-
-    // Remove existing to insert combined handler
-    server.removeAllListeners('upgrade');
-
+    // Attach to server upgrade — only handle /ws/bd-relay and /ws/bd-signal,
+    // let other handlers (remoteRelay, chatRelay, cdap) handle their paths.
     server.on('upgrade', (request, socket, head) => {
         const url = new URL(request.url, `http://${request.headers.host}`);
         const pathname = url.pathname;
@@ -183,12 +179,8 @@ function initBdRelay(server) {
             signalWss.handleUpgrade(request, socket, head, (ws) => {
                 signalWss.emit('connection', ws, request);
             });
-        } else {
-            // Delegate to previously-registered upgrade handlers (wsRelay.js etc.)
-            for (const listener of existingListeners) {
-                listener.call(server, request, socket, head);
-            }
         }
+        // Other paths: do nothing — let other upgrade handlers deal with them
     });
 
     // ---- Relay connections ----

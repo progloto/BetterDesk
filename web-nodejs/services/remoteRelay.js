@@ -210,9 +210,13 @@ function handleViewerConnection(ws, deviceId, operatorName) {
                 break;
 
             case 'input':
-                // Forward input event to agent
+                // Transform viewer event into agent InputEvent format.
+                // Viewer sends { type: 'input', event_type: 'mouse_move', x, y, ... }
+                // Agent expects { type: 'mouse_move', x, y, ... } (Rust InputEvent struct)
                 if (session.agentWs && session.agentWs.readyState === WebSocket.OPEN) {
-                    sendJson(session.agentWs, frame);
+                    const agentEvent = { ...frame, type: frame.event_type || frame.kind || 'unknown' };
+                    delete agentEvent.event_type;
+                    sendJson(session.agentWs, agentEvent);
                 }
                 break;
 
@@ -250,8 +254,15 @@ function initRemoteRelay(server, sessionMiddleware) {
         // Agent: /ws/remote-agent/<device_id>
         const agentMatch = path.match(/^\/ws\/remote-agent\/([^/]+)$/);
         if (agentMatch) {
+            const deviceId = decodeURIComponent(agentMatch[1]);
+            // Validate device ID format (reject path traversal etc.)
+            if (!/^[A-Za-z0-9_-]{3,32}$/.test(deviceId)) {
+                socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+                socket.destroy();
+                return;
+            }
             wss.handleUpgrade(req, socket, head, (ws) => {
-                handleAgentConnection(ws, agentMatch[1]);
+                handleAgentConnection(ws, deviceId);
             });
             return;
         }

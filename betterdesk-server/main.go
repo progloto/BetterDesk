@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	cryptoRand "crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -246,6 +247,14 @@ func main() {
 	go reloadHandler.ListenSIGHUP(reloadDone)
 	defer close(reloadDone)
 
+	// BD-2026-010: Warn when WebSocket origin policy is permissive
+	if cfg.AllowedWSOrigins == "" {
+		log.Printf("[SECURITY] NOTICE: WS_ALLOWED_ORIGINS is not set — signal/relay WebSocket accepts all origins")
+	}
+	if cfg.APIAllowedWSOrigins == "" {
+		log.Printf("[SECURITY] NOTICE: API_WS_ALLOWED_ORIGINS is not set — API events WebSocket accepts all origins")
+	}
+
 	// Start servers based on mode
 	switch cfg.Mode {
 	case "all":
@@ -363,6 +372,31 @@ func main() {
 	log.Printf("Server stopped")
 }
 
+func ensureScopedAPIKey(database db.Database, apiKey string) error {
+	if strings.TrimSpace(apiKey) == "" {
+		return nil
+	}
+	hash := sha256.Sum256([]byte(apiKey))
+	hashHex := hex.EncodeToString(hash[:])
+	if existing, err := database.GetAPIKeyByHash(hashHex); err == nil && existing != nil {
+		return nil
+	}
+	key := &db.APIKey{
+		KeyHash:   hashHex,
+		KeyPrefix: apiKey[:min(len(apiKey), 8)],
+		Name:      "console-bridge",
+		Role:      auth.RoleAdmin,
+	}
+	return database.CreateAPIKey(key)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // loadAPIKey reads the API key from API_KEY environment variable or .api_key file
 // in the key file directory (and DB directory as fallback), and syncs it to the
 // database's server_config table. This ensures the Node.js console and Go server
@@ -443,17 +477,23 @@ func loadAPIKey(cfg *config.Config, database db.Database) {
 	existing, _ := database.GetConfig("api_key")
 	if existing == apiKey {
 		log.Printf("API key loaded from %s (already in database)", source)
-		return
+	} else {
+		if err := database.SetConfig("api_key", apiKey); err != nil {
+			log.Printf("WARN: Failed to sync API key to database: %v", err)
+			return
+		}
+		if existing == "" {
+			log.Printf("API key loaded from %s and stored in database", source)
+		} else {
+			log.Printf("API key loaded from %s and updated in database", source)
+		}
 	}
 
-	if err := database.SetConfig("api_key", apiKey); err != nil {
-		log.Printf("WARN: Failed to sync API key to database: %v", err)
-		return
-	}
-	if existing == "" {
-		log.Printf("API key loaded from %s and stored in database", source)
+	// Always ensure the scoped API key exists in api_keys table
+	if err := ensureScopedAPIKey(database, apiKey); err != nil {
+		log.Printf("WARN: Failed to migrate API key into scoped api_keys table: %v", err)
 	} else {
-		log.Printf("API key loaded from %s and updated in database", source)
+		log.Printf("API key is available in scoped api_keys table")
 	}
 }
 

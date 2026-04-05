@@ -26,10 +26,15 @@ const db = require('./services/database');
 const { initWsProxy } = require('./services/wsRelay');
 const { initBdRelay } = require('./services/bdRelay');
 const { initChatRelay } = require('./services/chatRelay');
+const { apiClient: goApiClient } = require('./services/betterdeskApi');
 const { initRemoteRelay } = require('./services/remoteRelay');
+const { initCdapTerminalProxy } = require('./services/cdapTerminalProxy');
+const { initCdapMediaProxies } = require('./services/cdapMediaProxy');
 const { startDiscoveryService } = require('./services/lanDiscovery');
+const { initDeviceStatusPush } = require('./services/deviceStatusPush');
 const routes = require('./routes');
 const rustdeskApiRoutes = require('./routes/rustdesk-api.routes');
+const bdApiRoutes = require('./routes/bd-api.routes');
 const { getWanMiddlewareStack } = require('./middleware/wanSecurity');
 
 // Create Express app
@@ -56,6 +61,25 @@ if (!fs.existsSync(config.dataDir)) {
 // Security headers (Helmet)
 app.use(securityMiddleware);
 
+// CORS for BetterDesk desktop clients (Tauri webview origins)
+app.use('/api/', (req, res, next) => {
+    const origin = req.headers.origin || '';
+    const allowed = [
+        'http://localhost:1420',    // Tauri dev
+        'tauri://localhost',        // Tauri production (macOS/Linux)
+        'https://tauri.localhost',  // Tauri production (Windows)
+    ];
+    if (allowed.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-CSRF-Token');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Max-Age', '86400');
+    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
 // Body parsing (2MB limit for base64 logo images)
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false, limit: '2mb' }));
@@ -64,9 +88,12 @@ app.use(express.urlencoded({ extended: false, limit: '2mb' }));
 app.use(cookieParser());
 
 // Session management — also kept as a standalone middleware ref for WebSocket upgrades
+// Use a different cookie name in HTTP mode to avoid collision with stale
+// Secure cookies left over from a previous HTTPS configuration (Issue #82).
+const SESSION_COOKIE = config.httpsEnabled ? 'betterdesk.sid' : 'bd.sid';
 const sessionMiddleware = session({
     secret: config.sessionSecret,
-    name: 'betterdesk.sid',
+    name: SESSION_COOKIE,
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -78,9 +105,13 @@ const sessionMiddleware = session({
 });
 app.use(sessionMiddleware);
 
+// Cache version — changes on every restart/deployment, stable during runtime.
+// Used in ?v= query strings so browsers cache assets per deployment.
+app.locals.cacheVersion = config.appVersion + '.' + Date.now();
+
 // Static files
 app.use(express.static(path.join(__dirname, 'public'), {
-    maxAge: config.isProduction ? '1d' : '0',
+    maxAge: config.isProduction ? '7d' : '0',
     etag: true
 }));
 
@@ -88,6 +119,13 @@ app.use(express.static(path.join(__dirname, 'public'), {
 app.use('/protos', express.static(path.join(__dirname, 'protos'), {
     maxAge: config.isProduction ? '7d' : '0',
     etag: true
+}));
+
+// Serve desktop wallpapers
+app.use('/wallpapers', express.static(path.join(__dirname, 'wallpapers'), {
+    maxAge: config.isProduction ? '30d' : '0',
+    etag: true,
+    immutable: true
 }));
 
 // Rate limiting for API
@@ -98,6 +136,10 @@ app.use('/api/', apiLimiter);
 // dedicated WAN-facing port (21121) with additional hardening.
 app.use(rustdeskApiRoutes);
 
+// BetterDesk Desktop Client API — device-facing endpoints that use
+// Bearer token or X-Device-Id header, not browser CSRF cookies.
+app.use('/api/bd', bdApiRoutes);
+
 // i18n middleware
 app.use(initI18n());
 
@@ -105,12 +147,30 @@ app.use(initI18n());
 // Used by Desktop Mode to load pages inside floating windows (iframes)
 app.use((req, res, next) => {
     res.locals.embed = req.query.embed === '1';
+    // Prevent HTML page caching — only static assets should be cached
+    if (!req.path.match(/\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map|proto)$/)) {
+        res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
     next();
 });
 
 // CSRF protection — generate token for views, validate on POST/PUT/DELETE/PATCH
+// Skip CSRF for device-facing API routes (/api/bd/*) — these use Bearer token
+// or X-Device-Id header authentication, not browser cookie-based CSRF.
 app.use(csrfTokenProvider);
-app.use(doubleCsrfProtection);
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/bd/')) {
+        return next();
+    }
+    // Skip CSRF for BetterDesk desktop clients (Tauri) — they are not
+    // vulnerable to CSRF attacks (not browser tabs). Identified by origin.
+    const origin = req.headers.origin || '';
+    const tauriOrigins = ['http://localhost:1420', 'tauri://localhost', 'https://tauri.localhost'];
+    if (req.path.startsWith('/api/') && tauriOrigins.includes(origin)) {
+        return next();
+    }
+    doubleCsrfProtection(req, res, next);
+});
 
 // ============ Routes ============
 
@@ -122,18 +182,23 @@ app.use('/', routes);
 app.use((err, req, res, next) => {
     if (err.code === 'EBADCSRFTOKEN' || err.message?.includes('csrf') || err.message?.includes('CSRF')) {
         res.status(403);
+        // Detect likely SSL→HTTP transition: cookie missing because browser held Secure cookie
+        const likelySslTransition = !config.httpsEnabled && !req.secure;
+        const hint = likelySslTransition
+            ? ' If you recently disabled SSL, clear your browser cookies for this site and reload.'
+            : '';
         // Always return JSON for API routes (fetch sends Accept: */*)
         if (req.path.startsWith('/api/') || (req.headers['content-type'] && req.headers['content-type'].includes('application/json'))) {
-            return res.json({ success: false, error: 'Invalid CSRF token. Please refresh the page and try again.' });
+            return res.json({ success: false, error: 'Invalid CSRF token. Please refresh the page and try again.' + hint });
         }
         if (req.accepts('html')) {
             return res.render('errors/500', {
                 title: 'Forbidden',
                 activePage: 'error',
-                error: 'Invalid or missing CSRF token. Please refresh the page and try again.'
+                error: 'Invalid or missing CSRF token. Please refresh the page and try again.' + hint
             });
         }
-        return res.json({ success: false, error: 'Invalid CSRF token' });
+        return res.json({ success: false, error: 'Invalid CSRF token' + hint });
     }
     next(err);
 });
@@ -293,16 +358,25 @@ async function startServer() {
         }
         
         // Initialize WebSocket proxy for remote desktop client
-        initWsProxy(server);
+        initWsProxy(server, sessionMiddleware);
 
         // Initialize BetterDesk native relay (WebSocket)
         initBdRelay(server);
 
-        // Initialize Chat relay (WebSocket — agent ↔ operator)
-        initChatRelay(server, sessionMiddleware);
+        // Initialize Chat relay (WebSocket — agent ↔ operator, persistent via Go API)
+        initChatRelay(server, sessionMiddleware, goApiClient);
 
         // Initialize Remote Desktop relay (WebSocket — agent JPEG ↔ browser viewer)
         initRemoteRelay(server, sessionMiddleware);
+
+        // Initialize CDAP Terminal WebSocket proxy (browser ↔ Go server)
+        initCdapTerminalProxy(server, sessionMiddleware);
+
+        // Initialize CDAP Media WebSocket proxies (desktop, video, file browser)
+        initCdapMediaProxies(server, sessionMiddleware);
+
+        // Initialize real-time device status push (Go event bus → browser)
+        initDeviceStatusPush(server, sessionMiddleware, config.betterdeskApiUrl, config.betterdeskApiKey);
 
         // Start LAN Discovery UDP service
         startDiscoveryService();
@@ -498,6 +572,28 @@ function printStartupBanner(protocol, port) {
     console.log('  ║                                                  ║');
     console.log('  ╚══════════════════════════════════════════════════╝');
     console.log('');
+
+    // BD-2026-006: Warn if panel is bound to all interfaces in non-Docker environments
+    if (config.host === '0.0.0.0' && !config.isDocker) {
+        console.log('  ⚠️  WARNING [SECURITY]: Panel bound to 0.0.0.0 (all interfaces).');
+        console.log('     Set HOST=127.0.0.1 in .env to restrict to localhost only.');
+        console.log('');
+    }
+
+    // BD-2026-008: Warn if plaintext credentials file exists
+    const credFile = path.join(config.keysPath, '.admin_credentials');
+    if (fs.existsSync(credFile)) {
+        console.log('  ⚠️  WARNING [SECURITY]: Plaintext .admin_credentials file detected.');
+        console.log('     Delete it after noting the password: ' + credFile);
+        console.log('');
+    }
+
+    // BD-2026-009: Warn when proxy trust is enabled
+    if (trustProxy && trustProxy !== false && trustProxy !== 0) {
+        console.log('  ⚠️  NOTICE [SECURITY]: TRUST_PROXY is enabled (' + trustProxy + ').');
+        console.log('     Ensure a trusted reverse proxy sets X-Forwarded-For correctly.');
+        console.log('');
+    }
 }
 
 // Start the server

@@ -26,6 +26,13 @@ try {
 }
 
 /**
+ * GET /remote - Redirect to devices page (device ID required for remote)
+ */
+router.get('/remote', requireAuth, (req, res) => {
+    res.redirect('/devices');
+});
+
+/**
  * GET /remote/:deviceId - RustDesk-compatible remote desktop viewer
  */
 router.get('/remote/:deviceId', requireAuth, async (req, res) => {

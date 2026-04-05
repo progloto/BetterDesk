@@ -1,13 +1,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"regexp"
 	"sync/atomic"
+	"time"
 
+	"github.com/coder/websocket"
 	"github.com/unitronix/betterdesk-server/cdap"
 )
 
@@ -140,6 +143,34 @@ func (s *Server) handleCDAPSendCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	operator := getUsernameFromCtx(r)
+	operatorRole := getRoleFromCtx(r)
+
+	// RBAC per-widget check: verify the operator's role has sufficient
+	// privilege for the requested action on this widget.
+	// Check delegation store for elevated access first.
+	widget := s.cdapGw.GetWidget(id, body.WidgetID)
+	if widget == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Widget not found on device"})
+		return
+	}
+
+	effectiveRole := operatorRole
+	if delegated := s.cdapGw.Delegations().GetEffectiveRole(operator, id, body.WidgetID); delegated != "" {
+		if cdap.RoleLevel(delegated) > cdap.RoleLevel(effectiveRole) {
+			effectiveRole = delegated
+		}
+	}
+
+	if !cdap.CheckWidgetPermission(effectiveRole, body.Action, widget) {
+		log.Printf("[cdap-api] RBAC denied: %s (role=%s, effective=%s) action=%s on widget %s/%s", operator, operatorRole, effectiveRole, body.Action, id, body.WidgetID)
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":     "Insufficient permissions for this widget action",
+			"required":  cdap.EffectivePermissions(widget).Control,
+			"your_role": effectiveRole,
+		})
+		return
+	}
+
 	commandID := fmt.Sprintf("cmd_%s_%d", id, commandCounter.Add(1))
 
 	if err := s.cdapGw.SendCommandJSON(r.Context(), id, commandID, body.WidgetID, body.Action, body.Value, operator, body.Reason); err != nil {
@@ -195,4 +226,712 @@ func (s *Server) handleCDAPStatus(w http.ResponseWriter, r *http.Request) {
 		"port":      s.cfg.CDAPPort,
 		"tls":       s.cfg.CDAPTLSEnabled(),
 	})
+}
+
+// handleCDAPAlerts returns all currently firing CDAP alerts.
+// GET /api/cdap/alerts?device_id=optional
+func (s *Server) handleCDAPAlerts(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	deviceID := r.URL.Query().Get("device_id")
+	alerts := s.cdapGw.GetActiveAlerts(deviceID)
+	if alerts == nil {
+		alerts = make([]*cdap.AlertState, 0)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"alerts": alerts,
+		"total":  len(alerts),
+	})
+}
+
+// handleCDAPDelegateCreate creates a new auth delegation.
+// POST /api/cdap/delegate
+func (s *Server) handleCDAPDelegateCreate(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	// Only admins can create delegations
+	role := getRoleFromCtx(r)
+	if role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Only admins can create delegations"})
+		return
+	}
+
+	var body struct {
+		Grantee   string   `json:"grantee"`
+		DeviceID  string   `json:"device_id"`
+		WidgetIDs []string `json:"widget_ids"` // empty = all widgets
+		Role      string   `json:"role"`       // operator or admin
+		Duration  int      `json:"duration"`   // seconds, max 86400 (24h)
+		Reason    string   `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	if body.Grantee == "" || body.DeviceID == "" || body.Role == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "grantee, device_id, and role are required"})
+		return
+	}
+
+	if body.Role != "operator" && body.Role != "admin" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role must be 'operator' or 'admin'"})
+		return
+	}
+
+	if body.Duration <= 0 || body.Duration > 86400 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "duration must be 1-86400 seconds"})
+		return
+	}
+
+	if !cdapDeviceIDRegexp.MatchString(body.DeviceID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid device ID"})
+		return
+	}
+
+	grantor := getUsernameFromCtx(r)
+	delegationID := fmt.Sprintf("dlg_%d", commandCounter.Add(1))
+
+	d := &cdap.Delegation{
+		ID:        delegationID,
+		Grantor:   grantor,
+		Grantee:   body.Grantee,
+		DeviceID:  body.DeviceID,
+		WidgetIDs: body.WidgetIDs,
+		Role:      body.Role,
+		ExpiresAt: time.Now().Add(time.Duration(body.Duration) * time.Second),
+		CreatedAt: time.Now(),
+		Reason:    body.Reason,
+	}
+
+	if err := s.cdapGw.Delegations().Add(d); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[cdap-api] Delegation created: %s granted %s role=%s on device=%s by %s", delegationID, body.Grantee, body.Role, body.DeviceID, grantor)
+
+	if s.auditLog != nil {
+		s.auditLog.Log("cdap_delegation_created", s.remoteIP(r), grantor, map[string]string{
+			"delegation_id": delegationID,
+			"grantee":       body.Grantee,
+			"device_id":     body.DeviceID,
+			"role":          body.Role,
+			"duration":      fmt.Sprintf("%ds", body.Duration),
+		})
+	}
+
+	writeJSON(w, http.StatusCreated, d)
+}
+
+// handleCDAPDelegateRevoke revokes an active delegation.
+// DELETE /api/cdap/delegate/{id}
+func (s *Server) handleCDAPDelegateRevoke(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	role := getRoleFromCtx(r)
+	if role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Only admins can manage delegations"})
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Delegation ID required"})
+		return
+	}
+
+	if !s.cdapGw.Delegations().Revoke(id) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Delegation not found or already expired"})
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log("cdap_delegation_revoked", s.remoteIP(r), getUsernameFromCtx(r), map[string]string{
+			"delegation_id": id,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
+}
+
+// handleCDAPDelegateList returns all active delegations.
+// GET /api/cdap/delegations
+func (s *Server) handleCDAPDelegateList(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	role := getRoleFromCtx(r)
+	if role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Only admins can view all delegations"})
+		return
+	}
+
+	delegations := s.cdapGw.Delegations().ListAll()
+	if delegations == nil {
+		delegations = make([]*cdap.Delegation, 0)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"delegations": delegations,
+		"total":       len(delegations),
+	})
+}
+
+// handleCDAPTerminal upgrades the HTTP connection to a WebSocket and
+// relays terminal I/O between the browser and a CDAP device.
+// GET /api/cdap/devices/{id}/terminal
+func (s *Server) handleCDAPTerminal(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	id := r.PathValue("id")
+	if !cdapDeviceIDRegexp.MatchString(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid device ID"})
+		return
+	}
+
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+
+	// RBAC: only admins (or delegated users) can open terminal sessions
+	effectiveRole := role
+	if s.cdapGw.Delegations() != nil {
+		if delegated := s.cdapGw.Delegations().GetEffectiveRole(username, id, "terminal"); delegated != "" {
+			if cdap.RoleLevel(delegated) > cdap.RoleLevel(effectiveRole) {
+				effectiveRole = delegated
+			}
+		}
+	}
+	if effectiveRole != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Terminal access requires admin role"})
+		return
+	}
+
+	// Accept WebSocket upgrade
+	wsConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols: []string{"cdap-terminal"},
+	})
+	if err != nil {
+		log.Printf("[cdap] Terminal WS upgrade failed for device %s: %v", id, err)
+		return // Accept already wrote the HTTP error
+	}
+	defer wsConn.CloseNow()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Read initial message from browser with terminal dimensions
+	_, initData, err := wsConn.Read(ctx)
+	if err != nil {
+		log.Printf("[cdap] Terminal init read failed for device %s: %v", id, err)
+		wsConn.Close(websocket.StatusProtocolError, "expected init message")
+		return
+	}
+
+	var initMsg struct {
+		Cols int `json:"cols"`
+		Rows int `json:"rows"`
+	}
+	if err := json.Unmarshal(initData, &initMsg); err != nil {
+		wsConn.Close(websocket.StatusProtocolError, "invalid init message")
+		return
+	}
+	if initMsg.Cols < 1 {
+		initMsg.Cols = 80
+	}
+	if initMsg.Rows < 1 {
+		initMsg.Rows = 24
+	}
+
+	// Start terminal session on the device
+	session, err := s.cdapGw.StartTerminalSession(ctx, wsConn, id, username, role, initMsg.Cols, initMsg.Rows)
+	if err != nil {
+		errMsg, _ := json.Marshal(map[string]string{
+			"type":  "error",
+			"error": fmt.Sprintf("Failed to start terminal: %v", err),
+		})
+		wsConn.Write(ctx, websocket.MessageText, errMsg)
+		wsConn.Close(websocket.StatusInternalError, "terminal start failed")
+		return
+	}
+
+	// Notify browser that session is ready
+	readyMsg, _ := json.Marshal(map[string]string{
+		"type":       "ready",
+		"session_id": session.ID,
+	})
+	if err := wsConn.Write(ctx, websocket.MessageText, readyMsg); err != nil {
+		s.cdapGw.EndTerminalSession(ctx, session.ID, "browser write failed")
+		return
+	}
+
+	// Read loop: relay browser input/resize to device
+	for {
+		_, msgData, err := wsConn.Read(ctx)
+		if err != nil {
+			s.cdapGw.EndTerminalSession(ctx, session.ID, "browser disconnected")
+			return
+		}
+
+		var msg struct {
+			Type string `json:"type"`
+			Data string `json:"data,omitempty"`
+			Cols int    `json:"cols,omitempty"`
+			Rows int    `json:"rows,omitempty"`
+		}
+		if err := json.Unmarshal(msgData, &msg); err != nil {
+			continue // skip malformed messages
+		}
+
+		switch msg.Type {
+		case "input":
+			if err := s.cdapGw.RelayTerminalInput(ctx, session.ID, msg.Data); err != nil {
+				s.cdapGw.EndTerminalSession(ctx, session.ID, "relay input failed")
+				return
+			}
+		case "resize":
+			if msg.Cols > 0 && msg.Rows > 0 {
+				s.cdapGw.RelayTerminalResize(ctx, session.ID, msg.Cols, msg.Rows)
+			}
+		case "close":
+			s.cdapGw.EndTerminalSession(ctx, session.ID, "user closed terminal")
+			return
+		}
+	}
+}
+
+// handleCDAPDesktop handles WebSocket connections for remote desktop sessions.
+func (s *Server) handleCDAPDesktop(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	id := r.PathValue("id")
+	if !cdapDeviceIDRegexp.MatchString(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid device ID"})
+		return
+	}
+
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+
+	effectiveRole := role
+	if s.cdapGw.Delegations() != nil {
+		if delegated := s.cdapGw.Delegations().GetEffectiveRole(username, id, "desktop"); delegated != "" {
+			if cdap.RoleLevel(delegated) > cdap.RoleLevel(effectiveRole) {
+				effectiveRole = delegated
+			}
+		}
+	}
+	if effectiveRole != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Desktop access requires admin role"})
+		return
+	}
+
+	wsConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols: []string{"cdap-desktop"},
+	})
+	if err != nil {
+		log.Printf("[cdap] Desktop WS upgrade failed for device %s: %v", id, err)
+		return
+	}
+	defer wsConn.CloseNow()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Read init message with viewport size and quality preferences
+	_, initData, err := wsConn.Read(ctx)
+	if err != nil {
+		wsConn.Close(websocket.StatusProtocolError, "expected init message")
+		return
+	}
+
+	var initMsg struct {
+		Width   int `json:"width"`
+		Height  int `json:"height"`
+		Quality int `json:"quality"`
+		FPS     int `json:"fps"`
+	}
+	if err := json.Unmarshal(initData, &initMsg); err != nil {
+		wsConn.Close(websocket.StatusProtocolError, "invalid init message")
+		return
+	}
+
+	session, err := s.cdapGw.StartDesktopSession(ctx, wsConn, id, username, role, initMsg.Width, initMsg.Height, initMsg.Quality, initMsg.FPS)
+	if err != nil {
+		errMsg, _ := json.Marshal(map[string]string{"type": "error", "error": fmt.Sprintf("Failed to start desktop: %v", err)})
+		wsConn.Write(ctx, websocket.MessageText, errMsg)
+		wsConn.Close(websocket.StatusInternalError, "desktop start failed")
+		return
+	}
+
+	readyMsg, _ := json.Marshal(map[string]string{"type": "ready", "session_id": session.ID})
+	if err := wsConn.Write(ctx, websocket.MessageText, readyMsg); err != nil {
+		s.cdapGw.EndDesktopSession(ctx, session.ID, "browser write failed")
+		return
+	}
+
+	for {
+		_, msgData, err := wsConn.Read(ctx)
+		if err != nil {
+			s.cdapGw.EndDesktopSession(ctx, session.ID, "browser disconnected")
+			return
+		}
+
+		var msg struct {
+			Type      string          `json:"type"`
+			InputType string          `json:"input_type,omitempty"`
+			X         int             `json:"x,omitempty"`
+			Y         int             `json:"y,omitempty"`
+			Button    int             `json:"button,omitempty"`
+			Key       string          `json:"key,omitempty"`
+			Code      string          `json:"code,omitempty"`
+			Modifiers int             `json:"modifiers,omitempty"`
+			DeltaX    int             `json:"delta_x,omitempty"`
+			DeltaY    int             `json:"delta_y,omitempty"`
+			Width     int             `json:"width,omitempty"`
+			Height    int             `json:"height,omitempty"`
+			Format    string          `json:"format,omitempty"`
+			Data      string          `json:"data,omitempty"`
+			SessionID string          `json:"session_id,omitempty"`
+			Index     int             `json:"index,omitempty"`
+			Raw       json.RawMessage `json:"-"`
+		}
+		if err := json.Unmarshal(msgData, &msg); err != nil {
+			continue
+		}
+		msg.Raw = json.RawMessage(msgData)
+
+		switch msg.Type {
+		case "input":
+			input := &cdap.DesktopInputPayload{
+				InputType: msg.InputType,
+				X:         msg.X,
+				Y:         msg.Y,
+				Button:    msg.Button,
+				Key:       msg.Key,
+				Code:      msg.Code,
+				Modifiers: msg.Modifiers,
+				DeltaX:    msg.DeltaX,
+				DeltaY:    msg.DeltaY,
+			}
+			if err := s.cdapGw.RelayDesktopInput(ctx, session.ID, input); err != nil {
+				s.cdapGw.EndDesktopSession(ctx, session.ID, "relay input failed")
+				return
+			}
+		case "resize":
+			if msg.Width > 0 && msg.Height > 0 {
+				s.cdapGw.RelayDesktopResize(ctx, session.ID, msg.Width, msg.Height)
+			}
+		case "clipboard_set":
+			if msg.Format != "" && msg.Data != "" {
+				s.cdapGw.RelayClipboard(ctx, id, session.ID, msg.Format, msg.Data)
+			}
+		case "quality_report":
+			s.cdapGw.HandleQualityReport(ctx, session.ID, msg.Raw)
+		case "codec_offer":
+			s.cdapGw.RelayCodecOffer(ctx, session.ID, msg.Raw)
+		case "key_exchange":
+			s.cdapGw.RelayKeyExchangeToDevice(ctx, session.ID, msg.Raw)
+		case "keyframe_request":
+			s.cdapGw.RelayKeyframeRequest(ctx, session.ID)
+		case "monitor_select":
+			s.cdapGw.RelayMonitorSelect(ctx, session.ID, msg.Index)
+		case "close":
+			s.cdapGw.EndDesktopSession(ctx, session.ID, "user closed desktop")
+			return
+		}
+	}
+}
+
+// handleCDAPVideo handles WebSocket connections for video stream sessions.
+func (s *Server) handleCDAPVideo(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	id := r.PathValue("id")
+	if !cdapDeviceIDRegexp.MatchString(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid device ID"})
+		return
+	}
+
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+
+	wsConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols: []string{"cdap-video"},
+	})
+	if err != nil {
+		log.Printf("[cdap] Video WS upgrade failed for device %s: %v", id, err)
+		return
+	}
+	defer wsConn.CloseNow()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	_, initData, err := wsConn.Read(ctx)
+	if err != nil {
+		wsConn.Close(websocket.StatusProtocolError, "expected init message")
+		return
+	}
+
+	var initMsg struct {
+		StreamID string `json:"stream_id"`
+		Quality  int    `json:"quality"`
+		FPS      int    `json:"fps"`
+	}
+	if err := json.Unmarshal(initData, &initMsg); err != nil {
+		wsConn.Close(websocket.StatusProtocolError, "invalid init message")
+		return
+	}
+
+	session, err := s.cdapGw.StartVideoSession(ctx, wsConn, id, username, role, initMsg.StreamID, initMsg.Quality, initMsg.FPS)
+	if err != nil {
+		errMsg, _ := json.Marshal(map[string]string{"type": "error", "error": fmt.Sprintf("Failed to start video: %v", err)})
+		wsConn.Write(ctx, websocket.MessageText, errMsg)
+		wsConn.Close(websocket.StatusInternalError, "video start failed")
+		return
+	}
+
+	readyMsg, _ := json.Marshal(map[string]string{"type": "ready", "session_id": session.ID})
+	if err := wsConn.Write(ctx, websocket.MessageText, readyMsg); err != nil {
+		s.cdapGw.EndVideoSession(ctx, session.ID, "browser write failed")
+		return
+	}
+
+	// Read loop: only handle close messages (video is unidirectional)
+	for {
+		_, msgData, err := wsConn.Read(ctx)
+		if err != nil {
+			s.cdapGw.EndVideoSession(ctx, session.ID, "browser disconnected")
+			return
+		}
+
+		var msg struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(msgData, &msg) == nil {
+			switch msg.Type {
+			case "close":
+				s.cdapGw.EndVideoSession(ctx, session.ID, "user closed video")
+				return
+			case "quality_report":
+				s.cdapGw.HandleQualityReport(ctx, session.ID, json.RawMessage(msgData))
+			case "codec_offer":
+				s.cdapGw.RelayCodecOffer(ctx, session.ID, json.RawMessage(msgData))
+			case "key_exchange":
+				s.cdapGw.RelayKeyExchangeToDevice(ctx, session.ID, json.RawMessage(msgData))
+			case "keyframe_request":
+				s.cdapGw.RelayKeyframeRequest(ctx, session.ID)
+			}
+		}
+	}
+}
+
+// handleCDAPFileBrowser handles WebSocket connections for file browser sessions.
+func (s *Server) handleCDAPFileBrowser(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	id := r.PathValue("id")
+	if !cdapDeviceIDRegexp.MatchString(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid device ID"})
+		return
+	}
+
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+
+	effectiveRole := role
+	if s.cdapGw.Delegations() != nil {
+		if delegated := s.cdapGw.Delegations().GetEffectiveRole(username, id, "file_browser"); delegated != "" {
+			if cdap.RoleLevel(delegated) > cdap.RoleLevel(effectiveRole) {
+				effectiveRole = delegated
+			}
+		}
+	}
+	if effectiveRole != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "File browser access requires admin role"})
+		return
+	}
+
+	wsConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols: []string{"cdap-filebrowser"},
+	})
+	if err != nil {
+		log.Printf("[cdap] File browser WS upgrade failed for device %s: %v", id, err)
+		return
+	}
+	defer wsConn.CloseNow()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	session, err := s.cdapGw.StartFileSession(ctx, wsConn, id, username, role)
+	if err != nil {
+		errMsg, _ := json.Marshal(map[string]string{"type": "error", "error": fmt.Sprintf("Failed to start file browser: %v", err)})
+		wsConn.Write(ctx, websocket.MessageText, errMsg)
+		wsConn.Close(websocket.StatusInternalError, "file start failed")
+		return
+	}
+
+	readyMsg, _ := json.Marshal(map[string]string{"type": "ready", "session_id": session.ID})
+	if err := wsConn.Write(ctx, websocket.MessageText, readyMsg); err != nil {
+		s.cdapGw.EndFileSession(ctx, session.ID, "browser write failed")
+		return
+	}
+
+	for {
+		_, msgData, err := wsConn.Read(ctx)
+		if err != nil {
+			s.cdapGw.EndFileSession(ctx, session.ID, "browser disconnected")
+			return
+		}
+
+		var msg struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data,omitempty"`
+		}
+		if err := json.Unmarshal(msgData, &msg); err != nil {
+			continue
+		}
+
+		switch msg.Type {
+		case "file_list", "file_read", "file_write", "file_delete":
+			if err := s.cdapGw.RelayFileRequest(ctx, session.ID, msg.Type, msg.Data); err != nil {
+				s.cdapGw.EndFileSession(ctx, session.ID, "relay request failed")
+				return
+			}
+		case "close":
+			s.cdapGw.EndFileSession(ctx, session.ID, "user closed file browser")
+			return
+		}
+	}
+}
+
+// handleCDAPAudio handles WebSocket connections for audio stream sessions.
+// GET /api/cdap/devices/{id}/audio
+func (s *Server) handleCDAPAudio(w http.ResponseWriter, r *http.Request) {
+	if s.cdapGw == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "CDAP gateway not enabled"})
+		return
+	}
+
+	id := r.PathValue("id")
+	if !cdapDeviceIDRegexp.MatchString(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid device ID"})
+		return
+	}
+
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+
+	// RBAC: operator+ can access audio streams
+	effectiveRole := role
+	if s.cdapGw.Delegations() != nil {
+		if delegated := s.cdapGw.Delegations().GetEffectiveRole(username, id, "audio"); delegated != "" {
+			if cdap.RoleLevel(delegated) > cdap.RoleLevel(effectiveRole) {
+				effectiveRole = delegated
+			}
+		}
+	}
+	if cdap.RoleLevel(effectiveRole) < cdap.RoleLevel("operator") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Audio access requires operator role"})
+		return
+	}
+
+	wsConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols: []string{"cdap-audio"},
+	})
+	if err != nil {
+		log.Printf("[cdap] Audio WS upgrade failed for device %s: %v", id, err)
+		return
+	}
+	defer wsConn.CloseNow()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	_, initData, err := wsConn.Read(ctx)
+	if err != nil {
+		wsConn.Close(websocket.StatusProtocolError, "expected init message")
+		return
+	}
+
+	var initMsg struct {
+		Codec      string `json:"codec"`
+		SampleRate int    `json:"sample_rate"`
+		Channels   int    `json:"channels"`
+		Direction  string `json:"direction"`
+	}
+	if err := json.Unmarshal(initData, &initMsg); err != nil {
+		wsConn.Close(websocket.StatusProtocolError, "invalid init message")
+		return
+	}
+
+	session, err := s.cdapGw.StartAudioSession(ctx, wsConn, id, username, role, initMsg.Codec, initMsg.SampleRate, initMsg.Channels, initMsg.Direction)
+	if err != nil {
+		errMsg, _ := json.Marshal(map[string]string{"type": "error", "error": fmt.Sprintf("Failed to start audio: %v", err)})
+		wsConn.Write(ctx, websocket.MessageText, errMsg)
+		wsConn.Close(websocket.StatusInternalError, "audio start failed")
+		return
+	}
+
+	readyMsg, _ := json.Marshal(map[string]string{"type": "ready", "session_id": session.ID})
+	if err := wsConn.Write(ctx, websocket.MessageText, readyMsg); err != nil {
+		s.cdapGw.EndAudioSession(ctx, session.ID, "browser write failed")
+		return
+	}
+
+	for {
+		_, msgData, err := wsConn.Read(ctx)
+		if err != nil {
+			s.cdapGw.EndAudioSession(ctx, session.ID, "browser disconnected")
+			return
+		}
+
+		var msg struct {
+			Type      string `json:"type"`
+			Codec     string `json:"codec,omitempty"`
+			Data      string `json:"data,omitempty"`
+			Timestamp int64  `json:"timestamp,omitempty"`
+		}
+		if err := json.Unmarshal(msgData, &msg); err != nil {
+			continue
+		}
+
+		switch msg.Type {
+		case "audio_input":
+			if msg.Data != "" {
+				s.cdapGw.RelayAudioInput(ctx, session.ID, msg.Codec, msg.Data, msg.Timestamp)
+			}
+		case "key_exchange":
+			s.cdapGw.RelayKeyExchangeToDevice(ctx, session.ID, json.RawMessage(msgData))
+		case "close":
+			s.cdapGw.EndAudioSession(ctx, session.ID, "user closed audio")
+			return
+		}
+	}
 }

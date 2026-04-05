@@ -10,6 +10,7 @@ const db = require('../services/database');
 const brandingService = require('../services/brandingService');
 const serverBackend = require('../services/serverBackend');
 const backupService = require('../services/backupService');
+const updateService = require('../services/updateService');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const os = require('os');
 const multer = require('multer');
@@ -205,6 +206,70 @@ router.post('/api/settings/branding/import', requireAuth, requireAdmin, async (r
 });
 
 /**
+ * GET /api/settings/themes - List available theme presets
+ */
+router.get('/api/settings/themes', requireAuth, (req, res) => {
+    try {
+        const fs = require('fs');
+        const path = require('path');
+        const themesDir = path.join(__dirname, '..', 'themes');
+        const themes = [];
+
+        if (fs.existsSync(themesDir)) {
+            for (const file of fs.readdirSync(themesDir)) {
+                if (!file.endsWith('.json')) continue;
+                try {
+                    const data = JSON.parse(fs.readFileSync(path.join(themesDir, file), 'utf8'));
+                    if (data.type === 'betterdesk-theme' && data.branding) {
+                        themes.push({
+                            id: file.replace('.json', ''),
+                            name: data.branding.appName || file.replace('.json', ''),
+                            description: data.branding.appDescription || '',
+                            colors: data.branding.colors || {}
+                        });
+                    }
+                } catch { /* skip invalid files */ }
+            }
+        }
+
+        res.json({ success: true, data: themes });
+    } catch (err) {
+        console.error('List themes error:', err);
+        res.status(500).json({ success: false, error: 'Failed to list themes' });
+    }
+});
+
+/**
+ * POST /api/settings/themes/:id/apply - Apply a built-in theme preset (admin only)
+ */
+router.post('/api/settings/themes/:id/apply', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const fs = require('fs');
+        const path = require('path');
+        const themeFile = path.join(__dirname, '..', 'themes', req.params.id + '.json');
+
+        if (!fs.existsSync(themeFile)) {
+            return res.status(404).json({ success: false, error: 'Theme not found' });
+        }
+
+        const preset = JSON.parse(fs.readFileSync(themeFile, 'utf8'));
+        const success = await brandingService.importPreset(preset);
+
+        if (!success) {
+            return res.status(400).json({ success: false, error: 'Invalid theme format' });
+        }
+
+        const db = require('../services/database');
+        await db.logAction(req.session?.userId, 'theme_apply', `Applied theme: ${req.params.id}`, req.ip);
+
+        res.json({ success: true, message: `Theme "${req.params.id}" applied` });
+    } catch (err) {
+        console.error('Apply theme error:', err);
+        res.status(500).json({ success: false, error: 'Failed to apply theme' });
+    }
+});
+
+/**
  * GET /css/theme.css - Dynamic CSS theme overrides (no auth required, cached)
  */
 router.get('/css/theme.css', (req, res) => {
@@ -330,6 +395,144 @@ router.post('/api/settings/restore', requireAuth, requireAdmin, backupUpload.sin
     } catch (err) {
         console.error('Restore error:', err);
         res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+// ==================== Self-Update API ====================
+
+/**
+ * GET /api/settings/updates/check - Check for available updates
+ */
+router.get('/api/settings/updates/check', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const result = await updateService.checkForUpdates();
+        res.json({ success: true, data: result });
+    } catch (err) {
+        console.error('Update check error:', err);
+        res.status(500).json({ success: false, error: 'Failed to check for updates: ' + err.message });
+    }
+});
+
+/**
+ * GET /api/settings/updates/changes - Get list of changed files between versions
+ */
+router.get('/api/settings/updates/changes', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const { local, remote } = req.query;
+        if (!local || !remote) {
+            return res.status(400).json({ success: false, error: 'local and remote version params required' });
+        }
+        const files = await updateService.getChangedFiles(local, remote);
+        res.json({ success: true, data: { files, total: files.length } });
+    } catch (err) {
+        console.error('Get changes error:', err);
+        res.status(500).json({ success: false, error: 'Failed to get changed files: ' + err.message });
+    }
+});
+
+/**
+ * POST /api/settings/updates/install - Apply the update
+ * Body: { remoteVersion, createBackup: true/false }
+ */
+router.post('/api/settings/updates/install', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const { remoteVersion, createBackup } = req.body;
+        if (!remoteVersion || typeof remoteVersion !== 'string') {
+            return res.status(400).json({ success: false, error: 'remoteVersion is required' });
+        }
+        // Validate version format (semver-like)
+        if (!/^\d+\.\d+\.\d+/.test(remoteVersion.replace(/^v/i, ''))) {
+            return res.status(400).json({ success: false, error: 'Invalid version format' });
+        }
+
+        const localVersion = updateService.getLocalVersion();
+
+        // Get changed files
+        const changedFiles = await updateService.getChangedFiles(localVersion, remoteVersion);
+        if (changedFiles.length === 0) {
+            return res.json({ success: true, data: { applied: [], message: 'No files to update' } });
+        }
+
+        // Apply update
+        const doBackup = createBackup !== false;
+        const result = await updateService.applyUpdate(remoteVersion, changedFiles, doBackup);
+
+        await db.logAction(
+            req.session?.userId,
+            'system_update',
+            `Updated ${localVersion} → ${remoteVersion} (${result.applied.length} files, ${result.failed.length} failed)`,
+            req.ip
+        );
+
+        // If update applied successfully and has no critical failures, schedule restart
+        const needsRestart = result.applied.length > 0 && result.failed.length === 0;
+
+        res.json({
+            success: true,
+            data: {
+                ...result,
+                localVersion,
+                remoteVersion,
+                needsRestart
+            }
+        });
+
+        // Restart after response is sent (systemd/PM2 will restart automatically)
+        if (needsRestart) {
+            setTimeout(() => {
+                console.log(`[UPDATE] Restarting after update to v${remoteVersion}...`);
+                process.exit(0);
+            }, 2000);
+        }
+    } catch (err) {
+        console.error('Update install error:', err);
+        res.status(500).json({ success: false, error: 'Update failed: ' + err.message });
+    }
+});
+
+/**
+ * GET /api/settings/updates/backups - List pre-update backups
+ */
+router.get('/api/settings/updates/backups', requireAuth, requireAdmin, (req, res) => {
+    try {
+        const backups = updateService.listBackups();
+        res.json({ success: true, data: backups });
+    } catch (err) {
+        console.error('List backups error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/settings/updates/restore - Restore from pre-update backup
+ * Body: { backupName }
+ */
+router.post('/api/settings/updates/restore', requireAuth, requireAdmin, async (req, res) => {
+    try {
+        const { backupName } = req.body;
+        if (!backupName || typeof backupName !== 'string') {
+            return res.status(400).json({ success: false, error: 'backupName is required' });
+        }
+
+        const result = updateService.restoreFromBackup(backupName);
+
+        await db.logAction(
+            req.session?.userId,
+            'system_restore',
+            `Restored from backup: ${backupName} (v${result.version}, ${result.restored} files)`,
+            req.ip
+        );
+
+        res.json({ success: true, data: result });
+
+        // Restart after restore
+        setTimeout(() => {
+            console.log(`[UPDATE] Restarting after restore from ${backupName}...`);
+            process.exit(0);
+        }, 2000);
+    } catch (err) {
+        console.error('Restore error:', err);
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 

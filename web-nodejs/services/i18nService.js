@@ -17,11 +17,24 @@ const LANGUAGE_META = {
     'it': { name: 'Italian', native: 'Italiano', flag: '🇮🇹', rtl: false },
     'pt': { name: 'Portuguese', native: 'Português', flag: '🇵🇹', rtl: false },
     'nl': { name: 'Dutch', native: 'Nederlands', flag: '🇳🇱', rtl: false },
-    'ru': { name: 'Russian', native: 'Русский', flag: '🇷🇺', rtl: false },
     'zh': { name: 'Chinese', native: '中文', flag: '🇨🇳', rtl: false },
     'ja': { name: 'Japanese', native: '日本語', flag: '🇯🇵', rtl: false },
+    'ko': { name: 'Korean', native: '한국어', flag: '🇰🇷', rtl: false },
     'ar': { name: 'Arabic', native: 'العربية', flag: '🇸🇦', rtl: true },
-    'he': { name: 'Hebrew', native: 'עברית', flag: '🇮🇱', rtl: true }
+    'he': { name: 'Hebrew', native: 'עברית', flag: '🇮🇱', rtl: true },
+    'uk': { name: 'Ukrainian', native: 'Українська', flag: '🇺🇦', rtl: false },
+    'tr': { name: 'Turkish', native: 'Türkçe', flag: '🇹🇷', rtl: false },
+    'hi': { name: 'Hindi', native: 'हिन्दी', flag: '🇮🇳', rtl: false },
+    'sv': { name: 'Swedish', native: 'Svenska', flag: '🇸🇪', rtl: false },
+    'nb': { name: 'Norwegian', native: 'Norsk', flag: '🇳🇴', rtl: false },
+    'da': { name: 'Danish', native: 'Dansk', flag: '🇩🇰', rtl: false },
+    'fi': { name: 'Finnish', native: 'Suomi', flag: '🇫🇮', rtl: false },
+    'cs': { name: 'Czech', native: 'Čeština', flag: '🇨🇿', rtl: false },
+    'hu': { name: 'Hungarian', native: 'Magyar', flag: '🇭🇺', rtl: false },
+    'ro': { name: 'Romanian', native: 'Română', flag: '🇷🇴', rtl: false },
+    'th': { name: 'Thai', native: 'ไทย', flag: '🇹🇭', rtl: false },
+    'vi': { name: 'Vietnamese', native: 'Tiếng Việt', flag: '🇻🇳', rtl: false },
+    'id': { name: 'Indonesian', native: 'Bahasa Indonesia', flag: '🇮🇩', rtl: false }
 };
 
 // Security: Language code validation regex (prevents path traversal)

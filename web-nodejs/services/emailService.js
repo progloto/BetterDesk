@@ -19,6 +19,7 @@ try {
 }
 
 const { getAdapter } = require('./dbAdapter');
+const config = require('../config/config');
 
 let _transporter = null;
 let _cachedConfig = null;
@@ -73,7 +74,7 @@ async function getTransporter() {
         port: config.port || 587,
         secure: config.secure || false,
         auth: (config.user && config.pass) ? { user: config.user, pass: config.pass } : undefined,
-        tls: { rejectUnauthorized: false },
+        tls: { rejectUnauthorized: config.smtpTlsVerify },
     });
 
     _cachedConfig = config;

@@ -1247,3 +1247,104 @@
 .spinning {
     animation: spin 1s linear infinite;
 }
+
+/* ==================== Self-Update ==================== */
+
+.update-version-info {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.update-version-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: var(--space-xs) 0;
+}
+
+.update-label {
+    min-width: 160px;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.update-value {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.update-changelog {
+    background: var(--bg-tertiary, rgba(255,255,255,0.03));
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    padding: var(--space-md);
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    max-height: 240px;
+    overflow-y: auto;
+    line-height: 1.6;
+    white-space: pre-wrap;
+}
+
+.update-files-summary {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+.update-progress {
+    margin-top: var(--space-md);
+}
+
+.update-progress-bar {
+    height: 6px;
+    background: var(--bg-tertiary, rgba(255,255,255,0.06));
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.update-progress-fill {
+    height: 100%;
+    background: var(--primary);
+    border-radius: 3px;
+    transition: width 0.4s ease;
+    width: 0%;
+}
+
+.update-progress-text {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin-top: var(--space-xs);
+}
+
+.update-backups {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.update-backup-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--space-sm) var(--space-md);
+    background: var(--bg-tertiary, rgba(255,255,255,0.03));
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    gap: var(--space-md);
+}
+
+.update-backup-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.update-backup-info strong {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+.update-backup-info .text-muted {
+    font-size: var(--font-size-xs, 0.75rem);
+}

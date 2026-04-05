@@ -41,8 +41,32 @@ type Gateway struct {
 	httpSrv *http.Server
 	ln      net.Listener
 
+	// alertEngine evaluates manifest alert definitions on state changes.
+	alertEngine *AlertEngine
+
+	// delegations stores active auth delegations (admin → user grants).
+	delegations *DelegationStore
+
 	// devices holds all authenticated CDAP connections keyed by device ID.
 	devices sync.Map // map[string]*DeviceConn
+
+	// pendingCommands tracks commands sent to devices, keyed by command ID.
+	pendingCommands sync.Map // map[string]*PendingCommand
+
+	// terminalSessions tracks active terminal sessions, keyed by session ID.
+	terminalSessions sync.Map // map[string]*TerminalSession
+
+	// desktopSessions tracks active remote desktop sessions, keyed by session ID.
+	desktopSessions sync.Map // map[string]*DesktopSession
+
+	// videoSessions tracks active video stream sessions, keyed by session ID.
+	videoSessions sync.Map // map[string]*VideoSession
+
+	// fileSessions tracks active file browser sessions, keyed by session ID.
+	fileSessions sync.Map // map[string]*FileSession
+
+	// audioSessions tracks active audio stream sessions, keyed by session ID.
+	audioSessions sync.Map // map[string]*AudioSession
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -54,14 +78,28 @@ type Gateway struct {
 	version string
 }
 
+// PendingCommand tracks a command sent to a device, awaiting ACK/NACK.
+type PendingCommand struct {
+	CommandID string
+	DeviceID  string
+	SentAt    time.Time
+	ResultCh  chan *CommandResponsePayload // optional; nil if fire-and-forget
+}
+
 // New creates a new CDAP gateway.
 func New(cfg *config.Config, database db.Database, peerMap *peer.Map, eventBus *events.Bus) *Gateway {
+	rateLimit := cfg.CDAPRateLimit
+	if rateLimit <= 0 {
+		rateLimit = 30
+	}
 	return &Gateway{
-		cfg:      cfg,
-		db:       database,
-		peerMap:  peerMap,
-		eventBus: eventBus,
-		limiter:  ratelimit.NewIPLimiter(10, 1*time.Minute, 5*time.Minute),
+		cfg:         cfg,
+		db:          database,
+		peerMap:     peerMap,
+		eventBus:    eventBus,
+		limiter:     ratelimit.NewIPLimiter(rateLimit, 1*time.Minute, 5*time.Minute),
+		alertEngine: NewAlertEngine(eventBus),
+		delegations: NewDelegationStore(),
 	}
 }
 
@@ -79,6 +117,9 @@ func (g *Gateway) SetRateLimiter(l *ratelimit.IPLimiter) { g.limiter = l }
 
 // SetVersion sets the version string for startup log.
 func (g *Gateway) SetVersion(v string) { g.version = v }
+
+// Delegations returns the delegation store for auth delegation management.
+func (g *Gateway) Delegations() *DelegationStore { return g.delegations }
 
 // Start binds the WebSocket listener and begins accepting connections.
 func (g *Gateway) Start(ctx context.Context) error {
@@ -124,6 +165,10 @@ func (g *Gateway) Start(ctx context.Context) error {
 	// Heartbeat monitor: detect stale CDAP connections
 	g.wg.Add(1)
 	go g.heartbeatMonitor()
+
+	// Delegation cleanup: purge expired delegations every 5 minutes
+	g.wg.Add(1)
+	go g.delegationCleaner()
 
 	scheme := "ws"
 	if g.cfg.CDAPTLSEnabled() {
@@ -282,13 +327,44 @@ func (g *Gateway) messageLoop(ctx context.Context, dc *DeviceConn) {
 			return
 		case "token_refresh":
 			g.handleTokenRefresh(ctx, dc, msg)
+		case "terminal_output":
+			g.handleTerminalOutput(ctx, dc, msg)
+		case "terminal_end":
+			g.handleTerminalEnd(ctx, dc, msg)
+		case "desktop_frame":
+			g.handleDesktopFrame(ctx, dc, msg)
+		case "desktop_end":
+			g.handleDesktopEnd(ctx, dc, msg)
+		case "video_frame":
+			g.handleVideoFrame(ctx, dc, msg)
+		case "video_end":
+			g.handleVideoEnd(ctx, dc, msg)
+		case "file_list_response", "file_read_response", "file_write_response", "file_delete_response":
+			g.handleFileResponse(ctx, dc, msg)
+		case "file_end":
+			g.handleFileEnd(ctx, dc, msg)
+		case "audio_frame":
+			g.handleAudioFrame(ctx, dc, msg)
+		case "audio_end":
+			g.handleAudioEnd(ctx, dc, msg)
+		case "clipboard_update":
+			g.HandleClipboardUpdate(dc.ID, msg.Payload)
+		case "key_exchange":
+			g.HandleKeyExchange(ctx, dc.ID, msg.Payload)
+		case "cursor_update":
+			g.HandleCursorUpdate(ctx, dc.ID, msg.Payload)
+		case "codec_answer":
+			g.HandleCodecAnswer(ctx, dc.ID, msg.Payload)
+		case "monitor_list":
+			g.HandleMonitorList(ctx, dc.ID, msg.Payload)
 		default:
 			sendError(ctx, dc.conn, 1006, fmt.Sprintf("unknown message type: %s", msg.Type))
 		}
 	}
 }
 
-// heartbeatMonitor periodically checks for stale CDAP connections.
+// heartbeatMonitor periodically checks for stale CDAP connections
+// and cleans up expired pending commands.
 func (g *Gateway) heartbeatMonitor() {
 	defer g.wg.Done()
 	ticker := time.NewTicker(30 * time.Second)
@@ -317,6 +393,39 @@ func (g *Gateway) heartbeatMonitor() {
 				}
 				return true
 			})
+
+			// Cleanup stale pending commands (>2 min without response)
+			g.pendingCommands.Range(func(key, value any) bool {
+				pc, ok := value.(*PendingCommand)
+				if !ok {
+					return true
+				}
+				if now.Sub(pc.SentAt) > 2*time.Minute {
+					if pc.ResultCh != nil {
+						close(pc.ResultCh)
+					}
+					g.pendingCommands.Delete(key)
+				}
+				return true
+			})
+		}
+	}
+}
+
+// delegationCleaner periodically purges expired auth delegations.
+func (g *Gateway) delegationCleaner() {
+	defer g.wg.Done()
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		case <-ticker.C:
+			if n := g.delegations.CleanExpired(); n > 0 {
+				log.Printf("[cdap] Cleaned %d expired delegation(s)", n)
+			}
 		}
 	}
 }
@@ -327,6 +436,27 @@ func (g *Gateway) removeDevice(dc *DeviceConn) {
 		return
 	}
 	g.devices.Delete(dc.ID)
+
+	// Clear any firing alerts for this device
+	if g.alertEngine != nil {
+		g.alertEngine.RemoveDevice(dc.ID)
+	}
+
+	// Clean up manifest from server_config
+	if err := g.db.DeleteConfig(fmt.Sprintf("cdap_manifest_%s", dc.ID)); err != nil {
+		log.Printf("[cdap] %s: failed to delete manifest: %v", dc.ID, err)
+	}
+
+	// Clean up pending commands for this device
+	g.pendingCommands.Range(func(key, value any) bool {
+		if pc, ok := value.(*PendingCommand); ok && pc.DeviceID == dc.ID {
+			if pc.ResultCh != nil {
+				close(pc.ResultCh)
+			}
+			g.pendingCommands.Delete(key)
+		}
+		return true
+	})
 
 	// Update peer status to OFFLINE
 	if err := g.db.UpdatePeerStatus(dc.ID, "OFFLINE", dc.ClientIP); err != nil {
@@ -347,14 +477,21 @@ func (g *Gateway) removeDevice(dc *DeviceConn) {
 	log.Printf("[cdap] %s: disconnected (session: %s)", dc.ID, time.Since(dc.ConnectedAt).Round(time.Second))
 }
 
-// SendCommand sends a command to a connected CDAP device.
-// Returns error if the device is not connected.
+// SendCommand sends a command to a connected CDAP device and tracks it
+// for ACK/NACK. Returns error if the device is not connected.
 func (g *Gateway) SendCommand(ctx context.Context, deviceID string, cmd *CommandMessage) error {
 	val, ok := g.devices.Load(deviceID)
 	if !ok {
 		return fmt.Errorf("device %s not connected", deviceID)
 	}
 	dc := val.(*DeviceConn)
+
+	// Track pending command
+	g.pendingCommands.Store(cmd.ID, &PendingCommand{
+		CommandID: cmd.ID,
+		DeviceID:  deviceID,
+		SentAt:    time.Now(),
+	})
 
 	dc.CommandCount.Add(1)
 	return dc.WriteMessage(ctx, &Message{
@@ -363,6 +500,44 @@ func (g *Gateway) SendCommand(ctx context.Context, deviceID string, cmd *Command
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Payload:   cmd.Payload,
 	})
+}
+
+// ResolvePendingCommand resolves a pending command by ID.
+// Returns the PendingCommand and true if found, nil and false otherwise.
+func (g *Gateway) ResolvePendingCommand(commandID string) (*PendingCommand, bool) {
+	val, ok := g.pendingCommands.LoadAndDelete(commandID)
+	if !ok {
+		return nil, false
+	}
+	return val.(*PendingCommand), true
+}
+
+// SendRevoke sends a revocation message to a connected CDAP device
+// and forcefully closes its connection.
+func (g *Gateway) SendRevoke(ctx context.Context, deviceID, reason string) error {
+	val, ok := g.devices.Load(deviceID)
+	if !ok {
+		return fmt.Errorf("device %s not connected", deviceID)
+	}
+	dc := val.(*DeviceConn)
+
+	// Send revoke message (best-effort)
+	revokeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	sendMessage(revokeCtx, dc.conn, "revoke", map[string]string{
+		"reason": reason,
+	})
+
+	// Close the connection
+	dc.Close(4003, reason)
+	g.removeDevice(dc)
+
+	g.auditAction("cdap_revoke", deviceID, map[string]string{
+		"reason": reason,
+	})
+
+	log.Printf("[cdap] %s: revoked (%s)", deviceID, reason)
+	return nil
 }
 
 // GetDeviceConn returns the connection for a device, or nil if not connected.
