@@ -39,8 +39,9 @@ RUN apk add --no-cache \
     curl \
     sqlite \
     tini \
+    su-exec \
     || { sleep 2 && apk add --no-cache \
-    ca-certificates curl sqlite tini; } \
+    ca-certificates curl sqlite tini su-exec; } \
     && addgroup -g 10001 -S betterdesk \
     && adduser -u 10001 -S -G betterdesk betterdesk
 
@@ -49,6 +50,10 @@ RUN chmod +x /usr/local/bin/betterdesk-server
 
 # Create data directory
 RUN mkdir -p /opt/rustdesk && chown betterdesk:betterdesk /opt/rustdesk
+
+# Entrypoint script: fixes volume permissions, then drops to betterdesk user
+COPY docker/server-entrypoint.sh /server-entrypoint.sh
+RUN chmod +x /server-entrypoint.sh
 
 WORKDIR /opt/rustdesk
 
@@ -65,7 +70,8 @@ EXPOSE 21114 21115 21116/tcp 21116/udp 21117 21118 21119
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -sf http://localhost:21114/api/health || exit 1
 
-USER betterdesk
+# Note: Container starts as root so entrypoint can fix volume permissions.
+# server-entrypoint.sh drops to betterdesk user via su-exec before running the server.
 
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/sbin/tini", "--", "/server-entrypoint.sh"]
 CMD ["/usr/local/bin/betterdesk-server", "-mode", "all", "-key-file", "/opt/rustdesk/id_ed25519"]

@@ -23,6 +23,11 @@ echo ""
 # Ensure data directories exist and have correct permissions
 mkdir -p /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
 chown -R betterdesk:betterdesk /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
+# Fix private key permissions (volume mounts may preserve wrong UID/mode)
+if [ -f /opt/rustdesk/id_ed25519 ]; then
+    chmod 600 /opt/rustdesk/id_ed25519
+    chown betterdesk:betterdesk /opt/rustdesk/id_ed25519
+fi
 
 # BD-2026-007: Warn about weak default secrets
 if [ -n "${SESSION_SECRET}" ] && [ ${#SESSION_SECRET} -lt 32 ]; then
