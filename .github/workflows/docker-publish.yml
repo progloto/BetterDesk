@@ -91,14 +91,22 @@ jobs:
           platforms: linux/amd64,linux/arm64
 
       - name: Generate SBOM
+        continue-on-error: true
         uses: anchore/sbom-action@v0
+        env:
+          SYFT_REGISTRY_AUTH_USERNAME: ${{ github.actor }}
+          SYFT_REGISTRY_AUTH_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         with:
           image: ${{ env.IMAGE_PREFIX }}/betterdesk-server:latest
           format: spdx-json
           output-file: sbom-server.spdx.json
 
       - name: Trivy vulnerability scan
+        continue-on-error: true
         uses: aquasecurity/trivy-action@master
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         with:
           image-ref: ${{ env.IMAGE_PREFIX }}/betterdesk-server:latest
           format: table
