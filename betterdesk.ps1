@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     BetterDesk Console Manager v3.0.0 - All-in-One Interactive Tool for Windows
@@ -300,7 +300,7 @@ function Detect-Installation {
     }
 
     if ($detectedDbType -eq "postgres") {
-        # PostgreSQL: we trust the config — full validation is done by Do-Validate
+        # PostgreSQL: we trust the config -- full validation is done by Do-Validate
         $script:DATABASE_OK = $true
     } elseif (Test-Path "$script:RUSTDESK_PATH\db_v2.sqlite3") {
         $script:DATABASE_OK = $true
@@ -1459,7 +1459,7 @@ function Setup-Services {
     Print-Step "Configuring Windows services..."
     
     # SAFETY NET: Re-read database config from .env if script vars are empty.
-    # This prevents PostgreSQL → SQLite regression during UPDATE/REPAIR
+    # This prevents PostgreSQL -> SQLite regression during UPDATE/REPAIR
     # if Preserve-DatabaseConfig was not called or vars were lost.
     if (-not $script:USE_POSTGRESQL) {
         $envFile = Join-Path $script:CONSOLE_PATH ".env"
@@ -1499,7 +1499,7 @@ function Setup-Services {
         }
     }
     
-    # Warn if public IP detection failed — relay will not work for remote clients
+    # Warn if public IP detection failed -- relay will not work for remote clients
     if ($serverIP -eq "127.0.0.1" -or $serverIP -match "^10\." -or $serverIP -match "^192\.168\." -or $serverIP -match "^172\.(1[6-9]|2[0-9]|3[0-1])\.") {
         Print-Warning "Detected private/loopback IP: $serverIP"
         Print-Warning "Remote clients will NOT be able to connect via relay!"
@@ -1599,7 +1599,7 @@ function Setup-Services {
         }
     }
     if ($adminPass) {
-        $serverArgs += " -init-admin-pass $adminPass"
+        $serverArgs += " -init-admin-pass `"$adminPass`""
     }
     
     # Add TLS flags if certificates exist
@@ -1619,7 +1619,7 @@ function Setup-Services {
         }
         
         # Enable TLS on signal/relay for client encryption.
-        # API port (21114) MUST stay HTTP — RustDesk desktop clients always send
+        # API port (21114) MUST stay HTTP -- RustDesk desktop clients always send
         # plain HTTP to signal_port-2 and do not support HTTPS for API endpoints.
         $serverArgs += " -tls-cert `"$certPath`" -tls-key `"$keyPath`" -tls-signal -tls-relay"
         
@@ -1680,7 +1680,7 @@ function Setup-Services {
             $envExtra += "DB_TYPE=sqlite"
         }
         # Enable HTTPS on Node.js console when TLS certs are available (for browser access)
-        # This is separate from Go API TLS — the web panel can serve HTTPS for browsers
+        # This is separate from Go API TLS -- the web panel can serve HTTPS for browsers
         if ((Test-Path $certPath) -and (Test-Path $keyPath)) {
             $envExtra += "HTTPS_ENABLED=true"
             $envExtra += "SSL_CERT_PATH=$certPath"
@@ -1746,7 +1746,7 @@ function Setup-ScheduledTasks {
         }
     }
     if ($adminPass) {
-        $serverArgs += " -init-admin-pass $adminPass"
+        $serverArgs += " -init-admin-pass `"$adminPass`""
     }
     
     # Add TLS flags if certificates exist
@@ -2512,7 +2512,7 @@ function Do-Update {
         return
     }
     
-    # Detect Rust → Go upgrade (major architecture change)
+    # Detect Rust -> Go upgrade (major architecture change)
     if ($script:SERVER_TYPE -eq "rust") {
         Print-Warning "Legacy Rust server (hbbs/hbbr) detected!"
         Print-Warning "Upgrading from Rust to Go server requires a FRESH INSTALLATION."
@@ -2524,17 +2524,17 @@ function Do-Update {
                 Do-Install
                 return
             } else {
-                Print-Warning "Continuing with update — legacy Rust binaries will NOT be replaced with Go server."
+                Print-Warning "Continuing with update -- legacy Rust binaries will NOT be replaced with Go server."
             }
         } else {
-            Print-Info "Auto mode: Redirecting to fresh installation for Rust → Go migration"
+            Print-Info "Auto mode: Redirecting to fresh installation for Rust -> Go migration"
             Do-Install
             return
         }
     }
     
     # CRITICAL: Preserve database configuration before reinstalling console
-    # This prevents PostgreSQL → SQLite switch during updates
+    # This prevents PostgreSQL -> SQLite switch during updates
     Preserve-DatabaseConfig
     
     Print-Info "Creating backup before update..."
@@ -2570,7 +2570,7 @@ function Do-Repair {
     Detect-Installation
     
     # CRITICAL: Preserve database configuration before any repair operation
-    # This prevents PostgreSQL → SQLite switch when regenerating service files
+    # This prevents PostgreSQL -> SQLite switch when regenerating service files
     Preserve-DatabaseConfig
     
     Print-Status
@@ -2692,17 +2692,16 @@ function Repair-Services {
     Stop-AllServices
     Start-Sleep -Seconds 2
     
-    # Verify binaries exist
-    if (-not (Test-Path "$script:RUSTDESK_PATH\hbbs.exe")) {
-        Print-Error "hbbs.exe not found at $script:RUSTDESK_PATH"
-        Print-Info "Run 'Repair binaries' first"
-        return
-    }
-    
-    if (-not (Test-Path "$script:RUSTDESK_PATH\hbbr.exe")) {
-        Print-Error "hbbr.exe not found at $script:RUSTDESK_PATH"
-        Print-Info "Run 'Repair binaries' first"  
-        return
+    # Verify binaries exist (Go server: betterdesk-server.exe, fallback: legacy hbbs.exe)
+    $serverBinary = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
+    if (-not (Test-Path $serverBinary)) {
+        # Fallback to legacy Rust binary name
+        $serverBinary = Join-Path $script:RUSTDESK_PATH "hbbs.exe"
+        if (-not (Test-Path $serverBinary)) {
+            Print-Error "betterdesk-server.exe not found at $script:RUSTDESK_PATH"
+            Print-Info "Run 'Repair binaries' first"
+            return
+        }
     }
     
     # Recreate services/tasks
@@ -3053,11 +3052,11 @@ function Do-ResetPassword {
             Print-Info "Using direct database update..."
             
             if ($dbType -eq "postgres") {
-                # PostgreSQL mode — need psycopg2 or pg module
+                # PostgreSQL mode -- need psycopg2 or pg module
                 Print-Warning "PostgreSQL password reset requires Node.js. Please ensure node is installed."
                 Print-Info "Alternatively, run: psql DATABASE_URL -c `"UPDATE users SET password_hash='...' WHERE username='admin'`""
             } else {
-                # SQLite mode — update auth.db directly
+                # SQLite mode -- update auth.db directly
                 $authDbPath = Join-Path $script:CONSOLE_PATH "data\auth.db"
                 if (-not (Test-Path $authDbPath)) {
                     $authDbPath = Join-Path $script:RUSTDESK_PATH "auth.db"
@@ -3670,7 +3669,7 @@ function Do-Build {
     }
 }
 
-# Rebuild & deploy Go server: compile → backup → stop → replace → start → verify
+# Rebuild & deploy Go server: compile -> backup -> stop -> replace -> start -> verify
 function Do-RebuildGoServer {
     Print-Header
     Write-Host "========== REBUILD & DEPLOY GO SERVER ==========" -ForegroundColor White
@@ -3981,7 +3980,7 @@ function Do-ConfigureSSL {
     }
     
     # ── Update API URLs in .env when SSL is enabled/disabled ──
-    # API port MUST stay HTTP — RustDesk desktop clients always send plain HTTP
+    # API port MUST stay HTTP -- RustDesk desktop clients always send plain HTTP
     # to signal_port-2 (21114). Enabling TLS on API breaks all client communication.
     $envContent = Get-Content $envFile -Raw
     
@@ -4015,7 +4014,7 @@ function Do-ConfigureSSL {
                 }
             } catch { }
             
-            # Always remove -tls-api from Go server service — API must stay HTTP
+            # Always remove -tls-api from Go server service -- API must stay HTTP
             $goSvcName = $script:SERVER_SERVICE
             try {
                 $goArgs = & nssm get $goSvcName AppParameters 2>$null
@@ -4029,7 +4028,7 @@ function Do-ConfigureSSL {
         
         Print-Info "Signal/relay TLS enabled, API stays HTTP (RustDesk client compatibility)"
     } else {
-        # SSL disabled — revert API URLs to HTTP
+        # SSL disabled -- revert API URLs to HTTP
         $envContent = $envContent -replace 'HBBS_API_URL=https://localhost', 'HBBS_API_URL=http://localhost'
         $envContent = $envContent -replace 'BETTERDESK_API_URL=https://localhost', 'BETTERDESK_API_URL=http://localhost'
         $envContent = $envContent -replace '(?m)^NODE_EXTRA_CA_CERTS=.*\r?\n?', ''

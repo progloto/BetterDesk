@@ -1873,12 +1873,17 @@ setup_services() {
     fi
     
     # BetterDesk Go Server (single binary replacing hbbs+hbbr)
-    # Generate shared API key for Node.js ↔ Go server communication
+    # Generate shared API key for Node.js ↔ Go server communication (preserve existing)
     local api_key
-    api_key=$(openssl rand -hex 32)
-    echo "$api_key" > "$RUSTDESK_PATH/.api_key"
-    chmod 600 "$RUSTDESK_PATH/.api_key"
-    print_info "Generated API key for console ↔ server communication"
+    if [ -f "$RUSTDESK_PATH/.api_key" ] && [ -s "$RUSTDESK_PATH/.api_key" ]; then
+        api_key=$(cat "$RUSTDESK_PATH/.api_key" | tr -d '\n')
+        print_info "Using existing API key for console-server communication"
+    else
+        api_key=$(openssl rand -hex 32)
+        echo "$api_key" > "$RUSTDESK_PATH/.api_key"
+        chmod 600 "$RUSTDESK_PATH/.api_key"
+        print_info "Generated API key for console-server communication"
+    fi
     
     # Read admin password from install step (for syncing Go server admin)
     # Escape $ → $$ for systemd (ExecStart interprets $VAR as env var substitution)
@@ -2225,9 +2230,12 @@ setup_services_minimal() {
     fi
     
     # Database configuration for Go server
+    # Escape $ -> $$ for systemd (PostgreSQL passwords can contain $)
     local GO_ENV=""
     if [ "$USE_POSTGRESQL" = "true" ] && [ -n "$POSTGRESQL_URI" ]; then
-        GO_ENV="Environment=\"DB_URL=$POSTGRESQL_URI\""
+        local escaped_pg_uri
+        escaped_pg_uri=$(printf '%s' "$POSTGRESQL_URI" | sed 's/\$/\$\$/g')
+        GO_ENV="Environment=\"DB_URL=$escaped_pg_uri\""
     fi
     
     # TLS configuration
@@ -3119,7 +3127,8 @@ PYEOF
         # overwrite the new hash on next Node.js restart
         if [ -f "$CONSOLE_PATH/.env" ]; then
             if grep -q '^DEFAULT_ADMIN_PASSWORD=' "$CONSOLE_PATH/.env" 2>/dev/null; then
-                sed -i "s|^DEFAULT_ADMIN_PASSWORD=.*|DEFAULT_ADMIN_PASSWORD=$new_password|" "$CONSOLE_PATH/.env"
+                # Use awk to safely handle passwords with special chars (|, &, $, etc.)
+                awk -v pw="$new_password" '/^DEFAULT_ADMIN_PASSWORD=/{print "DEFAULT_ADMIN_PASSWORD=" pw; next}{print}' "$CONSOLE_PATH/.env" > "$CONSOLE_PATH/.env.tmp" && mv "$CONSOLE_PATH/.env.tmp" "$CONSOLE_PATH/.env"
             fi
         fi
         
@@ -3882,7 +3891,7 @@ do_configure_ssl() {
             
             # Setup auto-renewal
             if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-                (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl restart betterdesk'") | crontab -
+                (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl restart betterdesk-console betterdesk-server'") | crontab -
                 print_info "Auto-renewal cron job added (daily at 3:00 AM)"
             fi
             

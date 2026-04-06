@@ -298,6 +298,14 @@ func (s *Server) Start(ctx context.Context) error {
 	// Prometheus metrics (public, no API key required)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 
+	// Catch-all: return JSON 404 for unmatched routes.
+	// Go's default ServeMux returns HTML which breaks RustDesk (Dart) client parsing.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"not found"}`))
+	})
+
 	addr := fmt.Sprintf(":%d", s.cfg.APIPort)
 	s.httpSrv = &http.Server{
 		Addr:        addr,
