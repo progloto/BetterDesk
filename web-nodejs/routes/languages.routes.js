@@ -87,12 +87,12 @@ router.get('/api/panel/languages', requireAuth, requireAdmin, (req, res) => {
                 continue;
             }
 
-            const meta = data._meta || {};
+            const meta = data._meta || data.meta || {};
             const langKeys = flattenKeys(data);
             const langKeySet = new Set(langKeys.keys());
 
             const missing = [...refKeySet].filter(k => !langKeySet.has(k));
-            const extra = [...langKeySet].filter(k => !refKeySet.has(k) && !k.startsWith('_meta'));
+            const extra = [...langKeySet].filter(k => !refKeySet.has(k) && !k.startsWith('_meta') && !k.startsWith('meta.'));
             const empty = [...langKeySet].filter(k => refKeySet.has(k) && langKeys.get(k) === '');
 
             const coverage = code === 'en' ? 100
