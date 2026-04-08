@@ -16,7 +16,7 @@
   /* ── Organizations ─────────────────────────────────── */
   async function loadOrganizations() {
     try {
-      const resp = await fetch('/api/panel/organizations', { credentials: 'same-origin' });
+      const resp = await fetch('/api/panel/org', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       const orgs = data.organizations || data.data || data || [];

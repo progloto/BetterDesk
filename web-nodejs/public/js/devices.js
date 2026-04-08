@@ -191,9 +191,16 @@
     function positionKebabMenu(btn, menu) {
         if (window.innerWidth <= 600) return;
 
-        const rect = btn.getBoundingClientRect();
-        const menuHeight = menu.offsetHeight || 200;
+        // Force reflow so offsetHeight is accurate (menu just became display:block)
+        menu.style.visibility = 'hidden';
+        const prevDisplay = menu.style.display;
+        menu.style.display = 'block';
+        const menuHeight = menu.offsetHeight;
         const menuWidth = menu.offsetWidth || 180;
+        menu.style.display = prevDisplay;
+        menu.style.visibility = '';
+
+        const rect = btn.getBoundingClientRect();
         const spaceBelow = window.innerHeight - rect.bottom;
 
         let top, left;
@@ -208,6 +215,14 @@
         if (top < 8) top = 8;
         if (top + menuHeight > window.innerHeight - 8) {
             top = window.innerHeight - menuHeight - 8;
+        }
+
+        // Dynamically constrain max-height to available viewport space
+        const availableHeight = window.innerHeight - top - 8;
+        if (menuHeight > availableHeight) {
+            menu.style.maxHeight = availableHeight + 'px';
+        } else {
+            menu.style.maxHeight = '';
         }
 
         // Horizontal: align right edge to button right edge
