@@ -79,7 +79,7 @@ arboard = "3"
 
 # Video codec
 # vpx-sys = "0.4"    # TODO: VP9 encoding/decoding (requires libvpx)
-openh264 = "0.6"
+openh264 = "0.9"
 
 # File opener
 open = "5"

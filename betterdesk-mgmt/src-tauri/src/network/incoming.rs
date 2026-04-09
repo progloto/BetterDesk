@@ -453,7 +453,7 @@ fn capture_and_encode_loop(
     let api = openh264::OpenH264API::from_source();
 
     let config = openh264::encoder::EncoderConfig::new()
-        .set_bitrate_bps(2_000_000);
+        .bitrate(openh264::encoder::BitRate::from_bps(2_000_000));
 
     let mut encoder = match openh264::encoder::Encoder::with_api_config(api, config) {
         Ok(e) => e,
