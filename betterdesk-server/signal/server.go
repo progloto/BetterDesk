@@ -414,7 +414,6 @@ func (s *Server) handleTCPConn(conn net.Conn) {
 
 	rawAddr := conn.RemoteAddr().String()
 	addrKey := normalizeAddrKey(rawAddr)
-	log.Printf("[signal] TCP connection from %s", addrKey)
 
 	// Attempt secure TCP handshake (KeyExchange).
 	// New clients (≥1.2.x) expect the server to send a KeyExchange first.
@@ -834,5 +833,7 @@ func isNormalClose(err error) bool {
 	return strings.Contains(s, "EOF") ||
 		strings.Contains(s, "timeout") ||
 		strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "connection reset by peer")
+		strings.Contains(s, "connection reset by peer") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection refused")
 }

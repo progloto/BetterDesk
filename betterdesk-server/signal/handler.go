@@ -191,6 +191,13 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 		return
 	}
 
+	// Check if this ID was previously changed to a different one (#97) —
+	// do not allow a device to come back under its old ID.
+	if renamed, _ := s.db.IsRenamedPeerID(id); renamed {
+		log.Printf("[signal] Rejected registration for renamed peer ID: %s from %s", id, raddr.IP)
+		return
+	}
+
 	// New peer — add to memory map
 	// Try to load existing PK from database first (peer may have registered PK before server restart)
 	now := time.Now()
@@ -295,6 +302,12 @@ func (s *Server) processRegisterPk(msg *pb.RegisterPk, addrStr string) *pb.Rende
 	// Check soft-deleted status — do not allow re-registration
 	if deleted, _ := s.db.IsPeerSoftDeleted(id); deleted {
 		log.Printf("[signal] Rejected soft-deleted peer PK registration: %s", id)
+		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+	}
+
+	// Check if this ID was previously changed to a different one (#97)
+	if renamed, _ := s.db.IsRenamedPeerID(id); renamed {
+		log.Printf("[signal] Rejected PK registration for renamed peer ID: %s", id)
 		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
 	}
 

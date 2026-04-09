@@ -23,6 +23,16 @@ echo ""
 # Ensure data directories exist and have correct permissions
 mkdir -p /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
 chown -R betterdesk:betterdesk /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
+# Verify write access — SQLite WAL mode requires writable directory (Issue #78)
+if ! su -s /bin/sh betterdesk -c 'touch /opt/rustdesk/.write_test' 2>/dev/null; then
+    echo ""
+    echo "ERROR: /opt/rustdesk is NOT writable by the betterdesk user (UID 10001)."
+    echo "  SQLite WAL mode requires write access to the database directory."
+    echo "  If using bind mounts, run: chown -R 10001:10001 /path/to/your/data"
+    echo "  Or use Docker named volumes instead of bind mounts."
+    echo ""
+fi
+rm -f /opt/rustdesk/.write_test 2>/dev/null || true
 # Fix private key permissions (volume mounts may preserve wrong UID/mode)
 if [ -f /opt/rustdesk/id_ed25519 ]; then
     chmod 600 /opt/rustdesk/id_ed25519
@@ -137,7 +147,12 @@ fi
 
 echo ""
 echo "Starting services via supervisord..."
-echo "  Web Console:  http://localhost:${PORT:-5000}"
+if [ "${HTTPS_ENABLED:-false}" = "true" ]; then
+    echo "  Web Console:  https://localhost:${HTTPS_PORT:-5443}"
+    echo "  HTTP redirect: http://localhost:${PORT:-5000} → https://…:${HTTPS_PORT:-5443}"
+else
+    echo "  Web Console:  http://localhost:${PORT:-5000}"
+fi
 echo "  Go API:       http://localhost:21114/api"
 echo "========================================"
 echo ""

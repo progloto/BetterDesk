@@ -632,6 +632,18 @@ func (pg *PostgresDB) GetIDChangeHistory(id string) ([]*IDChangeHistory, error) 
 	return history, rows.Err()
 }
 
+// IsRenamedPeerID returns true if the given ID was previously used and then
+// changed to a different one (appears as old_id in id_change_history).
+func (pg *PostgresDB) IsRenamedPeerID(id string) (bool, error) {
+	var count int
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT COUNT(*) FROM id_change_history WHERE old_id = $1`, id).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // GetLinkedPeers returns all non-deleted peers that have linked_peer_id matching the given ID.
 func (pg *PostgresDB) GetLinkedPeers(id string) ([]*Peer, error) {
 	rows, err := pg.pool.Query(pg.ctx, `

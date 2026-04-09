@@ -252,6 +252,9 @@ type Database interface {
 	// ID change
 	ChangePeerID(oldID, newID string) error
 	GetIDChangeHistory(id string) ([]*IDChangeHistory, error)
+	// IsRenamedPeerID returns true if the given ID was previously used and
+	// changed to a different one (appears as old_id in id_change_history).
+	IsRenamedPeerID(id string) (bool, error)
 
 	// CDAP: linked device queries
 	GetLinkedPeers(id string) ([]*Peer, error)

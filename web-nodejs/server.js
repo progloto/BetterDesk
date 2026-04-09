@@ -19,7 +19,7 @@ const config = require('./config/config');
 const securityMiddleware = require('./middleware/security');
 const { initI18n } = require('./middleware/i18n');
 const { apiLimiter } = require('./middleware/rateLimiter');
-const { csrfTokenProvider, doubleCsrfProtection } = require('./middleware/csrf');
+const { csrfTokenProvider, doubleCsrfProtection, downgradeToHttp: csrfDowngradeToHttp } = require('./middleware/csrf');
 const authService = require('./services/authService');
 const serverBackend = require('./services/serverBackend');
 const db = require('./services/database');
@@ -344,6 +344,19 @@ async function startServer() {
             } else {
                 console.warn('WARNING: HTTPS enabled but certificates not found/invalid');
                 console.warn('Falling back to HTTP mode');
+                console.warn('  → Session and CSRF cookies downgraded to non-Secure');
+                console.warn('  → Fix: check SSL_CERT_PATH and SSL_KEY_PATH in .env');
+                
+                // BD-2026-082: Downgrade cookie flags to match actual HTTP mode.
+                // Session middleware was initialised with secure:true at module
+                // load time.  Without this fixup, browsers would ignore all
+                // cookies and every request would fail CSRF validation.
+                if (sessionMiddleware && sessionMiddleware.options) {
+                    sessionMiddleware.options.cookie = sessionMiddleware.options.cookie || {};
+                    sessionMiddleware.options.cookie.secure = false;
+                }
+                csrfDowngradeToHttp();
+                
                 server = http.createServer(app);
                 server.listen(config.port, config.host, () => {
                     printStartupBanner(protocol, config.port);

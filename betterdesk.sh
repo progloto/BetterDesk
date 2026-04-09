@@ -1887,17 +1887,18 @@ setup_services() {
     fi
     
     # Read admin password from install step (for syncing Go server admin)
-    # Escape $ → $$ for systemd (ExecStart interprets $VAR as env var substitution)
+    # Escape $ → $$ and % → %% for systemd (ExecStart interprets $VAR
+    # as env var substitution and %n/%u/etc. as specifiers)
     local init_admin_arg=""
     if [ -n "$ADMIN_PASSWORD" ]; then
         local escaped_admin_pass
-        escaped_admin_pass=$(printf '%s' "$ADMIN_PASSWORD" | sed 's/\$/\$\$/g')
+        escaped_admin_pass=$(printf '%s' "$ADMIN_PASSWORD" | sed 's/\$/\$\$/g; s/%/%%/g')
         init_admin_arg="-init-admin-pass $escaped_admin_pass"
     fi
     
-    # Escape $ in database URL for systemd (PostgreSQL passwords can contain $)
+    # Escape $ and % in database URL for systemd (PostgreSQL passwords can contain $ and %)
     local systemd_db_arg="$db_arg"
-    systemd_db_arg=$(printf '%s' "$systemd_db_arg" | sed 's/\$/\$\$/g')
+    systemd_db_arg=$(printf '%s' "$systemd_db_arg" | sed 's/\$/\$\$/g; s/%/%%/g')
     
     cat > /etc/systemd/system/betterdesk-server.service << EOF
 [Unit]

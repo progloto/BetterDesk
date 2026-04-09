@@ -15,6 +15,7 @@ const config = require('../config/config');
 // Secure cookies left over from a previous HTTPS configuration.  Browsers
 // refuse to send Secure cookies over HTTP and also refuse to let HTTP
 // overwrite an existing Secure cookie of the same name (RFC 6265bis §5.4.6).
+let csrfCookieSecure = config.httpsEnabled;
 const CSRF_COOKIE = config.httpsEnabled ? '__csrf' : '__csrf_h';
 
 const {
@@ -26,7 +27,7 @@ const {
     cookieOptions: {
         httpOnly: true,
         sameSite: 'lax',
-        secure: config.httpsEnabled,
+        get secure() { return csrfCookieSecure; },
         path: '/'
     },
     getTokenFromRequest: (req) => {
@@ -71,7 +72,7 @@ function csrfTokenProvider(req, res, next) {
         res.clearCookie(CSRF_COOKIE, {
             httpOnly: true,
             sameSite: 'lax',
-            secure: config.httpsEnabled,
+            secure: csrfCookieSecure,
             path: '/'
         });
         try {
@@ -99,7 +100,7 @@ function safeCsrfProtection(req, res, next) {
             res.clearCookie(CSRF_COOKIE, {
                 httpOnly: true,
                 sameSite: 'lax',
-                secure: config.httpsEnabled,
+                secure: csrfCookieSecure,
                 path: '/'
             });
             if (req.cookies) delete req.cookies[CSRF_COOKIE];
@@ -112,5 +113,13 @@ function safeCsrfProtection(req, res, next) {
 
 module.exports = {
     csrfTokenProvider,
-    doubleCsrfProtection: safeCsrfProtection
+    doubleCsrfProtection: safeCsrfProtection,
+    /**
+     * BD-2026-082: Downgrade CSRF cookie Secure flag to false.
+     * Called from server.js when HTTPS is enabled in config but SSL
+     * certificates fail to load, forcing a fallback to HTTP.
+     */
+    downgradeToHttp() {
+        csrfCookieSecure = false;
+    }
 };

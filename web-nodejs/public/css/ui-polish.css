@@ -22,10 +22,11 @@
     }
 }
 
-/* Staggered list item animations */
-.table tbody tr,
-.device-row,
-.card {
+/* Staggered list item animations — scoped to page content to avoid
+   interfering with modals, dropdowns, and other card-like elements. */
+.page-content .table tbody tr,
+.page-content .device-row,
+.page-content > .card {
     animation: listItemEnter 0.25s ease-out both;
 }
 
@@ -54,6 +55,7 @@
 /* Card hover animation */
 .card {
     transition: transform 0.15s ease, box-shadow 0.15s ease;
+    transform: translateY(0);
 }
 
 .card:hover {

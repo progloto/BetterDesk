@@ -15,6 +15,7 @@
     padding: var(--space-lg);
     cursor: pointer;
     transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+    transform: translateY(0);
     position: relative;
     overflow: hidden;
 }
