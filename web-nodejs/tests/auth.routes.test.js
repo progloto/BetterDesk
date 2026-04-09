@@ -17,7 +17,8 @@ jest.mock('../services/authService', () => ({
     authenticate: jest.fn().mockResolvedValue(null),
     changePassword: jest.fn().mockResolvedValue(true),
     hashPassword: jest.fn().mockResolvedValue('hashed'),
-    generateRecoveryCodes: jest.fn().mockReturnValue(['CODE1', 'CODE2'])
+    generateRecoveryCodes: jest.fn().mockReturnValue(['CODE1', 'CODE2']),
+    recordAttempt: jest.fn().mockResolvedValue(undefined)
 }));
 
 jest.mock('../middleware/rateLimiter', () => ({

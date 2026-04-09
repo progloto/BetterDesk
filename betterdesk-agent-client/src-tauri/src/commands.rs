@@ -72,16 +72,13 @@ pub fn get_agent_status(state: State<'_, AgentState>) -> Result<AgentStatus, Str
 
 #[tauri::command]
 pub async fn reconnect_agent(state: State<'_, AgentState>) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-
-    if !config.is_registered() {
-        return Err("Device not registered".to_string());
-    }
-
-    // Send a heartbeat to verify connection.
-    let address = config.server_address.clone();
-    let device_id = config.device_id.clone();
-    drop(config);
+    let (address, device_id) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        if !config.is_registered() {
+            return Err("Device not registered".to_string());
+        }
+        (config.server_address.clone(), config.device_id.clone())
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -105,16 +102,15 @@ pub async fn reconnect_agent(state: State<'_, AgentState>) -> Result<String, Str
 
 #[tauri::command]
 pub async fn send_diagnostics(state: State<'_, AgentState>) -> Result<String, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-
-    if !config.is_registered() {
-        return Err("Device not registered".to_string());
-    }
+    let (address, device_id) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        if !config.is_registered() {
+            return Err("Device not registered".to_string());
+        }
+        (config.server_address.clone(), config.device_id.clone())
+    };
 
     let sysinfo = SystemSnapshot::collect();
-    let address = config.server_address.clone();
-    let device_id = config.device_id.clone();
-    drop(config);
 
     let payload = serde_json::json!({
         "id": device_id,
@@ -214,16 +210,24 @@ pub async fn register_device(
     address: String,
     state: State<'_, AgentState>,
 ) -> Result<String, String> {
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    config.server_address = address;
+    // Clone config so MutexGuard is not held across await.
+    let mut config_clone = {
+        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+        config.server_address = address;
+        config.clone()
+    };
 
-    let device_id = registration::register(&mut config)
+    let device_id = registration::register(&mut config_clone)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Store token securely if available.
-    if let Err(e) = config.store_token_secure() {
-        info!("Keyring store skipped: {}", e);
+    // Apply mutations back to shared state.
+    {
+        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+        *config = config_clone;
+        if let Err(e) = config.store_token_secure() {
+            info!("Keyring store skipped: {}", e);
+        }
     }
 
     Ok(device_id)
@@ -251,21 +255,19 @@ pub async fn send_chat_message(
     message: String,
     state: State<'_, AgentState>,
 ) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-
-    if !config.is_registered() {
-        return Err("Device not registered".to_string());
-    }
-
-    let msg = ChatMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        sender: config.device_name.clone(),
-        sender_type: "user".to_string(),
-        content: message,
-        timestamp: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    let msg = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        if !config.is_registered() {
+            return Err("Device not registered".to_string());
+        }
+        ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: config.device_name.clone(),
+            sender_type: "user".to_string(),
+            content: message,
+            timestamp: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        }
     };
-
-    drop(config);
 
     let mut history = state.chat_history.lock().map_err(|e| e.to_string())?;
     history.push(msg);
@@ -286,16 +288,13 @@ pub async fn request_help(
     description: String,
     state: State<'_, AgentState>,
 ) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-
-    if !config.is_registered() {
-        return Err("Device not registered".to_string());
-    }
-
-    let address = config.server_address.clone();
-    let device_id = config.device_id.clone();
-    let device_name = config.device_name.clone();
-    drop(config);
+    let (address, device_id, device_name) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        if !config.is_registered() {
+            return Err("Device not registered".to_string());
+        }
+        (config.server_address.clone(), config.device_id.clone(), config.device_name.clone())
+    };
 
     let payload = serde_json::json!({
         "device_id": device_id,
@@ -329,15 +328,13 @@ pub async fn request_help(
 
 #[tauri::command]
 pub async fn cancel_help_request(state: State<'_, AgentState>) -> Result<(), String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-
-    if !config.is_registered() {
-        return Err("Device not registered".to_string());
-    }
-
-    let address = config.server_address.clone();
-    let device_id = config.device_id.clone();
-    drop(config);
+    let (address, device_id) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        if !config.is_registered() {
+            return Err("Device not registered".to_string());
+        }
+        (config.server_address.clone(), config.device_id.clone())
+    };
 
     let payload = serde_json::json!({
         "device_id": device_id,

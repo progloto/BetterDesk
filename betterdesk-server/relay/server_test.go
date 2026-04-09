@@ -77,27 +77,13 @@ func TestRelayPairing(t *testing.T) {
 		t.Fatalf("write B: %v", err)
 	}
 
-	// Wait a bit for pairing
-	time.Sleep(200 * time.Millisecond)
+	// Wait for pairing to complete. The relay server does NOT send
+	// RelayResponse confirmation — it immediately starts transparent
+	// bidirectional byte copy after pairing (sending RelayResponse would
+	// break the E2E encryption handshake in production).
+	time.Sleep(500 * time.Millisecond)
 
-	// Read the RelayResponse confirmation from both sides (raw protobuf, no framing header)
-	confirmA, err := codec.ReadRawProto(connA, 5*time.Second)
-	if err != nil {
-		t.Fatalf("read confirm A: %v", err)
-	}
-	if confirmA.GetRelayResponse() == nil {
-		t.Fatal("expected RelayResponse confirmation on A")
-	}
-
-	confirmB, err := codec.ReadRawProto(connB, 5*time.Second)
-	if err != nil {
-		t.Fatalf("read confirm B: %v", err)
-	}
-	if confirmB.GetRelayResponse() == nil {
-		t.Fatal("expected RelayResponse confirmation on B")
-	}
-
-	// Now test bidirectional data relay
+	// Test bidirectional data relay (no confirmation message expected)
 	testData := []byte("Hello from A to B!")
 	connA.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_, err = connA.Write(testData)
