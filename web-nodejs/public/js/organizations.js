@@ -51,8 +51,14 @@
         return res.json();
     }
 
+    // i18n helper — falls back to key
+    function t(key) {
+        return (typeof _ === 'function') ? _(`organizations.${key}`) || key : key;
+    }
+
     function showToast(msg, type = 'info') {
         if (window.showToast) window.showToast(msg, type);
+        else if (window.Toast) window.Toast[type] ? window.Toast[type]('', msg) : window.Toast.info('', msg);
         else console.log(`[${type}]`, msg);
     }
 
@@ -74,8 +80,8 @@
             orgList.innerHTML = `
                 <div class="empty-state">
                     <span class="material-icons" style="font-size:48px;opacity:0.3;">business</span>
-                    <p>No organizations yet</p>
-                    <p class="text-muted">Create your first organization to start managing devices and users.</p>
+                    <p>${escHtml(t('no_orgs'))}</p>
+                    <p class="text-muted">${escHtml(t('no_orgs_hint'))}</p>
                 </div>`;
             return;
         }
@@ -131,7 +137,7 @@
             organizations = data.organizations || [];
             renderOrganizations();
         } catch (err) {
-            showToast('Failed to load organizations: ' + err.message, 'error');
+            showToast(t('loading_failed') + ': ' + err.message, 'error');
             if (loading) loading.style.display = 'none';
         }
     }
@@ -142,7 +148,7 @@
     function openModal(org) {
         editingId = org ? org.id : null;
         editIdInput.value = editingId || '';
-        modalTitle.textContent = org ? 'Edit Organization' : 'Create Organization';
+        modalTitle.textContent = org ? t('edit') : t('create');
         nameInput.value = org ? org.name : '';
         slugInput.value = org ? org.slug : '';
         logoUrlInput.value = org ? org.logo_url || '' : '';
@@ -173,17 +179,17 @@
             logo_url: logoUrlInput.value.trim(),
         };
         if (!body.name || !body.slug) {
-            showToast('Name and slug are required', 'warning');
+            showToast(t('name_slug_required'), 'warning');
             return;
         }
 
         try {
             if (editingId) {
                 await api('PUT', `/${editingId}`, body);
-                showToast('Organization updated', 'success');
+                showToast(t('org_updated'), 'success');
             } else {
                 await api('POST', '', body);
-                showToast('Organization created', 'success');
+                showToast(t('org_created'), 'success');
             }
             closeModal();
             loadOrganizations();
@@ -196,10 +202,16 @@
     //  Delete
     // -----------------------------------------------------------------------
     async function removeOrg(id) {
-        if (!confirm('Delete this organization? This will remove all associated users, devices, and settings.')) return;
+        const confirmed = await Modal.confirm({
+            title: _('common.delete') || 'Delete',
+            message: t('confirm_delete_org'),
+            danger: true,
+            confirmIcon: 'delete'
+        });
+        if (!confirmed) return;
         try {
             await api('DELETE', `/${id}`);
-            showToast('Organization deleted', 'success');
+            showToast(t('org_deleted'), 'success');
             loadOrganizations();
         } catch (err) {
             showToast(err.message, 'error');

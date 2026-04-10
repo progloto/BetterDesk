@@ -2,7 +2,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 
 let apiClient;
 try {
@@ -27,7 +27,7 @@ async function goApiProxy(req, res, method, path, body) {
 
 // --- Page Route ---
 
-router.get('/resource-control', requireAuth, requireAdmin, (req, res) => {
+router.get('/resource-control', requireAuth, requirePermission('server.config'), (req, res) => {
     res.render('resource-control', {
         title: req.t('nav.resource_control'),
         pageStyles: ['resource-control'],
@@ -42,7 +42,7 @@ router.get('/resource-control', requireAuth, requireAdmin, (req, res) => {
 /**
  * GET /api/panel/resource-control/devices — List devices with resource policy status
  */
-router.get('/api/panel/resource-control/devices', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/panel/resource-control/devices', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         if (!apiClient) {
             return res.json({ devices: [], total: 0 });
@@ -66,49 +66,49 @@ router.get('/api/panel/resource-control/devices', requireAuth, requireAdmin, asy
 /**
  * GET /api/panel/resource-control/policies/:deviceId — Get resource policy for a device
  */
-router.get('/api/panel/resource-control/policies/:deviceId', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/panel/resource-control/policies/:deviceId', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'get', `/devices/${req.params.deviceId}/resources`);
 });
 
 /**
  * POST /api/panel/resource-control/policies/:deviceId/usb — Set USB policy
  */
-router.post('/api/panel/resource-control/policies/:deviceId/usb', requireAuth, requireAdmin, (req, res) => {
+router.post('/api/panel/resource-control/policies/:deviceId/usb', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'post', `/devices/${req.params.deviceId}/resources/usb`, req.body);
 });
 
 /**
  * POST /api/panel/resource-control/policies/:deviceId/optical — Set optical drive policy
  */
-router.post('/api/panel/resource-control/policies/:deviceId/optical', requireAuth, requireAdmin, (req, res) => {
+router.post('/api/panel/resource-control/policies/:deviceId/optical', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'post', `/devices/${req.params.deviceId}/resources/optical`, req.body);
 });
 
 /**
  * POST /api/panel/resource-control/policies/:deviceId/monitors — Set monitor policy
  */
-router.post('/api/panel/resource-control/policies/:deviceId/monitors', requireAuth, requireAdmin, (req, res) => {
+router.post('/api/panel/resource-control/policies/:deviceId/monitors', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'post', `/devices/${req.params.deviceId}/resources/monitors`, req.body);
 });
 
 /**
  * POST /api/panel/resource-control/policies/:deviceId/disks — Set disk policy
  */
-router.post('/api/panel/resource-control/policies/:deviceId/disks', requireAuth, requireAdmin, (req, res) => {
+router.post('/api/panel/resource-control/policies/:deviceId/disks', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'post', `/devices/${req.params.deviceId}/resources/disks`, req.body);
 });
 
 /**
  * POST /api/panel/resource-control/policies/:deviceId/quotas — Set per-user quotas
  */
-router.post('/api/panel/resource-control/policies/:deviceId/quotas', requireAuth, requireAdmin, (req, res) => {
+router.post('/api/panel/resource-control/policies/:deviceId/quotas', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'post', `/devices/${req.params.deviceId}/resources/quotas`, req.body);
 });
 
 /**
  * GET /api/panel/resource-control/compliance — Get compliance summary
  */
-router.get('/api/panel/resource-control/compliance', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/panel/resource-control/compliance', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         if (!apiClient) {
             return res.json({
@@ -149,14 +149,14 @@ router.get('/api/panel/resource-control/compliance', requireAuth, requireAdmin, 
 /**
  * GET /api/panel/resource-control/org-policy — Get org-wide default policy
  */
-router.get('/api/panel/resource-control/org-policy', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/panel/resource-control/org-policy', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'get', '/org/default/resource-policy');
 });
 
 /**
  * PUT /api/panel/resource-control/org-policy — Update org-wide default policy
  */
-router.put('/api/panel/resource-control/org-policy', requireAuth, requireAdmin, (req, res) => {
+router.put('/api/panel/resource-control/org-policy', requireAuth, requirePermission('server.config'), (req, res) => {
     goApiProxy(req, res, 'put', '/org/default/resource-policy', req.body);
 });
 

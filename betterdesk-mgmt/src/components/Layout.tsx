@@ -4,6 +4,7 @@
 import { createSignal, Show, Switch, Match, lazy } from 'solid-js';
 import { t } from '../lib/i18n';
 import { user } from '../stores/auth';
+import { canView } from '../lib/permissions';
 import Sidebar from './Sidebar';
 import Dashboard from './Dashboard';
 import DeviceList from './DeviceList';
@@ -88,12 +89,22 @@ export default function Layout() {
                             <div class="topbar-user">
                                 <div class="topbar-avatar">{userInitials()}</div>
                                 <span>{user()!.username}</span>
+                                <span class="topbar-role-badge">{user()!.role?.replace('_', ' ')}</span>
                             </div>
                         </Show>
                     </div>
                 </div>
 
                 <div class="page-content">
+                    <Show when={canView(sidebarActive())} fallback={
+                        <div class="empty-state">
+                            <span class="material-symbols-rounded">lock</span>
+                            <div class="empty-state-text">{t('common.access_denied')}</div>
+                            <div style="color: var(--text-tertiary); font-size: var(--font-size-sm); margin-top: 4px;">
+                                {t('common.no_permission')}
+                            </div>
+                        </div>
+                    }>
                     <Switch fallback={<Dashboard onNavigate={handleNavigate} />}>
                         <Match when={activePanel() === 'dashboard'}>
                             <Dashboard onNavigate={handleNavigate} />
@@ -144,6 +155,7 @@ export default function Layout() {
                             <Settings />
                         </Match>
                     </Switch>
+                    </Show>
                 </div>
             </div>
 

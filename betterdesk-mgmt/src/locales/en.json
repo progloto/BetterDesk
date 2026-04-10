@@ -168,7 +168,9 @@
     "yes": "Yes",
     "no": "No",
     "save": "Save",
-    "details": "Details"
+    "details": "Details",
+    "access_denied": "Access Denied",
+    "no_permission": "You do not have permission to access this feature. Contact your administrator."
   },
   "connection": {
     "connected_to": "Connected to {{name}}"

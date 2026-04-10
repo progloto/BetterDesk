@@ -118,6 +118,21 @@
     color: var(--accent-purple);
 }
 
+.role-badge.super_admin {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+}
+
+.role-badge.server_admin {
+    background: rgba(14, 165, 233, 0.15);
+    color: #0ea5e9;
+}
+
+.role-badge.global_admin {
+    background: rgba(168, 85, 247, 0.15);
+    color: #a855f7;
+}
+
 .role-badge.operator {
     background: var(--accent-orange-muted, rgba(249, 115, 22, 0.15));
     color: var(--accent-orange, #f97316);
@@ -126,6 +141,11 @@
 .role-badge.viewer {
     background: var(--accent-blue-muted);
     color: var(--accent-blue);
+}
+
+.role-badge.pro {
+    background: rgba(234, 179, 8, 0.15);
+    color: #eab308;
 }
 
 /* User Actions */

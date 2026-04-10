@@ -20,6 +20,7 @@ const securityMiddleware = require('./middleware/security');
 const { initI18n } = require('./middleware/i18n');
 const { apiLimiter } = require('./middleware/rateLimiter');
 const { csrfTokenProvider, doubleCsrfProtection, downgradeToHttp: csrfDowngradeToHttp } = require('./middleware/csrf');
+const { roleHasPermission, isSuperAdminRole } = require('./middleware/auth');
 const authService = require('./services/authService');
 const serverBackend = require('./services/serverBackend');
 const db = require('./services/database');
@@ -147,6 +148,10 @@ app.use(initI18n());
 // Used by Desktop Mode to load pages inside floating windows (iframes)
 app.use((req, res, next) => {
     res.locals.embed = req.query.embed === '1';
+    // Inject permission helper for EJS templates (sidebar/button visibility)
+    const role = req.session?.user?.role;
+    res.locals.hasPermission = (perm) => role ? roleHasPermission(role, perm) : false;
+    res.locals.isSuperAdmin = role ? isSuperAdminRole(role) : false;
     // Prevent HTML page caching — only static assets should be cached
     if (!req.path.match(/\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|map|proto)$/)) {
         res.set('Cache-Control', 'no-cache, no-store, must-revalidate');

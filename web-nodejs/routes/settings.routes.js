@@ -11,7 +11,7 @@ const brandingService = require('../services/brandingService');
 const serverBackend = require('../services/serverBackend');
 const backupService = require('../services/backupService');
 const updateService = require('../services/updateService');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 const os = require('os');
 const multer = require('multer');
 
@@ -135,7 +135,7 @@ router.get('/api/settings/branding', requireAuth, (req, res) => {
 /**
  * POST /api/settings/branding - Save branding configuration (admin only)
  */
-router.post('/api/settings/branding', requireAuth, requireAdmin, async (req, res) => {
+router.post('/api/settings/branding', requireAuth, requirePermission('branding.edit'), async (req, res) => {
     try {
         const updates = req.body;
         if (!updates || typeof updates !== 'object') {
@@ -156,7 +156,7 @@ router.post('/api/settings/branding', requireAuth, requireAdmin, async (req, res
 /**
  * POST /api/settings/branding/reset - Reset branding to defaults (admin only)
  */
-router.post('/api/settings/branding/reset', requireAuth, requireAdmin, async (req, res) => {
+router.post('/api/settings/branding/reset', requireAuth, requirePermission('branding.edit'), async (req, res) => {
     try {
         await brandingService.resetBranding();
         
@@ -172,7 +172,7 @@ router.post('/api/settings/branding/reset', requireAuth, requireAdmin, async (re
 /**
  * GET /api/settings/branding/export - Export branding preset as JSON
  */
-router.get('/api/settings/branding/export', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/settings/branding/export', requireAuth, requirePermission('branding.edit'), (req, res) => {
     try {
         const preset = brandingService.exportPreset();
         res.setHeader('Content-Type', 'application/json');
@@ -187,7 +187,7 @@ router.get('/api/settings/branding/export', requireAuth, requireAdmin, (req, res
 /**
  * POST /api/settings/branding/import - Import branding preset from JSON (admin only)
  */
-router.post('/api/settings/branding/import', requireAuth, requireAdmin, async (req, res) => {
+router.post('/api/settings/branding/import', requireAuth, requirePermission('branding.edit'), async (req, res) => {
     try {
         const preset = req.body;
         const success = await brandingService.importPreset(preset);
@@ -242,7 +242,7 @@ router.get('/api/settings/themes', requireAuth, (req, res) => {
 /**
  * POST /api/settings/themes/:id/apply - Apply a built-in theme preset (admin only)
  */
-router.post('/api/settings/themes/:id/apply', requireAuth, requireAdmin, async (req, res) => {
+router.post('/api/settings/themes/:id/apply', requireAuth, requirePermission('branding.edit'), async (req, res) => {
     try {
         const fs = require('fs');
         const path = require('path');
@@ -309,7 +309,7 @@ const backupUpload = multer({
 /**
  * GET /api/settings/backup/stats - Preview backup size/contents
  */
-router.get('/api/settings/backup/stats', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/settings/backup/stats', requireAuth, requirePermission('server.config'), (req, res) => {
     try {
         const stats = backupService.getBackupStats();
         res.json({ success: true, data: stats });
@@ -322,7 +322,7 @@ router.get('/api/settings/backup/stats', requireAuth, requireAdmin, (req, res) =
 /**
  * GET /api/settings/backup - Download full backup as JSON file
  */
-router.get('/api/settings/backup', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/settings/backup', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const backup = await backupService.createBackup();
         const json = JSON.stringify(backup, null, 2);
@@ -344,7 +344,7 @@ router.get('/api/settings/backup', requireAuth, requireAdmin, async (req, res) =
  * Expects multipart/form-data with field "backup" (JSON file)
  * Optional JSON body fields: restoreSettings, restoreBranding, restoreUsers, etc.
  */
-router.post('/api/settings/restore', requireAuth, requireAdmin, backupUpload.single('backup'), async (req, res) => {
+router.post('/api/settings/restore', requireAuth, requirePermission('server.config'), backupUpload.single('backup'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ success: false, error: req.t('backup.no_file') });
@@ -403,7 +403,7 @@ router.post('/api/settings/restore', requireAuth, requireAdmin, backupUpload.sin
 /**
  * GET /api/settings/updates/check - Check for available updates
  */
-router.get('/api/settings/updates/check', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/settings/updates/check', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const result = await updateService.checkForUpdates();
         res.json({ success: true, data: result });
@@ -416,7 +416,7 @@ router.get('/api/settings/updates/check', requireAuth, requireAdmin, async (req,
 /**
  * GET /api/settings/updates/changes - Get list of changed files between local SHA and remote
  */
-router.get('/api/settings/updates/changes', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/settings/updates/changes', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { sha } = req.query;
         if (!sha || !/^[0-9a-f]{7,40}$/i.test(sha)) {
@@ -434,7 +434,7 @@ router.get('/api/settings/updates/changes', requireAuth, requireAdmin, async (re
  * POST /api/settings/updates/install - Apply the update
  * Body: { remoteSHA, createBackup: true/false, components: ['console','scripts'] }
  */
-router.post('/api/settings/updates/install', requireAuth, requireAdmin, async (req, res) => {
+router.post('/api/settings/updates/install', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { remoteSHA, createBackup, components } = req.body;
         if (!remoteSHA || !/^[0-9a-f]{7,40}$/i.test(remoteSHA)) {
@@ -487,7 +487,7 @@ router.post('/api/settings/updates/install', requireAuth, requireAdmin, async (r
 /**
  * GET /api/settings/updates/backups - List pre-update backups
  */
-router.get('/api/settings/updates/backups', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/settings/updates/backups', requireAuth, requirePermission('server.config'), (req, res) => {
     try {
         const backups = updateService.listBackups();
         res.json({ success: true, data: backups });
@@ -501,7 +501,7 @@ router.get('/api/settings/updates/backups', requireAuth, requireAdmin, (req, res
  * POST /api/settings/updates/restore - Restore from pre-update backup
  * Body: { backupName }
  */
-router.post('/api/settings/updates/restore', requireAuth, requireAdmin, async (req, res) => {
+router.post('/api/settings/updates/restore', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { backupName } = req.body;
         if (!backupName || typeof backupName !== 'string') {

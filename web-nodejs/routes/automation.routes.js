@@ -52,33 +52,11 @@ const VALID_OPERATORS = ['gt', 'gte', 'lt', 'lte', 'eq', 'neq'];
 const VALID_SEVERITIES = ['info', 'warning', 'critical'];
 const VALID_COMMAND_TYPES = ['shell', 'powershell', 'script', 'restart_service', 'reboot'];
 
+const { requireAuth, requirePermission } = require('../middleware/auth');
+
 // ---------------------------------------------------------------------------
 //  Auth middleware
 // ---------------------------------------------------------------------------
-
-function requireAuth(req, res, next) {
-    if (req.session && req.session.user) return next();
-    return res.status(401).json({ error: 'Authentication required' });
-}
-
-function requireAdmin(req, res, next) {
-    if (!req.session || !req.session.user) {
-        return res.status(401).json({ error: 'Authentication required' });
-    }
-    if (req.session.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Admin role required' });
-    }
-    return next();
-}
-
-function requireAdminOrOperator(req, res, next) {
-    if (!req.session || !req.session.user) {
-        return res.status(401).json({ error: 'Authentication required' });
-    }
-    const role = req.session.user.role;
-    if (role === 'admin' || role === 'operator') return next();
-    return res.status(403).json({ error: 'Insufficient permissions' });
-}
 
 async function identifyDevice(req, res, next) {
     const auth = req.headers['authorization'];
@@ -122,7 +100,7 @@ router.get('/rules', requireAuth, async (req, res) => {
 /**
  * POST /api/automation/rules — Create an alert rule.
  */
-router.post('/rules', requireAdminOrOperator, async (req, res) => {
+router.post('/rules', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { name, description, condition_type, condition_op, condition_value,
             severity, scope_device_id, cooldown_secs, notify_emails } = req.body;
@@ -181,7 +159,7 @@ router.get('/rules/:id(\\d+)', requireAuth, async (req, res) => {
 /**
  * PATCH /api/automation/rules/:id — Update alert rule.
  */
-router.patch('/rules/:id(\\d+)', requireAdminOrOperator, async (req, res) => {
+router.patch('/rules/:id(\d+)', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const adapter = getAdapter();
         const rule = await adapter.getAlertRuleById(+req.params.id);
@@ -225,7 +203,7 @@ router.patch('/rules/:id(\\d+)', requireAdminOrOperator, async (req, res) => {
 /**
  * DELETE /api/automation/rules/:id — Delete alert rule.
  */
-router.delete('/rules/:id(\\d+)', requireAdminOrOperator, async (req, res) => {
+router.delete('/rules/:id(\d+)', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const adapter = getAdapter();
         const rule = await adapter.getAlertRuleById(+req.params.id);
@@ -292,7 +270,7 @@ router.post('/alerts/:id(\\d+)/ack', requireAuth, async (req, res) => {
 /**
  * POST /api/automation/commands — Send a command to a device.
  */
-router.post('/commands', requireAdminOrOperator, async (req, res) => {
+router.post('/commands', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { device_id, command_type, payload } = req.body;
 
@@ -419,7 +397,7 @@ router.post('/commands/:id(\\d+)/result', identifyDevice, async (req, res) => {
 /**
  * GET /api/automation/smtp — Get SMTP config (password masked).
  */
-router.get('/smtp', requireAdmin, async (req, res) => {
+router.get('/smtp', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const config = await emailService.loadSmtpConfig();
         if (!config) {
@@ -443,7 +421,7 @@ router.get('/smtp', requireAdmin, async (req, res) => {
 /**
  * PUT /api/automation/smtp — Update SMTP configuration.
  */
-router.put('/smtp', requireAdmin, async (req, res) => {
+router.put('/smtp', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { host, port, secure, user, pass, from } = req.body;
         if (!host) {
@@ -470,7 +448,7 @@ router.put('/smtp', requireAdmin, async (req, res) => {
 /**
  * POST /api/automation/smtp/test — Test SMTP connection.
  */
-router.post('/smtp/test', requireAdmin, async (req, res) => {
+router.post('/smtp/test', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const result = await emailService.testConnection();
         res.json(result);

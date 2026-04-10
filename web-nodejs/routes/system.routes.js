@@ -15,7 +15,7 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -255,7 +255,7 @@ const ALLOWED_COMMANDS = new Set([
     'ip addr', 'ss -tlnp', 'netstat -tlnp', 'top -bn1 | head -20'
 ]);
 
-router.post('/api/system/exec', requireAuth, requireAdmin, (req, res) => {
+router.post('/api/system/exec', requireAuth, requirePermission('server.config'), (req, res) => {
     try {
         const { command } = req.body;
         if (!command || typeof command !== 'string') {

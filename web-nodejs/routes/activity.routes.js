@@ -26,6 +26,8 @@ const router = express.Router();
 const db = require('../services/database');
 const { getAdapter } = require('../services/dbAdapter');
 
+const { requireAuth, requirePermission } = require('../middleware/auth');
+
 // ---------------------------------------------------------------------------
 //  Auth middleware (shared patterns)
 // ---------------------------------------------------------------------------
@@ -58,16 +60,6 @@ async function identifyDevice(req, res, next) {
         return next();
     }
     return res.status(401).json({ error: 'Missing device identification' });
-}
-
-/**
- * Admin auth — require valid session (web console login).
- */
-function requireAdmin(req, res, next) {
-    if (req.session && req.session.user) {
-        return next();
-    }
-    return res.status(401).json({ error: 'Admin authentication required' });
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +131,7 @@ router.post('/activity', identifyDevice, async (req, res) => {
  * GET /api/activity — List all activity summaries.
  * Query params: from, to (ISO 8601 date strings)
  */
-router.get('/', requireAdmin, async (req, res) => {
+router.get('/', requireAuth, requirePermission('audit.view'), async (req, res) => {
     try {
         const adapter = getAdapter();
         const { from, to } = req.query;
@@ -179,7 +171,7 @@ router.get('/', requireAdmin, async (req, res) => {
  * GET /api/activity/:id — Per-device activity detail.
  * Query params: from, to, limit
  */
-router.get('/:id', requireAdmin, async (req, res) => {
+router.get('/:id', requireAuth, requirePermission('audit.view'), async (req, res) => {
     try {
         const adapter = getAdapter();
         const deviceId = req.params.id;
@@ -221,7 +213,7 @@ router.get('/:id', requireAdmin, async (req, res) => {
  * GET /api/activity/:id/top — Top applications for a device.
  * Query params: from, to, limit (default 10)
  */
-router.get('/:id/top', requireAdmin, async (req, res) => {
+router.get('/:id/top', requireAuth, requirePermission('audit.view'), async (req, res) => {
     try {
         const adapter = getAdapter();
         const deviceId = req.params.id;

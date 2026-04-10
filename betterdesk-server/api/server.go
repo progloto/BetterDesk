@@ -223,6 +223,13 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("PUT /api/users/{id}", s.requirePermission(auth.PermUserEdit, s.handleUpdateUser))
 	mux.HandleFunc("DELETE /api/users/{id}", s.requirePermission(auth.PermUserDelete, s.handleDeleteUser))
 
+	// Roles and permissions (RBAC Phase 52)
+	mux.HandleFunc("GET /api/roles", s.requirePermission(auth.PermUserView, s.handleListRoles))
+	mux.HandleFunc("GET /api/roles/{role}/permissions", s.requirePermission(auth.PermUserView, s.handleGetRolePermissions))
+	mux.HandleFunc("GET /api/role-permissions", s.requirePermission(auth.PermServerConfig, s.handleListRolePermissionOverrides))
+	mux.HandleFunc("POST /api/role-permissions", s.requirePermission(auth.PermServerConfig, s.handleSetRolePermission))
+	mux.HandleFunc("DELETE /api/role-permissions/{role}/{permission}", s.requirePermission(auth.PermServerConfig, s.handleDeleteRolePermission))
+
 	// TOTP management (admin only)
 	mux.HandleFunc("POST /api/users/{id}/totp/setup", s.requireRole(auth.RoleAdmin, s.handleSetupTOTP))
 	mux.HandleFunc("POST /api/users/{id}/totp/confirm", s.requireRole(auth.RoleAdmin, s.handleConfirmTOTP))

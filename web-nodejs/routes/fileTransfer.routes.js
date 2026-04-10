@@ -28,16 +28,11 @@ const path = require('path');
 const fs = require('fs');
 const fileTransferService = require('../services/fileTransferService');
 
+const { requireAuth, requirePermission } = require('../middleware/auth');
+
 // ---------------------------------------------------------------------------
 //  Middleware helpers
 // ---------------------------------------------------------------------------
-
-function requireAdmin(req, res, next) {
-    if (!req.session || !req.session.user) {
-        return res.status(401).json({ error: 'Authentication required' });
-    }
-    next();
-}
 
 function identifyDevice(req, res, next) {
     const deviceId = req.headers['x-device-id'] || req.body?.device_id;
@@ -55,7 +50,7 @@ function identifyDevice(req, res, next) {
 /**
  * POST /api/files/transfer — Initiate a file transfer
  */
-router.post('/transfer', requireAdmin, (req, res) => {
+router.post('/transfer', requireAuth, requirePermission('device.connect'), (req, res) => {
     try {
         const { direction, device_id, filename, size, mime_type } = req.body;
 
@@ -85,7 +80,7 @@ router.post('/transfer', requireAdmin, (req, res) => {
 /**
  * GET /api/files/transfers — List all transfers
  */
-router.get('/transfers', requireAdmin, (req, res) => {
+router.get('/transfers', requireAuth, requirePermission('device.connect'), (req, res) => {
     try {
         const { device_id, status, direction } = req.query;
         const transfers = fileTransferService.listTransfers({
@@ -102,7 +97,7 @@ router.get('/transfers', requireAdmin, (req, res) => {
 /**
  * GET /api/files/transfers/:id — Get transfer progress
  */
-router.get('/transfers/:id', requireAdmin, (req, res) => {
+router.get('/transfers/:id', requireAuth, requirePermission('device.connect'), (req, res) => {
     const progress = fileTransferService.getProgress(req.params.id);
     if (!progress) {
         return res.status(404).json({ error: 'Transfer not found' });
@@ -113,7 +108,7 @@ router.get('/transfers/:id', requireAdmin, (req, res) => {
 /**
  * POST /api/files/transfers/:id/cancel — Cancel a transfer
  */
-router.post('/transfers/:id/cancel', requireAdmin, (req, res) => {
+router.post('/transfers/:id/cancel', requireAuth, requirePermission('device.connect'), (req, res) => {
     const ok = fileTransferService.cancelTransfer(req.params.id);
     if (!ok) {
         return res.status(404).json({ error: 'Transfer not found' });
@@ -124,7 +119,7 @@ router.post('/transfers/:id/cancel', requireAdmin, (req, res) => {
 /**
  * GET /api/files/transfers/:id/download — Download completed file
  */
-router.get('/transfers/:id/download', requireAdmin, (req, res) => {
+router.get('/transfers/:id/download', requireAuth, requirePermission('device.connect'), (req, res) => {
     const transfer = fileTransferService.getTransfer(req.params.id);
     if (!transfer) {
         return res.status(404).json({ error: 'Transfer not found' });

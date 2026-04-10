@@ -4,7 +4,7 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 
 const LANG_DIR = path.join(__dirname, '..', 'lang');
 const REFERENCE = 'en.json';
@@ -29,7 +29,7 @@ function flattenKeys(obj, prefix = '') {
 
 // --- Page Route ---
 
-router.get('/languages', requireAuth, requireAdmin, (req, res) => {
+router.get('/languages', requireAuth, requirePermission('server.config'), (req, res) => {
     res.render('languages', {
         title: req.t('nav.languages'),
         pageStyles: ['languages'],
@@ -44,7 +44,7 @@ router.get('/languages', requireAuth, requireAdmin, (req, res) => {
 /**
  * GET /api/panel/languages — List all languages with coverage stats
  */
-router.get('/api/panel/languages', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/panel/languages', requireAuth, requirePermission('server.config'), (req, res) => {
     try {
         const refPath = path.join(LANG_DIR, REFERENCE);
         if (!fs.existsSync(refPath)) {
@@ -126,7 +126,7 @@ router.get('/api/panel/languages', requireAuth, requireAdmin, (req, res) => {
 /**
  * GET /api/panel/languages/:code/missing — Get missing keys for a language
  */
-router.get('/api/panel/languages/:code/missing', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/panel/languages/:code/missing', requireAuth, requirePermission('server.config'), (req, res) => {
     try {
         const code = req.params.code.replace(/[^a-z-]/gi, '');
         const refPath = path.join(LANG_DIR, REFERENCE);
@@ -160,7 +160,7 @@ router.get('/api/panel/languages/:code/missing', requireAuth, requireAdmin, (req
 /**
  * POST /api/panel/languages/:code/fix — Add missing keys with EN fallback
  */
-router.post('/api/panel/languages/:code/fix', requireAuth, requireAdmin, (req, res) => {
+router.post('/api/panel/languages/:code/fix', requireAuth, requirePermission('server.config'), (req, res) => {
     try {
         const code = req.params.code.replace(/[^a-z-]/gi, '');
         if (code === 'en') {

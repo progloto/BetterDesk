@@ -2,7 +2,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 const { apiClient } = require('../services/betterdeskApi');
 
 // ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ async function goApiProxy(req, res, method, path, body) {
 // ---------------------------------------------------------------------------
 // Page route
 // ---------------------------------------------------------------------------
-router.get('/cross-platform', requireAuth, requireAdmin, (req, res) => {
+router.get('/cross-platform', requireAuth, requirePermission('device.view'), (req, res) => {
     const tab = req.query.tab || 'matrix';
     res.render('cross-platform', {
         title: req.t('cross_platform.title'),
@@ -39,7 +39,7 @@ router.get('/cross-platform', requireAuth, requireAdmin, (req, res) => {
 // ---------------------------------------------------------------------------
 // Platform Distribution — aggregate from Go server peers
 // ---------------------------------------------------------------------------
-router.get('/api/panel/cross-platform/distribution', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/panel/cross-platform/distribution', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
         const resp = await apiClient({ method: 'GET', url: '/peers?page_size=9999' });
         const peers = resp.data?.peers || resp.data?.data || [];
@@ -80,14 +80,14 @@ router.get('/api/panel/cross-platform/distribution', requireAuth, requireAdmin, 
 // ---------------------------------------------------------------------------
 // Capability report for a specific device
 // ---------------------------------------------------------------------------
-router.get('/api/panel/cross-platform/capabilities/:deviceId', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/panel/cross-platform/capabilities/:deviceId', requireAuth, requirePermission('device.view'), (req, res) => {
     goApiProxy(req, res, 'GET', `/peers/${encodeURIComponent(req.params.deviceId)}`);
 });
 
 // ---------------------------------------------------------------------------
 // Protocol negotiation status — aggregate connected peer capabilities
 // ---------------------------------------------------------------------------
-router.get('/api/panel/cross-platform/protocols', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/panel/cross-platform/protocols', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
         const resp = await apiClient({ method: 'GET', url: '/peers?page_size=9999' });
         const peers = resp.data?.peers || resp.data?.data || [];

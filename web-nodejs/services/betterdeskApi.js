@@ -735,6 +735,72 @@ async function deleteAccessPolicy(id) {
     }
 }
 
+// ── RBAC: Roles & Permissions (Phase 52) ─────────────────────
+
+/**
+ * List all built-in roles with their default permission sets.
+ */
+async function listRoles() {
+    try {
+        const { data } = await apiClient.get('/roles');
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Get effective permissions for a specific role (defaults + overrides).
+ */
+async function getRolePermissions(role) {
+    try {
+        const { data } = await apiClient.get(`/roles/${encodeURIComponent(role)}/permissions`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * List all custom permission overrides from the DB.
+ */
+async function listRolePermissionOverrides(role) {
+    try {
+        const url = role ? `/role-permissions?role=${encodeURIComponent(role)}` : '/role-permissions';
+        const { data } = await apiClient.get(url);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Set a custom permission override for a role.
+ * @param {string} role
+ * @param {string} permission
+ * @param {boolean} granted
+ */
+async function setRolePermission(role, permission, granted) {
+    try {
+        const { data } = await apiClient.post('/role-permissions', { role, permission, granted });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Delete a custom permission override (revert to default).
+ */
+async function deleteRolePermission(role, permission) {
+    try {
+        const { data } = await apiClient.delete(`/role-permissions/${encodeURIComponent(role)}/${encodeURIComponent(permission)}`);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
 module.exports = {
     // Health / Stats
     getHealth,
@@ -798,6 +864,12 @@ module.exports = {
     getAccessPolicy,
     saveAccessPolicy,
     deleteAccessPolicy,
+    // RBAC: Roles & Permissions (Phase 52)
+    listRoles,
+    getRolePermissions,
+    listRolePermissionOverrides,
+    setRolePermission,
+    deleteRolePermission,
     // Helpers
     normalisePeer,
     // Raw axios client (for services that need direct API access)

@@ -62,19 +62,31 @@
         
         emptyState?.classList.add('hidden');
         
-        tableBody.innerHTML = users.map(user => `
+        tableBody.innerHTML = users.map(user => {
+            const roleIcons = {
+                super_admin: 'shield_person',
+                admin: 'admin_panel_settings',
+                server_admin: 'dns',
+                global_admin: 'public',
+                operator: 'engineering',
+                viewer: 'visibility',
+                pro: 'star'
+            };
+            const roleIcon = roleIcons[user.role] || 'person';
+            const roleLabelKey = 'users.role_' + user.role;
+            return `
             <tr data-id="${user.id}">
                 <td>
                     <div class="user-info">
                         <div class="user-avatar">
-                            <span class="material-icons">${user.role === 'admin' ? 'admin_panel_settings' : user.role === 'operator' ? 'engineering' : 'person'}</span>
+                            <span class="material-icons">${roleIcon}</span>
                         </div>
                         <span class="user-username">${Utils.escapeHtml(user.username)}</span>
                     </div>
                 </td>
                 <td>
                     <span class="role-badge ${user.role}">
-                        ${user.role === 'admin' ? _('users.role_admin') : user.role === 'operator' ? _('users.role_operator') : _('users.role_viewer')}
+                        ${_(roleLabelKey)}
                     </span>
                 </td>
                 <td>${Utils.formatDate(user.created_at)}</td>
@@ -93,7 +105,7 @@
                     </div>
                 </td>
             </tr>
-        `).join('');
+        `}).join('');        
         
         // Attach event listeners
         tableBody.querySelectorAll('.action-btn').forEach(btn => {

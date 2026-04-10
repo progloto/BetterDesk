@@ -25,7 +25,7 @@ const tls     = require('tls');
 const https   = require('https');
 const dgram   = require('dgram');
 const dns     = require('dns');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 
 // ── Page ────────────────────────────────────────────────────────────────────
 
@@ -195,7 +195,7 @@ router.post('/api/toolkit/base64', requireAuth, (req, res) => {
 
 // ── Wake-on-LAN ─────────────────────────────────────────────────────────────
 
-router.post('/api/toolkit/wol', requireAuth, requireRole('admin'), (req, res) => {
+router.post('/api/toolkit/wol', requireAuth, requirePermission('device.connect'), (req, res) => {
     const { mac, broadcast } = req.body;
     if (!mac || typeof mac !== 'string') {
         return res.status(400).json({ success: false, error: 'MAC address is required' });

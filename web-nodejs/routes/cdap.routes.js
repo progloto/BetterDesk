@@ -6,7 +6,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 const betterdeskApi = require('../services/betterdeskApi');
 
 // ── Page Routes ──────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ router.get('/api/cdap/devices/:id/state', requireAuth, async (req, res) => {
  * Sends a command to a connected CDAP device
  * Body: { widget_id, action, value, reason? }
  */
-router.post('/api/cdap/devices/:id/command', requireAuth, requireRole('operator'), async (req, res) => {
+router.post('/api/cdap/devices/:id/command', requireAuth, requirePermission('cdap.command'), async (req, res) => {
     try {
         const { widget_id, action, value, reason } = req.body;
 
@@ -152,7 +152,7 @@ router.post('/api/cdap/devices/:id/command', requireAuth, requireRole('operator'
  * Enable or disable CDAP gateway (saves config; requires server restart)
  * Body: { enabled: true|false }
  */
-router.post('/api/cdap/toggle', requireAuth, requireRole('admin'), async (req, res) => {
+router.post('/api/cdap/toggle', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { enabled } = req.body;
         if (typeof enabled !== 'boolean') {
@@ -198,7 +198,7 @@ router.get('/api/cdap/devices/:id/linked', requireAuth, async (req, res) => {
  * Link or unlink a peer to this CDAP device
  * Body: { linked_peer_id: "PEERID" } or { linked_peer_id: "" } to unlink
  */
-router.post('/api/cdap/devices/:id/link', requireAuth, requireRole('admin'), async (req, res) => {
+router.post('/api/cdap/devices/:id/link', requireAuth, requirePermission('cdap.command'), async (req, res) => {
     try {
         const { linked_peer_id } = req.body;
         if (linked_peer_id === undefined) {

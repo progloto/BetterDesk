@@ -2,7 +2,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 
 let apiClient;
 try { apiClient = require('../services/betterdeskApi'); } catch (e) { apiClient = null; }
@@ -22,7 +22,7 @@ function goApiProxy(req, res, method, path, body) {
 }
 
 // ── Page ─────────────────────────────────────────────────────
-router.get('/security-audit', requireAuth, requireAdmin, (req, res) => {
+router.get('/security-audit', requireAuth, requirePermission('audit.view'), (req, res) => {
   const tab = req.query.tab || 'overview';
   res.render('security-audit', {
     title: req.t('security_audit.title'),
@@ -35,7 +35,7 @@ router.get('/security-audit', requireAuth, requireAdmin, (req, res) => {
 });
 
 // ── API: Security overview ───────────────────────────────────
-router.get('/api/panel/security-audit/overview', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/panel/security-audit/overview', requireAuth, requirePermission('audit.view'), async (req, res) => {
   try {
     const [healthRes, keysRes, auditRes] = await Promise.allSettled([
       apiClient ? apiClient.get('/health') : Promise.reject('no api'),
@@ -94,7 +94,7 @@ router.get('/api/panel/security-audit/overview', requireAuth, requireAdmin, asyn
 });
 
 // ── API: Audit events ────────────────────────────────────────
-router.get('/api/panel/security-audit/events', requireAuth, requireAdmin, (req, res) => {
+router.get('/api/panel/security-audit/events', requireAuth, requirePermission('audit.view'), (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
   const offset = parseInt(req.query.offset) || 0;
   const action = req.query.action || '';
@@ -104,7 +104,7 @@ router.get('/api/panel/security-audit/events', requireAuth, requireAdmin, (req, 
 });
 
 // ── API: Hardening checklist ─────────────────────────────────
-router.get('/api/panel/security-audit/hardening', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/panel/security-audit/hardening', requireAuth, requirePermission('audit.view'), async (req, res) => {
   try {
     const priorities = [
       { id: 'mutual_tls', name: 'Mutual TLS Console ↔ Go Server', category: 'network', severity: 'high', implemented: false, description: 'Replace plain HTTP localhost with mutual TLS authentication between web console and Go server.' },
@@ -125,7 +125,7 @@ router.get('/api/panel/security-audit/hardening', requireAuth, requireAdmin, asy
 });
 
 // ── API: Vulnerability scan results ──────────────────────────
-router.get('/api/panel/security-audit/vulnerabilities', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/panel/security-audit/vulnerabilities', requireAuth, requirePermission('audit.view'), async (req, res) => {
   try {
     const deps = {
       go: { total: 0, vulnerable: 0, items: [] },

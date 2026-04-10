@@ -6,7 +6,7 @@ const express = require('express');
 const router = express.Router();
 const db = require('../services/database');
 const serverBackend = require('../services/serverBackend');
-const { requireAuth, requireRole } = require('../middleware/auth');
+const { requireAuth, requirePermission } = require('../middleware/auth');
 
 /**
  * GET /devices - Devices list page
@@ -139,7 +139,7 @@ router.get('/api/devices/:id', requireAuth, async (req, res) => {
 /**
  * PATCH /api/devices/:id - Update device (name, note, display_name)
  */
-router.patch('/api/devices/:id', requireAuth, requireRole('operator'), async (req, res) => {
+router.patch('/api/devices/:id', requireAuth, requirePermission('device.edit'), async (req, res) => {
     try {
         const { user, note, display_name } = req.body;
         const id = req.params.id;
@@ -175,7 +175,7 @@ router.patch('/api/devices/:id', requireAuth, requireRole('operator'), async (re
  * DELETE /api/devices/:id - Delete device (soft delete)
  * Query params: revoke=true (blocklist + disconnect), cascade=true (delete linked devices)
  */
-router.delete('/api/devices/:id', requireAuth, requireRole('operator'), async (req, res) => {
+router.delete('/api/devices/:id', requireAuth, requirePermission('device.delete'), async (req, res) => {
     try {
         const id = req.params.id;
         const revoke = req.query.revoke === 'true';
@@ -227,7 +227,7 @@ router.delete('/api/devices/:id', requireAuth, requireRole('operator'), async (r
 /**
  * POST /api/devices/:id/ban - Ban device
  */
-router.post('/api/devices/:id/ban', requireAuth, requireRole('operator'), async (req, res) => {
+router.post('/api/devices/:id/ban', requireAuth, requirePermission('device.ban'), async (req, res) => {
     try {
         const id = req.params.id;
         const { reason } = req.body;
@@ -258,7 +258,7 @@ router.post('/api/devices/:id/ban', requireAuth, requireRole('operator'), async 
 /**
  * POST /api/devices/:id/unban - Unban device
  */
-router.post('/api/devices/:id/unban', requireAuth, requireRole('operator'), async (req, res) => {
+router.post('/api/devices/:id/unban', requireAuth, requirePermission('device.ban'), async (req, res) => {
     try {
         const id = req.params.id;
         
@@ -288,7 +288,7 @@ router.post('/api/devices/:id/unban', requireAuth, requireRole('operator'), asyn
 /**
  * POST /api/devices/:id/change-id - Change device ID
  */
-router.post('/api/devices/:id/change-id', requireAuth, requireRole('operator'), async (req, res) => {
+router.post('/api/devices/:id/change-id', requireAuth, requirePermission('device.change_id'), async (req, res) => {
     try {
         const oldId = req.params.id;
         const { newId } = req.body;
@@ -343,7 +343,7 @@ router.post('/api/devices/:id/change-id', requireAuth, requireRole('operator'), 
 /**
  * PUT /api/devices/:id/tags - Set device tags
  */
-router.put('/api/devices/:id/tags', requireAuth, requireRole('operator'), async (req, res) => {
+router.put('/api/devices/:id/tags', requireAuth, requirePermission('device.edit'), async (req, res) => {
     try {
         const id = req.params.id;
         const { tags } = req.body;
@@ -406,7 +406,7 @@ router.put('/api/devices/:id/tags', requireAuth, requireRole('operator'), async 
 /**
  * POST /api/devices/bulk-delete - Delete multiple devices
  */
-router.post('/api/devices/bulk-delete', requireAuth, requireRole('operator'), async (req, res) => {
+router.post('/api/devices/bulk-delete', requireAuth, requirePermission('device.delete'), async (req, res) => {
     try {
         const { ids } = req.body;
         
@@ -447,7 +447,7 @@ router.post('/api/devices/bulk-delete', requireAuth, requireRole('operator'), as
 /**
  * GET /api/devices/:id/access-policy - Get access policy for a device
  */
-router.get('/api/devices/:id/access-policy', requireAuth, requireRole('operator'), async (req, res) => {
+router.get('/api/devices/:id/access-policy', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
         const goApi = require('../services/betterdeskApi');
         const result = await goApi.getAccessPolicy(req.params.id);
@@ -461,7 +461,7 @@ router.get('/api/devices/:id/access-policy', requireAuth, requireRole('operator'
 /**
  * PUT /api/devices/:id/access-policy - Save access policy for a device
  */
-router.put('/api/devices/:id/access-policy', requireAuth, requireRole('admin'), async (req, res) => {
+router.put('/api/devices/:id/access-policy', requireAuth, requirePermission('device.edit'), async (req, res) => {
     try {
         const goApi = require('../services/betterdeskApi');
         const result = await goApi.saveAccessPolicy(req.params.id, req.body);
@@ -475,7 +475,7 @@ router.put('/api/devices/:id/access-policy', requireAuth, requireRole('admin'), 
 /**
  * DELETE /api/devices/:id/access-policy - Delete access policy for a device
  */
-router.delete('/api/devices/:id/access-policy', requireAuth, requireRole('admin'), async (req, res) => {
+router.delete('/api/devices/:id/access-policy', requireAuth, requirePermission('device.edit'), async (req, res) => {
     try {
         const goApi = require('../services/betterdeskApi');
         const result = await goApi.deleteAccessPolicy(req.params.id);

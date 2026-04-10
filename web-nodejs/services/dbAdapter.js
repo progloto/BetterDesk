@@ -1098,7 +1098,7 @@ function createSqliteAdapter(config) {
             openAuth().prepare('DELETE FROM users WHERE id = ?').run(id);
         },
         async countAdmins() {
-            return openAuth().prepare("SELECT COUNT(*) as c FROM users WHERE role = 'admin'").get().c;
+            return openAuth().prepare("SELECT COUNT(*) as c FROM users WHERE role IN ('admin', 'super_admin')").get().c;
         },
 
         // ---- TOTP ----
@@ -3379,7 +3379,7 @@ function createPostgresAdapter() {
         async getAllUsers() { return all('SELECT id, username, role, created_at, last_login, totp_enabled FROM users ORDER BY id'); },
         async updateUserRole(id, role) { await q('UPDATE users SET role = $1 WHERE id = $2', [role, id]); },
         async deleteUser(id) { await q('DELETE FROM users WHERE id = $1', [id]); },
-        async countAdmins() { return +(await one("SELECT COUNT(*) as c FROM users WHERE role = 'admin'")).c; },
+        async countAdmins() { return +(await one("SELECT COUNT(*) as c FROM users WHERE role IN ('admin', 'super_admin')")).c; },
 
         // ---- TOTP ----
 

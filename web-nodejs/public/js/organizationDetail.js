@@ -2,6 +2,7 @@
  * BetterDesk Console — Organization Detail Page JavaScript
  *
  * Handles org detail view with tabs: Users, Devices, Invitations, Settings.
+ * Uses Modal.show() for form inputs, i18n for all strings.
  */
 'use strict';
 
@@ -10,6 +11,11 @@
     if (!orgId) return;
 
     const API = `/api/panel/org/${orgId}`;
+
+    // i18n helper — falls back to key
+    function t(key) {
+        return (typeof _ === 'function') ? _(`organizations.${key}`) || key : key;
+    }
 
     // -----------------------------------------------------------------------
     //  Helpers
@@ -33,6 +39,7 @@
 
     function toast(msg, type = 'info') {
         if (window.showToast) window.showToast(msg, type);
+        else if (window.Toast) window.Toast[type] ? window.Toast[type]('', msg) : window.Toast.info('', msg);
         else console.log(`[${type}]`, msg);
     }
 
@@ -47,6 +54,13 @@
         return new Date(d).toLocaleDateString(undefined, {
             year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
         });
+    }
+
+    function roleOptions(selected) {
+        const roles = ['owner', 'admin', 'operator', 'user'];
+        return roles.map(r =>
+            `<option value="${r}" ${r === selected ? 'selected' : ''}>${t('role_' + r)}</option>`
+        ).join('');
     }
 
     // -----------------------------------------------------------------------
@@ -64,15 +78,58 @@
     // -----------------------------------------------------------------------
     //  Load org header
     // -----------------------------------------------------------------------
+    let currentOrg = {};
+
     async function loadOrgHeader() {
         try {
             const org = await api('GET', '');
+            currentOrg = org;
             document.getElementById('org-detail-name').textContent = org.name;
             document.getElementById('org-detail-slug').textContent = org.slug;
         } catch (err) {
-            toast('Failed to load organization', 'error');
+            toast(t('loading_failed'), 'error');
         }
     }
+
+    // -----------------------------------------------------------------------
+    //  Edit org (header button)
+    // -----------------------------------------------------------------------
+    document.getElementById('org-edit-btn')?.addEventListener('click', () => {
+        Modal.show({
+            title: t('edit'),
+            content: `
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('name'))}</label>
+                    <input type="text" id="modal-org-name" class="form-input" value="${escHtml(currentOrg.name || '')}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('slug'))}</label>
+                    <input type="text" id="modal-org-slug" class="form-input" value="${escHtml(currentOrg.slug || '')}">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('logo_url'))}</label>
+                    <input type="text" id="modal-org-logo" class="form-input" value="${escHtml(currentOrg.logo_url || '')}">
+                </div>
+            `,
+            buttons: [
+                { label: _('actions.cancel') || 'Cancel', class: 'btn-secondary', onClick: () => Modal.close() },
+                {
+                    label: _('actions.save') || 'Save', class: 'btn-primary', onClick: async () => {
+                        const name = document.getElementById('modal-org-name')?.value?.trim();
+                        const slug = document.getElementById('modal-org-slug')?.value?.trim();
+                        const logo_url = document.getElementById('modal-org-logo')?.value?.trim();
+                        if (!name || !slug) return;
+                        try {
+                            await api('PUT', '', { name, slug, logo_url });
+                            Modal.close();
+                            toast(t('edit'), 'success');
+                            loadOrgHeader();
+                        } catch (err) { toast(err.message, 'error'); }
+                    }
+                }
+            ]
+        });
+    });
 
     // -----------------------------------------------------------------------
     //  Users tab
@@ -85,7 +142,7 @@
             const container = document.getElementById('users-table');
 
             if (users.length === 0) {
-                container.innerHTML = '<p class="text-muted">No users in this organization.</p>';
+                container.innerHTML = `<p class="text-muted">${escHtml(t('no_users'))}</p>`;
                 return;
             }
 
@@ -93,12 +150,12 @@
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>Username</th>
-                            <th>Display Name</th>
-                            <th>Email</th>
-                            <th>Role</th>
-                            <th>Last Login</th>
-                            <th>Actions</th>
+                            <th>${escHtml(t('username'))}</th>
+                            <th>${escHtml(t('display_name'))}</th>
+                            <th>${escHtml(t('email'))}</th>
+                            <th>${escHtml(t('role'))}</th>
+                            <th>${escHtml(t('last_login'))}</th>
+                            <th>${escHtml(t('actions'))}</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -107,10 +164,13 @@
                                 <td><strong>${escHtml(u.username)}</strong></td>
                                 <td>${escHtml(u.display_name)}</td>
                                 <td>${escHtml(u.email)}</td>
-                                <td><span class="role-badge role-${u.role}">${u.role}</span></td>
+                                <td><span class="role-badge role-${u.role}">${escHtml(t('role_' + u.role) || u.role)}</span></td>
                                 <td>${formatDate(u.last_login)}</td>
                                 <td>
-                                    <button class="btn btn-icon btn-sm user-remove-btn" data-user-id="${u.id}" title="Remove">
+                                    <button class="btn btn-icon btn-sm user-role-btn" data-user-id="${u.id}" data-role="${u.role}" title="${escHtml(t('edit_role'))}">
+                                        <span class="material-icons">edit</span>
+                                    </button>
+                                    <button class="btn btn-icon btn-sm user-remove-btn" data-user-id="${u.id}" title="${escHtml(_('common.delete') || 'Remove')}">
                                         <span class="material-icons">person_remove</span>
                                     </button>
                                 </td>
@@ -122,25 +182,80 @@
             container.querySelectorAll('.user-remove-btn').forEach(btn => {
                 btn.addEventListener('click', () => deleteUser(btn.dataset.userId));
             });
+            container.querySelectorAll('.user-role-btn').forEach(btn => {
+                btn.addEventListener('click', () => editUserRole(btn.dataset.userId, btn.dataset.role));
+            });
         } catch (err) {
-            toast('Failed to load users', 'error');
+            toast(t('loading_failed'), 'error');
         }
     }
 
-    document.getElementById('add-user-btn')?.addEventListener('click', async () => {
-        const username = prompt('Username:');
-        if (!username) return;
-        const password = prompt('Password:');
-        if (!password) return;
-        const role = prompt('Role (owner/admin/operator/user):', 'user');
-        try {
-            await api('POST', '/users', { username, password, role: role || 'user' });
-            toast('User added', 'success');
-            loadUsers();
-        } catch (err) {
-            toast(err.message, 'error');
-        }
+    // Add User modal
+    document.getElementById('add-user-btn')?.addEventListener('click', () => {
+        Modal.show({
+            title: t('add_user'),
+            content: `
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('username'))}</label>
+                    <input type="text" id="modal-user-name" class="form-input" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('password'))}</label>
+                    <input type="password" id="modal-user-pass" class="form-input" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('role'))}</label>
+                    <select id="modal-user-role" class="form-input">${roleOptions('user')}</select>
+                </div>
+            `,
+            buttons: [
+                { label: _('actions.cancel') || 'Cancel', class: 'btn-secondary', onClick: () => Modal.close() },
+                {
+                    label: t('add_user'), class: 'btn-primary', icon: 'person_add', onClick: async () => {
+                        const username = document.getElementById('modal-user-name')?.value?.trim();
+                        const password = document.getElementById('modal-user-pass')?.value;
+                        const role = document.getElementById('modal-user-role')?.value || 'user';
+                        if (!username || !password) return;
+                        try {
+                            await api('POST', '/users', { username, password, role });
+                            Modal.close();
+                            toast(t('user_added'), 'success');
+                            loadUsers();
+                        } catch (err) { toast(err.message, 'error'); }
+                    }
+                }
+            ],
+            onOpen: () => setTimeout(() => document.getElementById('modal-user-name')?.focus(), 50)
+        });
     });
+
+    // Edit user role modal
+    async function editUserRole(uid, currentRole) {
+        Modal.show({
+            title: t('edit_role'),
+            content: `
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('role'))}</label>
+                    <select id="modal-edit-role" class="form-input">${roleOptions(currentRole)}</select>
+                </div>
+            `,
+            buttons: [
+                { label: _('actions.cancel') || 'Cancel', class: 'btn-secondary', onClick: () => Modal.close() },
+                {
+                    label: _('actions.save') || 'Save', class: 'btn-primary', onClick: async () => {
+                        const role = document.getElementById('modal-edit-role')?.value;
+                        if (!role) return;
+                        try {
+                            await api('PUT', `/users/${uid}`, { role });
+                            Modal.close();
+                            toast(t('user_updated'), 'success');
+                            loadUsers();
+                        } catch (err) { toast(err.message, 'error'); }
+                    }
+                }
+            ]
+        });
+    }
 
     // -----------------------------------------------------------------------
     //  Devices tab
@@ -153,7 +268,7 @@
             const container = document.getElementById('devices-table');
 
             if (devices.length === 0) {
-                container.innerHTML = '<p class="text-muted">No devices assigned to this organization.</p>';
+                container.innerHTML = `<p class="text-muted">${escHtml(t('no_devices'))}</p>`;
                 return;
             }
 
@@ -161,24 +276,24 @@
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>Device ID</th>
-                            <th>Department</th>
-                            <th>Building</th>
-                            <th>Location</th>
-                            <th>Assigned User</th>
-                            <th>Actions</th>
+                            <th>${escHtml(t('device_id'))}</th>
+                            <th>${escHtml(t('department'))}</th>
+                            <th>${escHtml(t('building'))}</th>
+                            <th>${escHtml(t('location'))}</th>
+                            <th>${escHtml(t('assigned_user'))}</th>
+                            <th>${escHtml(t('actions'))}</th>
                         </tr>
                     </thead>
                     <tbody>
                         ${devices.map(d => `
                             <tr>
-                                <td><a href="/devices/${d.device_id}">${escHtml(d.device_id)}</a></td>
+                                <td><a href="/devices/${escHtml(d.device_id)}">${escHtml(d.device_id)}</a></td>
                                 <td>${escHtml(d.department)}</td>
                                 <td>${escHtml(d.building)}</td>
                                 <td>${escHtml(d.location)}</td>
                                 <td>${escHtml(d.assigned_user_id)}</td>
                                 <td>
-                                    <button class="btn btn-icon btn-sm btn-danger device-unassign-btn" data-device-id="${d.device_id}" title="Unassign">
+                                    <button class="btn btn-icon btn-sm btn-danger device-unassign-btn" data-device-id="${escHtml(d.device_id)}" title="${escHtml(_('common.delete') || 'Unassign')}">
                                         <span class="material-icons">link_off</span>
                                     </button>
                                 </td>
@@ -191,22 +306,47 @@
                 btn.addEventListener('click', () => unassignDevice(btn.dataset.deviceId));
             });
         } catch (err) {
-            toast('Failed to load devices', 'error');
+            toast(t('loading_failed'), 'error');
         }
     }
 
-    document.getElementById('assign-device-btn')?.addEventListener('click', async () => {
-        const deviceId = prompt('Device ID to assign:');
-        if (!deviceId) return;
-        const dept = prompt('Department (optional):') || '';
-        const building = prompt('Building (optional):') || '';
-        try {
-            await api('POST', '/devices', { device_id: deviceId, department: dept, building });
-            toast('Device assigned', 'success');
-            loadDevices();
-        } catch (err) {
-            toast(err.message, 'error');
-        }
+    // Assign Device modal
+    document.getElementById('assign-device-btn')?.addEventListener('click', () => {
+        Modal.show({
+            title: t('assign_device'),
+            content: `
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('device_id'))}</label>
+                    <input type="text" id="modal-device-id" class="form-input" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('department'))}</label>
+                    <input type="text" id="modal-device-dept" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('building'))}</label>
+                    <input type="text" id="modal-device-building" class="form-input">
+                </div>
+            `,
+            buttons: [
+                { label: _('actions.cancel') || 'Cancel', class: 'btn-secondary', onClick: () => Modal.close() },
+                {
+                    label: t('assign_device'), class: 'btn-primary', icon: 'add_circle', onClick: async () => {
+                        const device_id = document.getElementById('modal-device-id')?.value?.trim();
+                        const department = document.getElementById('modal-device-dept')?.value?.trim() || '';
+                        const building = document.getElementById('modal-device-building')?.value?.trim() || '';
+                        if (!device_id) return;
+                        try {
+                            await api('POST', '/devices', { device_id, department, building });
+                            Modal.close();
+                            toast(t('device_assigned'), 'success');
+                            loadDevices();
+                        } catch (err) { toast(err.message, 'error'); }
+                    }
+                }
+            ],
+            onOpen: () => setTimeout(() => document.getElementById('modal-device-id')?.focus(), 50)
+        });
     });
 
     // -----------------------------------------------------------------------
@@ -220,7 +360,7 @@
             const container = document.getElementById('invitations-table');
 
             if (invs.length === 0) {
-                container.innerHTML = '<p class="text-muted">No invitations.</p>';
+                container.innerHTML = `<p class="text-muted">${escHtml(t('no_invitations'))}</p>`;
                 return;
             }
 
@@ -228,19 +368,19 @@
                 <table class="data-table">
                     <thead>
                         <tr>
-                            <th>Token</th>
-                            <th>Email</th>
-                            <th>Role</th>
-                            <th>Expires</th>
-                            <th>Used</th>
+                            <th>${escHtml(t('token'))}</th>
+                            <th>${escHtml(t('email'))}</th>
+                            <th>${escHtml(t('role'))}</th>
+                            <th>${escHtml(t('expires'))}</th>
+                            <th>${escHtml(t('used'))}</th>
                         </tr>
                     </thead>
                     <tbody>
                         ${invs.map(inv => `
                             <tr>
-                                <td><code>${escHtml(inv.token?.substring(0, 16) + '...')}</code></td>
+                                <td><code>${escHtml((inv.token || '').substring(0, 16) + '...')}</code></td>
                                 <td>${escHtml(inv.email)}</td>
-                                <td><span class="role-badge role-${inv.role}">${inv.role}</span></td>
+                                <td><span class="role-badge role-${inv.role}">${escHtml(t('role_' + inv.role) || inv.role)}</span></td>
                                 <td>${formatDate(inv.expires_at)}</td>
                                 <td>${inv.used_at ? formatDate(inv.used_at) : '—'}</td>
                             </tr>
@@ -248,20 +388,46 @@
                     </tbody>
                 </table>`;
         } catch (err) {
-            toast('Failed to load invitations', 'error');
+            toast(t('loading_failed'), 'error');
         }
     }
 
-    document.getElementById('create-invite-btn')?.addEventListener('click', async () => {
-        const email = prompt('Email (optional):') || '';
-        const role = prompt('Role (user/operator/admin):', 'user') || 'user';
-        try {
-            const inv = await api('POST', '/invite', { email, role, expires_in_hours: 72 });
-            toast('Invitation created! Token: ' + (inv.token || '').substring(0, 16) + '...', 'success');
-            loadInvitations();
-        } catch (err) {
-            toast(err.message, 'error');
-        }
+    // Create Invitation modal
+    document.getElementById('create-invite-btn')?.addEventListener('click', () => {
+        Modal.show({
+            title: t('create_invitation'),
+            content: `
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('email'))}</label>
+                    <input type="email" id="modal-invite-email" class="form-input" placeholder="optional">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('role'))}</label>
+                    <select id="modal-invite-role" class="form-input">${roleOptions('user')}</select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">${escHtml(t('expires_hours'))}</label>
+                    <input type="number" id="modal-invite-hours" class="form-input" value="72" min="1" max="720">
+                </div>
+            `,
+            buttons: [
+                { label: _('actions.cancel') || 'Cancel', class: 'btn-secondary', onClick: () => Modal.close() },
+                {
+                    label: t('create_invitation'), class: 'btn-primary', icon: 'link', onClick: async () => {
+                        const email = document.getElementById('modal-invite-email')?.value?.trim() || '';
+                        const role = document.getElementById('modal-invite-role')?.value || 'user';
+                        const hours = parseInt(document.getElementById('modal-invite-hours')?.value) || 72;
+                        try {
+                            const inv = await api('POST', '/invite', { email, role, expires_in_hours: hours });
+                            Modal.close();
+                            toast(t('invitation_created'), 'success');
+                            loadInvitations();
+                        } catch (err) { toast(err.message, 'error'); }
+                    }
+                }
+            ],
+            onOpen: () => setTimeout(() => document.getElementById('modal-invite-email')?.focus(), 50)
+        });
     });
 
     // -----------------------------------------------------------------------
@@ -276,37 +442,39 @@
             container.innerHTML = `
                 <div class="org-settings-form">
                     <div class="form-group">
-                        <label>Connection Policy</label>
+                        <label>${escHtml(t('connection_policy'))}</label>
                         <select id="setting-connection-policy" class="form-input">
-                            <option value="unattended">Unattended (instant)</option>
-                            <option value="attended">Attended (with confirmation)</option>
-                            <option value="ask_always">Always ask</option>
+                            <option value="unattended">${escHtml(t('policy_unattended'))}</option>
+                            <option value="attended">${escHtml(t('policy_attended'))}</option>
+                            <option value="ask_always">${escHtml(t('policy_ask'))}</option>
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Allow File Transfer</label>
+                        <label>${escHtml(t('allow_file_transfer'))}</label>
                         <select id="setting-allow-file-transfer" class="form-input">
-                            <option value="true">Yes</option>
-                            <option value="false">No</option>
+                            <option value="true">${_('common.yes') || 'Yes'}</option>
+                            <option value="false">${_('common.no') || 'No'}</option>
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Allow Clipboard</label>
+                        <label>${escHtml(t('allow_clipboard'))}</label>
                         <select id="setting-allow-clipboard" class="form-input">
-                            <option value="true">Yes</option>
-                            <option value="false">No</option>
+                            <option value="true">${_('common.yes') || 'Yes'}</option>
+                            <option value="false">${_('common.no') || 'No'}</option>
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Max Session Duration (minutes)</label>
+                        <label>${escHtml(t('max_session_duration'))}</label>
                         <input type="number" id="setting-max-session" class="form-input" value="120" min="0" />
                     </div>
-                    <button class="btn btn-primary" id="save-settings-btn">Save Settings</button>
+                    <button class="btn btn-primary" id="save-settings-btn">
+                        <span class="material-icons">save</span> ${escHtml(t('save'))}
+                    </button>
                 </div>
                 <div class="org-settings-raw">
-                    <h3>Raw Settings</h3>
+                    <h3>${escHtml(t('raw_settings'))}</h3>
                     <table class="data-table">
-                        <thead><tr><th>Key</th><th>Value</th></tr></thead>
+                        <thead><tr><th>${escHtml(t('key'))}</th><th>${escHtml(t('value'))}</th></tr></thead>
                         <tbody>
                             ${settings.map(s => `
                                 <tr><td><code>${escHtml(s.key)}</code></td><td>${escHtml(s.value)}</td></tr>
@@ -332,14 +500,14 @@
                     for (const s of settingsToSave) {
                         await api('PUT', '/settings', s);
                     }
-                    toast('Settings saved', 'success');
+                    toast(t('settings_saved'), 'success');
                     loadSettings();
                 } catch (err) {
                     toast(err.message, 'error');
                 }
             });
         } catch (err) {
-            toast('Failed to load settings', 'error');
+            toast(t('loading_failed'), 'error');
         }
     }
 
@@ -347,10 +515,16 @@
     //  Delete org
     // -----------------------------------------------------------------------
     document.getElementById('org-delete-btn')?.addEventListener('click', async () => {
-        if (!confirm('Delete this organization and all associated data?')) return;
+        const confirmed = await Modal.confirm({
+            title: _('common.delete') || 'Delete',
+            message: t('confirm_delete_org'),
+            danger: true,
+            confirmIcon: 'delete'
+        });
+        if (!confirmed) return;
         try {
             await api('DELETE', '');
-            toast('Organization deleted', 'success');
+            toast(t('org_deleted'), 'success');
             window.location.href = '/organizations';
         } catch (err) {
             toast(err.message, 'error');
@@ -358,10 +532,16 @@
     });
 
     async function deleteUser(uid) {
-        if (!confirm('Remove this user from the organization?')) return;
+        const confirmed = await Modal.confirm({
+            title: _('common.delete') || 'Remove',
+            message: t('confirm_remove_user'),
+            danger: true,
+            confirmIcon: 'person_remove'
+        });
+        if (!confirmed) return;
         try {
             await api('DELETE', `/users/${uid}`);
-            toast('User removed', 'success');
+            toast(t('user_removed'), 'success');
             loadUsers();
         } catch (err) {
             toast(err.message, 'error');
@@ -369,10 +549,16 @@
     }
 
     async function unassignDevice(did) {
-        if (!confirm('Unassign this device from the organization?')) return;
+        const confirmed = await Modal.confirm({
+            title: _('common.delete') || 'Unassign',
+            message: t('confirm_unassign_device'),
+            danger: true,
+            confirmIcon: 'link_off'
+        });
+        if (!confirmed) return;
         try {
             await api('DELETE', `/devices/${did}`);
-            toast('Device unassigned', 'success');
+            toast(t('device_unassigned'), 'success');
             loadDevices();
         } catch (err) {
             toast(err.message, 'error');

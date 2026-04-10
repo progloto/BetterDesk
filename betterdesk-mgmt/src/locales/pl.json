@@ -170,7 +170,9 @@
     "yes": "Tak",
     "no": "Nie",
     "save": "Zapisz",
-    "details": "Szczegóły"
+    "details": "Szczegóły",
+    "access_denied": "Brak dostępu",
+    "no_permission": "Nie masz uprawnień do tej funkcji. Skontaktuj się z administratorem."
   },
   "connection": {
     "connected_to": "Połączono z {{name}}"

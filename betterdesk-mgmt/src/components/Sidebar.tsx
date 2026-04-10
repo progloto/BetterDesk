@@ -1,8 +1,9 @@
 /**
- * Sidebar — main navigation
+ * Sidebar — main navigation with RBAC filtering
  */
 import { t } from '../lib/i18n';
 import { user, doLogout } from '../stores/auth';
+import { canView } from '../lib/permissions';
 import bdIcon from '../assets/bd-icon.png';
 
 interface SidebarProps {
@@ -61,7 +62,7 @@ export default function Sidebar(props: SidebarProps) {
             </div>
 
             <nav class="sidebar-nav">
-                {mainNav.map(renderItem)}
+                {mainNav.filter(e => canView(e.id)).map(renderItem)}
             </nav>
 
             <div class="sidebar-footer">

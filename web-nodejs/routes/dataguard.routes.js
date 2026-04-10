@@ -30,21 +30,11 @@ const express = require('express');
 const router = express.Router();
 const { getAdapter } = require('../services/dbAdapter');
 
-// ---------------------------------------------------------------------------
-//  Auth middleware helpers (reused from other route files)
-// ---------------------------------------------------------------------------
+const { requireAuth, requirePermission } = require('../middleware/auth');
 
-/** Require a valid admin/operator web session. */
-function requireSession(req, res, next) {
-    if (req.session && req.session.user) return next();
-    return res.status(401).json({ error: 'Authentication required' });
-}
-
-/** Require admin role specifically. */
-function requireAdmin(req, res, next) {
-    if (req.session && req.session.user && req.session.user.role === 'admin') return next();
-    return res.status(403).json({ error: 'Admin access required' });
-}
+// ---------------------------------------------------------------------------
+//  Auth middleware helpers
+// ---------------------------------------------------------------------------
 
 /** Accept device auth via X-Device-Id header or bearer token. */
 function acceptDeviceAuth(req, res, next) {
@@ -66,7 +56,7 @@ function acceptDeviceAuth(req, res, next) {
  * GET /api/dataguard/policies
  * Returns all DLP policies.
  */
-router.get('/policies', requireSession, async (req, res) => {
+router.get('/policies', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
         const db = getAdapter();
         const policies = await db.getDlpPolicies();
@@ -85,7 +75,7 @@ router.get('/policies', requireSession, async (req, res) => {
 /**
  * GET /api/dataguard/policies/:id
  */
-router.get('/policies/:id', requireSession, async (req, res) => {
+router.get('/policies/:id', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
         const db = getAdapter();
         const policy = await db.getDlpPolicyById(Number(req.params.id));
@@ -103,7 +93,7 @@ router.get('/policies/:id', requireSession, async (req, res) => {
  * Body: { name, description?, enabled?, rules? }
  * rules is an array of objects: [{ rule_type, action, filter }]
  */
-router.post('/policies', requireAdmin, async (req, res) => {
+router.post('/policies', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const { name, description, policy_type, action, scope, enabled, rules } = req.body;
         if (!name || typeof name !== 'string' || !name.trim()) {
@@ -128,7 +118,7 @@ router.post('/policies', requireAdmin, async (req, res) => {
 /**
  * PATCH /api/dataguard/policies/:id
  */
-router.patch('/policies/:id', requireAdmin, async (req, res) => {
+router.patch('/policies/:id', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const db = getAdapter();
         const id = Number(req.params.id);
@@ -153,7 +143,7 @@ router.patch('/policies/:id', requireAdmin, async (req, res) => {
 /**
  * DELETE /api/dataguard/policies/:id
  */
-router.delete('/policies/:id', requireAdmin, async (req, res) => {
+router.delete('/policies/:id', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
         const db = getAdapter();
         const ok = await db.deleteDlpPolicy(Number(req.params.id));
@@ -172,7 +162,7 @@ router.delete('/policies/:id', requireAdmin, async (req, res) => {
 /**
  * GET /api/dataguard/events?device_id=&event_source=usb|file&event_type=&limit=&from=&to=
  */
-router.get('/events', requireSession, async (req, res) => {
+router.get('/events', requireAuth, requirePermission('audit.view'), async (req, res) => {
     try {
         const db = getAdapter();
         const { device_id, event_source, event_type, limit, from, to } = req.query;
@@ -199,7 +189,7 @@ router.get('/events', requireSession, async (req, res) => {
 /**
  * GET /api/dataguard/stats
  */
-router.get('/stats', requireSession, async (req, res) => {
+router.get('/stats', requireAuth, requirePermission('audit.view'), async (req, res) => {
     try {
         const db = getAdapter();
         const stats = await db.getDlpEventStats();

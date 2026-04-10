@@ -57,6 +57,7 @@ const languagesRoutes = lazyRoute('./languages.routes');
 const resourceControlRoutes = lazyRoute('./resource-control.routes');
 const systemRoutes = lazyRoute('./system.routes');
 const cdapStudioRoutes = lazyRoute('./cdap-studio.routes');
+const permissionsRoutes = lazyRoute('./permissions.routes');
 
 /**
  * Middleware to require JSON Content-Type for POST/PATCH/PUT requests to API routes.
@@ -142,5 +143,6 @@ router.use('/', resourceControlRoutes);                      // admin-facing: /r
 router.use('/api/bd', resourceControlRoutes);                 // device-facing: /api/bd/resource-policy
 router.use('/', systemRoutes);                           // admin-facing: /api/system/*, /api/logs/*, /api/database/*, /api/docker/*, /api/speed-test
 router.use('/', cdapStudioRoutes);                       // admin-facing: /cdap-studio, /api/cdap-studio/*
+router.use('/', permissionsRoutes);                      // admin-facing: /permissions, /api/panel/roles/*, /api/panel/role-permissions/*
 
 module.exports = router;

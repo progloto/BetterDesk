@@ -7,13 +7,13 @@ const express = require('express');
 const router = express.Router();
 const authService = require('../services/authService');
 const db = require('../services/database');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requirePermission, isSuperAdminRole } = require('../middleware/auth');
 const { passwordChangeLimiter } = require('../middleware/rateLimiter');
 
 /**
  * GET /users - Users management page (admin only)
  */
-router.get('/users', requireAuth, requireAdmin, (req, res) => {
+router.get('/users', requireAuth, requirePermission('user.view'), (req, res) => {
     res.render('users', {
         title: req.t('nav.users'),
         activePage: 'users'
@@ -23,7 +23,7 @@ router.get('/users', requireAuth, requireAdmin, (req, res) => {
 /**
  * GET /api/users - Get all users (admin only)
  */
-router.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
+router.get('/api/users', requireAuth, requirePermission('user.view'), async (req, res) => {
     try {
         const users = await db.getAllUsers();
         
@@ -55,7 +55,7 @@ router.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
 /**
  * POST /api/users - Create new user (admin only)
  */
-router.post('/api/users', requireAuth, requireAdmin, passwordChangeLimiter, async (req, res) => {
+router.post('/api/users', requireAuth, requirePermission('user.create'), passwordChangeLimiter, async (req, res) => {
     try {
         const { username, password, role } = req.body;
         
@@ -94,8 +94,8 @@ router.post('/api/users', requireAuth, requireAdmin, passwordChangeLimiter, asyn
             });
         }
         
-        // Validate role
-        const validRoles = ['admin', 'operator', 'viewer', 'pro'];
+        // Validate role (7-role hierarchy — Phase 52)
+        const validRoles = ['super_admin', 'admin', 'server_admin', 'global_admin', 'operator', 'viewer', 'pro'];
         const userRole = validRoles.includes(role) ? role : 'viewer';
         
         // Hash password
@@ -127,7 +127,7 @@ router.post('/api/users', requireAuth, requireAdmin, passwordChangeLimiter, asyn
 /**
  * PATCH /api/users/:id - Update user (admin only)
  */
-router.patch('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
+router.patch('/api/users/:id', requireAuth, requirePermission('user.edit'), async (req, res) => {
     try {
         const userId = parseInt(req.params.id, 10);
         if (isNaN(userId) || userId <= 0) {
@@ -143,8 +143,8 @@ router.patch('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
             });
         }
         
-        // Prevent self-demotion from admin
-        if (userId === req.session.userId && role && role !== 'admin') {
+        // Prevent self-demotion from admin-level role
+        if (userId === req.session.userId && role && isSuperAdminRole(req.session.user.role) && !isSuperAdminRole(role)) {
             return res.status(400).json({
                 success: false,
                 error: req.t('users.cannot_demote_self')
@@ -153,7 +153,7 @@ router.patch('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
         
         // Update role if provided
         if (role) {
-            const validRoles = ['admin', 'operator', 'viewer', 'pro'];
+            const validRoles = ['super_admin', 'admin', 'server_admin', 'global_admin', 'operator', 'viewer', 'pro'];
             if (!validRoles.includes(role)) {
                 return res.status(400).json({
                     success: false,
@@ -194,7 +194,7 @@ router.patch('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
 /**
  * DELETE /api/users/:id - Delete user (admin only)
  */
-router.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
+router.delete('/api/users/:id', requireAuth, requirePermission('user.delete'), async (req, res) => {
     try {
         const userId = parseInt(req.params.id, 10);
         if (isNaN(userId) || userId <= 0) {
@@ -219,7 +219,7 @@ router.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
         
         // Ensure at least one admin remains
         const adminCount = await db.countAdmins();
-        if (user.role === 'admin' && adminCount <= 1) {
+        if (isSuperAdminRole(user.role) && adminCount <= 1) {
             return res.status(400).json({
                 success: false,
                 error: req.t('users.last_admin')
@@ -244,7 +244,7 @@ router.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
 /**
  * POST /api/users/:id/reset-password - Admin reset user password
  */
-router.post('/api/users/:id/reset-password', requireAuth, requireAdmin, passwordChangeLimiter, async (req, res) => {
+router.post('/api/users/:id/reset-password', requireAuth, requirePermission('user.edit'), passwordChangeLimiter, async (req, res) => {
     try {
         const userId = parseInt(req.params.id, 10);
         if (isNaN(userId) || userId <= 0) {
