@@ -507,7 +507,11 @@
     "tip_unique_accounts": "Twórz indywidualne konta dla każdej osoby",
     "tip_viewer_role": "Używaj roli obserwatora dla użytkowników, którzy potrzebują tylko odczytu",
     "tip_operator_role": "Używaj roli operatora dla użytkowników, którzy muszą zarządzać urządzeniami, ale nie użytkownikami",
-    "tip_audit_logs": "Regularnie przeglądaj dzienniki dla podejrzanej aktywności"
+    "tip_audit_logs": "Regularnie przeglądaj dzienniki dla podejrzanej aktywności",
+    "organizations": "Organizacje",
+    "user_organizations": "Organizacje użytkownika {username}",
+    "no_organizations": "Użytkownik nie jest przypisany do żadnej organizacji",
+    "org_removed": "Przypisanie do organizacji usunięte"
   },
   "folders": {
     "title": "Foldery",
@@ -562,7 +566,8 @@
     "error": "Błąd",
     "not_found": "Nie znaleziono",
     "server_error": "Błąd serwera",
-    "load_device_failed": "Nie udało się załadować urządzenia"
+    "load_device_failed": "Nie udało się załadować urządzenia",
+    "load_orgs_failed": "Nie udało się załadować organizacji"
   },
   "remote": {
     "title": "Pulpit Zdalny",
@@ -1924,7 +1929,15 @@
     "loading_failed": "Nie udało się załadować danych organizacji",
     "name_slug_required": "Nazwa i slug są wymagane",
     "org_created": "Organizacja utworzona",
-    "org_updated": "Organizacja zaktualizowana"
+    "org_updated": "Organizacja zaktualizowana",
+    "create_new_user": "Utwórz nowego",
+    "add_existing_user": "Dodaj istniejącego",
+    "none_available": "brak",
+    "select_user": "Wybierz użytkownika",
+    "org_role": "Rola w organizacji",
+    "link_user_hint": "Wybrany użytkownik zostanie powiązany z tą organizacją przy użyciu danych jego konta serwerowego.",
+    "no_available_users": "Wszyscy użytkownicy serwera są już powiązani z tą organizacją.",
+    "user_linked": "Użytkownik powiązany z organizacją"
   },
   "chat": {
     "e2e_enabled": "Szyfrowanie end-to-end",

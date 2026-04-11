@@ -25,6 +25,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -34,6 +35,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/unitronix/betterdesk-server/audit"
 	"github.com/unitronix/betterdesk-server/auth"
 	"github.com/unitronix/betterdesk-server/db"
 )
@@ -737,4 +739,437 @@ func (s *Server) handleOrgLogin(w http.ResponseWriter, r *http.Request) {
 		"org_id": orgID,
 		"type":   "org_user",
 	})
+}
+
+// ---------------------------------------------------------------------------
+//  Organization Policies
+// ---------------------------------------------------------------------------
+
+// policyCategories are the valid policy category names
+var policyCategories = []string{"connection", "features", "security", "network", "update"}
+
+// isPolicyCategory checks if category is valid
+func isPolicyCategory(category string) bool {
+	for _, c := range policyCategories {
+		if c == category {
+			return true
+		}
+	}
+	return false
+}
+
+// GET /api/org/{id}/policy
+func (s *Server) handleGetOrgPolicy(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+
+	result := make(map[string]interface{})
+
+	for _, category := range policyCategories {
+		key := "policy_" + category
+		value, err := s.db.GetOrgSetting(orgID, key)
+		if err != nil || value == "" {
+			result[category] = map[string]interface{}{}
+			continue
+		}
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(value), &parsed); err != nil {
+			result[category] = map[string]interface{}{}
+			continue
+		}
+		result[category] = parsed
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// PUT /api/org/{id}/policy/{category}
+func (s *Server) handleSetOrgPolicy(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	category := r.PathValue("category")
+
+	if !isPolicyCategory(category) {
+		http.Error(w, `{"error":"invalid policy category"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Read body as raw JSON to preserve
+	var body interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Serialize back to string for storage
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		http.Error(w, `{"error":"failed to encode policy"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Store as org setting
+	key := "policy_" + category
+	if err := s.db.SetOrgSetting(orgID, key, string(encoded)); err != nil {
+		log.Printf("[org] SetOrgPolicy error: %v", err)
+		http.Error(w, `{"error":"failed to save policy"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Record audit
+	if s.auditLog != nil {
+		s.auditLog.Log("org_policy_changed", s.remoteIP(r), getUsernameFromCtx(r), map[string]string{
+			"org_id":   orgID,
+			"category": category,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "ok",
+		"category": category,
+	})
+}
+
+// GET /api/org/{id}/policy/effective/{deviceId}
+func (s *Server) handleGetEffectivePolicy(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	deviceID := r.PathValue("deviceId")
+
+	// Get org policies
+	orgPolicies := make(map[string]interface{})
+	for _, category := range policyCategories {
+		key := "policy_" + category
+		value, err := s.db.GetOrgSetting(orgID, key)
+		if err != nil || value == "" {
+			continue
+		}
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(value), &parsed); err != nil {
+			continue
+		}
+		orgPolicies[category] = parsed
+	}
+
+	// For now, return org policies + device ID (future: merge with device-specific overrides)
+	result := map[string]interface{}{
+		"device_id": deviceID,
+		"org_id":    orgID,
+		"policies":  orgPolicies,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// GET /api/org/{id}/policy/audit
+func (s *Server) handleGetPolicyAudit(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+
+	// Get recent audit entries for this org's policies
+	var filtered []audit.Event
+	if s.auditLog != nil {
+		allEntries := s.auditLog.Recent(500)
+		for _, e := range allEntries {
+			if e.Action != audit.Action("org_policy_changed") {
+				continue
+			}
+			if e.Details != nil && e.Details["org_id"] == orgID {
+				filtered = append(filtered, e)
+			}
+		}
+	}
+
+	// Limit to 100 entries
+	if len(filtered) > 100 {
+		filtered = filtered[:100]
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"entries": filtered})
+}
+
+// ---------------------------------------------------------------------------
+//  User-Org Linking (Issue #106)
+// ---------------------------------------------------------------------------
+
+// POST /api/org/{id}/members
+// Links an existing server-level user to an organization.
+func (s *Server) handleLinkUserToOrg(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	if orgID == "" {
+		http.Error(w, `{"error":"org_id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Verify org exists
+	org, _ := s.db.GetOrganization(orgID)
+	if org == nil {
+		http.Error(w, `{"error":"organization not found"}`, http.StatusNotFound)
+		return
+	}
+
+	var body struct {
+		UserID int64  `json:"user_id"`
+		Role   string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	if body.UserID <= 0 {
+		http.Error(w, `{"error":"user_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Role == "" {
+		body.Role = db.OrgRoleUser
+	}
+	if !db.ValidOrgRole(body.Role) {
+		http.Error(w, `{"error":"invalid role (owner, admin, operator, user)"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Org role boundary: check caller's authority within this org.
+	callerRole := getRoleFromCtx(r)
+	callerUsername := getUsernameFromCtx(r)
+
+	if !auth.IsSuperAdminRole(callerRole) && callerRole != auth.RoleGlobalAdmin {
+		callerOrgUser, _ := s.db.GetOrgUserByUsername(orgID, callerUsername)
+		if callerOrgUser == nil {
+			http.Error(w, `{"error":"you are not a member of this organization"}`, http.StatusForbidden)
+			return
+		}
+		if !db.OrgCanAssignRole(callerOrgUser.Role, body.Role) {
+			http.Error(w, `{"error":"cannot assign a role higher than your org-level authority"}`, http.StatusForbidden)
+			return
+		}
+	}
+
+	// Link user
+	orgUser, err := s.db.LinkUserToOrg(orgID, body.UserID, body.Role)
+	if err != nil {
+		log.Printf("[org] LinkUserToOrg error: %v", err)
+		if strings.Contains(err.Error(), "already linked") {
+			http.Error(w, `{"error":"user already linked to this organization"}`, http.StatusConflict)
+			return
+		}
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, `{"error":"server user not found"}`, http.StatusNotFound)
+			return
+		}
+		if strings.Contains(err.Error(), "username already exists") {
+			http.Error(w, `{"error":"username already exists in this organization"}`, http.StatusConflict)
+			return
+		}
+		http.Error(w, `{"error":"failed to link user"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Audit
+	if s.auditLog != nil {
+		s.auditLog.Log("org_user_linked", s.remoteIP(r), callerUsername, map[string]string{
+			"org_id":  orgID,
+			"user_id": fmt.Sprintf("%d", body.UserID),
+			"role":    body.Role,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(orgUser)
+}
+
+// DELETE /api/org/{id}/members/{userId}
+// Unlinks a server-level user from an organization.
+func (s *Server) handleUnlinkUserFromOrg(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	userIDStr := r.PathValue("userId")
+
+	if orgID == "" || userIDStr == "" {
+		http.Error(w, `{"error":"org_id and user_id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	var userID int64
+	if _, err := fmt.Sscanf(userIDStr, "%d", &userID); err != nil || userID <= 0 {
+		http.Error(w, `{"error":"invalid user_id"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Check authority: super/global admin can always unlink
+	callerRole := getRoleFromCtx(r)
+	callerUsername := getUsernameFromCtx(r)
+
+	if !auth.IsSuperAdminRole(callerRole) && callerRole != auth.RoleGlobalAdmin {
+		callerOrgUser, _ := s.db.GetOrgUserByUsername(orgID, callerUsername)
+		if callerOrgUser == nil {
+			http.Error(w, `{"error":"you are not a member of this organization"}`, http.StatusForbidden)
+			return
+		}
+		// Only owner/admin can unlink
+		if callerOrgUser.Role != db.OrgRoleOwner && callerOrgUser.Role != db.OrgRoleAdmin {
+			http.Error(w, `{"error":"insufficient permissions to unlink users"}`, http.StatusForbidden)
+			return
+		}
+	}
+
+	if err := s.db.UnlinkUserFromOrg(orgID, userID); err != nil {
+		log.Printf("[org] UnlinkUserFromOrg error: %v", err)
+		if strings.Contains(err.Error(), "not linked") {
+			http.Error(w, `{"error":"user not linked to this organization"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"failed to unlink user"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Audit
+	if s.auditLog != nil {
+		s.auditLog.Log("org_user_unlinked", s.remoteIP(r), callerUsername, map[string]string{
+			"org_id":  orgID,
+			"user_id": userIDStr,
+		})
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GET /api/org/{id}/available-users
+// Returns server-level users not yet linked to this organization.
+func (s *Server) handleListAvailableUsers(w http.ResponseWriter, r *http.Request) {
+	orgID := r.PathValue("id")
+	if orgID == "" {
+		http.Error(w, `{"error":"org_id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	users, err := s.db.ListUsersNotInOrg(orgID)
+	if err != nil {
+		log.Printf("[org] ListUsersNotInOrg error: %v", err)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	if users == nil {
+		users = []*db.User{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"users": users})
+}
+
+// GET /api/users/{id}/organizations
+// Returns all organizations a server user is linked to.
+func (s *Server) handleListUserOrganizations(w http.ResponseWriter, r *http.Request) {
+	userIDStr := r.PathValue("id")
+	if userIDStr == "" {
+		http.Error(w, `{"error":"user_id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	var userID int64
+	if _, err := fmt.Sscanf(userIDStr, "%d", &userID); err != nil || userID <= 0 {
+		http.Error(w, `{"error":"invalid user_id"}`, http.StatusBadRequest)
+		return
+	}
+
+	orgs, err := s.db.ListUserOrganizations(userID)
+	if err != nil {
+		log.Printf("[org] ListUserOrganizations error: %v", err)
+		http.Error(w, `{"error":"internal"}`, http.StatusInternalServerError)
+		return
+	}
+	if orgs == nil {
+		orgs = []*db.Organization{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"organizations": orgs})
+}
+
+// POST /api/users/{id}/organizations
+// Links a server user to an organization (alternative endpoint).
+func (s *Server) handleAssignUserToOrg(w http.ResponseWriter, r *http.Request) {
+	userIDStr := r.PathValue("id")
+	if userIDStr == "" {
+		http.Error(w, `{"error":"user_id required"}`, http.StatusBadRequest)
+		return
+	}
+
+	var userID int64
+	if _, err := fmt.Sscanf(userIDStr, "%d", &userID); err != nil || userID <= 0 {
+		http.Error(w, `{"error":"invalid user_id"}`, http.StatusBadRequest)
+		return
+	}
+
+	var body struct {
+		OrgID string `json:"org_id"`
+		Role  string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	if body.OrgID == "" {
+		http.Error(w, `{"error":"org_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	if body.Role == "" {
+		body.Role = db.OrgRoleUser
+	}
+	if !db.ValidOrgRole(body.Role) {
+		http.Error(w, `{"error":"invalid role (owner, admin, operator, user)"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Verify org exists
+	org, _ := s.db.GetOrganization(body.OrgID)
+	if org == nil {
+		http.Error(w, `{"error":"organization not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// Auth check (same logic as handleLinkUserToOrg)
+	callerRole := getRoleFromCtx(r)
+	callerUsername := getUsernameFromCtx(r)
+
+	if !auth.IsSuperAdminRole(callerRole) && callerRole != auth.RoleGlobalAdmin {
+		callerOrgUser, _ := s.db.GetOrgUserByUsername(body.OrgID, callerUsername)
+		if callerOrgUser == nil {
+			http.Error(w, `{"error":"you are not a member of this organization"}`, http.StatusForbidden)
+			return
+		}
+		if !db.OrgCanAssignRole(callerOrgUser.Role, body.Role) {
+			http.Error(w, `{"error":"cannot assign a role higher than your org-level authority"}`, http.StatusForbidden)
+			return
+		}
+	}
+
+	orgUser, err := s.db.LinkUserToOrg(body.OrgID, userID, body.Role)
+	if err != nil {
+		log.Printf("[org] LinkUserToOrg (from users) error: %v", err)
+		if strings.Contains(err.Error(), "already linked") {
+			http.Error(w, `{"error":"user already linked to this organization"}`, http.StatusConflict)
+			return
+		}
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, `{"error":"server user not found"}`, http.StatusNotFound)
+			return
+		}
+		http.Error(w, `{"error":"failed to link user"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// Audit
+	if s.auditLog != nil {
+		s.auditLog.Log("user_org_assigned", s.remoteIP(r), callerUsername, map[string]string{
+			"user_id": userIDStr,
+			"org_id":  body.OrgID,
+			"role":    body.Role,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(orgUser)
 }

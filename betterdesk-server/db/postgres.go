@@ -314,6 +314,8 @@ func (pg *PostgresDB) Migrate() error {
 		`ALTER TABLE peers ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`,
 		// users: server admin flag (RBAC Phase 52)
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_server_admin BOOLEAN NOT NULL DEFAULT FALSE`,
+		// org_users: server_user_id for linking existing users (Issue #106)
+		`ALTER TABLE org_users ADD COLUMN IF NOT EXISTS server_user_id BIGINT NOT NULL DEFAULT 0`,
 	}
 
 	for _, ddl := range columnMigrations {
@@ -324,8 +326,18 @@ func (pg *PostgresDB) Migrate() error {
 
 	// Deferred indexes — must run AFTER column migrations so that columns
 	// like linked_peer_id exist on databases created before v2.5.0.
+	// We use PL/pgSQL DO blocks to safely check column existence first.
 	deferredIndexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_peers_linked_peer ON peers(linked_peer_id) WHERE linked_peer_id != ''`,
+		// linked_peer_id index — check column exists before creating
+		`DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns 
+				WHERE table_name = 'peers' AND column_name = 'linked_peer_id'
+			) THEN
+				CREATE INDEX IF NOT EXISTS idx_peers_linked_peer ON peers(linked_peer_id) WHERE linked_peer_id != '';
+			END IF;
+		END $$`,
 	}
 	for _, idx := range deferredIndexes {
 		if _, err := pg.pool.Exec(pg.ctx, idx); err != nil {

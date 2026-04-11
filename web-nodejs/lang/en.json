@@ -507,7 +507,11 @@
     "tip_unique_accounts": "Create individual accounts for each person",
     "tip_viewer_role": "Use viewer role for users who only need read access",
     "tip_operator_role": "Use operator role for users who need to manage devices but not users",
-    "tip_audit_logs": "Review audit logs regularly for suspicious activity"
+    "tip_audit_logs": "Review audit logs regularly for suspicious activity",
+    "organizations": "Organizations",
+    "user_organizations": "Organizations for {username}",
+    "no_organizations": "User is not assigned to any organization",
+    "org_removed": "Organization assignment removed"
   },
   "folders": {
     "title": "Folders",
@@ -562,7 +566,8 @@
     "error": "Error",
     "not_found": "Not found",
     "server_error": "Server error",
-    "load_device_failed": "Failed to load device"
+    "load_device_failed": "Failed to load device",
+    "load_orgs_failed": "Failed to load organizations"
   },
   "remote": {
     "title": "Remote Desktop",
@@ -1924,7 +1929,15 @@
     "loading_failed": "Failed to load organization data",
     "name_slug_required": "Name and slug are required",
     "org_created": "Organization created",
-    "org_updated": "Organization updated"
+    "org_updated": "Organization updated",
+    "create_new_user": "Create New",
+    "add_existing_user": "Add Existing",
+    "none_available": "none",
+    "select_user": "Select user",
+    "org_role": "Organization Role",
+    "link_user_hint": "Selected user will be linked to this organization using their server account credentials.",
+    "no_available_users": "All server users are already linked to this organization.",
+    "user_linked": "User linked to organization"
   },
   "chat": {
     "e2e_enabled": "End-to-end encrypted",

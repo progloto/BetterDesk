@@ -228,3 +228,41 @@
 
 /* Modal — uses standard .modal from main.css */
 .modal-overlay#org-modal .modal-header h3 { margin: 0; font-size: 1.1rem; font-weight: 700; }
+
+/* Modal tabs for Add User (Issue #106) */
+.modal-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--border-primary);
+}
+
+.modal-tab {
+    flex: 1;
+    padding: 12px 16px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.modal-tab:hover {
+    color: var(--text-primary);
+}
+
+.modal-tab.active {
+    color: var(--bd-accent, #4f6ef7);
+    border-bottom-color: var(--bd-accent, #4f6ef7);
+}
+
+.modal-tab-content {
+    min-height: 160px;
+}
+
+.text-sm {
+    font-size: 0.85rem;
+}

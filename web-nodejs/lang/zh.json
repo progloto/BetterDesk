@@ -507,7 +507,11 @@
     "tip_unique_accounts": "为每个人创建独立的账户",
     "tip_viewer_role": "对只需要查看权限的用户使用查看者角色",
     "tip_operator_role": "对需要管理设备但不需要管理用户的人员使用操作员角色",
-    "tip_audit_logs": "定期检查审计日志以发现可疑活动"
+    "tip_audit_logs": "定期检查审计日志以发现可疑活动",
+    "organizations": "组织",
+    "user_organizations": "{username} 的组织",
+    "no_organizations": "用户未分配到任何组织",
+    "org_removed": "组织分配已删除"
   },
   "folders": {
     "title": "文件夹",
@@ -562,7 +566,8 @@
     "error": "错误",
     "not_found": "未找到",
     "server_error": "服务器错误",
-    "load_device_failed": "加载设备失败"
+    "load_device_failed": "加载设备失败",
+    "load_orgs_failed": "加载组织失败"
   },
   "remote": {
     "title": "远程桌面",
@@ -1931,7 +1936,15 @@
     "loading_failed": "加载组织数据失败",
     "name_slug_required": "名称和标识符为必填项",
     "org_created": "组织已创建",
-    "org_updated": "组织已更新"
+    "org_updated": "组织已更新",
+    "create_new_user": "创建新用户",
+    "add_existing_user": "添加现有用户",
+    "none_available": "无",
+    "select_user": "选择用户",
+    "org_role": "组织角色",
+    "link_user_hint": "所选用户将使用其服务器帐户凭据链接到此组织。",
+    "no_available_users": "所有服务器用户都已链接到此组织。",
+    "user_linked": "用户已链接到组织"
   },
   "chat": {
     "e2e_enabled": "端到端加密",

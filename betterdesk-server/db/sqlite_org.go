@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ---------------------------------------------------------------------------
@@ -124,9 +126,9 @@ func (s *SQLiteDB) CreateOrgUser(u *OrgUser) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec(
-		`INSERT INTO org_users (id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.OrgID, u.Username, u.DisplayName, u.Email, u.PasswordHash,
+		`INSERT INTO org_users (id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.OrgID, u.ServerUserID, u.Username, u.DisplayName, u.Email, u.PasswordHash,
 		u.Role, u.TOTPSecret, u.AvatarURL, u.CreatedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -137,7 +139,7 @@ func (s *SQLiteDB) GetOrgUser(id string) (*OrgUser, error) {
 	defer s.mu.RUnlock()
 
 	return s.scanOrgUser(s.db.QueryRow(
-		`SELECT id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
 		 FROM org_users WHERE id = ?`, id,
 	))
 }
@@ -147,8 +149,18 @@ func (s *SQLiteDB) GetOrgUserByUsername(orgID, username string) (*OrgUser, error
 	defer s.mu.RUnlock()
 
 	return s.scanOrgUser(s.db.QueryRow(
-		`SELECT id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
 		 FROM org_users WHERE org_id = ? AND username = ?`, orgID, username,
+	))
+}
+
+func (s *SQLiteDB) GetOrgUserByServerUserID(orgID string, serverUserID int64) (*OrgUser, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.scanOrgUser(s.db.QueryRow(
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		 FROM org_users WHERE org_id = ? AND server_user_id = ?`, orgID, serverUserID,
 	))
 }
 
@@ -157,7 +169,7 @@ func (s *SQLiteDB) ListOrgUsers(orgID string) ([]*OrgUser, error) {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
-		`SELECT id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
 		 FROM org_users WHERE org_id = ? ORDER BY username`, orgID,
 	)
 	if err != nil {
@@ -213,8 +225,9 @@ func (s *SQLiteDB) scanOrgUser(row *sql.Row) (*OrgUser, error) {
 	var u OrgUser
 	var lastLogin sql.NullString
 	var createdAt string
+	var serverUserID sql.NullInt64
 	err := row.Scan(
-		&u.ID, &u.OrgID, &u.Username, &u.DisplayName, &u.Email,
+		&u.ID, &u.OrgID, &serverUserID, &u.Username, &u.DisplayName, &u.Email,
 		&u.PasswordHash, &u.Role, &u.TOTPSecret, &u.AvatarURL,
 		&lastLogin, &createdAt,
 	)
@@ -223,6 +236,9 @@ func (s *SQLiteDB) scanOrgUser(row *sql.Row) (*OrgUser, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if serverUserID.Valid {
+		u.ServerUserID = serverUserID.Int64
 	}
 	u.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	if lastLogin.Valid {
@@ -240,13 +256,17 @@ func (s *SQLiteDB) scanOrgUserRow(row orgUserRowScanner) (*OrgUser, error) {
 	var u OrgUser
 	var lastLogin sql.NullString
 	var createdAt string
+	var serverUserID sql.NullInt64
 	err := row.Scan(
-		&u.ID, &u.OrgID, &u.Username, &u.DisplayName, &u.Email,
+		&u.ID, &u.OrgID, &serverUserID, &u.Username, &u.DisplayName, &u.Email,
 		&u.PasswordHash, &u.Role, &u.TOTPSecret, &u.AvatarURL,
 		&lastLogin, &createdAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+	if serverUserID.Valid {
+		u.ServerUserID = serverUserID.Int64
 	}
 	u.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	if lastLogin.Valid {
@@ -484,4 +504,151 @@ func (s *SQLiteDB) ListOrgSettings(orgID string) ([]*OrgSetting, error) {
 		settings = append(settings, &s)
 	}
 	return settings, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+//  User-Org Linking (Issue #106)
+// ---------------------------------------------------------------------------
+
+// LinkUserToOrg links an existing server-level user to an organization.
+// Creates an OrgUser entry with server_user_id set and empty password_hash.
+func (s *SQLiteDB) LinkUserToOrg(orgID string, userID int64, role string) (*OrgUser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if already linked
+	var existingID string
+	err := s.db.QueryRow(
+		`SELECT id FROM org_users WHERE org_id = ? AND server_user_id = ?`, orgID, userID,
+	).Scan(&existingID)
+	if err == nil {
+		return nil, fmt.Errorf("user already linked to this organization")
+	}
+	if err != sql.ErrNoRows {
+		return nil, err
+	}
+
+	// Get user by ID directly
+	var username string
+	err = s.db.QueryRow(`SELECT username FROM users WHERE id = ?`, userID).Scan(&username)
+	if err != nil {
+		return nil, fmt.Errorf("server user not found: %w", err)
+	}
+
+	// Check username conflict
+	var conflictID string
+	err = s.db.QueryRow(
+		`SELECT id FROM org_users WHERE org_id = ? AND username = ?`, orgID, username,
+	).Scan(&conflictID)
+	if err == nil {
+		return nil, fmt.Errorf("username already exists in this organization")
+	}
+
+	id := uuid.New().String()
+	now := time.Now().UTC()
+
+	_, err = s.db.Exec(
+		`INSERT INTO org_users (id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, created_at)
+		 VALUES (?, ?, ?, ?, '', '', '', ?, '', '', ?)`,
+		id, orgID, userID, username, role, now.Format(time.RFC3339),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &OrgUser{
+		ID:           id,
+		OrgID:        orgID,
+		ServerUserID: userID,
+		Username:     username,
+		Role:         role,
+		CreatedAt:    now,
+	}, nil
+}
+
+// UnlinkUserFromOrg removes a linked server user from an organization.
+func (s *SQLiteDB) UnlinkUserFromOrg(orgID string, serverUserID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result, err := s.db.Exec(
+		`DELETE FROM org_users WHERE org_id = ? AND server_user_id = ?`, orgID, serverUserID,
+	)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("user not linked to this organization")
+	}
+	return nil
+}
+
+// ListUsersNotInOrg returns server-level users not yet linked to the organization.
+func (s *SQLiteDB) ListUsersNotInOrg(orgID string) ([]*User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		`SELECT id, username, role, is_server_admin, totp_enabled, created_at, last_login
+		 FROM users
+		 WHERE id NOT IN (
+			SELECT server_user_id FROM org_users WHERE org_id = ? AND server_user_id > 0
+		 )
+		 ORDER BY username`, orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []*User
+	for rows.Next() {
+		var u User
+		var lastLogin sql.NullString
+		var createdAt string
+		var totpEnabled int
+		var isServerAdmin int
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &isServerAdmin, &totpEnabled, &createdAt, &lastLogin); err != nil {
+			return nil, err
+		}
+		u.IsServerAdmin = isServerAdmin == 1
+		u.TOTPEnabled = totpEnabled == 1
+		u.CreatedAt = createdAt
+		if lastLogin.Valid {
+			u.LastLogin = lastLogin.String
+		}
+		users = append(users, &u)
+	}
+	return users, rows.Err()
+}
+
+// ListUserOrganizations returns all organizations a server user is linked to.
+func (s *SQLiteDB) ListUserOrganizations(userID int64) ([]*Organization, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		`SELECT o.id, o.name, o.slug, o.logo_url, o.settings, o.created_at
+		 FROM organizations o
+		 INNER JOIN org_users ou ON o.id = ou.org_id
+		 WHERE ou.server_user_id = ?
+		 ORDER BY o.name`, userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orgs []*Organization
+	for rows.Next() {
+		var org Organization
+		var createdAt string
+		if err := rows.Scan(&org.ID, &org.Name, &org.Slug, &org.LogoURL, &org.Settings, &createdAt); err != nil {
+			return nil, err
+		}
+		org.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		orgs = append(orgs, &org)
+	}
+	return orgs, rows.Err()
 }

@@ -89,6 +89,11 @@ router.post('/api/panel/org/:id/users', requireAuth, requirePermission('org.mana
 router.put('/api/panel/org/:id/users/:uid', requireAuth, requirePermission('org.manage_users'), (req, res) => goApiProxy(req, res, 'put', `/org/${req.params.id}/users/${req.params.uid}`, req.body));
 router.delete('/api/panel/org/:id/users/:uid', requireAuth, requirePermission('org.manage_users'), (req, res) => goApiProxy(req, res, 'delete', `/org/${req.params.id}/users/${req.params.uid}`));
 
+// User-Org Linking (Issue #106)
+router.get('/api/panel/org/:id/available-users', requireAuth, requirePermission('org.manage_users'), (req, res) => goApiProxy(req, res, 'get', `/org/${req.params.id}/available-users`));
+router.post('/api/panel/org/:id/members', requireAuth, requirePermission('org.manage_users'), (req, res) => goApiProxy(req, res, 'post', `/org/${req.params.id}/members`, req.body));
+router.delete('/api/panel/org/:id/members/:userId', requireAuth, requirePermission('org.manage_users'), (req, res) => goApiProxy(req, res, 'delete', `/org/${req.params.id}/members/${req.params.userId}`));
+
 // Invitations
 router.post('/api/panel/org/:id/invite', requireAuth, requirePermission('org.manage_users'), (req, res) => goApiProxy(req, res, 'post', `/org/${req.params.id}/invite`, req.body));
 router.get('/api/panel/org/:id/invitations', requireAuth, requirePermission('org.manage_users'), (req, res) => goApiProxy(req, res, 'get', `/org/${req.params.id}/invitations`));

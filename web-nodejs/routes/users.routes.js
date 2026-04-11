@@ -7,8 +7,26 @@ const express = require('express');
 const router = express.Router();
 const authService = require('../services/authService');
 const db = require('../services/database');
+const { apiClient } = require('../services/betterdeskApi');
 const { requireAuth, requirePermission, isSuperAdminRole } = require('../middleware/auth');
 const { passwordChangeLimiter } = require('../middleware/rateLimiter');
+
+// ---------------------------------------------------------------------------
+//  Helper: proxy to Go server
+// ---------------------------------------------------------------------------
+
+async function goApiProxy(req, res, method, path, body) {
+    try {
+        const opts = { method, url: path };
+        if (body) opts.data = body;
+        const resp = await apiClient(opts);
+        res.status(resp.status).json(resp.data);
+    } catch (err) {
+        const status = err.response?.status || 500;
+        const data = err.response?.data || { error: 'Go server unreachable' };
+        res.status(status).json(data);
+    }
+}
 
 /**
  * GET /users - Users management page (admin only)
@@ -290,6 +308,24 @@ router.post('/api/users/:id/reset-password', requireAuth, requirePermission('use
             error: req.t('errors.server_error')
         });
     }
+});
+
+// ---------------------------------------------------------------------------
+//  User-Org Linking (Issue #106)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/users/:id/organizations - Get organizations a user belongs to
+ */
+router.get('/api/users/:id/organizations', requireAuth, requirePermission('user.view'), (req, res) => {
+    goApiProxy(req, res, 'get', `/users/${req.params.id}/organizations`);
+});
+
+/**
+ * POST /api/users/:id/organizations - Assign user to an organization
+ */
+router.post('/api/users/:id/organizations', requireAuth, requirePermission('org.manage_users'), (req, res) => {
+    goApiProxy(req, res, 'post', `/users/${req.params.id}/organizations`, req.body);
 });
 
 module.exports = router;

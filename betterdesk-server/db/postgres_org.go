@@ -4,7 +4,9 @@ package db
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -99,9 +101,9 @@ func (pg *PostgresDB) DeleteOrganization(id string) error {
 
 func (pg *PostgresDB) CreateOrgUser(u *OrgUser) error {
 	_, err := pg.pool.Exec(pg.ctx,
-		`INSERT INTO org_users (id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		u.ID, u.OrgID, u.Username, u.DisplayName, u.Email, u.PasswordHash,
+		`INSERT INTO org_users (id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		u.ID, u.OrgID, u.ServerUserID, u.Username, u.DisplayName, u.Email, u.PasswordHash,
 		u.Role, u.TOTPSecret, u.AvatarURL, u.CreatedAt.UTC(),
 	)
 	return err
@@ -110,9 +112,9 @@ func (pg *PostgresDB) CreateOrgUser(u *OrgUser) error {
 func (pg *PostgresDB) GetOrgUser(id string) (*OrgUser, error) {
 	var u OrgUser
 	err := pg.pool.QueryRow(pg.ctx,
-		`SELECT id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
 		 FROM org_users WHERE id = $1`, id,
-	).Scan(&u.ID, &u.OrgID, &u.Username, &u.DisplayName, &u.Email,
+	).Scan(&u.ID, &u.OrgID, &u.ServerUserID, &u.Username, &u.DisplayName, &u.Email,
 		&u.PasswordHash, &u.Role, &u.TOTPSecret, &u.AvatarURL, &u.LastLogin, &u.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -126,9 +128,25 @@ func (pg *PostgresDB) GetOrgUser(id string) (*OrgUser, error) {
 func (pg *PostgresDB) GetOrgUserByUsername(orgID, username string) (*OrgUser, error) {
 	var u OrgUser
 	err := pg.pool.QueryRow(pg.ctx,
-		`SELECT id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
 		 FROM org_users WHERE org_id = $1 AND username = $2`, orgID, username,
-	).Scan(&u.ID, &u.OrgID, &u.Username, &u.DisplayName, &u.Email,
+	).Scan(&u.ID, &u.OrgID, &u.ServerUserID, &u.Username, &u.DisplayName, &u.Email,
+		&u.PasswordHash, &u.Role, &u.TOTPSecret, &u.AvatarURL, &u.LastLogin, &u.CreatedAt)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+func (pg *PostgresDB) GetOrgUserByServerUserID(orgID string, serverUserID int64) (*OrgUser, error) {
+	var u OrgUser
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		 FROM org_users WHERE org_id = $1 AND server_user_id = $2`, orgID, serverUserID,
+	).Scan(&u.ID, &u.OrgID, &u.ServerUserID, &u.Username, &u.DisplayName, &u.Email,
 		&u.PasswordHash, &u.Role, &u.TOTPSecret, &u.AvatarURL, &u.LastLogin, &u.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -141,7 +159,7 @@ func (pg *PostgresDB) GetOrgUserByUsername(orgID, username string) (*OrgUser, er
 
 func (pg *PostgresDB) ListOrgUsers(orgID string) ([]*OrgUser, error) {
 	rows, err := pg.pool.Query(pg.ctx,
-		`SELECT id, org_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
+		`SELECT id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, last_login, created_at
 		 FROM org_users WHERE org_id = $1 ORDER BY username`, orgID,
 	)
 	if err != nil {
@@ -152,7 +170,7 @@ func (pg *PostgresDB) ListOrgUsers(orgID string) ([]*OrgUser, error) {
 	var users []*OrgUser
 	for rows.Next() {
 		var u OrgUser
-		if err := rows.Scan(&u.ID, &u.OrgID, &u.Username, &u.DisplayName, &u.Email,
+		if err := rows.Scan(&u.ID, &u.OrgID, &u.ServerUserID, &u.Username, &u.DisplayName, &u.Email,
 			&u.PasswordHash, &u.Role, &u.TOTPSecret, &u.AvatarURL, &u.LastLogin, &u.CreatedAt); err != nil {
 			return nil, err
 		}
@@ -363,4 +381,132 @@ func (pg *PostgresDB) ListOrgSettings(orgID string) ([]*OrgSetting, error) {
 		settings = append(settings, &s)
 	}
 	return settings, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+//  User-Org Linking (Issue #106)
+// ---------------------------------------------------------------------------
+
+// LinkUserToOrg links an existing server-level user to an organization.
+// Creates an OrgUser entry with server_user_id set and empty password_hash.
+func (pg *PostgresDB) LinkUserToOrg(orgID string, userID int64, role string) (*OrgUser, error) {
+	// Check if already linked
+	var existingID string
+	err := pg.pool.QueryRow(pg.ctx,
+		`SELECT id FROM org_users WHERE org_id = $1 AND server_user_id = $2`, orgID, userID,
+	).Scan(&existingID)
+	if err == nil {
+		return nil, fmt.Errorf("user already linked to this organization")
+	}
+	if err != pgx.ErrNoRows {
+		return nil, err
+	}
+
+	// Get server user's username
+	var username string
+	err = pg.pool.QueryRow(pg.ctx, `SELECT username FROM users WHERE id = $1`, userID).Scan(&username)
+	if err != nil {
+		return nil, fmt.Errorf("server user not found: %w", err)
+	}
+
+	// Check username conflict
+	var conflictID string
+	err = pg.pool.QueryRow(pg.ctx,
+		`SELECT id FROM org_users WHERE org_id = $1 AND username = $2`, orgID, username,
+	).Scan(&conflictID)
+	if err == nil {
+		return nil, fmt.Errorf("username already exists in this organization")
+	}
+
+	id := uuid.New().String()
+	now := time.Now().UTC()
+
+	_, err = pg.pool.Exec(pg.ctx,
+		`INSERT INTO org_users (id, org_id, server_user_id, username, display_name, email, password_hash, role, totp_secret, avatar_url, created_at)
+		 VALUES ($1, $2, $3, $4, '', '', '', $5, '', '', $6)`,
+		id, orgID, userID, username, role, now,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &OrgUser{
+		ID:           id,
+		OrgID:        orgID,
+		ServerUserID: userID,
+		Username:     username,
+		Role:         role,
+		CreatedAt:    now,
+	}, nil
+}
+
+// UnlinkUserFromOrg removes a linked server user from an organization.
+func (pg *PostgresDB) UnlinkUserFromOrg(orgID string, serverUserID int64) error {
+	result, err := pg.pool.Exec(pg.ctx,
+		`DELETE FROM org_users WHERE org_id = $1 AND server_user_id = $2`, orgID, serverUserID,
+	)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("user not linked to this organization")
+	}
+	return nil
+}
+
+// ListUsersNotInOrg returns server-level users not yet linked to the organization.
+func (pg *PostgresDB) ListUsersNotInOrg(orgID string) ([]*User, error) {
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT id, username, role, is_server_admin, totp_enabled, created_at, last_login
+		 FROM users
+		 WHERE id NOT IN (
+			SELECT server_user_id FROM org_users WHERE org_id = $1 AND server_user_id > 0
+		 )
+		 ORDER BY username`, orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []*User
+	for rows.Next() {
+		var u User
+		var lastLogin *time.Time
+		var createdAt time.Time
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.IsServerAdmin, &u.TOTPEnabled, &createdAt, &lastLogin); err != nil {
+			return nil, err
+		}
+		u.CreatedAt = createdAt.Format(time.RFC3339)
+		if lastLogin != nil {
+			u.LastLogin = lastLogin.Format(time.RFC3339)
+		}
+		users = append(users, &u)
+	}
+	return users, rows.Err()
+}
+
+// ListUserOrganizations returns all organizations a server user is linked to.
+func (pg *PostgresDB) ListUserOrganizations(userID int64) ([]*Organization, error) {
+	rows, err := pg.pool.Query(pg.ctx,
+		`SELECT o.id, o.name, o.slug, o.logo_url, o.settings, o.created_at
+		 FROM organizations o
+		 INNER JOIN org_users ou ON o.id = ou.org_id
+		 WHERE ou.server_user_id = $1
+		 ORDER BY o.name`, userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orgs []*Organization
+	for rows.Next() {
+		var org Organization
+		if err := rows.Scan(&org.ID, &org.Name, &org.Slug, &org.LogoURL, &org.Settings, &org.CreatedAt); err != nil {
+			return nil, err
+		}
+		orgs = append(orgs, &org)
+	}
+	return orgs, rows.Err()
 }

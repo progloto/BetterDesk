@@ -93,6 +93,9 @@
                 <td>${user.last_login ? Utils.formatDate(user.last_login) : '<span class="text-muted">' + _('users.never') + '</span>'}</td>
                 <td>
                     <div class="user-actions">
+                        <button class="action-btn" title="${_('users.organizations')}" data-action="organizations" data-id="${user.id}" data-username="${Utils.escapeHtml(user.username)}">
+                            <span class="material-icons">business</span>
+                        </button>
                         <button class="action-btn" title="${_('users.reset_password')}" data-action="reset-password" data-id="${user.id}">
                             <span class="material-icons">lock_reset</span>
                         </button>
@@ -126,6 +129,9 @@
                 break;
             case 'delete':
                 await deleteUser(userId, data.username);
+                break;
+            case 'organizations':
+                await showOrganizationsModal(userId, data.username);
                 break;
         }
     }
@@ -369,5 +375,122 @@
         } catch (error) {
             Notifications.error(error.message || _('errors.server_error'));
         }
+    }
+    
+    /**
+     * Show organizations modal for user
+     */
+    async function showOrganizationsModal(userId, username) {
+        let userOrgs = [];
+        let allOrgs = [];
+        
+        try {
+            // Fetch user's organizations
+            const orgsResponse = await Utils.api(`/api/users/${userId}/organizations`);
+            userOrgs = orgsResponse.organizations || [];
+            
+            // Fetch all organizations for adding
+            const allOrgsResponse = await Utils.api('/api/organizations');
+            allOrgs = allOrgsResponse.organizations || [];
+        } catch (error) {
+            console.error('Failed to load organizations:', error);
+            Notifications.error(_('errors.load_orgs_failed'));
+            return;
+        }
+        
+        // Filter out orgs user is already in
+        const userOrgIds = new Set(userOrgs.map(o => o.org_id));
+        const availableOrgs = allOrgs.filter(o => !userOrgIds.has(o.id));
+        
+        const orgsListHtml = userOrgs.length > 0 
+            ? userOrgs.map(org => `
+                <div class="org-assignment-item" data-org-id="${org.org_id}">
+                    <div class="org-info">
+                        <span class="material-icons">business</span>
+                        <span class="org-name">${Utils.escapeHtml(org.org_name || org.name || 'Org #' + org.org_id)}</span>
+                        <span class="role-badge ${org.role}">${_(org.role)}</span>
+                    </div>
+                    <button class="action-btn danger remove-org-btn" data-org-id="${org.org_id}" title="${_('actions.remove')}">
+                        <span class="material-icons">remove_circle</span>
+                    </button>
+                </div>
+            `).join('')
+            : `<div class="empty-state-inline">${_('users.no_organizations')}</div>`;
+        
+        const addOrgHtml = availableOrgs.length > 0 
+            ? `
+                <div class="add-org-row">
+                    <select id="add-org-select" class="form-input">
+                        <option value="">${_('policy_audit.select_org_placeholder')}</option>
+                        ${availableOrgs.map(o => `<option value="${o.id}">${Utils.escapeHtml(o.name)}</option>`).join('')}
+                    </select>
+                    <select id="add-org-role" class="form-input" style="width: 120px;">
+                        <option value="user">User</option>
+                        <option value="operator">Operator</option>
+                        <option value="admin">Admin</option>
+                        <option value="owner">Owner</option>
+                    </select>
+                    <button id="add-org-btn" class="btn btn-primary btn-sm">
+                        <span class="material-icons">add</span>
+                        ${_('actions.add')}
+                    </button>
+                </div>
+            `
+            : '';
+        
+        Modal.show({
+            title: _('users.user_organizations', { username }),
+            content: `
+                <div class="org-assignments">
+                    <div class="org-assignments-list" id="user-orgs-list">
+                        ${orgsListHtml}
+                    </div>
+                    ${addOrgHtml}
+                </div>
+            `,
+            size: 'medium',
+            buttons: [
+                { label: _('actions.close'), class: 'btn-secondary', onClick: () => Modal.close() }
+            ],
+            onOpen: () => {
+                // Remove org handler
+                document.querySelectorAll('.remove-org-btn').forEach(btn => {
+                    btn.addEventListener('click', async () => {
+                        const orgId = btn.dataset.orgId;
+                        try {
+                            await Utils.api(`/api/organizations/${orgId}/members/${userId}`, { method: 'DELETE' });
+                            Notifications.success(_('users.org_removed'));
+                            Modal.close();
+                            showOrganizationsModal(userId, username); // Refresh
+                        } catch (error) {
+                            Notifications.error(error.message || _('errors.server_error'));
+                        }
+                    });
+                });
+                
+                // Add org handler
+                document.getElementById('add-org-btn')?.addEventListener('click', async () => {
+                    const orgId = document.getElementById('add-org-select').value;
+                    const role = document.getElementById('add-org-role').value;
+                    
+                    if (!orgId) {
+                        Notifications.error(_('policy_audit.select_org_placeholder'));
+                        return;
+                    }
+                    
+                    try {
+                        await Utils.api(`/api/users/${userId}/organizations`, {
+                            method: 'POST',
+                            body: { org_id: parseInt(orgId), role }
+                        });
+                        Notifications.success(_('organizations.user_linked'));
+                        Modal.close();
+                        showOrganizationsModal(userId, username); // Refresh
+                    } catch (error) {
+                        Notifications.error(error.message || _('errors.server_error'));
+                    }
+                });
+            }
+        });
     }
 })();

@@ -162,9 +162,12 @@ type Organization struct {
 }
 
 // OrgUser represents a user account within an organization.
+// Can be either a standalone org-scoped user (password_hash set) or a linked
+// server-level user (server_user_id set, password_hash empty).
 type OrgUser struct {
 	ID           string     `json:"id"`
 	OrgID        string     `json:"org_id"`
+	ServerUserID int64      `json:"server_user_id,omitempty"` // FK to users.id (0 = standalone org user)
 	Username     string     `json:"username"`
 	DisplayName  string     `json:"display_name,omitempty"`
 	Email        string     `json:"email,omitempty"`
@@ -383,10 +386,17 @@ type Database interface {
 	CreateOrgUser(u *OrgUser) error
 	GetOrgUser(id string) (*OrgUser, error)
 	GetOrgUserByUsername(orgID, username string) (*OrgUser, error)
+	GetOrgUserByServerUserID(orgID string, serverUserID int64) (*OrgUser, error)
 	ListOrgUsers(orgID string) ([]*OrgUser, error)
 	UpdateOrgUser(u *OrgUser) error
 	DeleteOrgUser(id string) error
 	UpdateOrgUserLogin(id string) error
+
+	// Org User Linking (Issue #106)
+	LinkUserToOrg(orgID string, userID int64, role string) (*OrgUser, error)
+	UnlinkUserFromOrg(orgID string, serverUserID int64) error
+	ListUsersNotInOrg(orgID string) ([]*User, error)
+	ListUserOrganizations(userID int64) ([]*Organization, error)
 
 	// Org Devices
 	AssignDeviceToOrg(d *OrgDevice) error

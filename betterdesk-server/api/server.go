@@ -186,6 +186,21 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("PUT /api/org/{id}/settings", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgSetting)))
 	mux.HandleFunc("POST /api/org/login", s.handleOrgLogin) // public — no auth required
 
+	// User-Org Linking (Issue #106)
+	mux.HandleFunc("GET /api/org/{id}/available-users", s.requirePermission(auth.PermOrgManageUsers, s.requireOrgMembership("id", s.handleListAvailableUsers)))
+	mux.HandleFunc("POST /api/org/{id}/members", s.requirePermission(auth.PermOrgManageUsers, s.requireOrgMembership("id", s.handleLinkUserToOrg)))
+	mux.HandleFunc("DELETE /api/org/{id}/members/{userId}", s.requirePermission(auth.PermOrgManageUsers, s.requireOrgMembership("id", s.handleUnlinkUserFromOrg)))
+
+	// Organization Policies (stored as org_settings with policy_ prefix)
+	mux.HandleFunc("GET /api/org/{id}/policy", s.requireOrgMembership("id", s.handleGetOrgPolicy))
+	mux.HandleFunc("PUT /api/org/{id}/policy/connection", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgPolicy)))
+	mux.HandleFunc("PUT /api/org/{id}/policy/features", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgPolicy)))
+	mux.HandleFunc("PUT /api/org/{id}/policy/security", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgPolicy)))
+	mux.HandleFunc("PUT /api/org/{id}/policy/network", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgPolicy)))
+	mux.HandleFunc("PUT /api/org/{id}/policy/update", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgPolicy)))
+	mux.HandleFunc("GET /api/org/{id}/policy/effective/{deviceId}", s.requireOrgMembership("id", s.handleGetEffectivePolicy))
+	mux.HandleFunc("GET /api/org/{id}/policy/audit", s.requireOrgMembership("id", s.handleGetPolicyAudit))
+
 	// Audit
 	mux.HandleFunc("GET /api/audit/events", s.handleAuditEvents)
 
@@ -222,6 +237,8 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /api/users", s.requirePermission(auth.PermUserCreate, s.handleCreateUser))
 	mux.HandleFunc("PUT /api/users/{id}", s.requirePermission(auth.PermUserEdit, s.handleUpdateUser))
 	mux.HandleFunc("DELETE /api/users/{id}", s.requirePermission(auth.PermUserDelete, s.handleDeleteUser))
+	mux.HandleFunc("GET /api/users/{id}/organizations", s.requirePermission(auth.PermUserView, s.handleListUserOrganizations))
+	mux.HandleFunc("POST /api/users/{id}/organizations", s.requirePermission(auth.PermOrgManageUsers, s.handleAssignUserToOrg))
 
 	// Roles and permissions (RBAC Phase 52)
 	mux.HandleFunc("GET /api/roles", s.requirePermission(auth.PermUserView, s.handleListRoles))

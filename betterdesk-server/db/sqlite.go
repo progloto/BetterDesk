@@ -297,6 +297,8 @@ func (s *SQLiteDB) Migrate() error {
 		{"peers", "display_name", `ALTER TABLE peers ADD COLUMN display_name TEXT DEFAULT ''`},
 		// users: is_server_admin flag (RBAC Phase 52)
 		{"users", "is_server_admin", `ALTER TABLE users ADD COLUMN is_server_admin INTEGER DEFAULT 0`},
+		// org_users: server_user_id for linking existing users (Issue #106)
+		{"org_users", "server_user_id", `ALTER TABLE org_users ADD COLUMN server_user_id INTEGER DEFAULT 0`},
 	}
 
 	for _, m := range columnMigrations {

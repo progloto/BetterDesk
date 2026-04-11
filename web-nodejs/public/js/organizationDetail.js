@@ -190,42 +190,110 @@
         }
     }
 
-    // Add User modal
-    document.getElementById('add-user-btn')?.addEventListener('click', () => {
+    // Add User modal — supports both creating new org user or linking existing server user
+    document.getElementById('add-user-btn')?.addEventListener('click', async () => {
+        // Fetch available users first
+        let availableUsers = [];
+        try {
+            const resp = await api('GET', '/available-users');
+            availableUsers = resp.users || [];
+        } catch (err) {
+            console.error('Failed to load available users:', err);
+        }
+
+        const hasAvailableUsers = availableUsers.length > 0;
+        const userOptions = availableUsers.map(u =>
+            `<option value="${u.id}">${escHtml(u.username)} (${escHtml(u.role)})</option>`
+        ).join('');
+
         Modal.show({
             title: t('add_user'),
             content: `
-                <div class="form-group">
-                    <label class="form-label">${escHtml(t('username'))}</label>
-                    <input type="text" id="modal-user-name" class="form-input" required>
+                <div class="modal-tabs">
+                    <button type="button" class="modal-tab active" data-tab="create">${escHtml(t('create_new_user'))}</button>
+                    <button type="button" class="modal-tab" data-tab="existing">${escHtml(t('add_existing_user'))}${!hasAvailableUsers ? ' (' + escHtml(t('none_available')) + ')' : ''}</button>
                 </div>
-                <div class="form-group">
-                    <label class="form-label">${escHtml(t('password'))}</label>
-                    <input type="password" id="modal-user-pass" class="form-input" required>
+                <div id="modal-tab-create" class="modal-tab-content" style="display:block">
+                    <div class="form-group">
+                        <label class="form-label">${escHtml(t('username'))}</label>
+                        <input type="text" id="modal-user-name" class="form-input" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">${escHtml(t('password'))}</label>
+                        <input type="password" id="modal-user-pass" class="form-input" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">${escHtml(t('role'))}</label>
+                        <select id="modal-user-role" class="form-input">${roleOptions('user')}</select>
+                    </div>
                 </div>
-                <div class="form-group">
-                    <label class="form-label">${escHtml(t('role'))}</label>
-                    <select id="modal-user-role" class="form-input">${roleOptions('user')}</select>
+                <div id="modal-tab-existing" class="modal-tab-content" style="display:none">
+                    ${hasAvailableUsers ? `
+                        <div class="form-group">
+                            <label class="form-label">${escHtml(t('select_user'))}</label>
+                            <select id="modal-existing-user" class="form-input">
+                                <option value="">— ${escHtml(t('select_user'))} —</option>
+                                ${userOptions}
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">${escHtml(t('org_role'))}</label>
+                            <select id="modal-existing-role" class="form-input">${roleOptions('user')}</select>
+                        </div>
+                        <p class="text-muted text-sm">${escHtml(t('link_user_hint'))}</p>
+                    ` : `
+                        <p class="text-muted">${escHtml(t('no_available_users'))}</p>
+                    `}
                 </div>
             `,
             buttons: [
                 { label: _('actions.cancel') || 'Cancel', class: 'btn-secondary', onClick: () => Modal.close() },
                 {
                     label: t('add_user'), class: 'btn-primary', icon: 'person_add', onClick: async () => {
-                        const username = document.getElementById('modal-user-name')?.value?.trim();
-                        const password = document.getElementById('modal-user-pass')?.value;
-                        const role = document.getElementById('modal-user-role')?.value || 'user';
-                        if (!username || !password) return;
-                        try {
-                            await api('POST', '/users', { username, password, role });
-                            Modal.close();
-                            toast(t('user_added'), 'success');
-                            loadUsers();
-                        } catch (err) { toast(err.message, 'error'); }
+                        const activeTab = document.querySelector('.modal-tab.active')?.dataset.tab || 'create';
+                        
+                        if (activeTab === 'create') {
+                            // Create new org user
+                            const username = document.getElementById('modal-user-name')?.value?.trim();
+                            const password = document.getElementById('modal-user-pass')?.value;
+                            const role = document.getElementById('modal-user-role')?.value || 'user';
+                            if (!username || !password) return;
+                            try {
+                                await api('POST', '/users', { username, password, role });
+                                Modal.close();
+                                toast(t('user_added'), 'success');
+                                loadUsers();
+                            } catch (err) { toast(err.message, 'error'); }
+                        } else {
+                            // Link existing server user
+                            const userId = document.getElementById('modal-existing-user')?.value;
+                            const role = document.getElementById('modal-existing-role')?.value || 'user';
+                            if (!userId) {
+                                toast(t('select_user'), 'warning');
+                                return;
+                            }
+                            try {
+                                await api('POST', '/members', { user_id: parseInt(userId, 10), role });
+                                Modal.close();
+                                toast(t('user_linked'), 'success');
+                                loadUsers();
+                            } catch (err) { toast(err.message, 'error'); }
+                        }
                     }
                 }
             ],
-            onOpen: () => setTimeout(() => document.getElementById('modal-user-name')?.focus(), 50)
+            onOpen: () => {
+                // Tab switching
+                document.querySelectorAll('.modal-tab').forEach(tab => {
+                    tab.addEventListener('click', () => {
+                        document.querySelectorAll('.modal-tab').forEach(t => t.classList.remove('active'));
+                        document.querySelectorAll('.modal-tab-content').forEach(c => c.style.display = 'none');
+                        tab.classList.add('active');
+                        document.getElementById(`modal-tab-${tab.dataset.tab}`).style.display = 'block';
+                    });
+                });
+                setTimeout(() => document.getElementById('modal-user-name')?.focus(), 50);
+            }
         });
     });
 
