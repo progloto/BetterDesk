@@ -1154,7 +1154,7 @@ func (s *SQLiteDB) GetDeviceTokenByPeerID(peerID string) (*DeviceToken, error) {
 	defer s.mu.RUnlock()
 	return s.getDeviceTokenByQuery(`SELECT id, token_hash, token_prefix, name, peer_id, status, max_uses, use_count, 
 		created_at, expires_at, revoked_at, last_used_at, created_by, note 
-		FROM device_tokens WHERE peer_id = ? AND status = 'active'`, peerID)
+		FROM device_tokens WHERE peer_id = ? AND status IN ('active', 'pending')`, peerID)
 }
 
 // getDeviceTokenByQuery is a helper function to scan a device token row.

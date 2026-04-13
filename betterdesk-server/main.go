@@ -106,6 +106,12 @@ func main() {
 
 	log.Printf("Database initialized successfully")
 
+	// Restore enrollment mode from DB (persisted via handleSetEnrollmentMode)
+	if storedMode, _ := database.GetConfig("enrollment_mode"); storedMode != "" {
+		cfg.EnrollmentMode = storedMode
+		log.Printf("Restored enrollment mode from DB: %s", storedMode)
+	}
+
 	// Initialize security modules
 	blocklist := security.NewBlocklist()
 	if cfg.BlocklistFile != "" {

@@ -1044,7 +1044,7 @@ func (pg *PostgresDB) GetDeviceTokenByHash(tokenHash string) (*DeviceToken, erro
 func (pg *PostgresDB) GetDeviceTokenByPeerID(peerID string) (*DeviceToken, error) {
 	return pg.getDeviceTokenByQuery(`SELECT id, token_hash, token_prefix, name, peer_id, status, max_uses, use_count, 
 		created_at, expires_at, revoked_at, last_used_at, created_by, note 
-		FROM device_tokens WHERE peer_id = $1 AND status = 'active'`, peerID)
+		FROM device_tokens WHERE peer_id = $1 AND status IN ('active', 'pending')`, peerID)
 }
 
 // getDeviceTokenByQuery is a helper function to scan a device token row.

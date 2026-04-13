@@ -224,14 +224,24 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "managed":
-		// Check for valid token first
+		// Check for valid token first — validate by token hash, not peer binding
 		if req.Token != "" {
-			if tok, err := s.db.GetDeviceTokenByPeerID(req.DeviceID); err == nil && tok != nil {
-				// Token exists — auto-approve
+			if tok, err := s.db.GetDeviceTokenByHash(hashToken(req.Token)); err == nil && tok != nil {
+				// Valid token — activate and bind to this device, then auto-approve
+				if tok.Status == "pending" {
+					_ = s.db.BindTokenToPeer(tok.TokenHash, req.DeviceID)
+				}
+				_ = s.db.IncrementTokenUse(tok.TokenHash)
 				s.createPeerFromEnrollment(&req, clientIP)
 				resp := s.buildEnrollmentResponse("approved", req.DeviceID, "standard", "")
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(resp)
+
+				if s.auditLog != nil {
+					s.auditLog.Log("device_enrolled", clientIP, req.DeviceID, map[string]string{
+						"mode": "managed", "method": "token", "hostname": req.Hostname,
+					})
+				}
 				return
 			}
 		}
@@ -269,6 +279,28 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "locked":
+		// Only allow enrollment with a valid token
+		if req.Token != "" {
+			if tok, err := s.db.GetDeviceTokenByHash(hashToken(req.Token)); err == nil && tok != nil {
+				// Valid token — activate and bind to this device, then approve
+				if tok.Status == "pending" {
+					_ = s.db.BindTokenToPeer(tok.TokenHash, req.DeviceID)
+				}
+				_ = s.db.IncrementTokenUse(tok.TokenHash)
+				s.createPeerFromEnrollment(&req, clientIP)
+				resp := s.buildEnrollmentResponse("approved", req.DeviceID, "standard", "")
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(resp)
+
+				if s.auditLog != nil {
+					s.auditLog.Log("device_enrolled", clientIP, req.DeviceID, map[string]string{
+						"mode": "locked", "method": "token", "hostname": req.Hostname,
+					})
+				}
+				return
+			}
+		}
+
 		resp := EnrollmentResponse{
 			Status:   "rejected",
 			DeviceID: req.DeviceID,
