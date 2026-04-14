@@ -575,6 +575,9 @@ const DeviceDetail = (function () {
     function _footerHTML() {
         return `
         <div class="device-panel-footer">
+            <button class="btn btn-secondary" id="dp-edit-btn">
+                <span class="material-icons">edit</span>${_('actions.edit')}
+            </button>
             <button class="btn btn-primary" id="dp-connect-btn">
                 <span class="material-icons">link</span>${_('actions.connect')}
             </button>
@@ -701,6 +704,13 @@ const DeviceDetail = (function () {
 
         // Footer buttons
         panel.querySelector('#dp-close-btn')?.addEventListener('click', close);
+        panel.querySelector('#dp-edit-btn')?.addEventListener('click', function () {
+            if (window.BetterDeskDevices && typeof window.BetterDeskDevices.showEditModal === 'function' && device) {
+                window.BetterDeskDevices.showEditModal(device.id);
+            } else {
+                Notifications.error(_('errors.server_error'));
+            }
+        });
         panel.querySelector('#dp-connect-btn')?.addEventListener('click', function () {
             if (device) window.open('/remote-desktop/' + encodeURIComponent(device.id), '_blank');
         });
