@@ -12,6 +12,20 @@
 const DeviceDetail = (function () {
     'use strict';
 
+    document.addEventListener('devices:updated', function (event) {
+        const detail = event.detail || {};
+        if (!device || !detail.id || device.id !== detail.id) return;
+
+        if (typeof detail.display_name === 'string') {
+            device.display_name = detail.display_name;
+        }
+        if (typeof detail.note === 'string') {
+            device.note = detail.note;
+        }
+
+        _render();
+    });
+
     // ──────────────────────────────────────────────────────────────────────
     // State
     // ──────────────────────────────────────────────────────────────────────

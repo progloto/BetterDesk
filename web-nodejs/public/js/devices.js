@@ -981,6 +981,22 @@
                 { label: _('actions.save'), class: 'btn-primary', onClick: async () => {
                     const displayName = document.getElementById('edit-display-name').value.trim();
                     const note = document.getElementById('edit-note').value.trim();
+                    const saveBtn = document.querySelector('.modal-overlay.open [data-btn-index="0"]');
+                    const closeBtn = document.querySelector('.modal-overlay.open [data-btn-index="1"]');
+                    const restoreButtons = () => {
+                        if (saveBtn) {
+                            saveBtn.disabled = false;
+                            saveBtn.textContent = _('actions.save');
+                        }
+                        if (closeBtn) closeBtn.disabled = false;
+                    };
+
+                    if (saveBtn) {
+                        saveBtn.disabled = true;
+                        saveBtn.textContent = _('common.loading');
+                    }
+                    if (closeBtn) closeBtn.disabled = true;
+
                     try {
                         const resp = await Utils.api(`/api/devices/${encodeURIComponent(device.id)}`, {
                             method: 'PATCH',
@@ -988,14 +1004,31 @@
                             headers: { 'Content-Type': 'application/json' }
                         });
                         if (resp.success) {
-                            Toast.success(_('devices.display_name'), _('actions.saved'));
-                            Modal.close();
+                            device.display_name = displayName;
+                            device.note = note;
+                            applyFilters();
+                            document.dispatchEvent(new CustomEvent('devices:updated', {
+                                detail: {
+                                    id: device.id,
+                                    display_name: displayName,
+                                    note: note
+                                }
+                            }));
+
+                            if (saveBtn) {
+                                saveBtn.textContent = _('common.saved');
+                            }
+
+                            Notifications.success(_('common.saved'), _('devices.display_name'));
+                            setTimeout(() => Modal.close(), 250);
                             loadDevices();
                         } else {
-                            Toast.error(_('errors.error'), resp.error || _('errors.server_error'));
+                            restoreButtons();
+                            Notifications.error(resp.error || _('errors.server_error'));
                         }
                     } catch (err) {
-                        Toast.error(_('errors.error'), err.message);
+                        restoreButtons();
+                        Notifications.error(err.message || _('errors.server_error'));
                     }
                 }},
                 { label: _('actions.close'), class: 'btn-secondary', onClick: () => Modal.close() }
