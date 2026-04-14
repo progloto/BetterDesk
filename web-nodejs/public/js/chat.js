@@ -654,9 +654,9 @@
                 });
             }
 
-            if (typeof Toast !== 'undefined') Toast.success(_('chat.file_share'), file.name);
+            if (typeof Notifications !== 'undefined') Notifications.success(file.name, _('chat.file_share'));
         } catch (e) {
-            if (typeof Toast !== 'undefined') Toast.error(_('toast.error_generic'), e.message);
+            if (typeof Notifications !== 'undefined') Notifications.error(e.message);
         }
     }
 
@@ -1017,7 +1017,7 @@
             const file = dom.fileInput.files[0];
             if (!file) return;
             if (file.size > 50 * 1024 * 1024) {
-                if (typeof Toast !== 'undefined') Toast.error(_('chat.file_too_large'));
+                if (typeof Notifications !== 'undefined') Notifications.error(_('chat.file_too_large'));
                 return;
             }
             pendingFile = file;

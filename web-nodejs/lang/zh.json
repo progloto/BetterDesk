@@ -2161,7 +2161,10 @@
     "update_channel": "更新频道",
     "audit_title": "策略变更",
     "audit_desc": "最近的策略变更历史",
-    "no_audit": "没有记录的策略变更。"
+    "no_audit": "没有记录的策略变更。",
+    "save_success": "策略保存成功",
+    "save_failed": "保存策略失败",
+    "load_failed": "加载策略失败"
   },
   "attestation": {
     "title": "设备认证",
@@ -2177,7 +2180,11 @@
     "col_status": "状态",
     "col_last_check": "最后检查",
     "col_actions": "操作",
-    "no_records": "未找到认证记录。"
+    "no_records": "未找到认证记录。",
+    "verify_success": "设备已标记为已验证",
+    "verify_failed": "验证设备失败",
+    "revoke_success": "设备认证已撤销",
+    "revoke_failed": "撤销认证失败"
   },
   "fleet": {
     "title": "车队管理",

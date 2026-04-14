@@ -82,10 +82,10 @@
         body: JSON.stringify({ status: 'verified' })
       });
       if (!resp.ok) throw new Error(resp.statusText);
-      if (typeof Toast !== 'undefined') Toast.success('Verified', 'Device marked as verified');
+      if (typeof Notifications !== 'undefined') Notifications.success(_('attestation.verify_success') || 'Device marked as verified');
       loadAttestation();
     } catch (e) {
-      if (typeof Toast !== 'undefined') Toast.error('Error', 'Failed to verify device');
+      if (typeof Notifications !== 'undefined') Notifications.error(_('attestation.verify_failed') || 'Failed to verify device');
     }
   }
 
@@ -103,10 +103,10 @@
         body: JSON.stringify({ status: 'revoked' })
       });
       if (!resp.ok) throw new Error(resp.statusText);
-      if (typeof Toast !== 'undefined') Toast.warning('Revoked', 'Device attestation revoked');
+      if (typeof Notifications !== 'undefined') Notifications.warning(_('attestation.revoke_success') || 'Device attestation revoked');
       loadAttestation();
     } catch (e) {
-      if (typeof Toast !== 'undefined') Toast.error('Error', 'Failed to revoke attestation');
+      if (typeof Notifications !== 'undefined') Notifications.error(_('attestation.revoke_failed') || 'Failed to revoke attestation');
     }
   }
 

@@ -173,15 +173,15 @@
             const data = await resp.json();
 
             if (data.fixed > 0) {
-                if (window.Toast) {
-                    Toast.success(_('languages.fixed_title'), _('languages.fixed_msg').replace('{n}', data.fixed).replace('{code}', code));
+                if (typeof Notifications !== 'undefined') {
+                    Notifications.success(_('languages.fixed_msg').replace('{n}', data.fixed).replace('{code}', code), _('languages.fixed_title'));
                 } else {
                     alert(`Fixed ${data.fixed} missing keys in ${code}`);
                 }
                 await loadLanguages();
             } else {
-                if (window.Toast) {
-                    Toast.info(_('languages.no_fix_needed'), '');
+                if (typeof Notifications !== 'undefined') {
+                    Notifications.info(_('languages.no_fix_needed'));
                 }
             }
         } catch (err) {

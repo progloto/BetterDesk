@@ -38,8 +38,8 @@
     }
 
     function toast(msg, type = 'info') {
-        if (window.showToast) window.showToast(msg, type);
-        else if (window.Toast) window.Toast[type] ? window.Toast[type]('', msg) : window.Toast.info('', msg);
+        if (typeof Notifications !== 'undefined' && Notifications[type]) Notifications[type](msg);
+        else if (window.showToast) window.showToast(msg, type);
         else console.log(`[${type}]`, msg);
     }
 

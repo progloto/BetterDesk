@@ -2154,7 +2154,10 @@
     "update_channel": "Update Channel",
     "audit_title": "Policy Changes",
     "audit_desc": "Recent policy change history",
-    "no_audit": "No policy changes recorded."
+    "no_audit": "No policy changes recorded.",
+    "save_success": "Policy saved successfully",
+    "save_failed": "Failed to save policy",
+    "load_failed": "Failed to load policies"
   },
   "attestation": {
     "title": "Device Attestation",
@@ -2170,7 +2173,11 @@
     "col_status": "Status",
     "col_last_check": "Last Check",
     "col_actions": "Actions",
-    "no_records": "No attestation records found."
+    "no_records": "No attestation records found.",
+    "verify_success": "Device marked as verified",
+    "verify_failed": "Failed to verify device",
+    "revoke_success": "Device attestation revoked",
+    "revoke_failed": "Failed to revoke attestation"
   },
   "fleet": {
     "title": "Fleet Management",

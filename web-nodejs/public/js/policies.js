@@ -53,7 +53,7 @@
       loadAuditLog();
     } catch (e) {
       console.warn('Failed to fetch policies:', e);
-      if (typeof Toast !== 'undefined') Toast.error('Error', 'Failed to load policies');
+      if (typeof Notifications !== 'undefined') Notifications.error(_('policies.load_failed') || 'Failed to load policies');
     }
   }
 
@@ -161,11 +161,11 @@
         body: JSON.stringify(body)
       });
       if (!resp.ok) throw new Error(resp.statusText);
-      if (typeof Toast !== 'undefined') Toast.success('Saved', `${section} policy updated`);
+      if (typeof Notifications !== 'undefined') Notifications.success(_('policies.save_success') || `${section} policy updated`);
       await fetchPolicies();
     } catch (e) {
       console.error('Save failed:', e);
-      if (typeof Toast !== 'undefined') Toast.error('Error', 'Failed to save policy');
+      if (typeof Notifications !== 'undefined') Notifications.error(_('policies.save_failed') || 'Failed to save policy');
     }
   }
 
