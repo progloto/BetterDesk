@@ -883,6 +883,11 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 395. [x] **requireOrgMembership global_admin bypass**: Updated to allow super_admin AND global_admin to access any org.
 396. [x] **Node.js 7-role middleware**: Updated `DEFAULT_ROLE_PERMISSIONS` with 7 entries (super_admin, admin, server_admin, global_admin, operator, viewer, pro). Added `SUPER_ADMIN_ROLES` set + `isSuperAdminRole()`. Updated `requireRole`, `requireAdmin`, `requirePermission` to handle new roles.
 
+#### Node.js Frontend — CSRF Token Fixes (Phase 53) ✅ COMPLETED 2026-04-10
+397. [x] **Organization policy save failing (Issue #112)**: `policies.js` retrieved CSRF token via `document.querySelector('meta[name="csrf-token"]')` which does NOT exist — layout uses `window.BetterDesk.csrfToken` instead. All PUT requests failed CSRF validation silently. Fixed `policies.js` to use `window.BetterDesk?.csrfToken || ''`.
+398. [x] **Attestation verify/revoke failing**: Same CSRF issue in `attestation.js` — both `verify()` and `revoke()` functions used non-existent meta tag. Fixed to use `window.BetterDesk?.csrfToken`.
+399. [x] **Toolkit API calls failing**: `toolkit.js` cached CSRF from meta tag at module init. Fixed to call `getCsrfToken()` dynamically which reads from `window.BetterDesk?.csrfToken`.
+
 ### Konfiguracja przez Zmienne Środowiskowe
 
 ```bash
@@ -1152,4 +1157,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-04-10 (Phase 51: GitHub Issue Triage — 16 issues closed, TCP EOF filter, admin password race fix, ID change ghost cleanup, CSS animations, RBAC discussion response. Previous: Phases 47-48 + Windows 11 snap layouts, desktop login fix, Chat E2E, Web Remote, UI polish, widget groups) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-04-10 (Phase 53: CSRF Token Fixes — Issue #112 policy save fix, attestation verify/revoke fix, toolkit API calls fix. Previous: Phase 51/52 GitHub Issue Triage, RBAC Permissions, 6-Role Hierarchy) przez GitHub Copilot*

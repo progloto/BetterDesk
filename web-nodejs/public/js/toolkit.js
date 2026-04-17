@@ -14,9 +14,9 @@
 (function () {
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    var csrfToken = '';
-    var meta = document.querySelector('meta[name="csrf-token"]');
-    if (meta) csrfToken = meta.getAttribute('content');
+    function getCsrfToken() {
+        return window.BetterDesk?.csrfToken || '';
+    }
 
     function t(key, fallback) {
         if (typeof _ === 'function') {
@@ -29,7 +29,8 @@
     function api(url, opts) {
         opts = opts || {};
         var headers = { 'Content-Type': 'application/json' };
-        if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+        var token = getCsrfToken();
+        if (token) headers['X-CSRF-Token'] = token;
         return fetch(url, {
             method: opts.method || 'POST',
             headers: headers,
