@@ -462,7 +462,118 @@ function deployServerBinary(builtBinaryPath, targetPath) {
 }
 
 /**
+ * Determine the expected binary asset name for this platform+arch on GitHub Releases.
+ * @returns {string}
+ */
+function getReleaseBinaryName() {
+    const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
+    if (IS_WINDOWS) return `betterdesk-server-windows-${arch}.exe`;
+    const os = process.platform === 'darwin' ? 'darwin' : 'linux';
+    return `betterdesk-server-${os}-${arch}`;
+}
+
+/**
+ * Check if a pre-built binary is available on GitHub Releases.
+ * Looks for the latest release, then for a binary asset matching the current OS/arch.
+ *
+ * @returns {Promise<{ available: boolean, downloadUrl: string|null, releaseName: string|null, releaseTag: string|null, assetSize: number|null }>}
+ */
+async function checkPrebuiltAvailable() {
+    try {
+        const release = await ghGet(`/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`);
+        if (!release || !release.assets || !release.assets.length) {
+            return { available: false, downloadUrl: null, releaseName: null, releaseTag: null, assetSize: null };
+        }
+
+        const binaryName = getReleaseBinaryName();
+        // Also check common alternative names (without os-arch suffix for Windows)
+        const altNames = IS_WINDOWS
+            ? [binaryName, 'betterdesk-server.exe']
+            : [binaryName, `betterdesk-server-${process.platform === 'darwin' ? 'darwin' : 'linux'}`];
+
+        const asset = release.assets.find(a =>
+            altNames.some(name => a.name === name || a.name.toLowerCase() === name.toLowerCase())
+        );
+
+        if (asset) {
+            return {
+                available: true,
+                downloadUrl: asset.browser_download_url,
+                releaseName: release.name || release.tag_name,
+                releaseTag: release.tag_name,
+                assetSize: asset.size || null
+            };
+        }
+
+        return { available: false, downloadUrl: null, releaseName: release.name, releaseTag: release.tag_name, assetSize: null };
+    } catch (_e) {
+        return { available: false, downloadUrl: null, releaseName: null, releaseTag: null, assetSize: null };
+    }
+}
+
+/**
+ * Download a pre-built binary from a URL.
+ * Validates the download is non-empty and reasonable size.
+ *
+ * @param {string} downloadUrl
+ * @returns {Promise<{ success: boolean, binaryPath: string|null, error?: string, size?: number }>}
+ */
+async function downloadPrebuiltBinary(downloadUrl) {
+    if (!downloadUrl || typeof downloadUrl !== 'string' || !downloadUrl.startsWith('https://')) {
+        return { success: false, binaryPath: null, error: 'Invalid download URL' };
+    }
+
+    const serverDir = COMPONENTS.server.localRoot;
+    fs.mkdirSync(serverDir, { recursive: true });
+
+    const binaryName = IS_WINDOWS ? 'betterdesk-server.exe' : 'betterdesk-server';
+    const outputPath = path.join(serverDir, binaryName);
+
+    try {
+        const data = await new Promise((resolve, reject) => {
+            const headers = { 'User-Agent': USER_AGENT, 'Accept': 'application/octet-stream' };
+            if (GITHUB_TOKEN) headers['Authorization'] = `Bearer ${GITHUB_TOKEN}`;
+
+            const follow = (target, redirects = 0) => {
+                if (redirects > 5) return reject(new Error('Too many redirects'));
+                const url = new URL(target);
+                const mod = url.protocol === 'https:' ? https : require('http');
+                const req = mod.get({ hostname: url.hostname, path: url.pathname + url.search, headers }, (res) => {
+                    if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
+                        return follow(res.headers.location, redirects + 1);
+                    }
+                    if (res.statusCode !== 200) {
+                        return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+                    }
+                    const chunks = [];
+                    res.on('data', c => chunks.push(c));
+                    res.on('end', () => resolve(Buffer.concat(chunks)));
+                });
+                req.on('error', reject);
+                req.setTimeout(120000, () => { req.destroy(); reject(new Error('Download timeout (120s)')); });
+            };
+            follow(downloadUrl);
+        });
+
+        // Sanity check: binary should be at least 1MB
+        if (!data || data.length < 1024 * 1024) {
+            return { success: false, binaryPath: null, error: `Downloaded file too small (${data ? data.length : 0} bytes) — likely not a valid binary` };
+        }
+
+        fs.writeFileSync(outputPath, data);
+        if (!IS_WINDOWS) {
+            try { fs.chmodSync(outputPath, 0o755); } catch (_e) { /* ok */ }
+        }
+
+        return { success: true, binaryPath: outputPath, size: data.length };
+    } catch (err) {
+        return { success: false, binaryPath: null, error: `Binary download failed: ${err.message}` };
+    }
+}
+
+/**
  * Get server update readiness info for the UI.
+ * Returns information about all available update strategies.
  */
 function getServerUpdateInfo() {
     const goInfo = checkGoAvailable();
@@ -474,8 +585,19 @@ function getServerUpdateInfo() {
         goVersion: goInfo.version,
         binaryPath,
         sourcePresent,
-        canAutoUpdate: goInfo.available
+        canAutoUpdate: goInfo.available,
+        // Platform info for binary matching
+        platform: IS_WINDOWS ? 'windows' : process.platform,
+        arch: process.arch === 'arm64' ? 'arm64' : 'amd64',
+        expectedBinary: getReleaseBinaryName()
     };
+}
+
+/**
+ * Check pre-built binary availability (async — called separately from getServerUpdateInfo).
+ */
+async function getPrebuiltInfo() {
+    return checkPrebuiltAvailable();
 }
 
 // ======================== Public API ====================================
@@ -740,53 +862,127 @@ async function applyUpdate(remoteSHA, changedData, opts = {}) {
         }
     }
 
-    // ---- Server source files + compile + deploy ----
+    // ---- Server source files + compile/download + deploy ----
     if (changedData.grouped.server?.length && selectedComponents.includes('server')) {
-        // 1. Ensure full source is present (downloads if missing)
-        try {
-            const sourceResult = await ensureServerSource(remoteSHA);
-            console.log(`[UPDATE] Server source: strategy=${sourceResult.strategy}, files=${sourceResult.filesDownloaded}`);
-        } catch (err) {
-            results.failed.push({ file: 'server-source', error: `Source download failed: ${err.message}` });
-        }
+        const strategy = opts.serverStrategy || 'auto'; // 'auto', 'compile', 'download'
+        const goAvailable = checkGoAvailable().available;
+        let serverBinaryPath = null;
+        let buildUsed = null;
 
-        // 2. Download changed server source files (incremental)
-        const serverDir = COMPONENTS.server.localRoot;
-        for (const file of changedData.grouped.server) {
+        if (strategy === 'compile' || (strategy === 'auto' && goAvailable)) {
+            // ---- Strategy: Compile from source ----
+            // 1. Ensure full source is present (downloads if missing)
             try {
-                if (file.status === 'removed') {
-                    const localPath = file.path.slice(COMPONENTS.server.prefix.length);
-                    const localFile = path.join(serverDir, localPath);
-                    if (fs.existsSync(localFile)) { fs.unlinkSync(localFile); results.removed.push(file.path); }
-                    continue;
-                }
-                const content = await ghDownloadFile(GITHUB_OWNER, GITHUB_REPO, remoteSHA, file.path);
-                const localPath = file.path.slice(COMPONENTS.server.prefix.length);
-                const dest = path.join(serverDir, localPath);
-                fs.mkdirSync(path.dirname(dest), { recursive: true });
-                fs.writeFileSync(dest, content);
-                results.applied.push(file.path);
+                const sourceResult = await ensureServerSource(remoteSHA);
+                console.log(`[UPDATE] Server source: strategy=${sourceResult.strategy}, files=${sourceResult.filesDownloaded}`);
             } catch (err) {
-                results.failed.push({ file: file.path, error: err.message });
+                results.failed.push({ file: 'server-source', error: `Source download failed: ${err.message}` });
+            }
+
+            // 2. Download changed server source files (incremental)
+            const serverDir = COMPONENTS.server.localRoot;
+            for (const file of changedData.grouped.server) {
+                try {
+                    if (file.status === 'removed') {
+                        const localPath = file.path.slice(COMPONENTS.server.prefix.length);
+                        const localFile = path.join(serverDir, localPath);
+                        if (fs.existsSync(localFile)) { fs.unlinkSync(localFile); results.removed.push(file.path); }
+                        continue;
+                    }
+                    const content = await ghDownloadFile(GITHUB_OWNER, GITHUB_REPO, remoteSHA, file.path);
+                    const localPath = file.path.slice(COMPONENTS.server.prefix.length);
+                    const dest = path.join(serverDir, localPath);
+                    fs.mkdirSync(path.dirname(dest), { recursive: true });
+                    fs.writeFileSync(dest, content);
+                    results.applied.push(file.path);
+                } catch (err) {
+                    results.failed.push({ file: file.path, error: err.message });
+                }
+            }
+
+            // 3. Build binary from source
+            const buildResult = await buildGoServer();
+            results.serverBuild = {
+                success: buildResult.success,
+                duration: buildResult.duration || 0,
+                error: buildResult.error || null,
+                method: 'compile'
+            };
+
+            if (buildResult.success) {
+                serverBinaryPath = buildResult.binaryPath;
+                buildUsed = 'compile';
+            }
+        } else {
+            // ---- Strategy: Download pre-built binary ----
+            console.log('[UPDATE] Go not available or download strategy selected — trying pre-built binary download');
+
+            // Try to get from GitHub Releases first
+            let downloadResult = null;
+            const prebuilt = await checkPrebuiltAvailable();
+
+            if (prebuilt.available && prebuilt.downloadUrl) {
+                downloadResult = await downloadPrebuiltBinary(prebuilt.downloadUrl);
+            }
+
+            // If release download failed, try direct raw download of the binary from the repo tree
+            if (!downloadResult || !downloadResult.success) {
+                const binaryName = IS_WINDOWS ? 'betterdesk-server.exe' : 'betterdesk-server-linux-amd64';
+                const repoPath = `betterdesk-server/${binaryName}`;
+                try {
+                    console.log(`[UPDATE] Trying raw binary download from repo: ${repoPath}`);
+                    const data = await ghDownloadFile(GITHUB_OWNER, GITHUB_REPO, remoteSHA, repoPath);
+                    if (data && data.length > 1024 * 1024) {
+                        const serverDir = COMPONENTS.server.localRoot;
+                        fs.mkdirSync(serverDir, { recursive: true });
+                        const outName = IS_WINDOWS ? 'betterdesk-server.exe' : 'betterdesk-server';
+                        const outputPath = path.join(serverDir, outName);
+                        fs.writeFileSync(outputPath, data);
+                        if (!IS_WINDOWS) {
+                            try { fs.chmodSync(outputPath, 0o755); } catch (_e) { /* ok */ }
+                        }
+                        downloadResult = { success: true, binaryPath: outputPath, size: data.length };
+                    }
+                } catch (_e) {
+                    // Binary not in repo tree — expected
+                }
+            }
+
+            if (downloadResult && downloadResult.success) {
+                results.serverBuild = {
+                    success: true,
+                    duration: 0,
+                    error: null,
+                    method: 'download',
+                    size: downloadResult.size || 0
+                };
+                serverBinaryPath = downloadResult.binaryPath;
+                buildUsed = 'download';
+            } else {
+                const errMsg = downloadResult?.error || 'No pre-built binary available and Go not installed';
+                results.serverBuild = {
+                    success: false,
+                    duration: 0,
+                    error: errMsg,
+                    method: 'download'
+                };
+            }
+
+            // Still download source files for tracking even if binary was downloaded
+            for (const f of changedData.grouped.server) {
+                results.skipped.push(f.path + ' (source — binary downloaded)');
             }
         }
 
-        // 3. Build binary from source
-        const buildResult = await buildGoServer();
-        results.serverBuild = {
-            success: buildResult.success,
-            duration: buildResult.duration || 0,
-            error: buildResult.error || null
-        };
-
-        if (buildResult.success) {
-            // 4. Deploy to service path
+        // 4. Deploy to service path (common for both strategies)
+        if (serverBinaryPath) {
             const targetPath = detectServerBinaryPath();
-            const deployResult = deployServerBinary(buildResult.binaryPath, targetPath);
+            const deployResult = deployServerBinary(serverBinaryPath, targetPath);
             results.serverDeploy = {
                 success: deployResult.success,
                 backupPath: deployResult.backupPath || null,
-                error: deployResult.error || null
+                error: deployResult.error || null,
+                method: buildUsed
             };
 
             if (deployResult.success) {
@@ -905,5 +1101,6 @@ module.exports = {
     getLocalSHA,
     saveLocalSHA,
     getServerUpdateInfo,
+    getPrebuiltInfo,
     COMPONENTS
 };

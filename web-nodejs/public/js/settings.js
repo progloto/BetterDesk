@@ -1312,12 +1312,27 @@
             
             if (grouped.server?.length > 0) {
                 html += `<div class="update-server-section" style="margin-top:12px;padding:12px;border:1px solid var(--border-color, #333);border-radius:8px;">
-                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
                         <label class="restore-option" style="margin:0;">
                             <input type="checkbox" id="update-include-server">
                             <span>${_('updates.include_server')}</span>
                         </label>
                         <span id="update-server-status" class="badge badge-warning badge-sm">${_('updates.checking_go')}</span>
+                    </div>
+                    <div id="update-server-strategy" style="display:none;margin:8px 0;padding:8px;background:var(--bg-tertiary, #1a1e24);border-radius:6px;">
+                        <div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;">${_('updates.strategy_label')}</div>
+                        <label style="display:flex;align-items:center;gap:6px;margin:4px 0;cursor:pointer;font-size:13px;">
+                            <input type="radio" name="server-strategy" value="download" id="strategy-download">
+                            <span class="material-icons" style="font-size:16px;">cloud_download</span>
+                            <span>${_('updates.strategy_download')}</span>
+                            <span id="strategy-download-badge" class="badge badge-sm" style="margin-left:4px;"></span>
+                        </label>
+                        <label style="display:flex;align-items:center;gap:6px;margin:4px 0;cursor:pointer;font-size:13px;">
+                            <input type="radio" name="server-strategy" value="compile" id="strategy-compile">
+                            <span class="material-icons" style="font-size:16px;">build</span>
+                            <span>${_('updates.strategy_compile')}</span>
+                            <span id="strategy-compile-badge" class="badge badge-sm" style="margin-left:4px;"></span>
+                        </label>
                     </div>
                     <div id="update-server-info" class="text-muted" style="font-size:11px;"></div>
                 </div>`;
@@ -1336,31 +1351,90 @@
         const statusEl = document.getElementById('update-server-status');
         const infoEl = document.getElementById('update-server-info');
         const toggleEl = document.getElementById('update-include-server');
+        const strategySection = document.getElementById('update-server-strategy');
+        const downloadRadio = document.getElementById('strategy-download');
+        const compileRadio = document.getElementById('strategy-compile');
+        const downloadBadge = document.getElementById('strategy-download-badge');
+        const compileBadge = document.getElementById('strategy-compile-badge');
         if (!statusEl || !toggleEl) return;
         
         try {
             const info = await Utils.api('/api/settings/updates/server-info');
-            if (info.goAvailable) {
-                statusEl.className = 'badge badge-success badge-sm';
-                statusEl.textContent = info.goVersion ? info.goVersion.replace('go version ', '') : 'Go available';
-                toggleEl.disabled = false;
+            const hasGo = info.goAvailable;
+            const prebuilt = info.prebuilt || {};
+            const hasDownload = prebuilt.available;
+            const canUpdate = hasGo || hasDownload;
+            
+            // Always enable the checkbox if at least one strategy is available
+            toggleEl.disabled = !canUpdate;
+            if (!canUpdate) toggleEl.checked = false;
+            
+            // Show strategy section when checkbox is enabled
+            if (strategySection && canUpdate) {
+                strategySection.style.display = '';
+                
+                // Show/enable strategy options based on availability
+                if (downloadRadio) {
+                    downloadRadio.disabled = !hasDownload;
+                    if (downloadBadge) {
+                        if (hasDownload) {
+                            const sizeMB = prebuilt.assetSize ? (prebuilt.assetSize / (1024 * 1024)).toFixed(1) + ' MB' : '';
+                            downloadBadge.className = 'badge badge-success badge-sm';
+                            downloadBadge.textContent = prebuilt.releaseTag ? `${prebuilt.releaseTag}${sizeMB ? ' · ' + sizeMB : ''}` : _('updates.available');
+                        } else {
+                            downloadBadge.className = 'badge badge-warning badge-sm';
+                            downloadBadge.textContent = _('updates.no_release');
+                        }
+                    }
+                }
+                if (compileRadio) {
+                    compileRadio.disabled = !hasGo;
+                    if (compileBadge) {
+                        if (hasGo) {
+                            compileBadge.className = 'badge badge-success badge-sm';
+                            compileBadge.textContent = info.goVersion ? info.goVersion.replace('go version ', '') : 'Go';
+                        } else {
+                            compileBadge.className = 'badge badge-warning badge-sm';
+                            compileBadge.textContent = _('updates.go_not_found');
+                        }
+                    }
+                }
+                
+                // Auto-select the best available strategy
+                if (hasDownload && downloadRadio) downloadRadio.checked = true;
+                else if (hasGo && compileRadio) compileRadio.checked = true;
+            }
+            
+            // Status badge
+            if (canUpdate) {
+                if (hasGo && hasDownload) {
+                    statusEl.className = 'badge badge-success badge-sm';
+                    statusEl.textContent = _('updates.both_available');
+                } else if (hasDownload) {
+                    statusEl.className = 'badge badge-info badge-sm';
+                    statusEl.textContent = _('updates.download_available');
+                } else {
+                    statusEl.className = 'badge badge-success badge-sm';
+                    statusEl.textContent = info.goVersion ? info.goVersion.replace('go version ', '') : 'Go';
+                }
             } else {
                 statusEl.className = 'badge badge-danger badge-sm';
-                statusEl.textContent = _('updates.go_not_found');
-                toggleEl.disabled = true;
-                toggleEl.checked = false;
+                statusEl.textContent = _('updates.no_method');
             }
+            
+            // Info line
             if (infoEl) {
                 const parts = [];
                 if (info.binaryPath) parts.push(`Binary: ${info.binaryPath}`);
                 if (info.sourcePresent) parts.push('Source: present');
-                else parts.push('Source: will be downloaded');
+                if (hasDownload && prebuilt.releaseName) parts.push(`Release: ${prebuilt.releaseName}`);
+                if (!hasGo && !hasDownload) parts.push(_('updates.install_go_hint'));
                 infoEl.textContent = parts.join(' · ');
             }
         } catch (_e) {
             statusEl.className = 'badge badge-warning badge-sm';
             statusEl.textContent = _('updates.go_check_failed');
-            toggleEl.disabled = true;
+            toggleEl.disabled = false; // Allow user to try anyway
         }
     }
     
@@ -1376,8 +1450,11 @@
         }
         
         const includeServer = document.getElementById('update-include-server')?.checked || false;
+        const serverStrategy = includeServer
+            ? (document.querySelector('input[name="server-strategy"]:checked')?.value || 'auto')
+            : null;
         const confirmMsg = includeServer
-            ? _('updates.install_confirm') + '\n\n' + _('updates.server_build_note')
+            ? _('updates.install_confirm') + '\n\n' + (serverStrategy === 'compile' ? _('updates.server_build_note') : _('updates.server_download_note'))
             : _('updates.install_confirm');
         
         if (!confirm(confirmMsg)) return;
@@ -1396,18 +1473,18 @@
             if (progressText) progressText.textContent = createBackup ? _('updates.creating_backup') : _('updates.downloading');
             
             if (includeServer) {
-                // Server build can take minutes — show an informative message
+                // Server build/download can take time — show an informative message
                 setTimeout(() => {
                     if (progressFill && progressFill.style.width !== '100%') {
                         progressFill.style.width = '50%';
-                        if (progressText) progressText.textContent = _('updates.server_building');
+                        if (progressText) progressText.textContent = serverStrategy === 'compile' ? _('updates.server_building') : _('updates.server_downloading');
                     }
                 }, 5000);
             }
             
             const result = await Utils.api('/api/settings/updates/install', {
                 method: 'POST',
-                body: { remoteSHA: _updateState.remoteSHA, createBackup, components }
+                body: { remoteSHA: _updateState.remoteSHA, createBackup, components, serverStrategy: serverStrategy || 'auto' }
             });
             
             if (progressFill) progressFill.style.width = '100%';
@@ -1419,10 +1496,15 @@
             // Server build/deploy results
             if (result.serverBuild) {
                 if (result.serverBuild.success) {
-                    const secs = Math.round((result.serverBuild.duration || 0) / 1000);
-                    msg += `. ${_('updates.server_built')}` + (secs ? ` (${secs}s)` : '');
+                    if (result.serverBuild.method === 'download') {
+                        const sizeMB = result.serverBuild.size ? ` (${(result.serverBuild.size / (1024 * 1024)).toFixed(1)} MB)` : '';
+                        msg += `. ${_('updates.server_downloaded')}${sizeMB}`;
+                    } else {
+                        const secs = Math.round((result.serverBuild.duration || 0) / 1000);
+                        msg += `. ${_('updates.server_built')}` + (secs ? ` (${secs}s)` : '');
+                    }
                 } else {
-                    msg += `. ${_('updates.server_build_failed')}`;
+                    msg += `. ${result.serverBuild.method === 'download' ? _('updates.server_download_failed') : _('updates.server_build_failed')}`;
                     if (result.serverBuild.error) Notifications.error(result.serverBuild.error);
                 }
             }

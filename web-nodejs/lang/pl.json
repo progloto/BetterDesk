@@ -2841,6 +2841,19 @@
     "server_deployed": "Binarka serwera wdrożona",
     "server_deploy_failed": "Wdrożenie serwera nie powiodło się",
     "server_build_note": "Kompilacja serwera może zająć 1-5 minut. Strona pozostanie nieaktywna podczas kompilacji.",
-    "server_source_downloading": "Pobieranie źródeł serwera…"
+    "server_source_downloading": "Pobieranie źródeł serwera…",
+    "strategy_label": "Metoda aktualizacji",
+    "strategy_download": "Pobierz gotową binarkę",
+    "strategy_compile": "Skompiluj ze źródeł",
+    "both_available": "Pobieranie i kompilacja",
+    "download_available": "Pobieranie dostępne",
+    "no_method": "Brak metody aktualizacji",
+    "no_release": "Brak wydania",
+    "available": "Dostępne",
+    "server_downloading": "Pobieranie binarki serwera…",
+    "server_downloaded": "Binarka serwera pobrana",
+    "server_download_failed": "Pobieranie binarki serwera nie powiodło się",
+    "server_download_note": "Gotowa binarka zostanie pobrana z GitHub Releases. Zwykle trwa to mniej niż minutę.",
+    "install_go_hint": "Zainstaluj Go z https://go.dev/dl/ aby włączyć kompilację lub opublikuj wydanie z gotowymi binarkami"
   }
 }

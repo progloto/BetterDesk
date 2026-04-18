@@ -2841,6 +2841,19 @@
     "server_deployed": "Server binary deployed",
     "server_deploy_failed": "Server deploy failed",
     "server_build_note": "Server compilation may take 1-5 minutes. The page will remain unresponsive during compilation.",
-    "server_source_downloading": "Downloading server source…"
+    "server_source_downloading": "Downloading server source…",
+    "strategy_label": "Update method",
+    "strategy_download": "Download pre-built binary",
+    "strategy_compile": "Compile from source",
+    "both_available": "Download & Compile",
+    "download_available": "Download available",
+    "no_method": "No update method",
+    "no_release": "No release",
+    "available": "Available",
+    "server_downloading": "Downloading server binary…",
+    "server_downloaded": "Server binary downloaded",
+    "server_download_failed": "Server binary download failed",
+    "server_download_note": "A pre-built binary will be downloaded from GitHub Releases. This usually takes less than a minute.",
+    "install_go_hint": "Install Go from https://go.dev/dl/ to enable compilation, or publish a release with pre-built binaries"
   }
 }

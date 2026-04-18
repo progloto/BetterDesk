@@ -533,10 +533,11 @@ router.post('/api/settings/restore', requireAuth, requirePermission('server.conf
 /**
  * GET /api/settings/updates/server-info - Check Go build environment for server updates
  */
-router.get('/api/settings/updates/server-info', requireAuth, requirePermission('server.config'), (_req, res) => {
+router.get('/api/settings/updates/server-info', requireAuth, requirePermission('server.config'), async (_req, res) => {
     try {
         const info = updateService.getServerUpdateInfo();
-        res.json({ success: true, data: info });
+        const prebuilt = await updateService.getPrebuiltInfo();
+        res.json({ success: true, data: { ...info, prebuilt } });
     } catch (err) {
         console.error('Server info error:', err);
         res.status(500).json({ success: false, error: err.message });
@@ -583,7 +584,7 @@ router.post('/api/settings/updates/install', requireAuth, requirePermission('ser
     res.setTimeout(600000);
 
     try {
-        const { remoteSHA, createBackup, components } = req.body;
+        const { remoteSHA, createBackup, components, serverStrategy } = req.body;
         if (!remoteSHA || !/^[0-9a-f]{7,40}$/i.test(remoteSHA)) {
             return res.status(400).json({ success: false, error: 'Valid remoteSHA is required' });
         }
@@ -597,7 +598,8 @@ router.post('/api/settings/updates/install', requireAuth, requirePermission('ser
         // Apply update
         const result = await updateService.applyUpdate(remoteSHA, changedData, {
             createBackup: createBackup !== false,
-            components: components || ['console', 'scripts']
+            components: components || ['console', 'scripts'],
+            serverStrategy: serverStrategy || 'auto'
         });
 
         await db.logAction(

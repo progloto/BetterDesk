@@ -2848,6 +2848,19 @@
     "server_deployed": "服务器二进制文件已部署",
     "server_deploy_failed": "服务器部署失败",
     "server_build_note": "服务器编译可能需要1-5分钟。编译期间页面将保持无响应。",
-    "server_source_downloading": "下载服务器源代码…"
+    "server_source_downloading": "下载服务器源代码…",
+    "strategy_label": "更新方式",
+    "strategy_download": "下载预编译二进制文件",
+    "strategy_compile": "从源代码编译",
+    "both_available": "下载和编译",
+    "download_available": "可下载",
+    "no_method": "无可用更新方式",
+    "no_release": "无发布版本",
+    "available": "可用",
+    "server_downloading": "正在下载服务器二进制文件…",
+    "server_downloaded": "服务器二进制文件已下载",
+    "server_download_failed": "服务器二进制文件下载失败",
+    "server_download_note": "将从 GitHub Releases 下载预编译的二进制文件。通常不到一分钟。",
+    "install_go_hint": "从 https://go.dev/dl/ 安装 Go 以启用编译，或发布包含预编译二进制文件的版本"
   }
 }
