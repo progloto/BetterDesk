@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  betterdesk:
+    image: nas:32768/betterdesk:latest
+    container_name: betterdesk
+    hostname: betterdesk
+    ports:
+      - "5000:5000"
+      - "21114:21114"
+      - "21115:21115"
+      - "21116:21116/tcp"
+      - "21116:21116/udp"
+      - "21117:21117"
+      - "21118:21118"
+      - "21119:21119"
+      - "21121:21121"
+    volumes:
+      - /share/CACHEDEV1_DATA/.qpkg/container-station/data/application/betterdesk/console-data:/app/data
+      - /share/CACHEDEV1_DATA/.qpkg/container-station/data/application/betterdesk/betterdesk-data:/opt/rustdesk
+    environment:
+      - PUB_KEY_PATH=/opt/rustdesk/id_ed25519.pub
+      - NODE_ENV=production
+      - ENCRYPTED_ONLY=1
+      - DB_PATH=/opt/rustdesk/db_v2.sqlite3
+      - HBBS_API_URL=http://127.0.0.1:21114/api
+      - RELAY_SERVERS=office.vadiaz.com:21117,office.vadiaz.com:21119
+      - BETTERDESK_API_URL=http://127.0.0.1:21114/api
+      - BETTERDESK_API_KEY=86799d7199f7e0340d0837616b6e483daffe8f521fc373a141ce8cc49cf15c82
+      - RUSTDESK_PATH=/opt/rustdesk
+      - DOCKER=true
+      - DATA_DIR=/app/data
+      - SERVER_BACKEND=betterdesk
+      - SESSION_SECRET=d3a8436e-1c9f-11f1-b094-50ebf6db2d97
+      - API_KEY_PATH=/opt/rustdesk/.api_key
+      - PORT=5000
+      - SIGNAL_PORT=21116
+      - HOST=0.0.0.0
+    networks:
+      - betterdesk-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:21114/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+networks:
+  betterdesk-net:
+    external: true
