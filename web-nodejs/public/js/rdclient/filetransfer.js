@@ -79,10 +79,25 @@ class RDFileTransfer {
      * @param {string} [path=''] - Path to browse (empty = root/drives)
      */
     browseDir(path) {
-        if (!this._enabled) return;
+        if (!this._enabled) {
+            console.warn('[FileTransfer] browseDir called but file transfer not enabled');
+            return;
+        }
         const dir = path != null ? path : '';
+        console.log('[FileTransfer] browseDir:', JSON.stringify(dir));
         this._sendMessage(this._proto.buildReadDir(dir, this._showHidden));
         this._emit('file_browsing', { path: dir });
+
+        // Set timeout — if no file_dir response within 5s, emit timeout event
+        if (this._browseTimeout) clearTimeout(this._browseTimeout);
+        this._browseTimedOut = false;
+        this._browseTimeout = setTimeout(() => {
+            if (!this._browseTimedOut) {
+                this._browseTimedOut = true;
+                console.warn('[FileTransfer] browseDir timeout — no response from peer after 5s');
+                this._emit('file_browse_timeout', { path: dir });
+            }
+        }, 5000);
     }
 
     /**
@@ -278,6 +293,7 @@ class RDFileTransfer {
      * @param {Object} resp - Decoded FileResponse protobuf
      */
     handleFileResponse(resp) {
+        console.log('[FileTransfer] handleFileResponse:', Object.keys(resp).filter(k => resp[k] != null).join(', '));
         if (resp.dir) {
             this._handleDir(resp.dir);
         } else if (resp.block) {
@@ -296,6 +312,14 @@ class RDFileTransfer {
      * @param {Object} dir - FileDirectory { id, path, entries[] }
      */
     _handleDir(dir) {
+        // Clear browse timeout — we got a response
+        if (this._browseTimeout) {
+            clearTimeout(this._browseTimeout);
+            this._browseTimeout = null;
+        }
+        this._browseTimedOut = false;
+
+        console.log('[FileTransfer] _handleDir: path=%s entries=%d', dir.path || '(root)', (dir.entries || []).length);
         this._currentPath = dir.path || '';
         this._entries = (dir.entries || []).map(e => ({
             name: e.name,

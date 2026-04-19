@@ -3,6 +3,29 @@
  * Fullscreen viewer with auto-hiding toolbar, connection overlay, and dark theme
  */
 
+/* ---- Toast Notifications ---- */
+.rd-toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #fff;
+    z-index: 100000;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s, transform 0.3s;
+    max-width: 420px;
+    text-align: center;
+}
+.rd-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.rd-toast-info { background: rgba(56, 132, 255, 0.92); }
+.rd-toast-warning { background: rgba(210, 153, 34, 0.92); }
+.rd-toast-error { background: rgba(218, 54, 51, 0.92); }
+.rd-toast-success { background: rgba(46, 164, 79, 0.92); }
+
 /* ---- Viewer Body (no sidebar, no scroll) ---- */
 .viewer-body {
     margin: 0;
@@ -420,7 +443,7 @@
 }
 
 .toggle-item[data-active="true"]::after {
-    content: '\\2713';
+    content: '✓';
     margin-left: auto;
     font-size: 14px;
     color: var(--accent-green, #2ea44f);

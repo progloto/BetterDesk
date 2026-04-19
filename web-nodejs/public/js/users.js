@@ -390,7 +390,7 @@
             userOrgs = orgsResponse.organizations || [];
             
             // Fetch all organizations for adding
-            const allOrgsResponse = await Utils.api('/api/organizations');
+            const allOrgsResponse = await Utils.api('/api/panel/org');
             allOrgs = allOrgsResponse.organizations || [];
         } catch (error) {
             console.error('Failed to load organizations:', error);
@@ -421,7 +421,7 @@
             ? `
                 <div class="add-org-row">
                     <select id="add-org-select" class="form-input">
-                        <option value="">${_('policy_audit.select_org_placeholder')}</option>
+                        <option value="">${_('policies.select_org_placeholder')}</option>
                         ${availableOrgs.map(o => `<option value="${o.id}">${Utils.escapeHtml(o.name)}</option>`).join('')}
                     </select>
                     <select id="add-org-role" class="form-input" style="width: 120px;">
@@ -458,7 +458,7 @@
                     btn.addEventListener('click', async () => {
                         const orgId = btn.dataset.orgId;
                         try {
-                            await Utils.api(`/api/organizations/${orgId}/members/${userId}`, { method: 'DELETE' });
+                            await Utils.api(`/api/panel/org/${orgId}/members/${userId}`, { method: 'DELETE' });
                             Notifications.success(_('users.org_removed'));
                             Modal.close();
                             showOrganizationsModal(userId, username); // Refresh
@@ -474,7 +474,7 @@
                     const role = document.getElementById('add-org-role').value;
                     
                     if (!orgId) {
-                        Notifications.error(_('policy_audit.select_org_placeholder'));
+                        Notifications.error(_('policies.select_org_placeholder'));
                         return;
                     }
                     

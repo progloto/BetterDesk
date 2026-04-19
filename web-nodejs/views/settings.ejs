@@ -160,6 +160,33 @@
                     </div>
                 </div>
             </div>
+            
+            <!-- Tutorials Section -->
+            <div class="settings-section">
+                <div class="settings-section-header">
+                    <h2 class="settings-section-title">
+                        <span class="material-icons">school</span>
+                        ${_('settings.tutorials_title')}
+                    </h2>
+                    <p class="settings-section-desc">${_('settings.tutorials_desc')}</p>
+                </div>
+                <div class="settings-section-body">
+                    <div class="form-group" style="max-width: 600px; display: flex; align-items: center; gap: 12px;">
+                        <input type="checkbox" id="tutorials-enabled" class="toggle-switch">
+                        <div>
+                            <label class="form-label" for="tutorials-enabled" style="margin-bottom: 0; cursor: pointer;">${_('settings.tutorials_enabled')}</label>
+                            <small class="form-hint" style="display: block; margin-top: 2px;">${_('settings.tutorials_enabled_hint')}</small>
+                        </div>
+                    </div>
+                    <div class="form-group" style="max-width: 600px;">
+                        <button class="btn btn-secondary btn-sm" id="tutorials-reset-btn">
+                            <span class="material-icons">refresh</span>
+                            ${_('tutorial.reset_all')}
+                        </button>
+                        <small class="form-hint" style="display: block; margin-top: 6px;">${_('settings.tutorials_reset_hint')}</small>
+                    </div>
+                </div>
+            </div>
         </div>
         </div>
         

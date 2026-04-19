@@ -720,6 +720,44 @@ table {
     margin-top: var(--space-xs);
 }
 
+/* Toggle Switch (checkbox styled as iOS-like toggle) */
+.toggle-switch {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 40px;
+    height: 22px;
+    background: var(--bg-tertiary, #21262d);
+    border-radius: 11px;
+    position: relative;
+    cursor: pointer;
+    border: 1px solid var(--border-primary, #30363d);
+    transition: background 0.2s, border-color 0.2s;
+    flex-shrink: 0;
+}
+.toggle-switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    background: var(--text-secondary, #8b949e);
+    border-radius: 50%;
+    transition: transform 0.2s, background 0.2s;
+}
+.toggle-switch:checked {
+    background: var(--accent-blue, #58a6ff);
+    border-color: var(--accent-blue, #58a6ff);
+}
+.toggle-switch:checked::after {
+    transform: translateX(18px);
+    background: #fff;
+}
+.toggle-switch:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 /* Search input with icon */
 .search-wrapper {
     position: relative;

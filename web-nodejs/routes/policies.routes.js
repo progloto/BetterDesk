@@ -165,15 +165,36 @@ router.get('/api/bd/device-policy', async (req, res) => {
 // ---------------------------------------------------------------------------
 
 // List attestation records
+// NOTE: Go server does not have /attestation endpoint yet — return empty data gracefully
 router.get('/api/panel/attestation', requireAuth, requireAdmin, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
     const offset = parseInt(req.query.offset) || 0;
-    goApiProxy(req, res, 'get', `/attestation?limit=${limit}&offset=${offset}`);
+    try {
+        const resp = await apiClient({ method: 'get', url: `/attestation?limit=${limit}&offset=${offset}` });
+        res.json(resp.data);
+    } catch (err) {
+        // Go server doesn't have attestation endpoint — return empty records
+        if (err.response?.status === 404 || err.code === 'ECONNREFUSED') {
+            return res.json({ records: [], total: 0 });
+        }
+        const status = err.response?.status || 500;
+        res.status(status).json(err.response?.data || { error: 'Attestation fetch failed' });
+    }
 });
 
 // Get attestation for specific device
-router.get('/api/panel/attestation/:deviceId', requireAuth, (req, res) =>
-    goApiProxy(req, res, 'get', `/attestation/${req.params.deviceId}`));
+router.get('/api/panel/attestation/:deviceId', requireAuth, async (req, res) => {
+    try {
+        const resp = await apiClient({ method: 'get', url: `/attestation/${req.params.deviceId}` });
+        res.json(resp.data);
+    } catch (err) {
+        if (err.response?.status === 404 || err.code === 'ECONNREFUSED') {
+            return res.json({ status: 'unknown', device_id: req.params.deviceId });
+        }
+        const status = err.response?.status || 500;
+        res.status(status).json(err.response?.data || { error: 'Attestation fetch failed' });
+    }
+});
 
 // Device reports attestation data
 router.post('/api/bd/attestation', async (req, res) => {

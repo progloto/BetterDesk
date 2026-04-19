@@ -251,7 +251,7 @@ class RDClient {
             const loginReq = this.proto.buildLoginRequest(hash, {
                 username: this.deviceId,
                 myId: 'betterdesk-web-' + Date.now().toString(36),
-                myName: 'BetterDesk Web',
+                myName: this.opts.myName || this.opts.myName || 'BetterDesk Web',
                 disableAudio: this.opts.disableAudio || false,
                 fps: this.opts.fps || 60,
                 imageQuality: this.opts.imageQuality || 'Best'
@@ -1416,8 +1416,7 @@ class RDClient {
         };
 
         var c = config[preset] || config.balanced;
-        this._sendPeerMessage(this.proto.buildMisc('imageQuality', c.imageQuality));
-        this._sendPeerMessage(this.proto.buildMisc('customFps', c.customFps));
+        this._sendPeerMessage(this.proto.buildOptionMisc({ imageQuality: c.imageQuality, customFps: c.customFps }));
         this.opts.qualityPreset = preset;
         this._emit('quality_changed', preset);
     }

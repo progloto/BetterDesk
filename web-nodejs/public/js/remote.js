@@ -9,6 +9,19 @@
 (function () {
     'use strict';
 
+    // ---- Simple toast notification ----
+    function showToast(message, type) {
+        const toast = document.createElement('div');
+        toast.className = 'rd-toast rd-toast-' + (type || 'info');
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        requestAnimationFrame(() => toast.classList.add('show'));
+        setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 300);
+        }, 3500);
+    }
+
     // ---- Session storage ----
     const sessions = new Map(); // deviceId → SessionInfo
     let activeSessionId = null;
@@ -192,9 +205,11 @@
 
         // Create RDClient — start conservative; AdaptiveQuality promotes when the
         // pipeline proves it can keep up (prevents 3–7 FPS stalls on weaker CPUs/JMuxer).
+        const userName = (window.BetterDesk.user && (window.BetterDesk.user.display_name || window.BetterDesk.user.username)) || 'BetterDesk Web';
         session.client = new RDClient(session.canvas, {
             deviceId: deviceId,
             serverPubKey: window.BetterDesk.serverPubKey || '',
+            myName: userName,
             scaleMode: 'fit',
             fps: 30,
             imageQuality: 'Balanced',
@@ -280,9 +295,11 @@
         if (spinner) spinner.style.display = 'block';
         session.statusText.textContent = _('remote.connecting');
 
+        const userName = (window.BetterDesk.user && (window.BetterDesk.user.display_name || window.BetterDesk.user.username)) || 'BetterDesk Web';
         session.client = new RDClient(session.canvas, {
             deviceId: session.deviceId,
             serverPubKey: window.BetterDesk.serverPubKey || '',
+            myName: userName,
             scaleMode: 'fit',
             fps: 30,
             imageQuality: 'Balanced',
@@ -533,6 +550,31 @@
 
         client.on('file_dir', (data) => {
             renderFileList(session, data.path, data.entries);
+        });
+
+        client.on('file_browsing', () => {
+            // Show loading state
+            if (session.fileList) {
+                session.fileList.innerHTML = '<div class="file-empty"><span class="material-icons spinning">sync</span> ' +
+                    (_('remote.file_loading') || 'Loading...') + '</div>';
+            }
+        });
+
+        client.on('file_browse_timeout', (data) => {
+            // Peer didn't respond — show timeout message with retry button
+            if (session.fileList) {
+                session.fileList.innerHTML =
+                    '<div class="file-empty">' +
+                        '<span class="material-icons" style="color:var(--warning)">warning</span> ' +
+                        (_('remote.file_timeout') || 'Remote device did not respond. File transfer may not be supported or is disabled on the remote machine.') +
+                        '<br><button class="btn btn-sm btn-primary file-retry-btn" style="margin-top:8px">' +
+                        '<span class="material-icons" style="font-size:16px;vertical-align:middle">refresh</span> ' +
+                        (_('actions.retry') || 'Retry') + '</button>' +
+                    '</div>';
+                session.fileList.querySelector('.file-retry-btn')?.addEventListener('click', () => {
+                    client.fileTransfer.browseDir(data.path);
+                });
+            }
         });
 
         client.on('file_transfer_start', (data) => {
@@ -908,18 +950,27 @@
         if (!session || !session.client) return;
         try {
             const text = await navigator.clipboard.readText();
-            if (text) session.client.sendClipboard(text);
-        } catch { /* clipboard permission denied */ }
+            if (text) {
+                session.client.sendClipboard(text);
+            } else {
+                showToast(_('remote.clipboard_empty') || 'Clipboard is empty', 'warning');
+            }
+        } catch {
+            // Clipboard API requires HTTPS or user permission
+            showToast(_('remote.clipboard_denied') || 'Clipboard access denied. HTTPS required or permission not granted.', 'error');
+        }
         closeAllDropdowns();
     });
 
     // Block Input toggle
     setupToggle('btn-block-input', (on) => withClient(c => c.setBlockInput(on)));
 
-    // Quality items
+    // Quality items — map HTML data-quality to client presets (includes FPS adjustment)
+    var qualityToPreset = { 'Best': 'best', 'Balanced': 'balanced', 'Low': 'speed' };
     document.querySelectorAll('.quality-item').forEach(btn => {
         btn.addEventListener('click', function () {
-            withClient(c => c.setImageQuality(this.dataset.quality));
+            var preset = qualityToPreset[this.dataset.quality] || 'balanced';
+            withClient(c => c.setQualityPreset(preset));
             document.querySelectorAll('.quality-item').forEach(b => b.classList.remove('active'));
             this.classList.add('active');
             closeAllDropdowns();

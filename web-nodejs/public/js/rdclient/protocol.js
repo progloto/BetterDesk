@@ -234,6 +234,7 @@ class RDProtocol {
                     showRemoteCursor: 2, // Yes
                     disableAudio: opts.disableAudio ? 2 : 1,
                     disableClipboard: 1, // No
+                    enableFileTransfer: 2, // Yes — required for file transfer on DEFAULT_CONN
                     lockAfterSessionEnd: 1 // No
                 }
             }

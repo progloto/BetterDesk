@@ -768,6 +768,27 @@
         });
         _helpMenu.appendChild(resetBtn);
 
+        // Disable/Enable toggle
+        var toggleDiv = document.createElement('div');
+        toggleDiv.className = 'tutorial-help-menu-divider';
+        _helpMenu.appendChild(toggleDiv);
+
+        var disableBtn = document.createElement('button');
+        disableBtn.className = 'tutorial-help-menu-item tutorial-toggle-btn';
+        _updateToggleBtn(disableBtn);
+        disableBtn.addEventListener('click', function() {
+            var nowDisabled = !isDisabled();
+            setDisabled(nowDisabled);
+            _updateToggleBtn(disableBtn);
+            closeHelpMenu();
+            if (nowDisabled) {
+                hideHelpButton();
+            }
+            // Notify settings page if open
+            window.dispatchEvent(new CustomEvent('tutorial:stateChanged', { detail: { disabled: nowDisabled } }));
+        });
+        _helpMenu.appendChild(disableBtn);
+
         document.body.appendChild(_helpMenu);
 
         _helpBtn.addEventListener('click', function(e) {
@@ -807,11 +828,39 @@
         return el.innerHTML;
     }
 
-    // Auto-show help button after DOM ready
+    function _updateToggleBtn(btn) {
+        if (!btn) return;
+        if (isDisabled()) {
+            btn.innerHTML = '<span class="material-icons">visibility</span>' + esc(t('tutorial.enable_tutorials', 'Enable Tutorials'));
+        } else {
+            btn.innerHTML = '<span class="material-icons">visibility_off</span>' + esc(t('tutorial.disable_tutorials', 'Disable Tutorials'));
+        }
+    }
+
+    // Listen for settings page toggle
+    window.addEventListener('tutorial:stateChanged', function(e) {
+        if (e.detail && typeof e.detail.disabled === 'boolean') {
+            setDisabled(e.detail.disabled);
+            if (e.detail.disabled) {
+                hideHelpButton();
+            } else {
+                showHelpButton();
+            }
+            // Update toggle button text if menu exists
+            if (_helpMenu) {
+                var tb = _helpMenu.querySelector('.tutorial-toggle-btn');
+                _updateToggleBtn(tb);
+            }
+        }
+    });
+
+    // Auto-show help button after DOM ready (only if not disabled)
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function() { showHelpButton(); });
+        document.addEventListener('DOMContentLoaded', function() {
+            if (!isDisabled()) showHelpButton();
+        });
     } else {
-        showHelpButton();
+        if (!isDisabled()) showHelpButton();
     }
 
 })();
