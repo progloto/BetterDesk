@@ -242,7 +242,9 @@
     async function loadDevices() {
         try {
             const response = await Utils.api('/api/devices');
-            devices = response.devices || [];
+            // Utils.api returns data field: { devices: [], total: N }
+            // or the whole response if .data is missing.
+            devices = response.devices || (Array.isArray(response) ? response : []);
             
             // Update count
             document.getElementById('devices-count').textContent = devices.length;
@@ -1251,7 +1253,7 @@
     async function loadFolders() {
         try {
             const response = await Utils.api('/api/folders');
-            folders = response.folders || [];
+            folders = response.folders || (Array.isArray(response) ? response : []);
             // Expose folders globally for DeviceDetail panel
             window._betterdesk_folders = folders;
             renderFolders();

@@ -104,8 +104,9 @@ async function getServerStats() {
 async function getAllPeers() {
     try {
         const { data } = await apiClient.get('/peers');
-        // Go server returns flat array or { peers: [...] }
-        const peers = Array.isArray(data) ? data : (data.peers || []);
+        // Go server returns: { total: N, data: [...], msg: "success" }
+        // We must extract the 'data' field which contains the array.
+        const peers = (data && data.data) ? data.data : (Array.isArray(data) ? data : (data.peers || []));
         return peers.map(normalisePeer);
     } catch (err) {
         console.warn('BetterDesk API getAllPeers error:', err.message);
@@ -119,7 +120,9 @@ async function getAllPeers() {
 async function getPeer(id) {
     try {
         const { data } = await apiClient.get(`/peers/${encodeURIComponent(id)}`);
-        return normalisePeer(data);
+        // handleGetPeer returns single object, possibly wrapped in { data: ... }
+        const p = (data && data.data && !Array.isArray(data.data)) ? data.data : data;
+        return normalisePeer(p);
     } catch (err) {
         return null;
     }
@@ -205,7 +208,8 @@ async function getStatusSummary() {
 async function getOnlinePeers() {
     try {
         const { data } = await apiClient.get('/peers/online');
-        const peers = Array.isArray(data) ? data : (data.peers || []);
+        // Go server returns { total, data: [...], msg }
+        const peers = (data && data.data) ? data.data : (Array.isArray(data) ? data : (data.peers || []));
         return peers;
     } catch (err) {
         console.warn('BetterDesk API getOnlinePeers error:', err.message);
@@ -301,7 +305,7 @@ async function updatePeer(id, fields) {
 async function getPeersByTag(tag) {
     try {
         const { data } = await apiClient.get(`/tags/${encodeURIComponent(tag)}/peers`);
-        const peers = Array.isArray(data) ? data : (data.peers || []);
+        const peers = (data && data.data) ? data.data : (Array.isArray(data) ? data : (data.peers || []));
         return peers.map(normalisePeer);
     } catch (err) {
         return [];
@@ -385,18 +389,19 @@ async function syncOnlineStatus(/* db */) {
 /**
  * Normalise a Go-server peer object to the shape the panel expects.
  *
- * Go server /api/peers returns (see db.Peer struct + peerResponse):
- *   id, uuid, pk, ip, user, hostname, os, version, status,
- *   nat_type, last_online, created_at, disabled, banned,
- *   ban_reason, banned_at, soft_deleted, deleted_at, note, tags,
- *   live_online (bool), live_status ("online"|"degraded"|"critical"|"offline")
- *
- * Panel expected shape: id, hostname, username, platform, ip, note,
- *   online (bool), banned (bool), created_at, last_online, ban_reason,
- *   folder_id, tags[], status_tier, uuid, disabled, os, version
+ * Supports both "full" objects (handleGetPeer) and "lite" objects (handleListPeers).
+ * Lite objects use nested 'info' and numeric 'status'.
  */
 function normalisePeer(peer) {
     if (!peer) return peer;
+
+    const info = peer.info || {};
+    
+    // Determine online status from either live_online (bool) or status (numeric)
+    let isOnline = !!(peer.live_online);
+    if (peer.status !== undefined && typeof peer.status === 'number') {
+        isOnline = peer.status === 1;
+    }
 
     // Parse tags: Go server sends comma-separated string or JSON array
     let tags = [];
@@ -413,15 +418,15 @@ function normalisePeer(peer) {
 
     return {
         id: peer.id || '',
-        hostname: peer.hostname || '',
+        hostname: peer.hostname || info.device_name || peer.note || '',
         display_name: peer.display_name || '',
-        username: peer.user || '',
-        platform: peer.os || '',
-        os: peer.os || '',
-        version: peer.version || '',
+        username: peer.user || peer.user_name || '',
+        platform: peer.os || info.os || '',
+        os: peer.os || info.os || '',
+        version: peer.version || info.version || '',
         ip: peer.ip || '',
         note: peer.note || '',
-        online: !!(peer.live_online),
+        online: isOnline,
         banned: !!(peer.banned),
         created_at: peer.created_at || '',
         last_online: peer.last_online || '',
@@ -429,7 +434,7 @@ function normalisePeer(peer) {
         banned_at: peer.banned_at || null,
         folder_id: peer.folder_id || null,
         tags,
-        status_tier: peer.live_status || (peer.live_online ? 'online' : 'offline'),
+        status_tier: peer.live_status || (isOnline ? 'online' : 'offline'),
         uuid: peer.uuid || '',
         nat_type: peer.nat_type || 0,
         disabled: !!(peer.disabled || peer.soft_deleted)
