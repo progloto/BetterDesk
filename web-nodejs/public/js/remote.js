@@ -4,10 +4,39 @@
  * Supports multiple concurrent RDClient sessions
  */
 
-/* global RDClient, RDVideo */
+/* global RDClient, RDVideo, CDAPSession */
 
 (function () {
     'use strict';
+
+    // ---- i18n helper ----
+    // window.t (from i18n-client.js) returns the key itself when missing;
+    // wrap it so callers can provide an English fallback string.
+    function t(key, fallback) {
+        if (typeof window.t === 'function') {
+            const val = window.t(key);
+            if (val && val !== key) return val;
+        }
+        return fallback !== undefined ? fallback : key;
+    }
+
+    // ---- Transport selection (PR 2.3) ----
+    // The unified web client picks the right transport per-device based
+    // on `window.__capabilities.transport` (set server-side from the Go
+    // peer record). RustDesk peers go through `RDClient`; OS-agent /
+    // CDAP-connected peers use `CDAPSession`, which exposes the same
+    // public surface so the rest of the session manager is transport-
+    // agnostic.
+    function getTransportName() {
+        const caps = window.__capabilities || {};
+        return String(caps.transport || 'rd').toLowerCase() === 'cdap' ? 'cdap' : 'rd';
+    }
+    function createTransportClient(canvas, opts) {
+        if (getTransportName() === 'cdap' && typeof CDAPSession === 'function') {
+            return new CDAPSession(canvas, opts);
+        }
+        return new RDClient(canvas, opts);
+    }
 
     // ---- Simple toast notification ----
     function showToast(message, type) {
@@ -53,6 +82,7 @@
             this.tfaOverlay = panel.querySelector('.session-2fa-overlay');
             this.tfaInput = panel.querySelector('.session-2fa-input');
             this.tfaError = panel.querySelector('.session-2fa-error');
+            this.cdapFallbackBtn = panel.querySelector('.session-btn-cdap-fallback');
             this.client = null;
             this.state = 'idle';
             this.latency = 0;
@@ -71,46 +101,111 @@
     const toolbarDeviceId = document.getElementById('toolbar-device-id');
     const tabBar = document.getElementById('session-tabs');
 
-    // ---- Auto-hide toolbar ----
-    let toolbarTimeout = null;
-    let toolbarVisible = true;
+    // ---- Floating toolbar (collapsible RustDesk-style pill) ----
+    // The compact handle is always visible; the action pill expands only on an
+    // explicit click of the expand button. There is NO hover-to-open behaviour.
     let toolbarPinned = false;
 
-    function showToolbar() {
-        toolbar.classList.add('visible');
-        toolbarVisible = true;
-        clearTimeout(toolbarTimeout);
-        if (!toolbarPinned) {
-            toolbarTimeout = setTimeout(hideToolbar, 3000);
+    function expandToolbar() {
+        toolbar.classList.add('expanded');
+        const exp = document.getElementById('btn-toolbar-expand');
+        if (exp) {
+            exp.classList.add('active');
+            const ic = exp.querySelector('.material-icons');
+            if (ic) ic.textContent = 'expand_less';
         }
     }
 
-    function hideToolbar() {
+    function collapseToolbar() {
         if (toolbarPinned) return;
         if (document.querySelector('.toolbar-dropdown-menu.open')) return;
-        const session = getActiveSession();
-        if (session && session.state === 'streaming') {
-            toolbar.classList.remove('visible');
-            toolbarVisible = false;
+        toolbar.classList.remove('expanded');
+        const exp = document.getElementById('btn-toolbar-expand');
+        if (exp) {
+            exp.classList.remove('active');
+            const ic = exp.querySelector('.material-icons');
+            if (ic) ic.textContent = 'expand_more';
         }
     }
 
-    document.body.addEventListener('mousemove', (e) => {
-        // Show toolbar when mouse near top (below tab bar)
-        if (e.clientY < 80 || toolbarVisible) {
-            showToolbar();
-        }
-    });
-
-    function setToolbarAutoHide(enable) {
-        if (enable) {
-            showToolbar();
+    function toggleToolbar() {
+        if (toolbar.classList.contains('expanded')) {
+            // Force-collapse (ignore pin) when the user explicitly clicks.
+            toolbar.classList.remove('expanded');
+            const exp = document.getElementById('btn-toolbar-expand');
+            if (exp) {
+                exp.classList.remove('active');
+                const ic = exp.querySelector('.material-icons');
+                if (ic) ic.textContent = 'expand_more';
+            }
         } else {
-            clearTimeout(toolbarTimeout);
-            toolbar.classList.add('visible');
-            toolbarVisible = true;
+            expandToolbar();
         }
     }
+
+    // Legacy compatibility shims — older code paths call these to surface the
+    // status while overlays are visible. They now drive expand/collapse only,
+    // never an auto-hide timer.
+    function showToolbar() { expandToolbar(); }
+    function setToolbarAutoHide(enable) {
+        // enable === true  -> session is streaming, keep the pill collapsed.
+        // enable === false -> an overlay is shown, expand so status is visible.
+        if (enable) {
+            collapseToolbar();
+        } else {
+            expandToolbar();
+        }
+    }
+
+    // ---- Independent "back to devices" navigation ----
+    // The rdclient page is opened as a script-launched tab (window.open) from
+    // the web panel. Navigating THIS tab to /devices spawned duplicate panel
+    // tabs that accumulated over time. Instead, close this tab and re-focus the
+    // opener; only fall back to navigation when there is no opener (e.g. the
+    // page was opened directly via URL).
+    function returnToDevices() {
+        try {
+            if (window.opener && !window.opener.closed) {
+                try { window.opener.focus(); } catch { /* ignore */ }
+                window.close();
+                // If the browser blocked window.close() (not script-opened),
+                // fall through to navigation after a short delay.
+                setTimeout(() => {
+                    if (!window.closed) window.location.href = '/devices';
+                }, 150);
+                return;
+            }
+        } catch { /* ignore */ }
+        window.location.href = '/devices';
+    }
+
+    // ---- Automatic clipboard sync (local -> remote) ----
+    // Native RustDesk pushes the controlling side's clipboard to the peer
+    // automatically, so a plain Ctrl+V on the remote pastes local content.
+    // The browser cannot observe clipboard changes, but it can read the
+    // clipboard once the tab regains focus (with transient activation), so we
+    // push the current local clipboard to the active streaming session then.
+    let _lastSyncedClipboard = '';
+    async function syncLocalClipboardToRemote() {
+        const session = getActiveSession();
+        if (!session || !session.client || session.state !== 'streaming') return;
+        if (!navigator.clipboard || !navigator.clipboard.readText) return;
+        try {
+            const text = await navigator.clipboard.readText();
+            if (text && text !== _lastSyncedClipboard) {
+                _lastSyncedClipboard = text;
+                session.client.sendClipboard(text);
+            }
+        } catch {
+            // Permission denied or not focused — ignore, the manual paste
+            // button remains available as a fallback.
+        }
+    }
+    window.addEventListener('focus', syncLocalClipboardToRemote);
+    if (viewerContainer) {
+        viewerContainer.addEventListener('mousedown', syncLocalClipboardToRemote);
+    }
+
 
     // ---- Tab Bar ----
 
@@ -206,13 +301,13 @@
         // Create RDClient — start conservative; AdaptiveQuality promotes when the
         // pipeline proves it can keep up (prevents 3–7 FPS stalls on weaker CPUs/JMuxer).
         const userName = (window.BetterDesk.user && (window.BetterDesk.user.display_name || window.BetterDesk.user.username)) || 'BetterDesk Web';
-        session.client = new RDClient(session.canvas, {
+        session.client = createTransportClient(session.canvas, {
             deviceId: deviceId,
             serverPubKey: window.BetterDesk.serverPubKey || '',
             myName: userName,
             scaleMode: 'fit',
             fps: 30,
-            imageQuality: 'Balanced',
+            imageQuality: 'Best',
             adaptiveQuality: true,
             disableAudio: false
         });
@@ -281,7 +376,7 @@
             if (sessions.size > 0) {
                 switchSession(sessions.keys().next().value);
             } else {
-                window.location.href = '/devices';
+                returnToDevices();
             }
         }
     }
@@ -291,18 +386,19 @@
         session.connectionOverlay.style.display = 'flex';
         session.passwordOverlay.style.display = 'none';
         session.overlayActions.style.display = 'none';
+        if (session.cdapFallbackBtn) session.cdapFallbackBtn.style.display = 'none';
         const spinner = session.connectionOverlay.querySelector('.spinner');
         if (spinner) spinner.style.display = 'block';
         session.statusText.textContent = _('remote.connecting');
 
         const userName = (window.BetterDesk.user && (window.BetterDesk.user.display_name || window.BetterDesk.user.username)) || 'BetterDesk Web';
-        session.client = new RDClient(session.canvas, {
+        session.client = createTransportClient(session.canvas, {
             deviceId: session.deviceId,
             serverPubKey: window.BetterDesk.serverPubKey || '',
             myName: userName,
             scaleMode: 'fit',
             fps: 30,
-            imageQuality: 'Balanced',
+            imageQuality: 'Best',
             adaptiveQuality: true,
             disableAudio: false
         });
@@ -337,10 +433,15 @@
             }
         });
 
-        c.on('error', (msg) => {
+        c.on('error', (msg, meta) => {
             setSessionStatus(session, 'error', msg);
             showSessionActions(session);
+            if (meta && meta.cdapFallback) showCdapFallback(session);
             if (isActive(session)) setToolbarAutoHide(false);
+        });
+
+        c.on('cdap_fallback_available', () => {
+            showCdapFallback(session);
         });
 
         c.on('disconnected', (reason) => {
@@ -386,6 +487,7 @@
             if (isActive(session)) {
                 session.canvas.focus();
                 setToolbarAutoHide(true);
+                try { refreshMonitorButton(session); } catch { /* not ready */ }
             }
             if (session.client.video) {
                 session.client.video.onAutoplayBlocked = () => {
@@ -402,6 +504,35 @@
         c.on('latency', (rtt) => { session.latency = rtt; });
 
         c.on('chat', (text) => addChatMessage(session, text, 'received'));
+
+        // CDAP transport: agent emits `monitors` after `monitor_list`. Show
+        // the toolbar dropdown on multi-display agents and refresh contents.
+        c.on('monitors', (list) => {
+            const btn = document.getElementById('btn-monitors');
+            if (btn) btn.style.display = (Array.isArray(list) && list.length > 1) ? '' : 'none';
+            if (isActive(session)) {
+                try { updateMonitorMenu(); } catch { /* menu not yet built */ }
+            }
+        });
+
+        // Native RustDesk transport: the rdclient emits `peer_info` once the
+        // login completes. Reveal the monitors dropdown when the peer has more
+        // than one display OR supports virtual displays, then rebuild it.
+        c.on('peer_info', () => {
+            if (isActive(session)) {
+                try { refreshMonitorButton(session); } catch { /* not ready */ }
+            }
+        });
+        c.on('display_switched', () => {
+            if (isActive(session)) {
+                try { updateMonitorMenu(); } catch { /* menu not yet built */ }
+            }
+        });
+        c.on('virtual_display_toggled', () => {
+            if (isActive(session)) {
+                try { updateMonitorMenu(); } catch { /* menu not yet built */ }
+            }
+        });
 
         // Security events: show warnings for E2E encryption issues
         c.on('signature_warning', (msg) => {
@@ -435,6 +566,11 @@
     function wireSessionDomEvents(session) {
         session.panel.querySelector('.session-btn-reconnect')
             ?.addEventListener('click', () => reconnectSession(session));
+
+        session.panel.querySelector('.session-btn-cdap-fallback')
+            ?.addEventListener('click', () => {
+                window.location.href = '/remote-cdap/' + encodeURIComponent(session.deviceId);
+            });
 
         session.panel.querySelector('.session-btn-authenticate')
             ?.addEventListener('click', () => {
@@ -787,6 +923,10 @@
         if (spinner) spinner.style.display = 'none';
     }
 
+    function showCdapFallback(session) {
+        if (session.cdapFallbackBtn) session.cdapFallbackBtn.style.display = 'inline-flex';
+    }
+
     function syncToolbarToSession(session) {
         const stateLabels = {
             'idle': _('remote.status_idle'),
@@ -987,6 +1127,33 @@
         });
     });
 
+    // Codec items — request the peer to (re)encode with a specific codec (GPU-friendly).
+    document.querySelectorAll('.codec-item').forEach(btn => {
+        btn.addEventListener('click', function () {
+            if (this.classList.contains('disabled')) return;
+            withClient(c => c.setCodec(this.dataset.codec));
+            document.querySelectorAll('.codec-item').forEach(b => b.classList.remove('active'));
+            this.classList.add('active');
+            closeAllDropdowns();
+        });
+    });
+
+    // Disable codec options the browser's decoder cannot handle.
+    (function probeCodecMenu() {
+        if (!window.RDVideo || typeof RDVideo.getSupportedCodecs !== 'function') return;
+        RDVideo.getSupportedCodecs().then(function (support) {
+            document.querySelectorAll('.codec-item').forEach(function (btn) {
+                var codec = (btn.dataset.codec || '').toLowerCase();
+                if (codec === 'auto') return; // always allowed
+                if (support && support[codec] === false) {
+                    btn.classList.add('disabled');
+                    btn.setAttribute('disabled', 'disabled');
+                    btn.title = 'Not supported by this browser';
+                }
+            });
+        }).catch(function () { /* ignore */ });
+    })();
+
     // Toggle helpers
     setupToggle('btn-show-cursor', (on) => withClient(c => c.setShowRemoteCursor(on)));
     setupToggle('btn-lock-session', (on) => withClient(c => c.setLockAfterSession(on)));
@@ -1013,12 +1180,41 @@
         document.getElementById('monitors-menu')?.classList.toggle('open');
     });
 
+    function refreshMonitorButton(session) {
+        session = session || getActiveSession();
+        if (!session || !session.client) return;
+        const btn = document.getElementById('btn-monitors');
+        if (!btn) return;
+        let monitors = [];
+        let vd = { supported: false };
+        try { monitors = session.client.getMonitors() || []; } catch { monitors = []; }
+        try {
+            vd = (typeof session.client.getVirtualDisplaySupport === 'function')
+                ? session.client.getVirtualDisplaySupport()
+                : { supported: false };
+        } catch { vd = { supported: false }; }
+        const visible = (monitors.length > 1) || (vd && vd.supported);
+        btn.style.display = visible ? '' : 'none';
+        if (visible) updateMonitorMenu();
+    }
+
     function updateMonitorMenu() {
         const session = getActiveSession();
         if (!session || !session.client) return;
-        const monitors = session.client.getMonitors();
+        const monitors = session.client.getMonitors() || [];
         const menu = document.getElementById('monitors-menu');
-        if (!menu || monitors.length < 2) return;
+        if (!menu) return;
+
+        let vd = { supported: false };
+        try {
+            vd = (typeof session.client.getVirtualDisplaySupport === 'function')
+                ? session.client.getVirtualDisplaySupport()
+                : { supported: false };
+        } catch { vd = { supported: false }; }
+
+        // Nothing meaningful to show: a single physical display and no virtual
+        // display support.
+        if (monitors.length < 2 && !(vd && vd.supported)) return;
 
         const btn = document.getElementById('btn-monitors');
         if (btn) btn.style.display = '';
@@ -1027,9 +1223,10 @@
         menu.innerHTML = '';
         if (label) menu.appendChild(label);
 
+        // Physical monitors
         monitors.forEach(m => {
             const item = document.createElement('button');
-            item.className = 'dropdown-item monitor-item';
+            item.className = 'dropdown-item monitor-item' + (m.current ? ' active' : '');
             item.dataset.idx = m.idx;
             item.innerHTML = '<span class="material-icons">' +
                 (m.primary ? 'desktop_windows' : 'monitor') +
@@ -1042,6 +1239,76 @@
             });
             menu.appendChild(item);
         });
+
+        // Virtual displays (RustDesk IDD / Amyuni IDD)
+        if (vd && vd.supported) {
+            const divider = document.createElement('div');
+            divider.className = 'dropdown-divider';
+            menu.appendChild(divider);
+
+            const vdLabel = document.createElement('div');
+            vdLabel.className = 'dropdown-label';
+            vdLabel.textContent = t('remote.virtual_displays', 'Virtual displays');
+            menu.appendChild(vdLabel);
+
+            if (vd.impl === 'rustdesk_idd') {
+                const active = Array.isArray(vd.rustdeskDisplays) ? vd.rustdeskDisplays : [];
+                for (let i = 0; i < 4; i++) {
+                    const idx = i + 1;
+                    const on = active.indexOf(idx) !== -1;
+                    const item = document.createElement('button');
+                    item.className = 'dropdown-item virtual-display-item' + (on ? ' active' : '');
+                    item.innerHTML = '<span class="material-icons">' +
+                        (on ? 'check_box' : 'check_box_outline_blank') + '</span> ' +
+                        escapeHtml(t('remote.virtual_display', 'Virtual display') + ' ' + idx);
+                    item.addEventListener('click', () => {
+                        session.client.toggleVirtualDisplay(idx, !on);
+                    });
+                    menu.appendChild(item);
+                }
+            } else if (vd.impl === 'amyuni_idd') {
+                const count = (typeof vd.amyuniCount === 'number') ? vd.amyuniCount : 0;
+                const row = document.createElement('div');
+                row.className = 'dropdown-item virtual-display-counter';
+
+                const minus = document.createElement('button');
+                minus.className = 'vd-count-btn';
+                minus.innerHTML = '<span class="material-icons">remove</span>';
+                minus.disabled = count <= 0;
+                minus.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    session.client.toggleVirtualDisplay(0, false);
+                });
+
+                const num = document.createElement('span');
+                num.className = 'vd-count-value';
+                num.textContent = String(count);
+
+                const plus = document.createElement('button');
+                plus.className = 'vd-count-btn';
+                plus.innerHTML = '<span class="material-icons">add</span>';
+                plus.disabled = count >= 4;
+                plus.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    session.client.toggleVirtualDisplay(0, true);
+                });
+
+                row.appendChild(minus);
+                row.appendChild(num);
+                row.appendChild(plus);
+                menu.appendChild(row);
+            }
+
+            // Plug out all
+            const plugOut = document.createElement('button');
+            plugOut.className = 'dropdown-item virtual-display-item';
+            plugOut.innerHTML = '<span class="material-icons">power_off</span> ' +
+                escapeHtml(t('remote.plug_out_all', 'Plug out all'));
+            plugOut.addEventListener('click', () => {
+                session.client.toggleVirtualDisplay(-1, false);
+            });
+            menu.appendChild(plugOut);
+        }
     }
 
     // Chat toggle
@@ -1112,12 +1379,81 @@
         withClient(c => c.setViewOnly(isViewOnly));
     });
 
-    // Pin Toolbar toggle
+    // Pin Toolbar toggle — keeps the expanded action pill open
     document.getElementById('btn-pin')?.addEventListener('click', function () {
         toolbarPinned = !toolbarPinned;
         toolbar.classList.toggle('pinned', toolbarPinned);
         this.classList.toggle('active', toolbarPinned);
-        if (toolbarPinned) clearTimeout(toolbarTimeout);
+        if (toolbarPinned) expandToolbar();
+    });
+
+    // ---- Compact handle: expand / collapse the action pill ----
+    document.getElementById('btn-toolbar-expand')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleToolbar();
+    });
+
+    // ---- Compact handle: fullscreen ----
+    document.getElementById('btn-handle-fullscreen')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        withClient(c => c.toggleFullscreen(viewerContainer));
+    });
+
+    // ---- Compact handle: drag the floating toolbar horizontally ----
+    (function setupToolbarDrag() {
+        const dragBtn = document.getElementById('btn-toolbar-drag');
+        if (!dragBtn) return;
+        let dragging = false;
+        let startX = 0;
+        let startLeft = 0;
+
+        function clampLeft(px) {
+            const w = toolbar.offsetWidth || 200;
+            const min = 8 + w / 2;
+            const max = window.innerWidth - 8 - w / 2;
+            return Math.max(min, Math.min(max, px));
+        }
+
+        function onMove(ev) {
+            if (!dragging) return;
+            ev.preventDefault();
+            const clientX = ev.touches ? ev.touches[0].clientX : ev.clientX;
+            const next = clampLeft(startLeft + (clientX - startX));
+            toolbar.style.left = next + 'px';
+            toolbar.style.transform = 'translateX(-50%)';
+        }
+
+        function onUp() {
+            if (!dragging) return;
+            dragging = false;
+            toolbar.classList.remove('dragging');
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            document.removeEventListener('touchmove', onMove);
+            document.removeEventListener('touchend', onUp);
+        }
+
+        function onDown(ev) {
+            ev.preventDefault();
+            dragging = true;
+            toolbar.classList.add('dragging');
+            const rect = toolbar.getBoundingClientRect();
+            startLeft = rect.left + rect.width / 2;
+            startX = ev.touches ? ev.touches[0].clientX : ev.clientX;
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+            document.addEventListener('touchmove', onMove, { passive: false });
+            document.addEventListener('touchend', onUp);
+        }
+
+        dragBtn.addEventListener('mousedown', onDown);
+        dragBtn.addEventListener('touchstart', onDown, { passive: false });
+    })();
+
+    // ---- Back to devices (independent tab — close instead of navigating) ----
+    document.getElementById('btn-back-devices')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        returnToDevices();
     });
 
     function closeAllDropdowns(exceptId) {
@@ -1149,8 +1485,11 @@
 
     // Fullscreen handler
     document.addEventListener('fullscreenchange', () => {
+        const fsIcon = document.fullscreenElement ? 'fullscreen_exit' : 'fullscreen';
         const icon = document.getElementById('btn-fullscreen')?.querySelector('.material-icons');
-        if (icon) icon.textContent = document.fullscreenElement ? 'fullscreen_exit' : 'fullscreen';
+        if (icon) icon.textContent = fsIcon;
+        const handleIcon = document.getElementById('btn-handle-fullscreen')?.querySelector('.material-icons');
+        if (handleIcon) handleIcon.textContent = fsIcon;
         setTimeout(() => {
             const session = getActiveSession();
             if (session && session.client && session.client.renderer) session.client.renderer.resize();
@@ -1185,7 +1524,7 @@
 
     document.getElementById('btn-connect-new')?.addEventListener('click', () => {
         const id = newSessionInput.value.trim();
-        if (!id || !/^[A-Za-z0-9_-]{3,32}$/.test(id)) {
+        if (!id || !/^[A-Za-z0-9_-]{3,64}$/.test(id)) {
             newSessionInput.classList.add('error');
             setTimeout(() => newSessionInput.classList.remove('error'), 1500);
             return;
@@ -1269,5 +1608,31 @@
         }
     }
 
+    // ── Tab / window lifecycle: auto-disconnect on tab close ─────────────
+    //
+    // Without this hook the remote peer keeps streaming video/audio until
+    // the relay notices the WebSocket is gone (seconds, sometimes longer
+    // when the OS pauses the page). An explicit `pagehide` / `beforeunload`
+    // triggers a clean `disconnect()` on every active session so the peer
+    // tears down immediately — saves bandwidth and CPU on the remote end.
+    function installLifecycleHandlers() {
+        const teardown = () => {
+            for (const session of sessions.values()) {
+                try {
+                    if (session.client) session.client.disconnect();
+                } catch { /* ignore */ }
+                if (session.mediaRecorder && session.mediaRecorder.state === 'recording') {
+                    try { session.mediaRecorder.stop(); } catch { /* ignore */ }
+                }
+            }
+        };
+        // pagehide fires on tab close, navigation, and bfcache eviction —
+        // the most reliable modern hook.
+        window.addEventListener('pagehide', teardown, { capture: true });
+        // beforeunload is a secondary fallback for older browsers.
+        window.addEventListener('beforeunload', teardown, { capture: true });
+    }
+
     init();
+    installLifecycleHandlers();
 })();

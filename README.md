@@ -15,9 +15,22 @@
 ![CDAP](https://img.shields.io/badge/CDAP-v1.0-orange.svg)
 ![i18n](https://img.shields.io/badge/i18n-25%2B%20languages-purple.svg)
 
+[![Sponsor on GitHub](https://img.shields.io/badge/GitHub-Sponsor-181717?logo=github&logoColor=white&style=flat)](https://github.com/sponsors/UNITRONIX)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%23FFDD00?logo=buy-me-a-coffee&logoColor=black&style=flat)](https://buymeacoffee.com/unitronix)
+
 **A clean-room RustDesk-compatible server written in Go — single binary replacing hbbs + hbbr — with full protocol support, TLS everywhere, PostgreSQL backend, CDAP (Custom Device API Protocol) for IoT/SCADA/network devices, and a modern Node.js web management console.**
 
 [Architecture](#-architecture) • [Installation](#-installation) • [Configuration](#-configuration) • [Security](#-security-architecture) • [API](#-api-reference) • [Troubleshooting](#-troubleshooting)
+
+<br>
+
+### 🏆 Honorary Supporter
+
+<a href="https://insolve.pl">
+  <img src="docs/assets/insolve-logo.png" alt="INSOLVE — Honorary Supporter" width="200">
+</a>
+
+BetterDesk is proudly supported by **[INSOLVE](https://insolve.pl)** — recognized as an *Honorary Supporter* of the project. See [SPONSORS.md](SPONSORS.md) for the full list of supporters and how to become one.
 
 </div>
 
@@ -550,7 +563,7 @@ curl -fsSL https://raw.githubusercontent.com/UNITRONIX/Rustdesk-FreeConsole/main
 docker compose up -d
 
 # Get admin password
-docker compose logs console 2>&1 | grep -i "Admin password"
+docker compose exec console sh -c 'cat /opt/rustdesk/.admin_credentials 2>/dev/null || cat /app/data/.admin_credentials'
 ```
 
 Open http://localhost:5000 — done in 30 seconds! See [DOCKER_QUICKSTART.md](docs/docker/DOCKER_QUICKSTART.md) for more options.
@@ -921,9 +934,12 @@ You can **upgrade to Let's Encrypt** or a custom certificate at any time using m
 | `-force-https` | `false` | `FORCE_HTTPS=Y` | Reject non-TLS API requests |
 | `-trust-proxy` | `false` | `TRUST_PROXY=Y` | Trust `X-Forwarded-For` / `X-Real-IP` headers |
 | `-relay-max-conns-ip` | `20` | `RELAY_MAX_CONNS_PER_IP` | Max relay connections per IP |
+| `-signal-rate-limit-per-ip` | `20` | `SIGNAL_RATE_LIMIT_PER_IP` | Max signal registrations per proxy/client bucket per minute (`0` = disabled) |
 | `-init-admin-user` | `admin` | `INIT_ADMIN_USER` | Initial admin username |
 | `-init-admin-pass` | *(auto)* | `INIT_ADMIN_PASS` | Initial admin password (auto-generated if omitted) |
 | `-version` | — | — | Show version and exit |
+
+> Signal proxy note: UDP/TCP signal traffic on port `21116` cannot use HTTP headers such as `X-Forwarded-For`. `TRUST_PROXY` only affects HTTP/API traffic. For NGINX stream or Docker proxy deployments, set `SIGNAL_RATE_LIMIT_PER_IP` higher for very large fleets, or `0` only on trusted private networks. Current builds scope registration buckets by proxy/client address plus peer ID to avoid false positives when multiple devices share one proxy address.
 
 ### Environment-Only Variables
 
@@ -947,7 +963,7 @@ You can **upgrade to Let's Encrypt** or a custom certificate at any time using m
 | `RelayIdleTimeout` | 30s | Close idle relay sessions (extended on activity) |
 | `DefaultTotalBandwidth` | 1 GB/s | Global bandwidth limit |
 | `DefaultSingleBandwidth` | 16 MB/s | Per-session bandwidth limit |
-| `IPRateLimitRegistrations` | 20/min | Registration rate limit per IP |
+| `IPRateLimitRegistrations` | 20/min | Registration rate limit per signal bucket |
 | `IDChangeCooldown` | 5 min | Minimum interval between ID changes |
 | `MaxFrameSize` | 64 KB | Maximum wire protocol frame size |
 

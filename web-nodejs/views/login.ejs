@@ -13,6 +13,14 @@
     <link rel="stylesheet" href="/css/login.css?v=<%= cacheVersion %>">
 </head>
 <body class="login-page">
+    <div class="login-language-picker">
+        <span class="material-icons" aria-hidden="true">language</span>
+        <select id="login-language-select" data-language-select aria-label="<%= _('settings.language') %>">
+            <% (availableLanguageList || Object.values(availableLanguages || {})).forEach(function(language) { %>
+                <option value="<%= language.code %>" <%= lang === language.code ? 'selected' : '' %>><%= language.native || language.name || language.code %></option>
+            <% }); %>
+        </select>
+    </div>
     <div class="login-container">
         <div class="login-card">
             <div class="login-header">
@@ -28,8 +36,8 @@
                     <span class="login-logo-text"><%= appName %></span>
                     <% } %>
                 </div>
-                <h1 class="login-title"><%= _('auth.login_title') %></h1>
-                <p class="login-subtitle"><%= _('auth.login_subtitle') %></p>
+                <h1 class="login-title"><%= branding.loginTitle || _('auth.login_title') %></h1>
+                <p class="login-subtitle"><%= branding.loginSubtitle || _('auth.login_subtitle') %></p>
             </div>
             
             <!-- Error message -->
@@ -89,6 +97,17 @@
                     <%= _('auth.login') %>
                 </button>
             </form>
+            
+            <!-- SSO / OIDC Login (shown dynamically when OIDC is enabled) -->
+            <div class="login-sso hidden" id="sso-section">
+                <div class="login-divider">
+                    <span><%= _('auth.or') %></span>
+                </div>
+                <a href="/api/auth/oidc/authorize" class="btn btn-secondary login-btn sso-btn" id="sso-btn">
+                    <span class="material-icons">key</span>
+                    <span id="sso-btn-text"><%= _('auth.login_sso') %></span>
+                </a>
+            </div>
             
             <!-- TOTP Verification Step (hidden by default) -->
             <form class="login-form hidden" id="totp-form">
@@ -152,7 +171,12 @@
             </form>
             
             <div class="login-footer">
+                <% if (branding.footerText) { %>
+                <p class="login-footer-custom"><%= branding.footerText %></p>
+                <% } %>
+                <% if (branding.showPoweredBy !== 'false') { %>
                 <p><%= appName %> v<%= appVersion %></p>
+                <% } %>
             </div>
         </div>
     </div>
@@ -161,11 +185,13 @@
         window.BetterDesk = {
             csrfToken: '<%= csrfToken || "" %>',
             lang: '<%= lang || "en" %>',
+            availableLanguages: <%- JSON.stringify(availableLanguageList || []) %>,
             translations: <%- JSON.stringify(translations || {}) %>,
             branding: <%- JSON.stringify(branding || {}) %>
         };
     </script>
     <script src="/js/utils.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/i18n-client.js?v=<%= cacheVersion %>"></script>
     <script src="/js/login.js?v=<%= cacheVersion %>"></script>
 </body>
 </html>

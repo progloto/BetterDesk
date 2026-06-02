@@ -6,6 +6,8 @@ const express = require('express');
 const router = express.Router();
 const db = require('../services/database');
 const serverBackend = require('../services/serverBackend');
+const addressBookSync = require('../services/rustdeskAddressBookSync');
+const deviceGroupService = require('../services/deviceGroupService');
 const { requireAuth, requirePermission } = require('../middleware/auth');
 
 /**
@@ -25,7 +27,7 @@ router.get('/devices', requireAuth, (req, res) => {
 const ALLOWED_SORT_FIELDS = ['last_online', 'id', 'hostname', 'created_at', 'os', 'version', 'username', 'note'];
 const ALLOWED_SORT_ORDERS = ['asc', 'desc'];
 
-router.get('/api/devices', requireAuth, async (req, res) => {
+router.get('/api/devices', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
         // Validate and sanitize sort parameters
         const sortBy = ALLOWED_SORT_FIELDS.includes(req.query.sortBy) 
@@ -41,7 +43,16 @@ router.get('/api/devices', requireAuth, async (req, res) => {
             sortOrder
         };
         
-        const devices = await serverBackend.getAllDevices(filters);
+        let devices = await serverBackend.getAllDevices(filters);
+        const scope = await deviceGroupService.getDeviceScopeForUser(db, req.session.user, devices);
+        devices = deviceGroupService.filterDevicesByScope(devices, scope);
+        for (const device of devices) {
+            try {
+                device.groups = await db.getDeviceGroupsForPeer(device.id);
+            } catch (_) {
+                device.groups = [];
+            }
+        }
         
         res.json({
             success: true,
@@ -60,9 +71,212 @@ router.get('/api/devices', requireAuth, async (req, res) => {
 });
 
 /**
+ * GET /api/tags - Get all visible device tags.
+ */
+router.get('/api/tags', requireAuth, requirePermission('device.view'), async (req, res) => {
+    try {
+        const devices = await getVisibleDevicesForRequest(req);
+        res.json({
+            success: true,
+            data: {
+                tags: addressBookSync.collectVisibleTags(devices, [], {})
+            }
+        });
+    } catch (err) {
+        console.error('Get tags error:', err);
+        res.status(500).json({
+            success: false,
+            error: req.t('errors.server_error')
+        });
+    }
+});
+
+function isValidGroupGuid(guid) {
+    return typeof guid === 'string' && guid.length > 0 && guid.length <= 80 && /^[A-Za-z0-9_.:-]+$/.test(guid);
+}
+
+function areValidGroupGuids(guids) {
+    return Array.isArray(guids) && guids.length <= 100 && guids.every(isValidGroupGuid);
+}
+
+async function getVisibleDevicesForRequest(req) {
+    const devices = await serverBackend.getAllDevices({});
+    const scope = await deviceGroupService.getDeviceScopeForUser(db, req.session.user, devices);
+    return deviceGroupService.filterDevicesByScope(devices, scope);
+}
+
+async function getVisibleDeviceGroupsForRequest(req) {
+    let groups = (await db.getAllDeviceGroups())
+        .filter(group => deviceGroupService.folderIdFromGroupGuid(group.guid) === null);
+    const accessUser = await deviceGroupService.getUserAccessContext(db, req.session.user);
+    groups = groups.filter(group => deviceGroupService.groupAllowedForUser(group, accessUser));
+    return groups;
+}
+
+async function rejectIfDeviceOutOfScope(req, res, device) {
+    if (await deviceGroupService.userCanAccessDevice(db, req.session.user, device)) return false;
+    res.status(403).json({ success: false, error: req.t('errors.forbidden') });
+    return true;
+}
+
+/**
+ * GET /api/device-groups - List device groups for the panel.
+ */
+router.get('/api/device-groups', requireAuth, requirePermission('device.view'), async (req, res) => {
+    try {
+        const devices = await getVisibleDevicesForRequest(req);
+        const groups = await getVisibleDeviceGroupsForRequest(req);
+        const enriched = await deviceGroupService.enrichGroups(db, groups, devices);
+        res.json({
+            success: true,
+            data: { groups: enriched, total: enriched.length }
+        });
+    } catch (err) {
+        console.error('Get device groups error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/device-groups - Create or update a device group.
+ */
+router.post('/api/device-groups', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    try {
+        const payload = deviceGroupService.normalizeGroupPayload(req.body || {});
+        if (!payload.name) {
+            return res.status(400).json({ success: false, error: req.t('folders.name_required') });
+        }
+        if (payload.source_type === 'tag' && !payload.tag_filter) {
+            return res.status(400).json({ success: false, error: req.t('devices.group_tag_required') });
+        }
+        if (!areValidGroupGuids(payload.allowed_groups)) {
+            return res.status(400).json({ success: false, error: req.t('devices.group_invalid') });
+        }
+
+        let group;
+        if (payload.guid) {
+            if (!isValidGroupGuid(payload.guid)) {
+                return res.status(400).json({ success: false, error: req.t('devices.group_invalid') });
+            }
+            if (deviceGroupService.folderIdFromGroupGuid(payload.guid) !== null) {
+                return res.status(400).json({ success: false, error: req.t('devices.folder_group_readonly') });
+            }
+            group = await db.updateDeviceGroup(payload.guid, payload);
+            if (!group) {
+                return res.status(404).json({ success: false, error: req.t('devices.group_not_found') });
+            }
+        } else {
+            group = await db.createDeviceGroup(payload);
+        }
+
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, 'allowed_users')) {
+            group = await db.setDeviceGroupUserAccess(group.guid, payload.allowed_users);
+        }
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, 'allowed_groups')) {
+            group = await db.setDeviceGroupUserGroupAccess(group.guid, payload.allowed_groups);
+        }
+
+        await db.logAction(req.session.userId, 'device_group_saved', `Device group ${group.name} saved`, req.ip);
+        res.json({ success: true, data: group });
+    } catch (err) {
+        console.error('Save device group error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * DELETE /api/device-groups/:guid - Delete a device group.
+ */
+router.delete('/api/device-groups/:guid', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    try {
+        const guid = String(req.params.guid || '');
+        if (!isValidGroupGuid(guid)) {
+            return res.status(400).json({ success: false, error: req.t('devices.group_invalid') });
+        }
+        const group = await db.getDeviceGroupByGuid(guid);
+        if (!group) {
+            return res.status(404).json({ success: false, error: req.t('devices.group_not_found') });
+        }
+        if (deviceGroupService.folderIdFromGroupGuid(guid) !== null) {
+            return res.status(400).json({ success: false, error: req.t('devices.folder_group_readonly') });
+        }
+        await db.deleteDeviceGroup(guid);
+        await db.logAction(req.session.userId, 'device_group_deleted', `Device group ${group.name} deleted`, req.ip);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Delete device group error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * GET /api/devices/:id/groups - Get manual and dynamic memberships for a device.
+ */
+router.get('/api/devices/:id/groups', requireAuth, requirePermission('device.view'), async (req, res) => {
+    try {
+        const device = await serverBackend.getDeviceById(req.params.id);
+        if (!device) return res.status(404).json({ success: false, error: req.t('devices.not_found') });
+        const allDevices = await getVisibleDevicesForRequest(req);
+        if (!await deviceGroupService.userCanAccessDevice(db, req.session.user, device, allDevices)) {
+            return res.status(403).json({ success: false, error: req.t('errors.forbidden') });
+        }
+        const groups = await deviceGroupService.enrichGroups(db, await getVisibleDeviceGroupsForRequest(req), allDevices);
+        const memberships = groups.filter(group => {
+            if (group.source_type === 'tag') return deviceGroupService.normalizeTags(device.tags).some(t => t.toLowerCase() === String(group.tag_filter || '').toLowerCase());
+            return false;
+        });
+        const manual = await db.getDeviceGroupsForPeer(req.params.id);
+        const manualGuids = new Set(manual.map(group => group.guid));
+        for (const group of groups) {
+            if (manualGuids.has(group.guid) && !memberships.some(g => g.guid === group.guid)) memberships.push(group);
+        }
+        res.json({ success: true, data: { groups, memberships } });
+    } catch (err) {
+        console.error('Get device memberships error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * PUT /api/devices/:id/groups - Replace manual group memberships for a device.
+ */
+router.put('/api/devices/:id/groups', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    try {
+        const deviceId = req.params.id;
+        const groupGuids = Array.isArray(req.body.groupGuids) ? req.body.groupGuids.map(String) : [];
+        if (groupGuids.length > 100 || groupGuids.some(guid => !isValidGroupGuid(guid))) {
+            return res.status(400).json({ success: false, error: req.t('devices.group_invalid') });
+        }
+
+        const device = await serverBackend.getDeviceById(deviceId);
+        if (!device) return res.status(404).json({ success: false, error: req.t('devices.not_found') });
+        const allDevices = await getVisibleDevicesForRequest(req);
+        if (!await deviceGroupService.userCanAccessDevice(db, req.session.user, device, allDevices)) {
+            return res.status(403).json({ success: false, error: req.t('errors.forbidden') });
+        }
+
+        const groups = await getVisibleDeviceGroupsForRequest(req);
+        const manualGroups = groups.filter(group => (group.source_type || 'manual') !== 'tag');
+        const manualGuidSet = new Set(manualGroups.map(group => group.guid));
+        const selected = Array.from(new Set(groupGuids.filter(guid => manualGuidSet.has(guid))));
+
+        for (const group of manualGroups) {
+            if (selected.includes(group.guid)) await db.addDeviceToGroup(group.guid, deviceId);
+            else await db.removeDeviceFromGroup(group.guid, deviceId);
+        }
+
+        await db.logAction(req.session.userId, 'device_group_membership_updated', `Device ${deviceId} groups set to [${selected.join(', ')}]`, req.ip);
+        res.json({ success: true, data: { groupGuids: selected } });
+    } catch (err) {
+        console.error('Update device memberships error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
  * GET /api/devices/:id - Get single device with sysinfo and latest metrics
  */
-router.get('/api/devices/:id', requireAuth, async (req, res) => {
+router.get('/api/devices/:id', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
         const device = await serverBackend.getDeviceById(req.params.id);
         
@@ -72,6 +286,7 @@ router.get('/api/devices/:id', requireAuth, async (req, res) => {
                 error: req.t('devices.not_found')
             });
         }
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
 
         // Enrich with sysinfo data (from peer_sysinfo table)
         try {
@@ -141,7 +356,9 @@ router.get('/api/devices/:id', requireAuth, async (req, res) => {
  */
 router.patch('/api/devices/:id', requireAuth, requirePermission('device.edit'), async (req, res) => {
     try {
-        const { user, note, display_name } = req.body;
+        const user = req.body.user !== undefined ? String(req.body.user).trim().slice(0, 128) : undefined;
+        const note = req.body.note !== undefined ? String(req.body.note).trim().slice(0, 512) : undefined;
+        const display_name = req.body.display_name !== undefined ? String(req.body.display_name).trim().slice(0, 128) : undefined;
         const id = req.params.id;
         
         // Check device exists
@@ -152,15 +369,26 @@ router.patch('/api/devices/:id', requireAuth, requirePermission('device.edit'), 
                 error: req.t('devices.not_found')
             });
         }
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
         
         const result = await serverBackend.updateDevice(id, { user, note, display_name });
+        if (result && result.error) {
+            return res.status(502).json({
+                success: false,
+                error: result.error
+            });
+        }
         
         // Log action
-        await db.logAction(req.session.userId, 'device_updated', `Device ${id} updated`, req.ip);
+        try {
+            await db.logAction(req.session.userId, 'device_updated', `Device ${id} updated`, req.ip);
+        } catch (auditErr) {
+            console.warn('Device update audit log failed:', auditErr.message);
+        }
         
         res.json({
             success: true,
-            data: { changes: result.changes }
+            data: { changes: result?.changes ?? 1 }
         });
     } catch (err) {
         console.error('Update device error:', err);
@@ -188,6 +416,7 @@ router.delete('/api/devices/:id', requireAuth, requirePermission('device.delete'
                 error: req.t('devices.not_found')
             });
         }
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
         
         const result = await serverBackend.deleteDevice(id, { revoke, cascade });
         
@@ -239,6 +468,7 @@ router.post('/api/devices/:id/ban', requireAuth, requirePermission('device.ban')
                 error: req.t('devices.not_found')
             });
         }
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
         
         await serverBackend.setBanStatus(id, true, reason || '');
         
@@ -269,6 +499,7 @@ router.post('/api/devices/:id/unban', requireAuth, requirePermission('device.ban
                 error: req.t('devices.not_found')
             });
         }
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
         
         await serverBackend.setBanStatus(id, false);
         
@@ -376,7 +607,7 @@ router.put('/api/devices/:id/tags', requireAuth, requirePermission('device.edit'
         }
 
         // BetterDesk backend: delegate to Go server
-        if (serverBackend.isBetterDesk()) {
+        if (await serverBackend.isBetterDesk()) {
             const result = await serverBackend.setPeerTags(id, cleaned);
             if (!result || !result.success) {
                 return res.status(400).json({
@@ -417,8 +648,15 @@ router.post('/api/devices/bulk-delete', requireAuth, requirePermission('device.d
             });
         }
         
-        let deleted = 0;
+        const devicesToDelete = [];
         for (const id of ids) {
+            const device = await serverBackend.getDeviceById(id);
+            if (!device || await rejectIfDeviceOutOfScope(req, res, device)) return;
+            devicesToDelete.push(String(id));
+        }
+
+        let deleted = 0;
+        for (const id of devicesToDelete) {
             const result = await serverBackend.deleteDevice(id);
             // In betterdesk mode, result is {success, data}; in rustdesk, result has .changes
             if (result && (result.success || result.changes)) deleted++;
@@ -449,6 +687,9 @@ router.post('/api/devices/bulk-delete', requireAuth, requirePermission('device.d
  */
 router.get('/api/devices/:id/access-policy', requireAuth, requirePermission('device.view'), async (req, res) => {
     try {
+        const device = await serverBackend.getDeviceById(req.params.id);
+        if (!device) return res.status(404).json({ success: false, error: req.t('devices.not_found') });
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
         const goApi = require('../services/betterdeskApi');
         const result = await goApi.getAccessPolicy(req.params.id);
         res.json(result);
@@ -463,6 +704,9 @@ router.get('/api/devices/:id/access-policy', requireAuth, requirePermission('dev
  */
 router.put('/api/devices/:id/access-policy', requireAuth, requirePermission('device.edit'), async (req, res) => {
     try {
+        const device = await serverBackend.getDeviceById(req.params.id);
+        if (!device) return res.status(404).json({ success: false, error: req.t('devices.not_found') });
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
         const goApi = require('../services/betterdeskApi');
         const result = await goApi.saveAccessPolicy(req.params.id, req.body);
         res.json(result);
@@ -477,6 +721,9 @@ router.put('/api/devices/:id/access-policy', requireAuth, requirePermission('dev
  */
 router.delete('/api/devices/:id/access-policy', requireAuth, requirePermission('device.edit'), async (req, res) => {
     try {
+        const device = await serverBackend.getDeviceById(req.params.id);
+        if (!device) return res.status(404).json({ success: false, error: req.t('devices.not_found') });
+        if (await rejectIfDeviceOutOfScope(req, res, device)) return;
         const goApi = require('../services/betterdeskApi');
         const result = await goApi.deleteAccessPolicy(req.params.id);
         res.json(result);
@@ -555,11 +802,145 @@ router.post('/api/devices/:id/files/read', requireAuth, requirePermission('devic
 });
 
 /**
+ * POST /api/devices/:id/files/write   (Phase 63)
+ * Body: { path, data: <base64>, mode?: 'overwrite|append|create' }
+ * Max payload ~16 MB (enforced agent-side). Audited.
+ */
+router.post('/api/devices/:id/files/write', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    const path = String(req.body?.path || '').slice(0, 4096);
+    const data = String(req.body?.data || '');
+    const mode = ['overwrite', 'append', 'create'].includes(req.body?.mode) ? req.body.mode : 'overwrite';
+    if (!path) return res.status(400).json({ success: false, error: 'path_required' });
+    if (data.length > 22 * 1024 * 1024) {
+        return res.status(413).json({ success: false, error: 'payload_too_large' });
+    }
+    try {
+        await db.logAction(req.session.userId, 'files.write',
+            `Write ${mode} on ${req.params.id}: ${path}`, req.ip || null);
+    } catch (_) { /* non-fatal */ }
+    proxyAgentRequest(req, res, 'files.write', { path, data, mode }, 30000);
+});
+
+/**
+ * POST /api/devices/:id/files/delete   (Phase 63)
+ * Body: { path, recursive?: bool }
+ */
+router.post('/api/devices/:id/files/delete', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    const path = String(req.body?.path || '').slice(0, 4096);
+    const recursive = req.body?.recursive === true;
+    if (!path) return res.status(400).json({ success: false, error: 'path_required' });
+    try {
+        await db.logAction(req.session.userId, 'files.delete',
+            `Delete${recursive ? ' (recursive)' : ''} on ${req.params.id}: ${path}`, req.ip || null);
+    } catch (_) { /* non-fatal */ }
+    proxyAgentRequest(req, res, 'files.delete', { path, recursive }, 15000);
+});
+
+/**
+ * POST /api/devices/:id/files/rename   (Phase 63)
+ * Body: { from, to }
+ */
+router.post('/api/devices/:id/files/rename', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    const from = String(req.body?.from || '').slice(0, 4096);
+    const to = String(req.body?.to || '').slice(0, 4096);
+    if (!from || !to) return res.status(400).json({ success: false, error: 'paths_required' });
+    try {
+        await db.logAction(req.session.userId, 'files.rename',
+            `Rename on ${req.params.id}: ${from} -> ${to}`, req.ip || null);
+    } catch (_) { /* non-fatal */ }
+    proxyAgentRequest(req, res, 'files.rename', { from, to }, 10000);
+});
+
+/**
+ * POST /api/devices/:id/files/mkdir   (Phase 63)
+ * Body: { path, recursive?: bool (default true) }
+ */
+router.post('/api/devices/:id/files/mkdir', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    const path = String(req.body?.path || '').slice(0, 4096);
+    const recursive = req.body?.recursive !== false;
+    if (!path) return res.status(400).json({ success: false, error: 'path_required' });
+    try {
+        await db.logAction(req.session.userId, 'files.mkdir',
+            `Mkdir on ${req.params.id}: ${path}`, req.ip || null);
+    } catch (_) { /* non-fatal */ }
+    proxyAgentRequest(req, res, 'files.mkdir', { path, recursive }, 10000);
+});
+
+/**
+ * GET /api/devices/:id/clipboard   (Phase 64)
+ * Reads the device's text clipboard.
+ */
+router.get('/api/devices/:id/clipboard', requireAuth, requirePermission('device.view'), (req, res) => {
+    proxyAgentRequest(req, res, 'clipboard.get', null, 5000);
+});
+
+/**
+ * POST /api/devices/:id/clipboard   (Phase 64)
+ * Body: { text }   (max 1 MiB enforced agent-side)
+ */
+router.post('/api/devices/:id/clipboard', requireAuth, requirePermission('device.edit'), async (req, res) => {
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+    if (text.length > 1024 * 1024) {
+        return res.status(413).json({ success: false, error: 'text_too_large' });
+    }
+    try {
+        await db.logAction(req.session.userId, 'clipboard.set',
+            `Clipboard set on ${req.params.id} (${text.length} chars)`, req.ip || null);
+    } catch (_) { /* non-fatal */ }
+    proxyAgentRequest(req, res, 'clipboard.set', { text }, 5000);
+});
+
+/**
  * POST /api/devices/:id/screenshot
  * Captures a JPEG snapshot from the agent. Returns base64 image.
  */
 router.post('/api/devices/:id/screenshot', requireAuth, requirePermission('device.view'), (req, res) => {
     proxyAgentRequest(req, res, 'screenshot.capture', null, 20000);
+});
+
+/**
+ * POST /api/devices/:id/input/mouse
+ * Body: { action: 'move|down|up|click|wheel', x?, y?, x_rel?, y_rel?,
+ *         screen_w?, screen_h?, button?: 'left|right|middle',
+ *         wheel_dx?, wheel_dy? }
+ * Forwards a single mouse event to the agent (Phase 58).
+ */
+router.post('/api/devices/:id/input/mouse', requireAuth, requirePermission('device.edit'), (req, res) => {
+    const b = req.body || {};
+    const payload = {
+        action: String(b.action || 'move'),
+        button: typeof b.button === 'string' ? b.button : undefined,
+    };
+    if (typeof b.x === 'number') payload.x = Math.trunc(b.x);
+    if (typeof b.y === 'number') payload.y = Math.trunc(b.y);
+    if (typeof b.x_rel === 'number') payload.x_rel = b.x_rel;
+    if (typeof b.y_rel === 'number') payload.y_rel = b.y_rel;
+    if (typeof b.screen_w === 'number') payload.screen_w = Math.trunc(b.screen_w);
+    if (typeof b.screen_h === 'number') payload.screen_h = Math.trunc(b.screen_h);
+    if (typeof b.wheel_dx === 'number') payload.wheel_dx = Math.trunc(b.wheel_dx);
+    if (typeof b.wheel_dy === 'number') payload.wheel_dy = Math.trunc(b.wheel_dy);
+    proxyAgentRequest(req, res, 'input.mouse', payload, 5000);
+});
+
+/**
+ * POST /api/devices/:id/input/key
+ * Body: { key: 'Enter|Escape|a|F5|...', action?: 'press|down|up' }
+ */
+router.post('/api/devices/:id/input/key', requireAuth, requirePermission('device.edit'), (req, res) => {
+    const key = String(req.body?.key || '').slice(0, 32);
+    if (!key) return res.status(400).json({ success: false, error: 'key_required' });
+    const action = String(req.body?.action || 'press');
+    proxyAgentRequest(req, res, 'input.key', { key, action }, 5000);
+});
+
+/**
+ * POST /api/devices/:id/input/text
+ * Body: { text: 'hello world' }
+ */
+router.post('/api/devices/:id/input/text', requireAuth, requirePermission('device.edit'), (req, res) => {
+    const text = String(req.body?.text || '').slice(0, 4096);
+    if (!text) return res.status(400).json({ success: false, error: 'text_required' });
+    proxyAgentRequest(req, res, 'input.text', { text }, 8000);
 });
 
 /**

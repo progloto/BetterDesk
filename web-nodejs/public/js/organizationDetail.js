@@ -56,8 +56,12 @@
         });
     }
 
+    // Roles ordered lowest → highest, matching the org membership modal.
+    // (Member/Operator/Admin/Owner). Backend value `user` is preserved for
+    // compatibility but the label is standardized to "Member" via i18n
+    // to avoid vocabulary collision with the server-wide "Viewer" role.
     function roleOptions(selected) {
-        const roles = ['owner', 'admin', 'operator', 'user'];
+        const roles = ['user', 'operator', 'admin', 'owner'];
         return roles.map(r =>
             `<option value="${r}" ${r === selected ? 'selected' : ''}>${t('role_' + r)}</option>`
         ).join('');

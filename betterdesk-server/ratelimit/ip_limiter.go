@@ -10,13 +10,13 @@ import (
 
 // IPLimiter tracks registration attempts per IP address using a sliding window.
 type IPLimiter struct {
-	mu       sync.Mutex
-	entries  map[string]*ipEntry
-	limit    int           // Max events per window
-	window   time.Duration // Sliding window duration
-	cleanup  time.Duration // How often to clean stale entries
-	stopCh   chan struct{}
-	stopped  bool
+	mu      sync.Mutex
+	entries map[string]*ipEntry
+	limit   int           // Max events per window
+	window  time.Duration // Sliding window duration
+	cleanup time.Duration // How often to clean stale entries
+	stopCh  chan struct{}
+	stopped bool
 }
 
 type ipEntry struct {
@@ -45,7 +45,14 @@ func NewIPLimiter(limit int, window, cleanup time.Duration) *IPLimiter {
 
 // Allow checks if an event from the given IP should be allowed.
 // Returns true if the IP is within the rate limit, false if blocked.
+//
+// A limit of 0 (or negative) disables rate limiting entirely; every call
+// returns true. This is useful for deployments behind a single corporate
+// NAT where many devices legitimately share one public IP.
 func (l *IPLimiter) Allow(ip string) bool {
+	if l == nil || l.limit <= 0 {
+		return true
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

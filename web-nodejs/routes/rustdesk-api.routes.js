@@ -38,7 +38,19 @@ const fs = require('fs');
 const crypto = require('crypto');
 const authService = require('../services/authService');
 const db = require('../services/database');
+const serverBackend = require('../services/serverBackend');
+const betterdeskApi = require('../services/betterdeskApi');
+const addressBookSync = require('../services/rustdeskAddressBookSync');
+const deviceGroupService = require('../services/deviceGroupService');
 const config = require('../config/config');
+const { roleHasPermission } = require('../middleware/auth');
+
+// After the API-port consolidation the RustDesk clients report audit events to
+// the Go server (port 21121). When Node's own client API listener is disabled
+// the Go server is the source of truth, so panel audit widgets must read audit
+// data back from Go to stay consistent (notably on SQLite, where Go and Node
+// keep separate database files).
+const AUDIT_SOURCE_IS_GO = config.serverBackend === 'betterdesk' && !config.apiEnabled;
 
 // ==================== Constants ====================
 
@@ -154,6 +166,466 @@ function isValidDeviceId(id) {
     return typeof id === 'string' && id.length > 0 && id.length <= MAX_ID_LEN && /^[a-zA-Z0-9_-]+$/.test(id);
 }
 
+function canSyncDeviceInventory(user) {
+    return user && user.role !== 'pro' && roleHasPermission(user.role, 'device.edit');
+}
+
+function canBrowseDeviceInventory(user) {
+    return user && user.role !== 'pro' && roleHasPermission(user.role, 'device.view');
+}
+
+function canSyncDeviceTags(user) {
+    return user && user.role !== 'pro' && roleHasPermission(user.role, 'device.edit');
+}
+
+function isReachableRustDeskDevice(device) {
+    if (!device || device.banned || device.disabled) return false;
+    if (device.online === true || device.live_online === true || device.cdap_connected === true) return true;
+
+    const liveStatus = String(device.live_status || device.status_tier || device.status || '').trim().toLowerCase();
+    return liveStatus === 'online' || liveStatus === 'degraded' || liveStatus === 'critical';
+}
+
+function getDeviceFolderId(device) {
+    const raw = device && device.folder_id;
+    if (raw === undefined || raw === null || raw === '') return null;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function folderGroupGuid(folderId) {
+    return `folder_${folderId}`;
+}
+
+function folderIdFromGroupGuid(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const raw = String(value).trim();
+    const match = raw.match(/^folder_(\d+)$/i) || raw.match(/^(\d+)$/);
+    if (!match) return null;
+    const parsed = Number.parseInt(match[1], 10);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function groupFieldValue(value) {
+    if (Array.isArray(value)) return groupFieldValue(value[0]);
+    if (value && typeof value === 'object') {
+        return groupFieldValue(
+            value.guid ||
+            value.id ||
+            value.device_group_guid ||
+            value.device_group_id ||
+            value.group_guid ||
+            value.group_id ||
+            value.name ||
+            value.group_name ||
+            value.tag ||
+            value.tag_filter ||
+            ''
+        );
+    }
+    return String(value || '').trim();
+}
+
+function requestFilterParams(req) {
+    const params = {};
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+        Object.assign(params, req.body);
+    }
+    Object.assign(params, req.query || {});
+    return params;
+}
+
+function requestedGroupValue(query = {}) {
+    const keys = [
+        'folder_id', 'folderId', 'folder', 'folder_name', 'folderName',
+        'device_group_guid', 'deviceGroupGuid',
+        'device_group_id', 'deviceGroupId',
+        'device_group', 'deviceGroup',
+        'device_group_name', 'deviceGroupName',
+        'group_guid', 'groupGuid',
+        'group_id', 'groupId',
+        'group_name', 'groupName',
+        'group'
+    ];
+
+    for (const key of keys) {
+        const value = groupFieldValue(query[key]);
+        if (value) return value;
+    }
+    return '';
+}
+
+function queryListValue(value) {
+    const raw = Array.isArray(value) ? value : String(value || '').split(',');
+    return Array.from(new Set(raw
+        .map(item => String(item || '').trim())
+        .filter(Boolean)
+        .map(item => sanitizeStr(item, 50))
+        .filter(Boolean)
+    ));
+}
+
+function requestedTagValues(query = {}) {
+    return queryListValue(query.tag || query.tags || query.tag_name || query.tagName || query.tag_filter || query.tagFilter || '');
+}
+
+function deviceHasAllTags(device, expectedTags) {
+    if (!expectedTags || expectedTags.length === 0) return true;
+    const tags = new Set(addressBookSync.normalizeTags(device && device.tags).map(tag => tag.toLowerCase()));
+    return expectedTags.every(tag => tags.has(String(tag || '').toLowerCase()));
+}
+
+function resolveRequestedFolderId(query = {}, folders = []) {
+    const rawValue = requestedGroupValue(query);
+    const parsed = folderIdFromGroupGuid(rawValue);
+    if (parsed !== null) return parsed;
+
+    const normalized = String(rawValue || '').trim().toLowerCase();
+    if (!normalized) return null;
+    const folder = (folders || []).find(item => String(item.name || '').trim().toLowerCase() === normalized);
+    if (!folder) return null;
+    const id = Number.parseInt(folder.id, 10);
+    return Number.isFinite(id) ? id : null;
+}
+
+async function getAddressBookPeerIds(user) {
+    const allowedIds = new Set();
+    if (!user || !user.id) return allowedIds;
+
+    for (const abType of ['legacy', 'personal']) {
+        try {
+            const row = await db.getAddressBook(user.id, abType);
+            const parsed = addressBookSync.parseAddressBookData(row && row.data);
+            for (const peer of parsed.peers) {
+                const id = String(peer && peer.id || '').trim();
+                if (id) allowedIds.add(id);
+            }
+        } catch (err) {
+            console.warn(`[API:AB] Failed to read ${abType} address book for user ${user.username}:`, err.message);
+        }
+    }
+
+    return allowedIds;
+}
+
+async function filterDevicesForRustDeskUser(user, devices) {
+    let scoped = devices;
+    try {
+        scoped = deviceGroupService.filterDevicesByScope(
+            devices,
+            await deviceGroupService.getDeviceScopeForUser(db, user, devices)
+        );
+    } catch (err) {
+        console.warn(`[API:PEERS] Failed to apply device group scope for ${user && user.username}:`, err.message);
+    }
+
+    if (canBrowseDeviceInventory(user)) return scoped;
+
+    const allowedIds = await getAddressBookPeerIds(user);
+    if (allowedIds.size === 0) return [];
+
+    return scoped.filter(device => allowedIds.has(String(device.id)));
+}
+
+async function syncAddressBookTagsToConsole(user, dataStr, abType) {
+    if (!canSyncDeviceTags(user)) return;
+
+    const updates = addressBookSync.collectPeerTagUpdates(dataStr);
+    if (updates.length === 0) return;
+
+    let synced = 0;
+    for (const update of updates) {
+        if (!isValidDeviceId(update.id)) continue;
+        try {
+            const result = await serverBackend.setPeerTags(update.id, update.tags);
+            if (result && result.success !== false) synced++;
+        } catch (err) {
+            console.warn(`[API:AB] Failed to sync tags for peer ${update.id}:`, err.message);
+        }
+    }
+
+    if (synced > 0) {
+        console.log(`[API:AB] Synced ${synced} peer tag set(s) from ${abType} address book for user ${user.username}`);
+    }
+}
+
+async function getConsoleDeviceContext(user) {
+    const context = {
+        devices: [],
+        folders: [],
+        assignments: {}
+    };
+
+    try {
+        context.folders = await db.getAllFolders();
+    } catch (err) {
+        console.warn('[API:AB] Failed to read panel folders:', err.message);
+    }
+
+    try {
+        context.assignments = await db.getAllFolderAssignments();
+    } catch (err) {
+        console.warn('[API:AB] Failed to read folder assignments:', err.message);
+    }
+
+    try {
+        context.devices = await serverBackend.getAllDevices({});
+        if (!canBrowseDeviceInventory(user)) {
+            context.devices = await filterDevicesForRustDeskUser(user, context.devices);
+        }
+    } catch (err) {
+        console.warn('[API:AB] Failed to read panel devices:', err.message);
+    }
+
+    return context;
+}
+
+async function buildSyncedAddressBook(user, abType) {
+    const abRecord = await db.getAddressBook(user.id, abType);
+    const abData = (abRecord && abRecord.data) ? String(abRecord.data) : '{}';
+    const context = await getConsoleDeviceContext(user);
+
+    // Issue #138 (2.1): Do NOT auto-include all server devices into the AB.
+    // Previously this was true for admin/operator users, causing "ghost" entries
+    // that reappear after deletion. The "Available Devices" tab shows all server
+    // devices via /api/peers/list — the AB should only contain user-added entries.
+    return addressBookSync.mergeAddressBookData(abData, {
+        ...context,
+        includeDevices: false
+    });
+}
+
+async function getSyncedAddressBookTags(user) {
+    const context = await getConsoleDeviceContext(user);
+    const tags = addressBookSync.collectVisibleTags(context.devices, context.folders, context.assignments);
+    const seen = new Set(tags.map(tag => String(tag || '').trim().toLowerCase()).filter(Boolean));
+
+    try {
+        for (const tag of await db.getAddressBookTags(user.id)) {
+            const value = String(tag || '').trim();
+            const normalized = value.toLowerCase();
+            if (normalized && !seen.has(normalized)) {
+                seen.add(normalized);
+                tags.push(value);
+            }
+        }
+    } catch (_) { /* non-critical */ }
+
+    return tags.sort((a, b) => a.localeCompare(b));
+}
+
+async function getRustDeskDeviceGroups(user) {
+    const groups = [];
+    let devices = [];
+    const accessUser = await deviceGroupService.getUserAccessContext(db, user);
+
+    try {
+        devices = await serverBackend.getAllDevices();
+        devices = await filterDevicesForRustDeskUser(user, devices);
+    } catch (err) {
+        console.warn('[API:DEVICE-GROUP] Failed to read devices for dynamic counts:', err.message);
+    }
+
+    // Build folder assignments map for peer lookups
+    let assignments = {};
+    try {
+        assignments = await db.getAllFolderAssignments() || {};
+    } catch (_) { /* non-critical */ }
+
+    try {
+        const rawGroups = (await db.getAllDeviceGroups())
+            .filter(group => folderIdFromGroupGuid(group.guid) === null)
+            .filter(group => deviceGroupService.groupAllowedForUser(group, accessUser));
+        const deviceGroups = await deviceGroupService.enrichGroups(db, rawGroups, devices);
+        for (const group of deviceGroups) {
+            const peerIds = await deviceGroupService.getGroupPeerIds(db, group, devices);
+            groups.push({
+                guid: group.guid,
+                name: group.name,
+                note: group.note || '',
+                peer_ids: [...peerIds]
+            });
+        }
+    } catch (err) {
+        console.warn('[API:DEVICE-GROUP] Failed to read device groups:', err.message);
+    }
+
+    try {
+        const folders = await db.getAllFolders();
+        for (const folder of folders) {
+            const guid = folderGroupGuid(folder.id);
+            let mirrorGroup = null;
+            try {
+                mirrorGroup = await db.getDeviceGroupByGuid(guid);
+            } catch (_) { /* non-critical */ }
+            const allowedUsers = mirrorGroup && Array.isArray(mirrorGroup.allowed_users) ? mirrorGroup.allowed_users : [];
+            const allowedGroups = mirrorGroup && Array.isArray(mirrorGroup.allowed_groups) ? mirrorGroup.allowed_groups : [];
+            if (!deviceGroupService.groupAllowedForUser({ allowed_users: allowedUsers, allowed_groups: allowedGroups }, accessUser)) continue;
+
+            // Collect peer IDs assigned to this folder
+            const folderPeerIds = [];
+            for (const [deviceId, folderId] of Object.entries(assignments)) {
+                if (Number.parseInt(folderId, 10) === Number.parseInt(folder.id, 10)) {
+                    folderPeerIds.push(String(deviceId));
+                }
+            }
+
+            groups.push({
+                guid,
+                name: folder.name,
+                note: '',
+                peer_ids: folderPeerIds
+            });
+        }
+    } catch (err) {
+        console.warn('[API:DEVICE-GROUP] Failed to read folders:', err.message);
+    }
+
+    return groups;
+}
+
+function rustDeskDeviceGroupPayload(group, index) {
+    const guid = String(group.guid || '').trim();
+    // Build team.peers array from peer_ids — required by RustDesk Dart client
+    const peerRefs = (group.peer_ids || []).map(id => ({ id: String(id) }));
+    return {
+        guid,
+        name: group.name || '',
+        team: { peers: peerRefs },
+        access_perm: 1,
+        note: group.note || '',
+        created_at: '',
+        sort: typeof index === 'number' ? index : 0
+    };
+}
+
+async function getRustDeskPeerList(user, params = {}) {
+    let folders = [];
+    try {
+        folders = await db.getAllFolders();
+    } catch (_) { /* non-critical */ }
+
+    const requestedFolder = resolveRequestedFolderId(params, folders);
+    const requestedGroup = requestedGroupValue(params);
+    const requestedTags = requestedTagValues(params);
+    let devices = await serverBackend.getAllDevices({
+        search: params.search || ''
+    });
+
+    let assignments = {};
+    try {
+        assignments = await db.getAllFolderAssignments();
+        for (const device of devices) {
+            const assigned = assignments[String(device.id)];
+            if (assigned !== undefined) device.folder_id = assigned;
+        }
+    } catch (_) { /* non-critical */ }
+
+    devices = await filterDevicesForRustDeskUser(user, devices);
+    const accessUser = await deviceGroupService.getUserAccessContext(db, user);
+
+    // Filter banned/disabled but keep offline devices visible (with correct status)
+    devices = devices.filter(d => d && !d.banned && !d.disabled);
+
+    if (requestedFolder !== null) {
+        devices = devices.filter(device => getDeviceFolderId(device) === requestedFolder);
+    } else if (requestedGroup) {
+        const normalizedGroup = String(requestedGroup).trim().toLowerCase();
+        let group = null;
+        try {
+            group = await db.getDeviceGroupByGuid(String(requestedGroup).trim());
+            if (!group) {
+                const allGroups = await db.getAllDeviceGroups();
+                group = (allGroups || []).find(item => String(item.name || '').trim().toLowerCase() === normalizedGroup) || null;
+            }
+        } catch (_) { /* non-critical */ }
+        if (group && deviceGroupService.groupAllowedForUser(group, accessUser)) {
+            const groupPeerIds = await deviceGroupService.getGroupPeerIds(db, group, devices);
+            devices = devices.filter(device => groupPeerIds.has(String(device.id)));
+        } else if (!group && normalizedGroup) {
+            devices = devices.filter(device => deviceHasAllTags(device, [normalizedGroup]));
+        } else {
+            devices = [];
+        }
+    }
+
+    if (requestedTags.length > 0) {
+        devices = devices.filter(device => deviceHasAllTags(device, requestedTags));
+    }
+
+    let folderNames = new Map();
+    try {
+        folderNames = new Map(folders.map(folder => [Number.parseInt(folder.id, 10), folder.name]));
+    } catch (_) { /* non-critical */ }
+
+    const allSysinfo = await db.getAllPeerSysinfo();
+    const sysinfoMap = {};
+    for (const sysinfo of allSysinfo) {
+        sysinfoMap[sysinfo.peer_id] = sysinfo;
+    }
+
+    const enrichedPeers = devices.map(device => {
+        const sysinfo = sysinfoMap[device.id] || {};
+        const tags = addressBookSync.normalizeTags(device.tags);
+        const folderId = getDeviceFolderId(device);
+        const deviceGroupGuid = folderId ? folderGroupGuid(folderId) : '';
+        const deviceGroupName = folderId ? (folderNames.get(folderId) || '') : '';
+        const hostname = sysinfo.hostname || device.hostname || '';
+        const username = sysinfo.username || device.username || device.user || '';
+        const platform = sysinfo.platform || device.platform || device.os || '';
+        const displayName = device.display_name || '';
+        const alias = displayName || device.note || hostname || String(device.id || '');
+        const reachable = isReachableRustDeskDevice(device);
+
+        // Match Go server PeerPayload format — info as nested map, status as int
+        return {
+            id: device.id,
+            info: {
+                device_name: hostname,
+                os: platform,
+                username: username,
+                version: sysinfo.version || ''
+            },
+            status: 1,
+            user: username,
+            user_name: username,
+            note: device.note || '',
+            device_group_name: deviceGroupName,
+            tags,
+            online: reachable,
+            alias,
+            hash: device.hash || ''
+        };
+    });
+
+    const page = Math.max(1, parseInt(params.page, 10) || 1);
+    const pageSize = Math.min(200, Math.max(1, parseInt(params.page_size || params.pageSize, 10) || 100));
+    const start = (page - 1) * pageSize;
+    const paged = enrichedPeers.slice(start, start + pageSize);
+
+    return {
+        data: paged,
+        total: enrichedPeers.length
+    };
+}
+
+async function sendRustDeskDeviceGroups(req, res) {
+    try {
+        if (req.authUser && req.authUser.role === 'pro') {
+            return res.json({ data: [], total: 0, msg: 'success' });
+        }
+        const groups = await getRustDeskDeviceGroups(req.authUser);
+        return res.json({
+            data: groups.map((g, i) => rustDeskDeviceGroupPayload(g, i)),
+            total: groups.length,
+            msg: 'success'
+        });
+    } catch (err) {
+        console.error('[API:DEVICE-GROUP] Error:', err.message);
+        return res.json({ data: [], total: 0, msg: 'success' });
+    }
+}
+
 // ==================== Phase 0: Core Auth Endpoints ====================
 
 /**
@@ -214,7 +686,7 @@ router.post('/api/heartbeat', async (req, res) => {
             }
             return res.json({ modified_at: new Date().toISOString(), sysinfo: true });
         }
-        
+
         // Check if sysinfo is older than 1 hour
         const updatedAt = new Date(sysinfo.updated_at).getTime();
         const oneHourAgo = Date.now() - (60 * 60 * 1000);
@@ -357,7 +829,7 @@ router.post('/api/sysinfo', async (req, res) => {
 router.post('/api/sysinfo_ver', async (req, res) => {
     const body = req.body || {};
     const deviceId = sanitizeStr(body.id || body.uuid || '', MAX_ID_LEN);
-    
+
     if (!deviceId || !isValidDeviceId(deviceId)) {
         return res.type('text/plain').send('');
     }
@@ -395,8 +867,7 @@ router.get('/api/ab', async (req, res) => {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
     try {
-        const abRecord = await db.getAddressBook(user.id, 'legacy');
-        const abData = (abRecord && abRecord.data) ? String(abRecord.data) : '{}';
+        const abData = await buildSyncedAddressBook(user, 'legacy');
         return res.json({ data: abData, licensed_devices: 0 });
     } catch (err) {
         console.error('[API:AB] Error reading legacy address book:', err.message);
@@ -423,6 +894,7 @@ router.post('/api/ab', async (req, res) => {
         const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
         try {
             await db.saveAddressBook(user.id, dataStr, 'legacy');
+            await syncAddressBookTagsToConsole(user, dataStr, 'legacy');
             console.log(`[API:AB] Saved legacy address book for user ${user.username} (${dataStr.length} bytes)`);
         } catch (err) {
             console.error('[API:AB] Error saving legacy address book:', err.message);
@@ -445,8 +917,7 @@ router.get('/api/ab/personal', async (req, res) => {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
     try {
-        const abRecord = await db.getAddressBook(user.id, 'personal');
-        const abData = (abRecord && abRecord.data) ? String(abRecord.data) : '{}';
+        const abData = await buildSyncedAddressBook(user, 'personal');
         return res.json({ data: abData });
     } catch (err) {
         console.error('[API:AB] Error reading personal address book:', err.message);
@@ -465,6 +936,22 @@ router.get('/api/audit', async (req, res) => {
     }
     // Return combined recent audit events
     try {
+        if (AUDIT_SOURCE_IS_GO) {
+            const [c, f, a] = await Promise.all([
+                betterdeskApi.getClientAuditConnections({ limit: 50 }),
+                betterdeskApi.getClientAuditFiles({ limit: 50 }),
+                betterdeskApi.getClientAuditAlarms({ limit: 50 })
+            ]);
+            if (c || f || a) {
+                return res.json({
+                    data: {
+                        connections: (c && c.data) || [],
+                        files: (f && f.data) || [],
+                        alarms: (a && a.data) || []
+                    }
+                });
+            }
+        }
         const conns = await db.getAuditConnections({ limit: 50 });
         const files = await db.getAuditFiles({ limit: 50 });
         const alarms = await db.getAuditAlarms({ limit: 50 });
@@ -499,6 +986,7 @@ router.post('/api/ab/personal', async (req, res) => {
         const dataStr = typeof data === 'string' ? data : JSON.stringify(data);
         try {
             await db.saveAddressBook(user.id, dataStr, 'personal');
+            await syncAddressBookTagsToConsole(user, dataStr, 'personal');
             console.log(`[API:AB] Saved personal address book for user ${user.username} (${dataStr.length} bytes)`);
         } catch (err) {
             console.error('[API:AB] Error saving personal address book:', err.message);
@@ -521,7 +1009,7 @@ router.get('/api/ab/tags', async (req, res) => {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
     try {
-        const tags = await db.getAddressBookTags(user.id);
+        const tags = await getSyncedAddressBookTags(user);
         return res.json({ data: tags });
     } catch (err) {
         console.error('[API:AB] Error reading address book tags:', err.message);
@@ -574,62 +1062,40 @@ router.get('/api/peers', async (req, res, next) => {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
-    // Pro users cannot see the device list — only their own address book
+    // Pro users are API-only accounts for RustDesk PRO activation/telemetry.
+    // They intentionally do not receive reachable device inventory.
     if (user.role === 'pro') {
         return res.json({ data: [], total: 0 });
     }
 
     try {
-        // Get all devices from peer table
-        const devices = await db.getAllDevices({
-            search: req.query.search || '',
-            status: req.query.status || ''
-        });
-
-        // Build sysinfo lookup map
-        const allSysinfo = await db.getAllPeerSysinfo();
-        const sysinfoMap = {};
-        for (const si of allSysinfo) {
-            sysinfoMap[si.peer_id] = si;
-        }
-
-        // Merge devices with sysinfo
-        const enrichedPeers = devices.map(device => {
-            const si = sysinfoMap[device.id] || {};
-            return {
-                id: device.id,
-                hostname: si.hostname || device.hostname || '',
-                username: si.username || device.username || '',
-                platform: si.platform || device.platform || '',
-                version: si.version || '',
-                ip: device.ip || '',
-                online: device.online,
-                last_online: device.last_online || '',
-                created_at: device.created_at || '',
-                note: device.note || '',
-                banned: device.banned,
-                pk: device.pk || '',
-                cpu: si.cpu_name || '',
-                memory: si.memory_gb || 0,
-                os: si.os_full || '',
-                displays: si.displays || [],
-                folder_id: device.folder_id
-            };
-        });
-
-        // Pagination
-        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-        const pageSize = Math.min(200, Math.max(1, parseInt(req.query.page_size, 10) || 100));
-        const start = (page - 1) * pageSize;
-        const paged = enrichedPeers.slice(start, start + pageSize);
-
-        return res.json({
-            data: paged,
-            total: enrichedPeers.length
-        });
+        const result = await getRustDeskPeerList(user, requestFilterParams(req));
+        return res.json(result);
     } catch (err) {
         console.error('[API:PEERS] Error:', err.message);
         return res.json({ data: [], total: 0 });
+    }
+});
+
+/**
+ * GET/POST /api/peers/list
+ * RustDesk PRO-compatible peer-list envelope used by some desktop builds when
+ * a folder/group is selected in Available Devices.
+ */
+router.all('/api/peers/list', requireAuth, async (req, res) => {
+    if (req.authUser && req.authUser.role === 'pro') {
+        return res.json({ data: [], total: 0, msg: 'success' });
+    }
+    try {
+        const result = await getRustDeskPeerList(req.authUser, requestFilterParams(req));
+        return res.json({
+            data: result.data,
+            total: result.total,
+            msg: 'success'
+        });
+    } catch (err) {
+        console.error('[API:PEERS/LIST] Error:', err.message);
+        return res.json({ data: [], total: 0, msg: 'success' });
     }
 });
 
@@ -638,53 +1104,19 @@ router.get('/api/peers', async (req, res, next) => {
  * Returns accessible device groups for the current user.
  */
 router.get('/api/device-group/accessible', requireAuth, async (req, res) => {
-    try {
-        // Pro users cannot see device groups
-        if (req.authUser && req.authUser.role === 'pro') {
-            return res.json({ data: [], total: 0 });
-        }
-        const groups = await db.getAllDeviceGroups();
-        return res.json({
-            data: groups.map(g => ({
-                guid: g.guid,
-                name: g.name,
-                note: g.note || '',
-                team_id: g.team_id || '',
-                accessed_count: g.member_count || 0
-            })),
-            total: groups.length
-        });
-    } catch (err) {
-        console.error('[API:DEVICE-GROUP] Error:', err.message);
-        return res.json({ data: [], total: 0 });
-    }
+    return sendRustDeskDeviceGroups(req, res);
 });
+
+router.get('/api/group', requireAuth, sendRustDeskDeviceGroups);
+router.get('/api/group/get', requireAuth, sendRustDeskDeviceGroups);
+router.post('/api/group/get', requireAuth, sendRustDeskDeviceGroups);
 
 /**
  * GET /api/device-group
  * List all device groups.
  */
 router.get('/api/device-group', requireAuth, async (req, res) => {
-    try {
-        // Pro users cannot see device groups
-        if (req.authUser && req.authUser.role === 'pro') {
-            return res.json({ data: [], total: 0 });
-        }
-        const groups = await db.getAllDeviceGroups();
-        return res.json({
-            data: groups.map(g => ({
-                guid: g.guid,
-                name: g.name,
-                note: g.note || '',
-                team_id: g.team_id || '',
-                member_count: g.member_count || 0
-            })),
-            total: groups.length
-        });
-    } catch (err) {
-        console.error('[API:DEVICE-GROUP] Error:', err.message);
-        return res.json({ data: [], total: 0 });
-    }
+    return sendRustDeskDeviceGroups(req, res);
 });
 
 /**
@@ -693,17 +1125,22 @@ router.get('/api/device-group', requireAuth, async (req, res) => {
  */
 router.post('/api/device-group', requireAuth, requireAdmin, async (req, res) => {
     try {
-        const { guid, name, note, team_id } = req.body || {};
-        if (!name || typeof name !== 'string' || name.trim().length === 0) {
+        const payload = deviceGroupService.normalizeGroupPayload(req.body || {});
+        if (!payload.name) {
             return res.status(400).json({ error: 'Group name is required' });
         }
+        if (payload.source_type === 'tag' && !payload.tag_filter) {
+            return res.status(400).json({ error: 'Tag filter is required for dynamic groups' });
+        }
 
-        if (guid) {
+        if (payload.guid) {
             // Update existing
-            const updated = await db.updateDeviceGroup(guid, {
-                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
-                note: sanitizeStr(note || '', MAX_STRING_LEN),
-                team_id: sanitizeStr(team_id || '', 64)
+            const updated = await db.updateDeviceGroup(payload.guid, {
+                name: sanitizeStr(payload.name, MAX_HOSTNAME_LEN),
+                note: sanitizeStr(payload.note || '', MAX_STRING_LEN),
+                team_id: sanitizeStr(payload.team_id || '', 64),
+                source_type: payload.source_type,
+                tag_filter: payload.tag_filter
             });
             if (!updated) {
                 return res.status(404).json({ error: 'Group not found' });
@@ -712,9 +1149,11 @@ router.post('/api/device-group', requireAuth, requireAdmin, async (req, res) => 
         } else {
             // Create new
             const created = await db.createDeviceGroup({
-                name: sanitizeStr(name, MAX_HOSTNAME_LEN),
-                note: sanitizeStr(note || '', MAX_STRING_LEN),
-                team_id: sanitizeStr(team_id || '', 64)
+                name: sanitizeStr(payload.name, MAX_HOSTNAME_LEN),
+                note: sanitizeStr(payload.note || '', MAX_STRING_LEN),
+                team_id: sanitizeStr(payload.team_id || '', 64),
+                source_type: payload.source_type,
+                tag_filter: payload.tag_filter
             });
             return res.json(created);
         }
@@ -730,15 +1169,22 @@ router.post('/api/device-group', requireAuth, requireAdmin, async (req, res) => 
  */
 router.get('/api/user/group', requireAuth, async (req, res) => {
     try {
-        const groups = await db.getAllUserGroups();
-        if (groups.length === 0) {
+        const groups = typeof db.getUserGroupsForUser === 'function'
+            ? await db.getUserGroupsForUser(req.authUser.id)
+            : await db.getAllUserGroups();
+        if (!groups || groups.length === 0) {
             return res.json({ data: { name: 'Default', guid: 'default' } });
         }
-        // Return the first user group (user group assignment is future work)
         return res.json({
             data: {
                 name: groups[0].name,
-                guid: groups[0].guid
+                guid: groups[0].guid,
+                groups: groups.map(group => ({
+                    name: group.name,
+                    guid: group.guid,
+                    note: group.note || '',
+                    team_id: group.team_id || ''
+                }))
             }
         });
     } catch (err) {
@@ -781,7 +1227,7 @@ router.post('/api/login', async (req, res) => {
 
     try {
         const body = req.body || {};
-        
+
         // Debug: log exact body for Issue #104 investigation
         console.log('[API:LOGIN] Request from', ip, '- body:', JSON.stringify({
             username: body.username,
@@ -796,7 +1242,7 @@ router.post('/api/login', async (req, res) => {
         const rawPassword = body.password;
         const username = typeof rawUsername === 'string' ? rawUsername.trim() : '';
         const password = typeof rawPassword === 'string' ? rawPassword : '';
-        
+
         // Debug: log extraction result for Issue #104
         console.log(`[API:LOGIN] Extracted credentials: username=${JSON.stringify(username)} (from raw type: ${typeof rawUsername}), password=${password ? '[SET]' : '[EMPTY]'}`);
 
@@ -824,8 +1270,8 @@ router.post('/api/login', async (req, res) => {
             return res.status(400).json({ error: 'Missing credentials' });
         }
 
-        // Check brute-force protection
-        const bruteCheck = authService.checkBruteForce(username, ip);
+        // Check brute-force protection (await — checkBruteForce is async)
+        const bruteCheck = await authService.checkBruteForce(username, ip);
         if (bruteCheck.blocked) {
             await db.logAction(null, 'api_login_blocked', `User: ${username}, IP: ${ip}, Reason: ${bruteCheck.reason}`, ip);
             return res.status(429).json({
@@ -858,6 +1304,35 @@ router.post('/api/login', async (req, res) => {
 
         // Check if TOTP 2FA is required
         if (user.totpRequired) {
+            // Issue #104: stock RustDesk OSS clients (v1.4.6 and earlier) do
+            // not implement the `tfa_check` response shape and reject it as
+            // "bad response from server". When the operator has explicitly
+            // opted in via RUSTDESK_API_DISABLE_TOTP=true, skip 2FA on this
+            // (RustDesk-only) endpoint and issue an access token directly.
+            // The web panel routes still enforce TOTP independently.
+            //
+            // SECURITY (audit fix H-04, 2026-04-10): the bypass also requires
+            // RUSTDESK_API_DISABLE_TOTP_ACKNOWLEDGED=true to confirm the
+            // operator understands the WAN-facing risk on :21121. Without the
+            // ACK flag TOTP is enforced normally even if DISABLE_TOTP is set.
+            if (config.rustdeskApiDisableTotp && config.rustdeskApiDisableTotpAck) {
+                authService.recordAttempt(username, ip, true);
+                const token = await authService.generateAccessToken(user.id, clientId, clientUuid, ip);
+                await db.updateLastLogin(user.id);
+                await db.logAction(
+                    user.id,
+                    'api_login_success_totp_bypassed',
+                    `Client: ${clientId || 'unknown'} (RUSTDESK_API_DISABLE_TOTP=true)`,
+                    ip
+                );
+                console.warn(`[API:LOGIN] TOTP bypass active for user '${username}' (RUSTDESK_API_DISABLE_TOTP=true)`);
+                return res.json({
+                    type: 'access_token',
+                    access_token: token,
+                    user: buildUserPayload(user)
+                });
+            }
+
             // Generate a temporary secret for the TFA session
             const tfaSessionSecret = require('crypto').randomBytes(16).toString('hex');
 
@@ -1157,6 +1632,11 @@ router.get('/api/audit/conn', async (req, res) => {
             offset: Math.max(0, parseInt(req.query.offset, 10) || 0)
         };
 
+        if (AUDIT_SOURCE_IS_GO) {
+            const remote = await betterdeskApi.getClientAuditConnections(filters);
+            if (remote) return res.json(remote);
+        }
+
         const data = await db.getAuditConnections(filters);
         const total = await db.countAuditConnections(filters);
 
@@ -1216,6 +1696,11 @@ router.get('/api/audit/file', requireAuth, async (req, res) => {
             offset: Math.max(0, parseInt(req.query.offset, 10) || 0)
         };
 
+        if (AUDIT_SOURCE_IS_GO) {
+            const remote = await betterdeskApi.getClientAuditFiles(filters);
+            if (remote) return res.json(remote);
+        }
+
         const data = await db.getAuditFiles(filters);
         const total = await db.countAuditFiles(filters);
 
@@ -1268,6 +1753,11 @@ router.get('/api/audit/alarm', requireAuth, async (req, res) => {
             limit: Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 100)),
             offset: Math.max(0, parseInt(req.query.offset, 10) || 0)
         };
+
+        if (AUDIT_SOURCE_IS_GO) {
+            const remote = await betterdeskApi.getClientAuditAlarms(filters);
+            if (remote) return res.json(remote);
+        }
 
         const data = await db.getAuditAlarms(filters);
         const total = await db.countAuditAlarms(filters);

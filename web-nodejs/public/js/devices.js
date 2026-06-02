@@ -32,9 +32,15 @@
     let devices = [];
     let filteredDevices = [];
     let folders = [];
+    let deviceGroups = [];
+    let availableUserGroups = [];
+    let userGroupsLoaded = false;
+    let availableTags = [];
+    let selectedTags = new Set();
     let selectedIds = new Set();
     let currentFilter = 'all';
     let currentFolder = 'all';
+    let currentGroup = 'all';
     let currentSort = { field: 'last_online', order: 'desc' };
     let currentPage = 1;
     let perPage = 20;
@@ -54,14 +60,19 @@
         
         // Load data
         loadFolders();
+        loadUserGroups();
+        loadDeviceGroups();
+        loadTags();
         loadDevices();
         
         // Event listeners
         initSearch();
         initFilters();
+        initTagFilter();
         initSorting();
         initSync();
         initFolders();
+        initDeviceGroups();
         initDragDrop();
         attachFolderDropEvents();  // For static folder chips
         initColumnVisibility();    // Column show/hide toggle
@@ -70,12 +81,18 @@
         // Refresh handler
         window.addEventListener('app:refresh', () => {
             loadFolders();
+            loadUserGroups();
+            loadDeviceGroups();
+            loadTags();
             loadDevices();
         });
 
         // Listen for changes from DeviceDetail panel
         document.addEventListener('deviceDetail:changed', () => {
             loadFolders();
+            loadUserGroups();
+            loadDeviceGroups();
+            loadTags();
             loadDevices();
         });
 
@@ -129,27 +146,33 @@
         const row = tableBody?.querySelector(`tr[data-id="${deviceId}"]`);
         if (!row) return;
 
+        const normalizedStatus = String(status || '').toLowerCase();
+        const statusClassName = ['online', 'offline', 'degraded', 'critical'].includes(normalizedStatus)
+            ? normalizedStatus
+            : 'offline';
+        const statusText = _('status.' + statusClassName);
+        const statusLabel = statusText === 'status.' + statusClassName ? statusClassName : statusText;
+
         const dot = row.querySelector('.device-status-dot');
         if (dot) {
             dot.className = 'device-status-dot';
-            if (status === 'online' || status === 'ONLINE') {
-                dot.classList.add('online');
-                dot.title = 'Online';
-            } else if (status === 'offline' || status === 'OFFLINE') {
-                dot.classList.add('offline');
-                dot.title = 'Offline';
-            } else {
-                dot.classList.add(status.toLowerCase());
-                dot.title = status;
-            }
+            dot.classList.add(statusClassName);
+            dot.title = statusLabel;
+        }
+
+        const badge = row.querySelector('[data-column="status"] .status-badge');
+        if (badge) {
+            badge.className = `status-badge ${statusClassName}`;
+            badge.innerHTML = `<span class="status-dot"></span>${statusLabel}`;
         }
 
         // Also update the device in our local state
-        const dev = allDevices.find(d => d.id === deviceId);
+        const dev = devices.find(d => d.id === deviceId);
         if (dev) {
             dev.status = status;
-            dev.live_status = status;
-            dev.live_online = (status === 'online' || status === 'ONLINE');
+            dev.live_status = statusClassName;
+            dev.live_online = statusClassName === 'online';
+            dev.online = statusClassName === 'online';
         }
     }
 
@@ -251,6 +274,7 @@
             
             // Update folder counts now that devices are loaded
             updateFolderCounts();
+            updateGroupCounts();
             
             applyFilters();
             
@@ -258,6 +282,94 @@
             console.error('Failed to load devices:', error);
             Notifications.error(_('errors.load_devices_failed'));
         }
+    }
+
+    function normalizeTags(value) {
+        if (!value) return [];
+        if (Array.isArray(value)) return value.map(String).map(t => t.trim()).filter(Boolean);
+        if (typeof value === 'string') {
+            try {
+                const parsed = JSON.parse(value);
+                if (Array.isArray(parsed)) return parsed.map(String).map(t => t.trim()).filter(Boolean);
+            } catch (_) {}
+            return value.split(',').map(t => t.trim()).filter(Boolean);
+        }
+        return [];
+    }
+
+    function normalizeGuids(value) {
+        if (!value) return [];
+        const raw = Array.isArray(value) ? value : String(value || '').split(',');
+        const seen = new Set();
+        const guids = [];
+        raw.forEach(item => {
+            const guid = typeof item === 'object' ? String(item.guid || '').trim() : String(item || '').trim();
+            if (guid && !seen.has(guid)) {
+                seen.add(guid);
+                guids.push(guid);
+            }
+        });
+        return guids;
+    }
+
+    async function loadUserGroups() {
+        try {
+            const response = await Utils.api('/api/panel/user-groups');
+            availableUserGroups = response.groups || [];
+            userGroupsLoaded = true;
+        } catch (error) {
+            availableUserGroups = [];
+            userGroupsLoaded = true;
+            console.error('Failed to load user groups:', error);
+        }
+    }
+
+    async function ensureUserGroupsLoaded() {
+        if (!userGroupsLoaded) await loadUserGroups();
+    }
+
+    function renderUserGroupAccessOptions(selectedGuids) {
+        const selected = new Set(normalizeGuids(selectedGuids));
+        if (!availableUserGroups.length) {
+            return `<div class="tag-filter-empty user-group-empty">
+                <span>${_('devices.no_user_groups') || 'No user groups'}</span>
+                <button type="button" class="btn btn-secondary btn-sm" id="dg-manage-user-groups-empty">
+                    <span class="material-icons">group_add</span>
+                    ${_('devices.manage_user_groups') || 'Manage user groups'}
+                </button>
+            </div>`;
+        }
+        return availableUserGroups.map(group => `
+            <label class="group-membership-option compact">
+                <input type="checkbox" class="dg-user-group" value="${Utils.escapeHtml(group.guid)}" ${selected.has(group.guid) ? 'checked' : ''}>
+                <span class="material-icons">group</span>
+                <span>${Utils.escapeHtml(group.name || group.guid)}</span>
+            </label>`).join('');
+    }
+
+    function deviceMatchesGroup(device, group) {
+        if (!device || !group) return false;
+        if ((group.source_type || 'manual') === 'tag') {
+            const tag = String(group.tag_filter || '').toLowerCase();
+            return tag && normalizeTags(device.tags).some(t => t.toLowerCase() === tag);
+        }
+        const groups = Array.isArray(device.groups) ? device.groups : [];
+        return groups.some(g => g.guid === group.guid);
+    }
+
+    function renderTagsCell(device) {
+        const tags = normalizeTags(device.tags);
+        if (tags.length === 0) {
+            return `<span class="device-tags-empty">-</span>`;
+        }
+
+        const visible = tags.slice(0, 2);
+        const rest = tags.length - visible.length;
+        return `
+            <div class="device-tags" title="${Utils.escapeHtml(tags.join(', '))}">
+                ${visible.map(tag => `<span class="device-tag-pill">${Utils.escapeHtml(tag)}</span>`).join('')}
+                ${rest > 0 ? `<span class="device-tag-more">+${rest}</span>` : ''}
+            </div>`;
     }
     
     /**
@@ -269,6 +381,20 @@
             if (currentFolder === 'unassigned' && device.folder_id) return false;
             if (currentFolder !== 'all' && currentFolder !== 'unassigned') {
                 if (device.folder_id !== parseInt(currentFolder, 10)) return false;
+            }
+
+            // Device group filter (manual or dynamic)
+            if (currentGroup !== 'all') {
+                const group = deviceGroups.find(g => g.guid === currentGroup);
+                if (!group || !deviceMatchesGroup(device, group)) return false;
+            }
+
+            // Tag filters: all selected tags must be present
+            if (selectedTags.size > 0) {
+                const tags = normalizeTags(device.tags).map(t => t.toLowerCase());
+                for (const tag of selectedTags) {
+                    if (!tags.includes(tag.toLowerCase())) return false;
+                }
             }
             
             // Status filter
@@ -384,6 +510,7 @@
                 <td data-column="status">
                     <span class="status-badge ${sc}"><span class="status-dot"></span>${statusLabel(device)}</span>
                 </td>
+                <td data-column="tags">${renderTagsCell(device)}</td>
                 <td data-column="actions">
                     <div class="kebab-wrapper">
                         <button class="kebab-btn" title="${_('devices.actions')}">
@@ -393,6 +520,10 @@
                             <button class="kebab-menu-item connect-desktop" data-action="web-remote" data-id="${eid}">
                                 <span class="material-icons">screen_share</span>
                                 <span>${_('actions.web_remote') || 'Web Remote'}</span>
+                            </button>
+                            <button class="kebab-menu-item" data-action="cdap-viewer" data-id="${eid}">
+                                <span class="material-icons">photo_camera</span>
+                                <span>${_('actions.cdap_viewer') || 'CDAP Snapshot Viewer'}</span>
                             </button>
                             <button class="kebab-menu-item" data-action="connect-desktop" data-id="${eid}">
                                 <span class="material-icons">computer</span>
@@ -406,6 +537,10 @@
                             <button class="kebab-menu-item" data-action="edit" data-id="${eid}">
                                 <span class="material-icons">edit</span>
                                 <span>${_('actions.edit')}</span>
+                            </button>
+                            <button class="kebab-menu-item" data-action="groups" data-id="${eid}">
+                                <span class="material-icons">hub</span>
+                                <span>${_('devices.manage_groups') || 'Manage Groups'}</span>
                             </button>
                             <button class="kebab-menu-item" data-action="access-policy" data-id="${eid}">
                                 <span class="material-icons">lock</span>
@@ -538,6 +673,10 @@
                 _tryAddRemoteTab(deviceId, data);
                 break;
 
+            case 'cdap-viewer':
+                window.open(`/remote-cdap/${encodeURIComponent(deviceId)}`, '_blank');
+                break;
+
             case 'connect-desktop':
                 connectDesktopClient(deviceId);
                 break;
@@ -557,6 +696,10 @@
                 
             case 'edit':
                 showEditModal(deviceId);
+                break;
+
+            case 'groups':
+                showDeviceMembershipModal(deviceId);
                 break;
                 
             case 'toggle-ban':
@@ -582,6 +725,163 @@
      */
     function connectDesktopClient(deviceId) {
         window.open('rustdesk://' + encodeURIComponent(deviceId), '_blank');
+    }
+
+    async function showDeviceGroupModal(group = null) {
+        await ensureUserGroupsLoaded();
+        const editing = !!group;
+        const sourceType = group?.source_type || 'manual';
+        const selectedUserGroups = normalizeGuids(group?.allowed_groups || group?.allowed_user_groups);
+        const allowedUsersValue = Array.isArray(group?.allowed_users) ? group.allowed_users.join(', ') : String(group?.allowed_users || '');
+        const tagOptions = availableTags.map(tag => `<option value="${Utils.escapeHtml(tag)}"></option>`).join('');
+        const content = `
+            <div class="device-group-form">
+                <div class="form-group">
+                    <label>${_('devices.group_name') || 'Group name'}</label>
+                    <input type="text" id="dg-name" class="form-input" maxlength="80" placeholder="${_('devices.group_name_placeholder') || 'e.g. Media PCs'}" value="${Utils.escapeHtml(group?.name || '')}">
+                </div>
+                <label class="toggle-row">
+                    <input type="checkbox" id="dg-dynamic" ${sourceType === 'tag' ? 'checked' : ''}>
+                    <span>${_('devices.dynamic_group') || 'Dynamic group from tag'}</span>
+                </label>
+                <div class="form-group" id="dg-tag-row" style="opacity:${sourceType === 'tag' ? '1' : '0.5'};pointer-events:${sourceType === 'tag' ? 'auto' : 'none'}">
+                    <label>${_('devices.tag_filter') || 'Tag filter'}</label>
+                    <input type="text" id="dg-tag" class="form-input" maxlength="50" list="dg-tag-options" placeholder="Linux" value="${Utils.escapeHtml(group?.tag_filter || '')}">
+                    <datalist id="dg-tag-options">${tagOptions}</datalist>
+                    <p class="form-hint">${_('devices.dynamic_group_hint') || 'Devices with this tag join automatically.'}</p>
+                </div>
+                <div class="form-group">
+                    <label>${_('devices.group_allowed_users') || 'Allowed users'}</label>
+                    <input type="text" id="dg-users" class="form-input" placeholder="operator1, operator2" value="${Utils.escapeHtml(allowedUsersValue)}">
+                    <p class="form-hint">${_('devices.group_allowed_users_hint') || 'Leave empty to keep the group visible to everyone with device permissions.'}</p>
+                </div>
+                <div class="form-group">
+                    <div class="form-label-row">
+                        <label>${_('devices.group_allowed_user_groups') || 'Allowed user groups'}</label>
+                        <button type="button" class="btn btn-secondary btn-sm" id="dg-manage-user-groups">
+                            <span class="material-icons">groups</span>
+                            ${_('devices.manage_user_groups') || 'Manage user groups'}
+                        </button>
+                    </div>
+                    <div class="group-membership-list compact">${renderUserGroupAccessOptions(selectedUserGroups)}</div>
+                    <p class="form-hint">${_('devices.group_allowed_user_groups_hint') || 'Users in selected user groups can access this device group.'}</p>
+                </div>
+            </div>`;
+
+        Modal.show({
+            title: editing ? (_('devices.edit_group') || 'Edit device group') : (_('devices.create_group') || 'Create device group'),
+            content,
+            size: 'medium',
+            buttons: [
+                { label: _('actions.cancel'), class: 'btn-secondary', onClick: () => Modal.close() },
+                {
+                    label: _('actions.save'), class: 'btn-primary', onClick: async () => {
+                        const dynamic = document.getElementById('dg-dynamic').checked;
+                        const payload = {
+                            guid: group?.guid || '',
+                            name: document.getElementById('dg-name').value.trim(),
+                            source_type: dynamic ? 'tag' : 'manual',
+                            tag_filter: document.getElementById('dg-tag').value.trim(),
+                            allowed_users: document.getElementById('dg-users').value,
+                            allowed_groups: Array.from(document.querySelectorAll('.dg-user-group:checked')).map(input => input.value)
+                        };
+                        if (!payload.name) {
+                            Notifications.error(_('common.name_required') || 'Name is required');
+                            return;
+                        }
+                        if (payload.source_type === 'tag' && !payload.tag_filter) {
+                            Notifications.error(_('devices.group_tag_required') || 'Tag filter is required');
+                            return;
+                        }
+                        try {
+                            await Utils.api('/api/device-groups', {
+                                method: 'POST',
+                                body: payload
+                            });
+                            Notifications.success(_('devices.group_saved') || 'Device group saved');
+                            Modal.close();
+                            loadDeviceGroups();
+                        } catch (err) {
+                            Notifications.error(err.message || _('errors.server_error'));
+                        }
+                    }
+                }
+            ]
+        });
+
+        const dynamicInput = document.getElementById('dg-dynamic');
+        const tagRow = document.getElementById('dg-tag-row');
+        dynamicInput?.addEventListener('change', () => {
+            tagRow.style.opacity = dynamicInput.checked ? '1' : '0.5';
+            tagRow.style.pointerEvents = dynamicInput.checked ? 'auto' : 'none';
+        });
+        document.getElementById('dg-manage-user-groups')?.addEventListener('click', () => {
+            window.location.href = '/users#user-groups';
+        });
+        document.getElementById('dg-manage-user-groups-empty')?.addEventListener('click', () => {
+            window.location.href = '/users#user-groups';
+        });
+    }
+
+    async function showDeviceMembershipModal(deviceId) {
+        try {
+            const response = await Utils.api(`/api/devices/${encodeURIComponent(deviceId)}/groups`);
+            const groups = response.groups || [];
+            const memberships = response.memberships || [];
+            const selected = new Set(memberships.map(group => group.guid));
+            const manualGroups = groups.filter(group => (group.source_type || 'manual') !== 'tag');
+            const dynamicGroups = groups.filter(group => (group.source_type || 'manual') === 'tag' && selected.has(group.guid));
+
+            const manualHtml = manualGroups.length ? manualGroups.map(group => `
+                <label class="group-membership-option">
+                    <input type="checkbox" value="${Utils.escapeHtml(group.guid)}" ${selected.has(group.guid) ? 'checked' : ''}>
+                    <span class="material-icons">hub</span>
+                    <span>${Utils.escapeHtml(group.name)}</span>
+                </label>`).join('') : `<div class="tag-filter-empty">${_('devices.no_groups') || 'No groups yet'}</div>`;
+
+            const dynamicHtml = dynamicGroups.length ? `
+                <div class="form-group">
+                    <label>${_('devices.dynamic_memberships') || 'Dynamic memberships'}</label>
+                    <div class="device-tags">
+                        ${dynamicGroups.map(group => `<span class="device-tag-pill" title="${Utils.escapeHtml(group.tag_filter || '')}">${Utils.escapeHtml(group.name)}</span>`).join('')}
+                    </div>
+                </div>` : '';
+
+            Modal.show({
+                title: (_('devices.manage_groups') || 'Manage Groups') + ' — ' + deviceId,
+                content: `
+                    <div class="device-group-memberships">
+                        <div class="form-group">
+                            <label>${_('devices.manual_groups') || 'Manual groups'}</label>
+                            <div class="group-membership-list">${manualHtml}</div>
+                        </div>
+                        ${dynamicHtml}
+                    </div>`,
+                size: 'medium',
+                buttons: [
+                    { label: _('actions.cancel'), class: 'btn-secondary', onClick: () => Modal.close() },
+                    {
+                        label: _('actions.save'), class: 'btn-primary', onClick: async () => {
+                            const groupGuids = Array.from(document.querySelectorAll('.group-membership-list input:checked')).map(input => input.value);
+                            try {
+                                await Utils.api(`/api/devices/${encodeURIComponent(deviceId)}/groups`, {
+                                    method: 'PUT',
+                                    body: { groupGuids }
+                                });
+                                Notifications.success(_('devices.groups_saved') || 'Groups saved');
+                                Modal.close();
+                                loadDevices();
+                                loadDeviceGroups();
+                            } catch (err) {
+                                Notifications.error(err.message || _('errors.server_error'));
+                            }
+                        }
+                    }
+                ]
+            });
+        } catch (error) {
+            Notifications.error(error.message || _('errors.server_error'));
+        }
     }
     
     /**
@@ -1001,34 +1301,30 @@
                     if (closeBtn) closeBtn.disabled = true;
 
                     try {
-                        const resp = await Utils.api(`/api/devices/${encodeURIComponent(device.id)}`, {
+                        await Utils.api(`/api/devices/${encodeURIComponent(device.id)}`, {
                             method: 'PATCH',
                             body: JSON.stringify({ display_name: displayName, note }),
                             headers: { 'Content-Type': 'application/json' }
                         });
-                        if (resp.success) {
-                            device.display_name = displayName;
-                            device.note = note;
-                            applyFilters();
-                            document.dispatchEvent(new CustomEvent('devices:updated', {
-                                detail: {
-                                    id: device.id,
-                                    display_name: displayName,
-                                    note: note
-                                }
-                            }));
 
-                            if (saveBtn) {
-                                saveBtn.textContent = _('common.saved');
+                        device.display_name = displayName;
+                        device.note = note;
+                        applyFilters();
+                        document.dispatchEvent(new CustomEvent('devices:updated', {
+                            detail: {
+                                id: device.id,
+                                display_name: displayName,
+                                note: note
                             }
+                        }));
 
-                            Notifications.success(_('common.saved'), _('devices.display_name'));
-                            setTimeout(() => Modal.close(), 250);
-                            loadDevices();
-                        } else {
-                            restoreButtons();
-                            Notifications.error(resp.error || _('errors.server_error'));
+                        if (saveBtn) {
+                            saveBtn.textContent = _('common.saved');
                         }
+
+                        Notifications.success(_('common.saved'), _('devices.display_name'));
+                        setTimeout(() => Modal.close(), 250);
+                        loadDevices();
                     } catch (err) {
                         restoreButtons();
                         Notifications.error(err.message || _('errors.server_error'));
@@ -1244,6 +1540,167 @@
             }
         });
     }
+
+    // ==================== Tag and Device Group Filters ====================
+
+    async function loadTags() {
+        try {
+            const response = await Utils.api('/api/tags');
+            availableTags = response.tags || [];
+            renderTagFilters();
+        } catch (error) {
+            console.error('Failed to load tags:', error);
+        }
+    }
+
+    function renderTagFilters() {
+        const menu = document.getElementById('tags-filter-menu');
+        const btn = document.getElementById('tags-filter-btn');
+        if (!menu) return;
+
+        if (!availableTags.length) {
+            menu.innerHTML = `<div class="tag-filter-empty">${_('devices.no_tags') || 'No tags'}</div>`;
+        } else {
+            menu.innerHTML = availableTags.map(tag => {
+                const checked = selectedTags.has(tag) ? 'checked' : '';
+                return `<label class="tag-filter-option">
+                    <input type="checkbox" value="${Utils.escapeHtml(tag)}" ${checked}>
+                    <span>${Utils.escapeHtml(tag)}</span>
+                </label>`;
+            }).join('');
+        }
+
+        menu.querySelectorAll('input[type="checkbox"]').forEach(input => {
+            input.addEventListener('change', () => {
+                if (input.checked) selectedTags.add(input.value);
+                else selectedTags.delete(input.value);
+                currentPage = 1;
+                if (btn) btn.classList.toggle('tag-filter-active', selectedTags.size > 0);
+                applyFilters();
+            });
+        });
+
+        if (btn) btn.classList.toggle('tag-filter-active', selectedTags.size > 0);
+    }
+
+    function initTagFilter() {
+        const btn = document.getElementById('tags-filter-btn');
+        const menu = document.getElementById('tags-filter-menu');
+        if (!btn || !menu) return;
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            menu.classList.toggle('show');
+        });
+        menu.addEventListener('click', (e) => e.stopPropagation());
+        document.addEventListener('click', (e) => {
+            if (!btn.contains(e.target) && !menu.contains(e.target)) menu.classList.remove('show');
+        });
+    }
+
+    async function loadDeviceGroups() {
+        try {
+            const response = await Utils.api('/api/device-groups');
+            deviceGroups = response.groups || [];
+            window._betterdesk_device_groups = deviceGroups;
+            renderDeviceGroups();
+            updateGroupCounts();
+        } catch (error) {
+            console.error('Failed to load device groups:', error);
+        }
+    }
+
+    function renderDeviceGroups() {
+        const container = document.getElementById('custom-device-groups');
+        if (!container) return;
+        container.innerHTML = deviceGroups.map(group => {
+            const isDynamic = (group.source_type || 'manual') === 'tag';
+            return `<span class="group-chip ${currentGroup === group.guid ? 'active' : ''} ${isDynamic ? 'dynamic' : ''}" data-group="${Utils.escapeHtml(group.guid)}" role="button" tabindex="0" title="${Utils.escapeHtml(isDynamic ? (_('devices.dynamic_group_hint') || 'Dynamic tag group') + ': ' + group.tag_filter : group.name)}">
+                <span class="material-icons chip-icon">${isDynamic ? 'sell' : 'hub'}</span>
+                <span class="chip-label">${Utils.escapeHtml(group.name)}</span>
+                <span class="chip-count">${group.member_count || 0}</span>
+                <span class="chip-actions">
+                    <button type="button" class="chip-action group-chip-action" data-action="edit" data-group="${Utils.escapeHtml(group.guid)}" title="${_('devices.edit_group') || 'Edit group'}">
+                        <span class="material-icons">edit</span>
+                    </button>
+                    <button type="button" class="chip-action group-chip-action group-delete" data-action="delete" data-group="${Utils.escapeHtml(group.guid)}" title="${_('devices.delete_group') || 'Delete group'}">
+                        <span class="material-icons">delete</span>
+                    </button>
+                </span>
+            </span>`;
+        }).join('');
+
+        container.querySelectorAll('.group-chip').forEach(el => {
+            el.addEventListener('click', (event) => {
+                if (event.target.closest('.group-chip-action')) return;
+                selectDeviceGroup(el.dataset.group);
+            });
+            el.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                selectDeviceGroup(el.dataset.group);
+            });
+        });
+
+        container.querySelectorAll('.group-chip-action').forEach(btn => {
+            btn.addEventListener('click', async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                const group = deviceGroups.find(item => item.guid === btn.dataset.group);
+                if (!group) return;
+                if (btn.dataset.action === 'edit') {
+                    await showDeviceGroupModal(group);
+                } else if (btn.dataset.action === 'delete') {
+                    await deleteDeviceGroup(group);
+                }
+            });
+        });
+    }
+
+    async function deleteDeviceGroup(group) {
+        const confirmed = await Modal.confirm({
+            title: _('devices.delete_group') || 'Delete group',
+            message: (_('devices.delete_group_confirm') || 'Delete device group {name}?').replace('{name}', group.name),
+            confirmLabel: _('actions.delete'),
+            danger: true
+        });
+        if (!confirmed) return;
+
+        try {
+            await Utils.api(`/api/device-groups/${encodeURIComponent(group.guid)}`, { method: 'DELETE' });
+            Notifications.success(_('devices.group_deleted') || 'Device group deleted');
+            if (currentGroup === group.guid) selectDeviceGroup('all');
+            loadDeviceGroups();
+            loadDevices();
+        } catch (error) {
+            Notifications.error(error.message || _('errors.server_error'));
+        }
+    }
+
+    function updateGroupCounts() {
+        const allCount = document.getElementById('group-count-all');
+        if (allCount) allCount.textContent = devices.length;
+        for (const group of deviceGroups) {
+            const count = devices.filter(device => deviceMatchesGroup(device, group)).length;
+            const chip = Array.from(document.querySelectorAll('.group-chip[data-group]')).find(el => el.dataset.group === group.guid);
+            const countEl = chip ? chip.querySelector('.chip-count') : null;
+            if (countEl) countEl.textContent = count;
+        }
+    }
+
+    function selectDeviceGroup(groupGuid) {
+        currentGroup = groupGuid || 'all';
+        currentPage = 1;
+        document.querySelectorAll('.group-chip').forEach(el => {
+            el.classList.toggle('active', el.dataset.group === currentGroup);
+        });
+        applyFilters();
+    }
+
+    function initDeviceGroups() {
+        document.getElementById('add-device-group-btn')?.addEventListener('click', () => showDeviceGroupModal());
+        document.querySelector('.group-chip[data-group="all"]')?.addEventListener('click', () => selectDeviceGroup('all'));
+    }
     
     // ==================== Folder Functions ====================
     
@@ -1279,21 +1736,23 @@
         container.innerHTML = folders.map(folder => {
             const safeColor = (Utils.sanitizeColor || _sanitizeColorFallback)(folder.color);
             return `
-            <button class="folder-chip ${currentFolder == folder.id ? 'active' : ''}" 
+            <span class="folder-chip ${currentFolder == folder.id ? 'active' : ''}"
                  data-folder="${folder.id}" 
+                 role="button"
+                 tabindex="0"
                  style="--folder-color: ${safeColor}">
                 <span class="material-icons chip-icon" style="color: ${safeColor}">folder</span>
                 <span class="chip-label">${Utils.escapeHtml(folder.name)}</span>
                 <span class="chip-count">${folder.device_count || 0}</span>
                 <span class="chip-actions">
-                    <span class="chip-action folder-edit" data-id="${folder.id}" title="${_('actions.edit')}">
+                    <button type="button" class="chip-action folder-edit" data-id="${folder.id}" title="${_('actions.edit')}">
                         <span class="material-icons">edit</span>
-                    </span>
-                    <span class="chip-action folder-delete" data-id="${folder.id}" title="${_('actions.delete')}">
+                    </button>
+                    <button type="button" class="chip-action folder-delete" data-id="${folder.id}" title="${_('actions.delete')}">
                         <span class="material-icons">delete</span>
-                    </span>
+                    </button>
                 </span>
-            </button>
+            </span>
         `}).join('');
         
         // Attach folder click listeners
@@ -1303,10 +1762,17 @@
                     selectFolder(el.dataset.folder);
                 }
             });
+            el.addEventListener('keydown', (e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                if (e.target.closest('.chip-actions')) return;
+                e.preventDefault();
+                selectFolder(el.dataset.folder);
+            });
         });
         
         container.querySelectorAll('.folder-edit').forEach(btn => {
             btn.addEventListener('click', (e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 editFolder(btn.dataset.id);
             });
@@ -1314,6 +1780,7 @@
         
         container.querySelectorAll('.folder-delete').forEach(btn => {
             btn.addEventListener('click', (e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 deleteFolder(btn.dataset.id);
             });
@@ -1547,6 +2014,7 @@
                 initColorPicker();
                 document.getElementById('folder-name').value = folder.name;
                 document.getElementById('folder-color').value = folder.color;
+                document.getElementById('folder-allowed-users').value = (folder.allowed_users || []).join(', ');
                 
                 // Set active color
                 document.querySelectorAll('.color-option').forEach(btn => {
@@ -1575,6 +2043,7 @@
     async function submitFolderForm(folderId = null) {
         const name = document.getElementById('folder-name')?.value.trim();
         const color = document.getElementById('folder-color')?.value;
+        const allowedUsers = document.getElementById('folder-allowed-users')?.value || '';
         
         if (!name) {
             Notifications.error(_('folders.name_required'));
@@ -1585,13 +2054,13 @@
             if (folderId) {
                 await Utils.api(`/api/folders/${folderId}`, {
                     method: 'PATCH',
-                    body: { name, color }
+                    body: { name, color, allowed_users: allowedUsers }
                 });
                 Notifications.success(_('folders.updated'));
             } else {
                 await Utils.api('/api/folders', {
                     method: 'POST',
-                    body: { name, color }
+                    body: { name, color, allowed_users: allowedUsers }
                 });
                 Notifications.success(_('folders.created'));
             }

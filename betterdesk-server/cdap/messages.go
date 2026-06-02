@@ -117,6 +117,22 @@ type UnregisterPayload struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// HelpRequestPayload is sent by an agent device to raise a support request.
+// The device identity is taken from the authenticated connection (dc.ID),
+// never from the payload, to prevent spoofing.
+type HelpRequestPayload struct {
+	Message  string `json:"message"`
+	Hostname string `json:"hostname,omitempty"`
+}
+
+// ChatMessagePayload is sent by an agent device to deliver a chat message to
+// the operator console. The sender identity is taken from the authenticated
+// connection (dc.ID).
+type ChatMessagePayload struct {
+	Text string `json:"text"`
+	ToID string `json:"to_id,omitempty"` // optional target operator/group; "" = console
+}
+
 // TokenRefreshPayload is sent by client to refresh JWT.
 type TokenRefreshPayload struct {
 	Token string `json:"token"`
@@ -175,6 +191,35 @@ func (dc *DeviceConn) ReadMessage(ctx context.Context) (*Message, error) {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 	return &msg, nil
+}
+
+// ReadAny reads the next WebSocket frame, returning either a parsed JSON
+// Message (for text frames) or the raw payload bytes (for binary frames).
+// Used by the message loop to support binary fast-path frames (e.g. raw
+// JPEG bytes for desktop sessions) alongside the regular JSON envelope.
+func (dc *DeviceConn) ReadAny(ctx context.Context) (typ websocket.MessageType, raw []byte, msg *Message, err error) {
+	typ, data, err := dc.conn.Read(ctx)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	if typ == websocket.MessageBinary {
+		return typ, data, nil, nil
+	}
+	var m Message
+	if jErr := json.Unmarshal(data, &m); jErr != nil {
+		return typ, nil, nil, fmt.Errorf("invalid JSON: %w", jErr)
+	}
+	return typ, data, &m, nil
+}
+
+// WriteBinary sends a raw binary WebSocket frame on the connection.
+// Used for high-throughput media (e.g. desktop JPEG frames) to avoid the
+// per-frame base64+JSON overhead. The first bytes of the payload should
+// encode any framing the recipient needs (e.g. session ID prefix).
+func (dc *DeviceConn) WriteBinary(ctx context.Context, data []byte) error {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	return dc.conn.Write(ctx, websocket.MessageBinary, data)
 }
 
 // WriteMessage encodes and sends a CDAP JSON message on the WebSocket.

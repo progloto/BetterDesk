@@ -58,6 +58,11 @@ class RDClient {
         this._rendezvousDecoder = null;
         this._relayDecoder = null;
 
+        // Codec / quality control
+        this._codecAbilities = null;          // probed VideoDecoder support map
+        this._preferCodec = opts.preferCodec || 'Auto';
+        this._adaptivePaused = false;         // true once the user picks codec/quality manually
+
         // Relay state tracking
         this._relayFrameIdx = 0;         // Counter for relay frames (debugging)
         this._relayConfirmReceived = false; // Whether hbbr's RelayResponse confirmation was consumed
@@ -246,6 +251,13 @@ class RDClient {
             console.log('[RDClient] Auth: hash=' + Array.from(hash.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('')
                 + '... (' + hash.length + ' bytes)');
 
+            // Probe which codecs this browser's VideoDecoder can actually decode so we
+            // only advertise real abilities (avoids the peer sending a codec we can't decode).
+            if (!this._codecAbilities) {
+                try { this._codecAbilities = await RDVideo.getSupportedCodecs(); }
+                catch { this._codecAbilities = null; }
+            }
+
             // Build and send LoginRequest
             // username must be set to target device ID (RustDesk validates: is_ip || is_domain_port || == Config::get_id())
             const loginReq = this.proto.buildLoginRequest(hash, {
@@ -254,7 +266,9 @@ class RDClient {
                 myName: this.opts.myName || this.opts.myName || 'BetterDesk Web',
                 disableAudio: this.opts.disableAudio || false,
                 fps: this.opts.fps || 60,
-                imageQuality: this.opts.imageQuality || 'Best'
+                imageQuality: this.opts.imageQuality || 'Best',
+                codecAbilities: this._codecAbilities,
+                preferCodec: this._preferCodec
             });
 
             console.log('[RDClient] Auth: sending LoginRequest, crypto.enabled=' + this.crypto.enabled
@@ -875,13 +889,16 @@ class RDClient {
         // Login successful
         this._peerInfo = resp.peerInfo || null;
         console.log('[RDClient] Login successful, peerInfo:', this._peerInfo ? 'present' : 'null');
+        this._processPeerInfo(this._peerInfo);
         this._emit('log', 'Login successful');
         this._emit('login_success', resp);
+        if (this._peerInfo) this._emit('peer_info', this._peerInfo);
         this._startSession();
     }
 
     _handlePeerInfo(info) {
         this._peerInfo = info;
+        this._processPeerInfo(info);
         this._emit('peer_info', info);
 
         // If we got peer info without hash challenge, session can start
@@ -952,11 +969,23 @@ class RDClient {
 
     _handleTestDelay(testDelay) {
         if (!testDelay.fromClient) {
-            // Respond to server's ping
-            const pong = this.proto.buildTestDelay();
-            this._sendPeerMessage(pong);
+            // This is the controlled peer's QoS probe. RustDesk's video QoS
+            // controller measures the round-trip delay of this exact message to
+            // size the target bitrate AND framerate. We MUST echo it back
+            // verbatim (same `time`, `from_client` stays false, original
+            // last_delay/target_bitrate). Replying with a fresh timestamp makes
+            // the peer compute a bogus delay and throttle the stream down to
+            // ~1 fps. Echoing correctly keeps the full 24-30 fps stream.
+            this._sendPeerMessage({
+                testDelay: {
+                    time: testDelay.time,
+                    fromClient: false,
+                    lastDelay: testDelay.lastDelay || 0,
+                    targetBitrate: testDelay.targetBitrate || 0
+                }
+            });
         } else {
-            // Our ping came back - calculate RTT
+            // Our own ping came back - calculate RTT
             const rtt = Date.now() - (testDelay.time || 0);
             this._emit('latency', rtt);
         }
@@ -980,6 +1009,9 @@ class RDClient {
             return;
         }
         if (misc.switchDisplay) {
+            if (typeof misc.switchDisplay.display === 'number') {
+                this._currentDisplay = misc.switchDisplay.display;
+            }
             this._emit('switch_display', misc.switchDisplay);
             return;
         }
@@ -999,7 +1031,15 @@ class RDClient {
 
         // Initialize video decoder callbacks
         this.video.onFrame = (frame) => this.renderer.pushFrame(frame);
-        this.video.onError = (err) => this._emit('log', 'Video error: ' + err.message);
+        this.video.onError = (err) => this._emit('log', 'Video error: ' + (err && err.message ? err.message : err));
+
+        // The decoder asks for a keyframe whenever it (re)configures or recovers
+        // from an error; forward that as a refresh_video request to the peer.
+        this.video.onNeedKeyframe = () => {
+            if (this._state === 'streaming') {
+                this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
+            }
+        };
 
         // Request keyframe on resize/fullscreen to fix blur
         this.renderer.onResizeRefresh = () => {
@@ -1035,6 +1075,10 @@ class RDClient {
             imageQuality: quality
         }));
 
+        // Proactively request an initial keyframe so the decoder can start
+        // immediately even if we joined an already-running stream on a delta.
+        this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
+
         // Start ping interval
         this._pingInterval = setInterval(() => {
             if (this._state === 'streaming') {
@@ -1050,15 +1094,35 @@ class RDClient {
             }
         }, 1000);
 
-        // Stall recovery: if no video frames arrive for 3 seconds, request a keyframe
+        // Stall recovery. Two cases trigger a keyframe request:
+        //  1. No VideoFrame at all from the peer for 3s.
+        //  2. The peer keeps sending frames but the decoder produces no output
+        //     (e.g. we joined mid-stream on delta frames) for 2s.
+        this._lastDecodedCount = 0;
+        this._lastDecodeProgressTime = Date.now();
         this._stallCheckInterval = setInterval(() => {
             if (this._state !== 'streaming') return;
             const now = Date.now();
+
+            const decoded = this.video ? this.video.frameCount : 0;
+            if (decoded !== this._lastDecodedCount) {
+                this._lastDecodedCount = decoded;
+                this._lastDecodeProgressTime = now;
+            }
+
             const lastFrame = this._lastVideoFrameTime || 0;
-            if (lastFrame > 0 && now - lastFrame > 3000) {
+            const noPeerFrames = lastFrame > 0 && now - lastFrame > 3000;
+            const peerFramesButNoDecode = (this._peerFrameCount || 0) > 0
+                && decoded === 0 && now - this._lastDecodeProgressTime > 2000;
+
+            if (noPeerFrames || peerFramesButNoDecode) {
                 this._emit('log', 'Video stall detected, requesting keyframe');
                 this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
+                if (this.video) {
+                    this.video._needKeyframe = true;
+                }
                 this._lastVideoFrameTime = now; // prevent rapid retries
+                this._lastDecodeProgressTime = now;
             }
         }, 1500);
 
@@ -1107,6 +1171,7 @@ class RDClient {
 
         this._adaptiveInterval = setInterval(() => {
             if (this._state !== 'streaming') return;
+            if (this._adaptivePaused) return; // user took manual control of quality/codec
             const stats = this.video.getStats();
             const fps = stats.videoFps || 0;
             const target = tiers[current].fps;
@@ -1183,7 +1248,15 @@ class RDClient {
 
     _handleError(err) {
         console.error('[RDClient]', err);
-        this._emit('error', err.message || err);
+        const msg = err && err.message ? err.message : String(err);
+        // Detect peer-offline scenarios where the agent is reachable through
+        // bd-signal/CDAP but not through the RustDesk relay (no peer registration).
+        // In that case, signal the UI that a CDAP fallback viewer is available.
+        const offlineHint = /target offline|relay refused|peer.*offline|not online|not registered/i.test(msg);
+        this._emit('error', msg, { cdapFallback: offlineHint });
+        if (offlineHint) {
+            this._emit('cdap_fallback_available', this.deviceId);
+        }
         this._cleanup();
         this._setState('error');
     }
@@ -1378,25 +1451,125 @@ class RDClient {
      */
     getMonitors() {
         if (!this._peerInfo || !this._peerInfo.displays) return [];
+        var current = this.getCurrentDisplay();
         return this._peerInfo.displays.map(function (d, i) {
             return {
                 idx: i,
                 name: d.name || ('Monitor ' + (i + 1)),
                 width: d.width || 0,
                 height: d.height || 0,
-                primary: d.is_primary || false
+                // A display positioned at the origin is the primary one.
+                primary: (d.x === 0 && d.y === 0),
+                current: (i === current)
             };
         });
     }
 
     /**
-     * Switch to a specific monitor.
+     * Index of the currently captured remote display.
+     * @returns {number}
+     */
+    getCurrentDisplay() {
+        if (typeof this._currentDisplay === 'number') return this._currentDisplay;
+        if (this._peerInfo && typeof this._peerInfo.currentDisplay === 'number') {
+            return this._peerInfo.currentDisplay;
+        }
+        return 0;
+    }
+
+    /**
+     * Switch to a specific monitor (RustDesk-compatible).
+     * Sends a SwitchDisplay message followed by a CaptureDisplays message
+     * (matching the desktop client's software-render switch path), then
+     * forces a fresh keyframe.
      * @param {number} monitorIdx - Monitor index
      */
     switchMonitor(monitorIdx) {
         if (this._state !== 'streaming') return;
-        this._sendPeerMessage(this.proto.buildMisc('switchDisplay', monitorIdx));
+        this._currentDisplay = monitorIdx;
+        this._sendPeerMessage(this.proto.buildMisc('switchDisplay', {
+            display: monitorIdx,
+            width: 0,
+            height: 0
+        }));
+        this._sendPeerMessage(this.proto.buildMisc('captureDisplays', {
+            add: [],
+            sub: [],
+            set: [monitorIdx]
+        }));
+        if (this.video) this.video._needKeyframe = true;
         this.sendRefreshScreen();
+        this._emit('display_switched', monitorIdx);
+    }
+
+    // ---- Virtual Displays (RustDesk IDD / Amyuni IDD) ----
+
+    /**
+     * Parse peer info into cached current-display and virtual-display state.
+     * @param {Object} info - PeerInfo from login response or peer_info message
+     */
+    _processPeerInfo(info) {
+        if (!info) return;
+        if (typeof info.currentDisplay === 'number') {
+            this._currentDisplay = info.currentDisplay;
+        } else if (typeof this._currentDisplay !== 'number') {
+            this._currentDisplay = 0;
+        }
+        this._virtualDisplay = this._parseVirtualDisplaySupport(info);
+    }
+
+    /**
+     * Derive virtual-display support from PeerInfo.platformAdditions (JSON).
+     * @param {Object} info
+     * @returns {{supported:boolean, impl:string, rustdeskDisplays:Array<number>, amyuniCount:number}}
+     */
+    _parseVirtualDisplaySupport(info) {
+        var result = { supported: false, impl: '', rustdeskDisplays: [], amyuniCount: 0 };
+        if (!info) return result;
+        var platform = info.platform || '';
+        var additions = info.platformAdditions || info.platform_additions || '';
+        if (typeof additions === 'string') {
+            if (!additions) return result;
+            try { additions = JSON.parse(additions); } catch (e) { return result; }
+        }
+        if (!additions || typeof additions !== 'object') return result;
+        var isInstalled = additions['is_installed'] === true;
+        var impl = additions['idd_impl'] || '';
+        if (platform !== 'Windows' || !isInstalled) return result;
+        if (impl === 'rustdesk_idd') {
+            result.supported = true;
+            result.impl = impl;
+            var list = additions['rustdesk_virtual_displays'];
+            if (Array.isArray(list)) result.rustdeskDisplays = list.slice();
+        } else if (impl === 'amyuni_idd') {
+            result.supported = true;
+            result.impl = impl;
+            var count = additions['amyuni_virtual_displays'];
+            result.amyuniCount = (typeof count === 'number') ? count : 0;
+        }
+        return result;
+    }
+
+    /**
+     * Virtual-display capability of the connected peer.
+     * @returns {{supported:boolean, impl:string, rustdeskDisplays:Array<number>, amyuniCount:number}}
+     */
+    getVirtualDisplaySupport() {
+        return this._virtualDisplay || { supported: false, impl: '', rustdeskDisplays: [], amyuniCount: 0 };
+    }
+
+    /**
+     * Plug in / plug out a virtual display (RustDesk-compatible).
+     * @param {number} index - Display index. Use -1 to plug out all.
+     * @param {boolean} on - True to plug in, false to plug out
+     */
+    toggleVirtualDisplay(index, on) {
+        if (this._state !== 'streaming') return;
+        this._sendPeerMessage(this.proto.buildMisc('toggleVirtualDisplay', {
+            display: index,
+            on: !!on
+        }));
+        this._emit('virtual_display_toggled', { index: index, on: !!on });
     }
 
     // ---- Image Quality Control ----
@@ -1416,9 +1589,32 @@ class RDClient {
         };
 
         var c = config[preset] || config.balanced;
+        this._adaptivePaused = true; // explicit user choice — stop auto-adjusting
         this._sendPeerMessage(this.proto.buildOptionMisc({ imageQuality: c.imageQuality, customFps: c.customFps }));
         this.opts.qualityPreset = preset;
         this._emit('quality_changed', preset);
+    }
+
+    // ---- Codec Control ----
+
+    /**
+     * Request the remote peer to (re)encode using a specific codec.
+     * @param {'Auto'|'VP9'|'AV1'|'H264'|'H265'|'VP8'} codec
+     */
+    setCodec(codec) {
+        if (this._state !== 'streaming') return;
+        const name = codec || 'Auto';
+        this._preferCodec = name;
+        this._adaptivePaused = true; // explicit user choice
+        // Re-advertise abilities with the new preferred codec so the peer switches encoder.
+        this._sendPeerMessage(this.proto.buildOptionMisc({
+            supportedDecoding: { abilities: this._codecAbilities, prefer: name }
+        }));
+        // The encoder restarts with a fresh keyframe; force our decoder to wait for it.
+        if (this.video) this.video._needKeyframe = true;
+        this._sendPeerMessage(this.proto.buildMisc('refreshVideo', true));
+        this.opts.preferCodec = name;
+        this._emit('codec_changed', name);
     }
 
     /**
@@ -1444,6 +1640,7 @@ class RDClient {
      */
     setImageQuality(quality) {
         if (this._state !== 'streaming') return;
+        this._adaptivePaused = true; // explicit user choice
         this._sendPeerMessage(this.proto.buildOptionMisc({ imageQuality: quality }));
     }
 

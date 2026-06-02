@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,6 +28,10 @@ type Config struct {
 	FileBrowser bool `json:"file_browser"`
 	Clipboard   bool `json:"clipboard"`
 	Screenshot  bool `json:"screenshot"`
+	// RequireConsent: when true the agent prints CONSENT_REQUEST to stdout
+	// and waits for CONSENT_GRANTED / CONSENT_DENIED from stdin before
+	// starting a desktop session. The Tauri wrapper shows a dialog to the user.
+	RequireConsent bool `json:"require_consent"`
 
 	FileRoot     string `json:"file_root,omitempty"` // root dir for file browser (default: /)
 	HeartbeatSec int    `json:"heartbeat_sec"`       // default 15
@@ -34,6 +39,33 @@ type Config struct {
 	MaxReconnect int    `json:"max_reconnect"`       // max reconnect delay
 	LogLevel     string `json:"log_level"`           // debug, info, warning, error
 	DataDir      string `json:"data_dir"`
+
+	// VideoCodec pins the desktop-stream encoder. "" or "auto" lets the agent
+	// pick the most efficient codec the operator can decode (probe-driven).
+	// Concrete values: mjpeg, webp, h264, vp9, av1.
+	VideoCodec string `json:"video_codec,omitempty"`
+	// HwAccel pins the hardware encode back-end. "" or "auto" lets the probe
+	// choose; "none" forces software. Concrete: vaapi, nvenc, qsv, amf,
+	// videotoolbox.
+	HwAccel string `json:"hw_accel,omitempty"`
+
+	// ── TLS hardening (Phase 4) ──────────────────────────────────────
+	// EnforceTLS rejects plaintext ws:// for any non-local host (returns an
+	// error from Validate instead of only warning). Recommended for any
+	// production deployment reachable over a network.
+	EnforceTLS bool `json:"enforce_tls,omitempty"`
+	// ServerCertPin is a hex-encoded SHA-256 of the server certificate's
+	// SubjectPublicKeyInfo (SPKI). When set, the agent verifies that the TLS
+	// leaf certificate's public key matches this pin and rejects any
+	// connection that does not — defeating man-in-the-middle attacks even
+	// when a rogue CA is trusted by the system. Generate with:
+	//   openssl x509 -in cert.pem -pubkey -noout |
+	//   openssl pkey -pubin -outform der | openssl dgst -sha256
+	ServerCertPin string `json:"server_cert_pin,omitempty"`
+	// TLSInsecureSkipVerify disables system CA verification (self-signed
+	// servers). Only honoured when ServerCertPin is empty; logs a warning.
+	// Prefer ServerCertPin over this for self-signed deployments.
+	TLSInsecureSkipVerify bool `json:"tls_insecure_skip_verify,omitempty"`
 }
 
 // DefaultConfig returns sensible defaults for all platforms.
@@ -64,6 +96,8 @@ func DefaultConfig() *Config {
 		MaxReconnect: 300,
 		LogLevel:     "info",
 		DataDir:      defaultDataDir(),
+		VideoCodec:   CodecAuto,
+		HwAccel:      HwAuto,
 	}
 }
 
@@ -110,10 +144,15 @@ func (c *Config) loadEnv() {
 	envStr("BDAGENT_LOG_LEVEL", &c.LogLevel)
 	envStr("BDAGENT_DATA_DIR", &c.DataDir)
 	envStr("BDAGENT_FILE_ROOT", &c.FileRoot)
+	envStr("BDAGENT_VIDEO_CODEC", &c.VideoCodec)
+	envStr("BDAGENT_HW_ACCEL", &c.HwAccel)
 	envBool("BDAGENT_TERMINAL", &c.Terminal)
 	envBool("BDAGENT_FILE_BROWSER", &c.FileBrowser)
 	envBool("BDAGENT_CLIPBOARD", &c.Clipboard)
 	envBool("BDAGENT_SCREENSHOT", &c.Screenshot)
+	envStr("BDAGENT_SERVER_CERT_PIN", &c.ServerCertPin)
+	envBool("BDAGENT_ENFORCE_TLS", &c.EnforceTLS)
+	envBool("BDAGENT_TLS_INSECURE", &c.TLSInsecureSkipVerify)
 }
 
 // Validate checks required fields and clamps values to safe ranges.
@@ -133,8 +172,26 @@ func (c *Config) Validate() error {
 		}
 		isLocal := host == "localhost" || host == "127.0.0.1" || host == "::1"
 		if !isLocal {
+			if c.EnforceTLS {
+				return fmt.Errorf("plaintext ws:// is not allowed for non-local host %q while enforce_tls is enabled; use wss://", host)
+			}
 			log.Printf("WARNING: server URL uses plaintext ws:// (%s). API key and CDAP payloads will be transmitted unencrypted. Use wss:// in production.", c.Server)
 		}
+	}
+	// Phase 4: validate the certificate pin format up-front so a typo fails
+	// fast instead of silently disabling pinning at connect time.
+	if c.ServerCertPin != "" {
+		pin := normalizeCertPin(c.ServerCertPin)
+		if len(pin) != 64 {
+			return fmt.Errorf("server_cert_pin must be a 64-character hex SHA-256 (got %d chars)", len(pin))
+		}
+		if _, err := hex.DecodeString(pin); err != nil {
+			return fmt.Errorf("server_cert_pin is not valid hex: %w", err)
+		}
+		c.ServerCertPin = pin
+	}
+	if c.TLSInsecureSkipVerify && c.ServerCertPin == "" {
+		log.Printf("WARNING: tls_insecure_skip_verify is enabled without a server_cert_pin; the server certificate will NOT be validated. Prefer setting server_cert_pin for self-signed deployments.")
 	}
 	switch c.AuthMethod {
 	case "api_key":
@@ -164,7 +221,40 @@ func (c *Config) Validate() error {
 	if c.MaxReconnect < c.ReconnectSec {
 		c.MaxReconnect = c.ReconnectSec * 60
 	}
+	c.VideoCodec = normalizeCodecValue(c.VideoCodec)
+	c.HwAccel = normalizeHwAccelValue(c.HwAccel)
 	return nil
+}
+
+// normalizeCodecValue lowercases and validates a configured codec, falling
+// back to "auto" for empty or unknown values.
+func normalizeCodecValue(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case CodecMJPEG, CodecWebP, CodecH264, CodecVP9, CodecAV1:
+		return strings.ToLower(strings.TrimSpace(v))
+	default:
+		return CodecAuto
+	}
+}
+
+// normalizeHwAccelValue lowercases and validates a configured hw back-end,
+// falling back to "auto" for empty or unknown values.
+func normalizeHwAccelValue(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case HwNone, HwVAAPI, HwNVENC, HwQSV, HwAMF, HwVideoToolbox:
+		return strings.ToLower(strings.TrimSpace(v))
+	default:
+		return HwAuto
+	}
+}
+
+// normalizeCertPin strips common separators (colons, whitespace) and
+// lowercases a certificate pin so values copied from openssl/sha256sum output
+// (e.g. "AB:CD:...") are accepted.
+func normalizeCertPin(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	v = strings.NewReplacer(":", "", " ", "", "\t", "", "\n", "").Replace(v)
+	return strings.TrimPrefix(v, "sha256:")
 }
 
 func defaultDataDir() string {

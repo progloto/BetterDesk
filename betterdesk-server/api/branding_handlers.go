@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -128,6 +129,7 @@ type EnrollmentRequest struct {
 type EnrollmentResponse struct {
 	Status       string          `json:"status"` // approved, pending, rejected
 	DeviceID     string          `json:"device_id"`
+	DeviceToken  string          `json:"device_token,omitempty"`
 	ServerTime   int64           `json:"server_time"`
 	SyncMode     string          `json:"sync_mode,omitempty"`    // silent, standard, turbo
 	DisplayName  string          `json:"display_name,omitempty"` // Operator-assigned name
@@ -191,6 +193,16 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 		displayName, _ := s.db.GetConfig("device_display_name_" + req.DeviceID)
 
 		resp := s.buildEnrollmentResponse("approved", req.DeviceID, syncMode, displayName)
+		// Re-issue a device_token so an agent that lost its local copy
+		// (e.g. user reset agent-config) can recover authentication for the
+		// CDAP sidecar without manual intervention. Existing tokens remain
+		// valid — server stores only hashes so we cannot return the prior one.
+		if token, err := s.issueEnrollmentDeviceToken(req.DeviceID); err == nil {
+			resp.DeviceToken = token
+			log.Printf("[API] Re-issued enrollment device token for %s (len=%d)", req.DeviceID, len(token))
+		} else {
+			log.Printf("[API] Failed to re-issue enrollment device token for %s: %v", req.DeviceID, err)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -214,6 +226,11 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 		// Auto-approve: create peer immediately
 		s.createPeerFromEnrollment(&req, clientIP)
 		resp := s.buildEnrollmentResponse("approved", req.DeviceID, "standard", "")
+		if token, err := s.issueEnrollmentDeviceToken(req.DeviceID); err == nil {
+			resp.DeviceToken = token
+		} else {
+			log.Printf("[API] Failed to auto-issue enrollment device token for %s: %v", req.DeviceID, err)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 
@@ -234,6 +251,7 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 				_ = s.db.IncrementTokenUse(tok.TokenHash)
 				s.createPeerFromEnrollment(&req, clientIP)
 				resp := s.buildEnrollmentResponse("approved", req.DeviceID, "standard", "")
+				resp.DeviceToken = req.Token
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(resp)
 
@@ -289,6 +307,7 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 				_ = s.db.IncrementTokenUse(tok.TokenHash)
 				s.createPeerFromEnrollment(&req, clientIP)
 				resp := s.buildEnrollmentResponse("approved", req.DeviceID, "standard", "")
+				resp.DeviceToken = req.Token
 				w.Header().Set("Content-Type", "application/json")
 				json.NewEncoder(w).Encode(resp)
 
@@ -417,6 +436,7 @@ func (s *Server) handleApproveDevice(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DisplayName string `json:"display_name"`
 		SyncMode    string `json:"sync_mode"` // silent, standard, turbo
+		Tags        string `json:"tags"`      // comma-separated tag list
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -471,12 +491,18 @@ func (s *Server) handleApproveDevice(w http.ResponseWriter, r *http.Request) {
 		s.db.UpdatePeerFields(deviceID, map[string]string{"note": req.DisplayName})
 	}
 
+	// Apply tags if provided (comma-separated, normalized)
+	tags := normalizeEnrollmentTags(req.Tags)
+	if tags != "" {
+		s.db.UpdatePeerFields(deviceID, map[string]string{"tags": tags})
+	}
+
 	// Remove from pending
 	s.db.DeleteConfig("pending_device_" + deviceID)
 
 	if s.auditLog != nil {
 		s.auditLog.Log("device_approved", s.remoteIP(r), getUsernameFromCtx(r), map[string]string{
-			"device_id": deviceID, "sync_mode": syncMode, "display_name": req.DisplayName,
+			"device_id": deviceID, "sync_mode": syncMode, "display_name": req.DisplayName, "tags": tags,
 		})
 	}
 
@@ -509,14 +535,28 @@ func (s *Server) handleRejectDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var req struct {
+		Ban bool `json:"ban"` // also ban the device so it cannot retry
+	}
+	// Body is optional; ignore decode errors (empty body = no ban).
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
 	// Remove from pending
 	s.db.DeleteConfig("pending_device_" + deviceID)
 	// Store rejection marker (so status poll returns "rejected")
 	s.db.SetConfig("rejected_device_"+deviceID, `{"rejected":true}`)
 
+	// Optionally ban the device so subsequent registration attempts are blocked.
+	if req.Ban {
+		if err := s.db.BanPeer(deviceID, "enrollment rejected"); err != nil {
+			log.Printf("[API] handleRejectDevice: failed to ban %s: %v", deviceID, err)
+		}
+	}
+
 	if s.auditLog != nil {
 		s.auditLog.Log("device_rejected", s.remoteIP(r), getUsernameFromCtx(r), map[string]string{
 			"device_id": deviceID,
+			"banned":    strconv.FormatBool(req.Ban),
 		})
 	}
 
@@ -525,12 +565,13 @@ func (s *Server) handleRejectDevice(w http.ResponseWriter, r *http.Request) {
 			Type: "device_rejected",
 			Data: map[string]string{
 				"device_id": deviceID,
+				"banned":    strconv.FormatBool(req.Ban),
 			},
 		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "banned": req.Ban})
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +618,31 @@ func (s *Server) buildEnrollmentResponse(status, deviceID, syncMode, displayName
 	}
 
 	return resp
+}
+
+func (s *Server) issueEnrollmentDeviceToken(deviceID string) (string, error) {
+	plainToken, err := generateSecureToken(32)
+	if err != nil {
+		return "", err
+	}
+
+	token := &db.DeviceToken{
+		Token:     plainToken,
+		TokenHash: hashToken(plainToken),
+		Name:      "Auto-" + deviceID,
+		PeerID:    deviceID,
+		Status:    db.TokenStatusActive,
+		MaxUses:   0,
+		UseCount:  0,
+		CreatedBy: "system",
+		Note:      "Auto-issued during device enrollment",
+	}
+
+	if err := s.db.CreateDeviceToken(token); err != nil {
+		return "", err
+	}
+
+	return plainToken, nil
 }
 
 func (s *Server) createPeerFromEnrollment(req *EnrollmentRequest, clientIP string) {
@@ -662,4 +728,26 @@ func timeNowUnixMilli() int64 {
 
 func timeNowISO() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// normalizeEnrollmentTags cleans a comma-separated tag list: trims whitespace,
+// drops empty entries and de-duplicates while preserving order.
+func normalizeEnrollmentTags(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	seen := make(map[string]struct{})
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		t := strings.TrimSpace(part)
+		if t == "" {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return strings.Join(out, ",")
 }

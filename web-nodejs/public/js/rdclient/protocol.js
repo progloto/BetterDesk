@@ -87,6 +87,7 @@ class RDProtocol {
         this.enums.ImageQuality = this.protoRoot.lookupEnum('hbb.ImageQuality');
         this.enums.ClipboardFormat = this.protoRoot.lookupEnum('hbb.ClipboardFormat');
         this.enums.FileType = this.protoRoot.lookupEnum('hbb.FileType');
+        this.enums.PreferCodec = this.protoRoot.lookupEnum('hbb.SupportedDecoding.PreferCodec');
 
         this.loaded = true;
     }
@@ -106,9 +107,16 @@ class RDProtocol {
     /**
      * Serialize a Message to raw protobuf bytes (NO frame header)
      * Use this when encryption will be applied before framing
+     *
+     * Uses fromObject() (not create()) so that string enum names — e.g. a
+     * KeyEvent's `controlKey: 'Backspace'` or `mode: 'Legacy'` — are converted
+     * to their numeric enum values. create() leaves them as strings, which the
+     * encoder writes as 0 (Unknown), breaking every non-character key. Byte
+     * fields supplied as Uint8Array (clipboard content, file blocks, keys) are
+     * preserved as-is by fromObject().
      */
     serializeMessage(msgObj) {
-        const msg = this.types.Message.create(msgObj);
+        const msg = this.types.Message.fromObject(msgObj);
         return this.types.Message.encode(msg).finish();
     }
 
@@ -223,13 +231,12 @@ class RDProtocol {
                 sessionId: Date.now(),
                 option: {
                     imageQuality: this.enums.ImageQuality.values[quality] || this.enums.ImageQuality.values.Best,
-                    supportedDecoding: {
-                        abilityVp9: hasWebCodecs ? 1 : 0,
-                        abilityH264: (hasWebCodecs || hasJMuxer) ? 1 : 0,
-                        abilityAv1: hasWebCodecs ? 1 : 0,
-                        abilityVp8: hasWebCodecs ? 1 : 0,
-                        prefer: hasWebCodecs ? 0 : 2 // Auto when WebCodecs, H264 when fallback
-                    },
+                    supportedDecoding: this.buildSupportedDecoding({
+                        abilities: opts.codecAbilities,
+                        prefer: opts.preferCodec,
+                        hasWebCodecs,
+                        hasJMuxer
+                    }),
                     customFps: opts.fps || 60,
                     showRemoteCursor: 2, // Yes
                     disableAudio: opts.disableAudio ? 2 : 1,
@@ -238,6 +245,41 @@ class RDProtocol {
                     lockAfterSessionEnd: 1 // No
                 }
             }
+        };
+    }
+
+    /**
+     * Map a PreferCodec name (Auto/VP9/H264/H265/VP8/AV1) to its enum value.
+     * @param {string} name
+     * @returns {number}
+     */
+    preferCodecValue(name) {
+        if (!name) return 0;
+        const v = this.enums.PreferCodec.values;
+        return (v && v[name] !== undefined) ? v[name] : 0;
+    }
+
+    /**
+     * Build a SupportedDecoding object advertising decode abilities + preferred codec.
+     * @param {Object} o
+     * @param {Object} [o.abilities] - { vp9, h264, h265, av1, vp8 } booleans (probed)
+     * @param {string} [o.prefer] - PreferCodec name (Auto/VP9/H264/H265/VP8/AV1)
+     * @param {boolean} [o.hasWebCodecs]
+     * @param {boolean} [o.hasJMuxer]
+     * @returns {Object}
+     */
+    buildSupportedDecoding(o = {}) {
+        const hasWebCodecs = o.hasWebCodecs !== undefined ? o.hasWebCodecs : (typeof VideoDecoder !== 'undefined');
+        const hasJMuxer = o.hasJMuxer !== undefined ? o.hasJMuxer : (typeof JMuxer !== 'undefined');
+        const a = o.abilities || null;
+        const can = (key, fallback) => a ? (a[key] ? 1 : 0) : (fallback ? 1 : 0);
+        return {
+            abilityVp9: can('vp9', hasWebCodecs),
+            abilityH264: can('h264', hasWebCodecs || hasJMuxer),
+            abilityH265: can('h265', false),
+            abilityAv1: can('av1', hasWebCodecs),
+            abilityVp8: can('vp8', hasWebCodecs),
+            prefer: this.preferCodecValue(o.prefer || (hasWebCodecs ? 'Auto' : 'H264'))
         };
     }
 
@@ -323,6 +365,9 @@ class RDProtocol {
         }
         if (opts.disableKeyboard !== undefined) {
             optionMsg.disableKeyboard = opts.disableKeyboard ? 2 : 1;
+        }
+        if (opts.supportedDecoding !== undefined) {
+            optionMsg.supportedDecoding = this.buildSupportedDecoding(opts.supportedDecoding);
         }
         return {
             misc: { option: optionMsg }

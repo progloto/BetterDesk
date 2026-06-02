@@ -12,6 +12,20 @@ jest.mock('../services/database', () => ({
     getLatestPeerMetric: jest.fn().mockResolvedValue(null),
     getPeerMetrics: jest.fn().mockResolvedValue([]),
     getDeviceGroupsForPeer: jest.fn().mockResolvedValue([]),
+    getDeviceGroupAccessForUser: jest.fn().mockResolvedValue([]),
+    getUserGroupsForUser: jest.fn().mockResolvedValue([]),
+    getAllDeviceGroups: jest.fn().mockResolvedValue([]),
+    getDeviceGroupMembers: jest.fn().mockResolvedValue([]),
+    getDeviceGroupByGuid: jest.fn().mockResolvedValue(null),
+    createDeviceGroup: jest.fn().mockResolvedValue({ guid: 'group-1', name: 'Group 1', source_type: 'manual', tag_filter: '', allowed_users: [] }),
+    updateDeviceGroup: jest.fn().mockResolvedValue(null),
+    deleteDeviceGroup: jest.fn().mockResolvedValue(undefined),
+    setDeviceGroupUserAccess: jest.fn().mockImplementation((_guid, users) => Promise.resolve({ guid: 'group-1', name: 'Group 1', allowed_users: users })),
+    setDeviceGroupUserGroupAccess: jest.fn().mockImplementation((_guid, groups) => Promise.resolve({ guid: 'group-1', name: 'Group 1', allowed_groups: groups })),
+    addDeviceToGroup: jest.fn().mockResolvedValue(undefined),
+    removeDeviceFromGroup: jest.fn().mockResolvedValue(undefined),
+    getAllFolders: jest.fn().mockResolvedValue([]),
+    getAllFolderAssignments: jest.fn().mockResolvedValue({}),
     cleanupDeletedPeerData: jest.fn().mockResolvedValue(undefined)
 }));
 
@@ -161,6 +175,155 @@ describe('Devices Routes', () => {
             expect(res.status).toBe(200);
             expect(res.body.success).toBe(true);
             expect(res.body.data.id).toBe('123456789');
+        });
+    });
+
+    describe('GET /api/tags', () => {
+        it('should return unique device tags without folder names', async () => {
+            serverBackend.getAllDevices.mockResolvedValue([
+                { id: '123456789', tags: ['Internal', 'Windows'], folder_id: 1 },
+                { id: '987654321', tags: 'External,Windows' }
+            ]);
+            db.getAllFolders.mockResolvedValue([{ id: 1, name: 'Servers' }]);
+            db.getAllFolderAssignments.mockResolvedValue({ '123456789': 1 });
+
+            const res = await request(app).get('/api/tags');
+
+            expect(res.status).toBe(200);
+            expect(res.body.success).toBe(true);
+            expect(res.body.data.tags).toEqual(['External', 'Internal', 'Windows']);
+        });
+    });
+
+    describe('Device groups', () => {
+        it('should count dynamic tag groups from visible devices', async () => {
+            serverBackend.getAllDevices.mockResolvedValue([
+                { id: 'LINUX1', tags: ['Linux', 'Kiosk'] },
+                { id: 'WIN1', tags: ['Windows'] }
+            ]);
+            db.getAllDeviceGroups.mockResolvedValue([
+                { guid: 'linux', name: 'Linux Devices', source_type: 'tag', tag_filter: 'Linux', allowed_users: [] }
+            ]);
+
+            const res = await request(app).get('/api/device-groups');
+
+            expect(res.status).toBe(200);
+            expect(res.body.success).toBe(true);
+            expect(res.body.data.groups[0].member_count).toBe(1);
+        });
+
+        it('should create a dynamic group with allowed users and user groups', async () => {
+            db.createDeviceGroup.mockResolvedValue({ guid: 'group-1', name: 'Linux', source_type: 'tag', tag_filter: 'Linux' });
+
+            const res = await request(app)
+                .post('/api/device-groups')
+                .send({
+                    name: 'Linux',
+                    source_type: 'tag',
+                    tag_filter: 'Linux',
+                    allowed_users: 'operator1, operator2',
+                    allowed_groups: ['volunteers']
+                });
+
+            expect(res.status).toBe(200);
+            expect(db.createDeviceGroup).toHaveBeenCalledWith(expect.objectContaining({
+                name: 'Linux',
+                source_type: 'tag',
+                tag_filter: 'Linux'
+            }));
+            expect(db.setDeviceGroupUserAccess).toHaveBeenCalledWith('group-1', ['operator1', 'operator2']);
+            expect(db.setDeviceGroupUserGroupAccess).toHaveBeenCalledWith('group-1', ['volunteers']);
+        });
+
+        it('should scope operator devices through user group ACLs', async () => {
+            const scopedApp = createTestApp();
+            scopedApp.use((req, _res, next) => {
+                req.session.userId = 2;
+                req.session.user = { id: 2, username: 'operator1', role: 'operator' };
+                next();
+            });
+            scopedApp.use('/', devicesRoutes);
+
+            serverBackend.getAllDevices.mockResolvedValue([
+                { id: 'LINUX1', tags: ['Linux'] },
+                { id: 'WIN1', tags: ['Windows'] }
+            ]);
+            db.getUserGroupsForUser.mockResolvedValue([{ guid: 'volunteers', name: 'Volunteers' }]);
+            db.getAllDeviceGroups.mockResolvedValue([
+                { guid: 'linux', name: 'Linux', source_type: 'tag', tag_filter: 'Linux', allowed_groups: ['volunteers'], allowed_users: [] },
+                { guid: 'windows', name: 'Windows', source_type: 'tag', tag_filter: 'Windows', allowed_groups: ['coordinators'], allowed_users: [] }
+            ]);
+
+            const res = await request(scopedApp).get('/api/devices');
+
+            expect(res.status).toBe(200);
+            expect(res.body.data.devices.map(device => device.id)).toEqual(['LINUX1']);
+        });
+
+        it('should replace manual group memberships without touching dynamic groups', async () => {
+            serverBackend.getDeviceById.mockResolvedValue({ id: '123456789', tags: ['Linux'] });
+            serverBackend.getAllDevices.mockResolvedValue([{ id: '123456789', tags: ['Linux'] }]);
+            db.getAllDeviceGroups.mockResolvedValue([
+                { guid: 'manual-a', name: 'Manual A', source_type: 'manual' },
+                { guid: 'tag-linux', name: 'Linux', source_type: 'tag', tag_filter: 'Linux' }
+            ]);
+
+            const res = await request(app)
+                .put('/api/devices/123456789/groups')
+                .send({ groupGuids: ['manual-a', 'tag-linux'] });
+
+            expect(res.status).toBe(200);
+            expect(db.addDeviceToGroup).toHaveBeenCalledWith('manual-a', '123456789');
+            expect(db.addDeviceToGroup).not.toHaveBeenCalledWith('tag-linux', '123456789');
+        });
+    });
+
+    describe('PATCH /api/devices/:id', () => {
+        it('should update display name and note', async () => {
+            serverBackend.getDeviceById.mockResolvedValue({ id: '123456789', hostname: 'PC-1' });
+            serverBackend.updateDevice.mockResolvedValue({ changes: 1 });
+
+            const res = await request(app)
+                .patch('/api/devices/123456789')
+                .send({ display_name: 'Accounting PC', note: 'Front desk' });
+
+            expect(res.status).toBe(200);
+            expect(res.body.success).toBe(true);
+            expect(res.body.data.changes).toBe(1);
+            expect(serverBackend.updateDevice).toHaveBeenCalledWith('123456789', {
+                user: undefined,
+                note: 'Front desk',
+                display_name: 'Accounting PC'
+            });
+        });
+
+        it('should return backend update errors instead of reporting success', async () => {
+            serverBackend.getDeviceById.mockResolvedValue({ id: '123456789', hostname: 'PC-1' });
+            serverBackend.updateDevice.mockResolvedValue({ changes: 0, error: 'Go API update failed' });
+
+            const res = await request(app)
+                .patch('/api/devices/123456789')
+                .send({ display_name: 'Accounting PC' });
+
+            expect(res.status).toBe(502);
+            expect(res.body.success).toBe(false);
+            expect(res.body.error).toBe('Go API update failed');
+        });
+
+        it('should not fail the update when audit logging fails', async () => {
+            const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+            serverBackend.getDeviceById.mockResolvedValue({ id: '123456789', hostname: 'PC-1' });
+            serverBackend.updateDevice.mockResolvedValue({ changes: 1 });
+            db.logAction.mockRejectedValueOnce(new Error('audit unavailable'));
+
+            const res = await request(app)
+                .patch('/api/devices/123456789')
+                .send({ display_name: 'Accounting PC' });
+
+            expect(res.status).toBe(200);
+            expect(res.body.success).toBe(true);
+            expect(warnSpy).toHaveBeenCalledWith('Device update audit log failed:', 'audit unavailable');
+            warnSpy.mockRestore();
         });
     });
 

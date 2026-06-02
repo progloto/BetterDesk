@@ -92,6 +92,7 @@ func (s *SQLiteDB) Migrate() error {
 			username TEXT UNIQUE NOT NULL,
 			password_hash TEXT NOT NULL,
 			role TEXT NOT NULL DEFAULT 'viewer',
+			auth_provider TEXT NOT NULL DEFAULT 'local',
 			totp_secret TEXT DEFAULT '',
 			totp_enabled INTEGER DEFAULT 0,
 			totp_recovery_codes TEXT DEFAULT NULL,
@@ -179,6 +180,23 @@ func (s *SQLiteDB) Migrate() error {
 			created_at TEXT DEFAULT (datetime('now'))
 		)`,
 
+		// Help requests table (support requests raised by agent devices)
+		`CREATE TABLE IF NOT EXISTS help_requests (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			device_id TEXT NOT NULL,
+			hostname TEXT DEFAULT '',
+			org_id TEXT DEFAULT '',
+			message TEXT DEFAULT '',
+			status TEXT DEFAULT 'pending',
+			handled_by TEXT DEFAULT '',
+			created_at TEXT DEFAULT (datetime('now')),
+			updated_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_device ON help_requests(device_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_status ON help_requests(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_created ON help_requests(created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_org ON help_requests(org_id)`,
+
 		// Organizations (v3.0.0)
 		`CREATE TABLE IF NOT EXISTS organizations (
 			id TEXT PRIMARY KEY,
@@ -263,6 +281,82 @@ func (s *SQLiteDB) Migrate() error {
 			UNIQUE(role, permission)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_role_permissions_role ON role_permissions(role)`,
+
+		// Audit logs (RustDesk client reporting — API-port consolidation Phase A)
+		`CREATE TABLE IF NOT EXISTS audit_connections (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			host_id TEXT NOT NULL,
+			host_uuid TEXT DEFAULT '',
+			peer_id TEXT DEFAULT '',
+			peer_name TEXT DEFAULT '',
+			action TEXT NOT NULL DEFAULT '',
+			conn_type INTEGER DEFAULT 0,
+			session_id TEXT DEFAULT '',
+			ip TEXT DEFAULT '',
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_conn_host ON audit_connections(host_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_conn_peer ON audit_connections(peer_id, created_at)`,
+
+		`CREATE TABLE IF NOT EXISTS audit_files (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			host_id TEXT NOT NULL,
+			host_uuid TEXT DEFAULT '',
+			peer_id TEXT DEFAULT '',
+			direction INTEGER DEFAULT 0,
+			path TEXT DEFAULT '',
+			is_file INTEGER DEFAULT 1,
+			num_files INTEGER DEFAULT 0,
+			files_json TEXT DEFAULT '[]',
+			ip TEXT DEFAULT '',
+			peer_name TEXT DEFAULT '',
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_files_host ON audit_files(host_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_files_peer ON audit_files(peer_id, created_at)`,
+
+		`CREATE TABLE IF NOT EXISTS audit_alarms (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			alarm_type INTEGER NOT NULL DEFAULT 0,
+			alarm_name TEXT DEFAULT '',
+			host_id TEXT DEFAULT '',
+			peer_id TEXT DEFAULT '',
+			ip TEXT DEFAULT '',
+			details TEXT DEFAULT '{}',
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_alarms_type ON audit_alarms(alarm_type, created_at)`,
+
+		// User/device groups + strategies (API-port consolidation Phase A)
+		`CREATE TABLE IF NOT EXISTS user_groups (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			guid TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			note TEXT DEFAULT '',
+			team_id TEXT DEFAULT '',
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS device_groups (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			guid TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			note TEXT DEFAULT '',
+			team_id TEXT DEFAULT '',
+			source_type TEXT DEFAULT 'manual',
+			tag_filter TEXT DEFAULT '',
+			created_at TEXT DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS strategies (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			guid TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			user_group_guid TEXT DEFAULT '',
+			device_group_guid TEXT DEFAULT '',
+			enabled INTEGER DEFAULT 1,
+			permissions TEXT DEFAULT '{}',
+			created_at TEXT DEFAULT (datetime('now')),
+			updated_at TEXT DEFAULT (datetime('now'))
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -297,6 +391,7 @@ func (s *SQLiteDB) Migrate() error {
 		{"peers", "display_name", `ALTER TABLE peers ADD COLUMN display_name TEXT DEFAULT ''`},
 		// users: is_server_admin flag (RBAC Phase 52)
 		{"users", "is_server_admin", `ALTER TABLE users ADD COLUMN is_server_admin INTEGER DEFAULT 0`},
+		{"users", "auth_provider", `ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local'`},
 		// org_users: server_user_id for linking existing users (Issue #106)
 		{"org_users", "server_user_id", `ALTER TABLE org_users ADD COLUMN server_user_id INTEGER DEFAULT 0`},
 	}
@@ -446,6 +541,10 @@ func (s *SQLiteDB) UpsertPeer(p *Peer) error {
 			note = COALESCE(NULLIF(excluded.note, ''), peers.note),
 			tags = COALESCE(NULLIF(excluded.tags, ''), peers.tags),
 			heartbeat_seq = excluded.heartbeat_seq`,
+		/* SECURITY (GHSA-3v82-3gf8-fxx8): UpsertPeer MUST NOT silently clear
+		   soft_deleted/deleted_at on conflict. Doing so allows any successful
+		   registration to undo an administrator's deletion. Restoration is now
+		   an explicit operation — see RestorePeer. */
 		p.ID, p.UUID, p.PK, p.IP, p.User, p.Hostname, p.OS, p.Version,
 		p.Status, p.NATType, formatTime(p.LastOnline),
 		p.Disabled, p.Note, p.Tags, p.HeartbeatSeq,
@@ -626,6 +725,19 @@ func (s *SQLiteDB) IsPeerSoftDeleted(id string) (bool, error) {
 		return false, nil
 	}
 	return deleted, err
+}
+
+// RestorePeer clears soft_deleted and deleted_at for a previously deleted
+// peer. Required because UpsertPeer no longer does this implicitly
+// (GHSA-3v82-3gf8-fxx8).
+func (s *SQLiteDB) RestorePeer(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		`UPDATE peers SET soft_deleted = 0, deleted_at = NULL WHERE id = ?`,
+		id)
+	return err
 }
 
 // UpdatePeerFields updates specific peer fields (note, user, tags, device_type, linked_peer_id, display_name).
@@ -937,9 +1049,12 @@ func formatTime(t time.Time) string {
 func (s *SQLiteDB) CreateUser(u *User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`INSERT INTO users (username, password_hash, role, totp_secret, totp_enabled)
-		VALUES (?, ?, ?, ?, ?)`,
-		u.Username, u.PasswordHash, u.Role, u.TOTPSecret, u.TOTPEnabled)
+	if u.AuthProvider == "" {
+		u.AuthProvider = AuthProviderLocal
+	}
+	res, err := s.db.Exec(`INSERT INTO users (username, password_hash, role, auth_provider, totp_secret, totp_enabled)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		u.Username, u.PasswordHash, u.Role, u.AuthProvider, u.TOTPSecret, u.TOTPEnabled)
 	if err != nil {
 		return fmt.Errorf("db: CreateUser: %w", err)
 	}
@@ -953,9 +1068,9 @@ func (s *SQLiteDB) GetUser(username string) (*User, error) {
 	defer s.mu.RUnlock()
 	u := &User{}
 	err := s.db.QueryRow(`SELECT id, username, password_hash, role, COALESCE(is_server_admin, 0),
-		totp_secret, totp_enabled, created_at, last_login FROM users WHERE username = ?`, username).Scan(
+		COALESCE(auth_provider, 'local'), totp_secret, totp_enabled, COALESCE(totp_recovery_codes, ''), created_at, last_login FROM users WHERE username = ?`, username).Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.IsServerAdmin,
-		&u.TOTPSecret, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin)
+		&u.AuthProvider, &u.TOTPSecret, &u.TOTPEnabled, &u.TOTPRecoveryCodes, &u.CreatedAt, &u.LastLogin)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -968,9 +1083,9 @@ func (s *SQLiteDB) GetUserByID(id int64) (*User, error) {
 	defer s.mu.RUnlock()
 	u := &User{}
 	err := s.db.QueryRow(`SELECT id, username, password_hash, role, COALESCE(is_server_admin, 0),
-		totp_secret, totp_enabled, created_at, last_login FROM users WHERE id = ?`, id).Scan(
+		COALESCE(auth_provider, 'local'), totp_secret, totp_enabled, COALESCE(totp_recovery_codes, ''), created_at, last_login FROM users WHERE id = ?`, id).Scan(
 		&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.IsServerAdmin,
-		&u.TOTPSecret, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin)
+		&u.AuthProvider, &u.TOTPSecret, &u.TOTPEnabled, &u.TOTPRecoveryCodes, &u.CreatedAt, &u.LastLogin)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -982,7 +1097,7 @@ func (s *SQLiteDB) ListUsers() ([]*User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`SELECT id, username, password_hash, role, COALESCE(is_server_admin, 0),
-		totp_secret, totp_enabled, created_at, last_login FROM users ORDER BY id`)
+		COALESCE(auth_provider, 'local'), totp_secret, totp_enabled, COALESCE(totp_recovery_codes, ''), created_at, last_login FROM users ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("db: ListUsers: %w", err)
 	}
@@ -991,7 +1106,7 @@ func (s *SQLiteDB) ListUsers() ([]*User, error) {
 	for rows.Next() {
 		u := &User{}
 		if err := rows.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.IsServerAdmin,
-			&u.TOTPSecret, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin); err != nil {
+			&u.AuthProvider, &u.TOTPSecret, &u.TOTPEnabled, &u.TOTPRecoveryCodes, &u.CreatedAt, &u.LastLogin); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
@@ -1003,9 +1118,12 @@ func (s *SQLiteDB) ListUsers() ([]*User, error) {
 func (s *SQLiteDB) UpdateUser(u *User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE users SET password_hash=?, role=?, is_server_admin=?,
-		totp_secret=?, totp_enabled=? WHERE id=?`,
-		u.PasswordHash, u.Role, u.IsServerAdmin, u.TOTPSecret, u.TOTPEnabled, u.ID)
+	if u.AuthProvider == "" {
+		u.AuthProvider = AuthProviderLocal
+	}
+	_, err := s.db.Exec(`UPDATE users SET password_hash=?, role=?, is_server_admin=?, auth_provider=?,
+		totp_secret=?, totp_enabled=?, totp_recovery_codes=? WHERE id=?`,
+		u.PasswordHash, u.Role, u.IsServerAdmin, u.AuthProvider, u.TOTPSecret, u.TOTPEnabled, u.TOTPRecoveryCodes, u.ID)
 	return err
 }
 

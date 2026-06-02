@@ -245,6 +245,11 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[cdap] WebSocket upgrade failed from %s: %v", clientIP, err)
 		return
 	}
+	// Default coder/websocket limit is 32 KiB which is far too small for
+	// continuous desktop frames (a 1280x720 q70 JPEG base64-encoded is
+	// ~150 KB). Allow up to 8 MB per CDAP message to support screen capture
+	// and bulk file payloads.
+	conn.SetReadLimit(8 * 1024 * 1024)
 
 	g.totalConns.Add(1)
 	g.activeConns.Add(1)
@@ -301,12 +306,25 @@ func (g *Gateway) runConnection(baseCtx context.Context, conn *websocket.Conn, c
 // messageLoop reads messages until the connection closes or context is cancelled.
 func (g *Gateway) messageLoop(ctx context.Context, dc *DeviceConn) {
 	for {
-		msg, err := dc.ReadMessage(ctx)
+		typ, raw, msg, err := dc.ReadAny(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
 				log.Printf("[cdap] %s: read error: %v", dc.ID, err)
 			}
 			return
+		}
+
+		// Binary fast-path: raw bytes (currently used for desktop JPEG frames).
+		// The agent prefixes the payload with FRAME_HEADER_SIZE bytes encoding
+		// the desktop session ID, so we can route the frame to the correct
+		// browser without parsing JSON.
+		if typ == websocket.MessageBinary {
+			g.handleDesktopFrameBinary(ctx, dc, raw)
+			continue
+		}
+
+		if msg == nil {
+			continue
 		}
 
 		switch msg.Type {
@@ -322,6 +340,10 @@ func (g *Gateway) messageLoop(ctx context.Context, dc *DeviceConn) {
 			g.handleEvent(ctx, dc, msg)
 		case "log":
 			g.handleLog(ctx, dc, msg)
+		case "help_request":
+			g.handleHelpRequest(ctx, dc, msg)
+		case "chat_message":
+			g.handleChatMessage(ctx, dc, msg)
 		case "unregister":
 			g.handleUnregister(ctx, dc, msg)
 			return
@@ -335,6 +357,8 @@ func (g *Gateway) messageLoop(ctx context.Context, dc *DeviceConn) {
 			g.handleDesktopFrame(ctx, dc, msg)
 		case "desktop_end":
 			g.handleDesktopEnd(ctx, dc, msg)
+		case "desktop_input_error":
+			g.HandleDesktopInputError(ctx, dc, msg)
 		case "video_frame":
 			g.handleVideoFrame(ctx, dc, msg)
 		case "video_end":
@@ -458,6 +482,8 @@ func (g *Gateway) removeDevice(dc *DeviceConn) {
 		return true
 	})
 
+	g.cleanupDeviceSessions(dc.ID, "device disconnected")
+
 	// Update peer status to OFFLINE
 	if err := g.db.UpdatePeerStatus(dc.ID, "OFFLINE", dc.ClientIP); err != nil {
 		log.Printf("[cdap] %s: failed to set offline: %v", dc.ID, err)
@@ -499,6 +525,32 @@ func (g *Gateway) SendCommand(ctx context.Context, deviceID string, cmd *Command
 		ID:        cmd.ID,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Payload:   cmd.Payload,
+	})
+}
+
+// SendChatToDevice delivers an operator chat message to a connected device.
+// Returns an error if the device is not connected. The caller is responsible
+// for persisting the message and performing RBAC checks.
+func (g *Gateway) SendChatToDevice(ctx context.Context, deviceID, fromID, fromName, text string) error {
+	val, ok := g.devices.Load(deviceID)
+	if !ok {
+		return fmt.Errorf("device %s not connected", deviceID)
+	}
+	dc := val.(*DeviceConn)
+
+	payload, err := json.Marshal(map[string]string{
+		"from_id":   fromID,
+		"from_name": fromName,
+		"text":      text,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal chat payload: %w", err)
+	}
+
+	return dc.WriteMessage(ctx, &Message{
+		Type:      "chat_message",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Payload:   payload,
 	})
 }
 

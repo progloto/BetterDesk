@@ -1,4 +1,10 @@
 <!-- Top Navigation Bar -->
+<% if (typeof emergencyMode !== 'undefined' && emergencyMode) { %>
+<div class="emergency-banner" role="alert">
+    <span class="material-icons">warning</span>
+    <span><%= _('auth.emergency_mode_banner') %></span>
+</div>
+<% } %>
 <header class="navbar">
     <div class="navbar-left">
         <!-- Mobile menu button -->
@@ -50,6 +56,17 @@
             </div>
         </div>
 
+        <!-- Accessibility preferences -->
+        <button class="navbar-btn accessibility-btn" id="accessibility-btn" title="<%= _('accessibility.title') %>" aria-label="<%= _('accessibility.title') %>" aria-haspopup="dialog">
+            <span class="material-icons">accessibility_new</span>
+        </button>
+
+        <!-- Beta 3.1 Panel toggle -->
+        <button class="navbar-btn beta31-toggle-btn" id="beta31-toggle-btn" title="Beta 3.1 Console">
+            <span class="material-icons">view_sidebar</span>
+            <span class="beta-badge">3.1</span>
+        </button>
+
         <!-- Desktop mode toggle (Beta) - visible only on large screens -->
         <button class="navbar-btn desktop-toggle-btn" id="desktop-toggle-btn" title="<%= _('desktop.switch_mode') %> (Beta)">
             <span class="material-icons">desktop_windows</span>
@@ -62,14 +79,15 @@
                 <span class="material-icons">language</span>
             </button>
             <div class="lang-dropdown" id="lang-dropdown">
-                <div class="lang-option <%= lang === 'en' ? 'active' : '' %>" data-lang="en">
-                    <span>🇬🇧</span>
-                    <span>English</span>
-                </div>
-                <div class="lang-option <%= lang === 'pl' ? 'active' : '' %>" data-lang="pl">
-                    <span>🇵🇱</span>
-                    <span>Polski</span>
-                </div>
+                <% (availableLanguageList || Object.values(availableLanguages || {})).forEach(function(language) { %>
+                    <div class="lang-option <%= lang === language.code ? 'active' : '' %>" data-lang="<%= language.code %>" role="button" tabindex="0">
+                        <span class="lang-flag"><%= language.flag || '🌐' %></span>
+                        <span class="lang-label"><%= language.native || language.name || language.code %></span>
+                        <% if (lang === language.code) { %>
+                            <span class="material-icons lang-check">check</span>
+                        <% } %>
+                    </div>
+                <% }); %>
             </div>
         </div>
         

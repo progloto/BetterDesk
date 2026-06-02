@@ -118,6 +118,7 @@ func (pg *PostgresDB) Migrate() error {
 			username             TEXT UNIQUE NOT NULL,
 			password_hash        TEXT NOT NULL,
 			role                 TEXT NOT NULL DEFAULT 'viewer',
+			auth_provider        TEXT NOT NULL DEFAULT 'local',
 			totp_secret          TEXT NOT NULL DEFAULT '',
 			totp_enabled         BOOLEAN NOT NULL DEFAULT FALSE,
 			totp_recovery_codes  TEXT DEFAULT NULL,
@@ -192,7 +193,6 @@ func (pg *PostgresDB) Migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_chat_messages_conv ON chat_messages(conversation_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_chat_messages_from ON chat_messages(from_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at)`,
-
 		// Chat groups
 		`CREATE TABLE IF NOT EXISTS chat_groups (
 			id         TEXT PRIMARY KEY,
@@ -201,6 +201,23 @@ func (pg *PostgresDB) Migrate() error {
 			created_by TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+
+		// Help requests (support requests raised by agent devices)
+		`CREATE TABLE IF NOT EXISTS help_requests (
+			id         BIGSERIAL PRIMARY KEY,
+			device_id  TEXT NOT NULL,
+			hostname   TEXT NOT NULL DEFAULT '',
+			org_id     TEXT NOT NULL DEFAULT '',
+			message    TEXT NOT NULL DEFAULT '',
+			status     TEXT NOT NULL DEFAULT 'pending',
+			handled_by TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_device ON help_requests(device_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_status ON help_requests(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_created ON help_requests(created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_help_requests_org ON help_requests(org_id)`,
 
 		// Organizations (v3.0.0)
 		`CREATE TABLE IF NOT EXISTS organizations (
@@ -284,6 +301,82 @@ func (pg *PostgresDB) Migrate() error {
 			updated_at TIMESTAMPTZ,
 			updated_by TEXT NOT NULL DEFAULT ''
 		)`,
+
+		// Audit logs (RustDesk client reporting — API-port consolidation Phase A)
+		`CREATE TABLE IF NOT EXISTS audit_connections (
+			id BIGSERIAL PRIMARY KEY,
+			host_id TEXT NOT NULL,
+			host_uuid TEXT NOT NULL DEFAULT '',
+			peer_id TEXT NOT NULL DEFAULT '',
+			peer_name TEXT NOT NULL DEFAULT '',
+			action TEXT NOT NULL DEFAULT '',
+			conn_type INTEGER NOT NULL DEFAULT 0,
+			session_id TEXT NOT NULL DEFAULT '',
+			ip TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_conn_host ON audit_connections(host_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_conn_peer ON audit_connections(peer_id, created_at)`,
+
+		`CREATE TABLE IF NOT EXISTS audit_files (
+			id BIGSERIAL PRIMARY KEY,
+			host_id TEXT NOT NULL,
+			host_uuid TEXT NOT NULL DEFAULT '',
+			peer_id TEXT NOT NULL DEFAULT '',
+			direction INTEGER NOT NULL DEFAULT 0,
+			path TEXT NOT NULL DEFAULT '',
+			is_file INTEGER NOT NULL DEFAULT 1,
+			num_files INTEGER NOT NULL DEFAULT 0,
+			files_json TEXT NOT NULL DEFAULT '[]',
+			ip TEXT NOT NULL DEFAULT '',
+			peer_name TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_files_host ON audit_files(host_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_files_peer ON audit_files(peer_id, created_at)`,
+
+		`CREATE TABLE IF NOT EXISTS audit_alarms (
+			id BIGSERIAL PRIMARY KEY,
+			alarm_type INTEGER NOT NULL DEFAULT 0,
+			alarm_name TEXT NOT NULL DEFAULT '',
+			host_id TEXT NOT NULL DEFAULT '',
+			peer_id TEXT NOT NULL DEFAULT '',
+			ip TEXT NOT NULL DEFAULT '',
+			details TEXT NOT NULL DEFAULT '{}',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_alarms_type ON audit_alarms(alarm_type, created_at)`,
+
+		// User/device groups + strategies (API-port consolidation Phase A)
+		`CREATE TABLE IF NOT EXISTS user_groups (
+			id BIGSERIAL PRIMARY KEY,
+			guid TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			note TEXT NOT NULL DEFAULT '',
+			team_id TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS device_groups (
+			id BIGSERIAL PRIMARY KEY,
+			guid TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			note TEXT NOT NULL DEFAULT '',
+			team_id TEXT NOT NULL DEFAULT '',
+			source_type TEXT NOT NULL DEFAULT 'manual',
+			tag_filter TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS strategies (
+			id BIGSERIAL PRIMARY KEY,
+			guid TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			user_group_guid TEXT NOT NULL DEFAULT '',
+			device_group_guid TEXT NOT NULL DEFAULT '',
+			enabled BOOLEAN NOT NULL DEFAULT TRUE,
+			permissions TEXT NOT NULL DEFAULT '{}',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -314,6 +407,8 @@ func (pg *PostgresDB) Migrate() error {
 		`ALTER TABLE peers ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`,
 		// users: server admin flag (RBAC Phase 52)
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_server_admin BOOLEAN NOT NULL DEFAULT FALSE`,
+		// users: authentication provider (Issue #148)
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'local'`,
 		// org_users: server_user_id for linking existing users (Issue #106)
 		`ALTER TABLE org_users ADD COLUMN IF NOT EXISTS server_user_id BIGINT NOT NULL DEFAULT 0`,
 	}
@@ -442,6 +537,9 @@ func (pg *PostgresDB) UpsertPeer(p *Peer) error {
 			note          = COALESCE(NULLIF(EXCLUDED.note, ''), peers.note),
 			tags          = COALESCE(NULLIF(EXCLUDED.tags, ''), peers.tags),
 			heartbeat_seq = EXCLUDED.heartbeat_seq`,
+		/* SECURITY (GHSA-3v82-3gf8-fxx8): UpsertPeer MUST NOT silently clear
+		   soft_deleted/deleted_at on conflict. Restoration is now an explicit
+		   operation — see RestorePeer. */
 		p.ID, p.UUID, p.PK, p.IP, p.User, p.Hostname, p.OS, p.Version,
 		p.Status, p.NATType, lastOnline, p.Disabled, p.Note, p.Tags, p.HeartbeatSeq,
 	)
@@ -573,6 +671,16 @@ func (pg *PostgresDB) IsPeerSoftDeleted(id string) (bool, error) {
 		return false, nil
 	}
 	return deleted, err
+}
+
+// RestorePeer clears soft_deleted and deleted_at for a previously deleted
+// peer. Required because UpsertPeer no longer does this implicitly
+// (GHSA-3v82-3gf8-fxx8).
+func (pg *PostgresDB) RestorePeer(id string) error {
+	_, err := pg.pool.Exec(pg.ctx,
+		`UPDATE peers SET soft_deleted = FALSE, deleted_at = NULL WHERE id = $1`,
+		id)
+	return err
 }
 
 // UpdatePeerFields updates specific peer fields (note, user, tags, device_type, linked_peer_id).
@@ -804,10 +912,13 @@ func (pg *PostgresDB) ListConfigByPrefix(prefix string) ([]ServerConfig, error) 
 
 // CreateUser inserts a new user and sets u.ID to the generated primary key.
 func (pg *PostgresDB) CreateUser(u *User) error {
+	if u.AuthProvider == "" {
+		u.AuthProvider = AuthProviderLocal
+	}
 	err := pg.pool.QueryRow(pg.ctx,
-		`INSERT INTO users (username, password_hash, role, totp_secret, totp_enabled)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		u.Username, u.PasswordHash, u.Role, u.TOTPSecret, u.TOTPEnabled,
+		`INSERT INTO users (username, password_hash, role, auth_provider, totp_secret, totp_enabled)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		u.Username, u.PasswordHash, u.Role, u.AuthProvider, u.TOTPSecret, u.TOTPEnabled,
 	).Scan(&u.ID)
 	if err != nil {
 		return fmt.Errorf("db: CreateUser: %w", err)
@@ -822,9 +933,11 @@ func scanUser(row pgx.Row) (*User, error) {
 	u := &User{}
 	var createdAt *time.Time
 	var lastLogin *time.Time
+	var recoveryCodes *string
+	var authProvider *string
 
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role,
-		&u.TOTPSecret, &u.TOTPEnabled, &createdAt, &lastLogin, &u.IsServerAdmin)
+		&u.TOTPSecret, &u.TOTPEnabled, &createdAt, &lastLogin, &u.IsServerAdmin, &recoveryCodes, &authProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -835,6 +948,14 @@ func scanUser(row pgx.Row) (*User, error) {
 	if lastLogin != nil {
 		u.LastLogin = lastLogin.Format("2006-01-02 15:04:05")
 	}
+	if recoveryCodes != nil {
+		u.TOTPRecoveryCodes = *recoveryCodes
+	}
+	if authProvider != nil && *authProvider != "" {
+		u.AuthProvider = *authProvider
+	} else {
+		u.AuthProvider = AuthProviderLocal
+	}
 
 	return u, nil
 }
@@ -843,7 +964,7 @@ func scanUser(row pgx.Row) (*User, error) {
 func (pg *PostgresDB) GetUser(username string) (*User, error) {
 	row := pg.pool.QueryRow(pg.ctx,
 		`SELECT id, username, password_hash, role, totp_secret, totp_enabled,
-		        created_at, last_login, COALESCE(is_server_admin, FALSE) FROM users WHERE username = $1`, username)
+		        created_at, last_login, COALESCE(is_server_admin, FALSE), totp_recovery_codes, COALESCE(auth_provider, 'local') FROM users WHERE username = $1`, username)
 	u, err := scanUser(row)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -855,7 +976,7 @@ func (pg *PostgresDB) GetUser(username string) (*User, error) {
 func (pg *PostgresDB) GetUserByID(id int64) (*User, error) {
 	row := pg.pool.QueryRow(pg.ctx,
 		`SELECT id, username, password_hash, role, totp_secret, totp_enabled,
-		        created_at, last_login, COALESCE(is_server_admin, FALSE) FROM users WHERE id = $1`, id)
+		        created_at, last_login, COALESCE(is_server_admin, FALSE), totp_recovery_codes, COALESCE(auth_provider, 'local') FROM users WHERE id = $1`, id)
 	u, err := scanUser(row)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -867,7 +988,7 @@ func (pg *PostgresDB) GetUserByID(id int64) (*User, error) {
 func (pg *PostgresDB) ListUsers() ([]*User, error) {
 	rows, err := pg.pool.Query(pg.ctx,
 		`SELECT id, username, password_hash, role, totp_secret, totp_enabled,
-		        created_at, last_login, COALESCE(is_server_admin, FALSE) FROM users ORDER BY id`)
+		        created_at, last_login, COALESCE(is_server_admin, FALSE), totp_recovery_codes, COALESCE(auth_provider, 'local') FROM users ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("db: ListUsers: %w", err)
 	}
@@ -886,10 +1007,19 @@ func (pg *PostgresDB) ListUsers() ([]*User, error) {
 
 // UpdateUser updates a user's mutable fields.
 func (pg *PostgresDB) UpdateUser(u *User) error {
+	var recoveryCodes interface{}
+	if u.TOTPRecoveryCodes == "" {
+		recoveryCodes = nil
+	} else {
+		recoveryCodes = u.TOTPRecoveryCodes
+	}
+	if u.AuthProvider == "" {
+		u.AuthProvider = AuthProviderLocal
+	}
 	_, err := pg.pool.Exec(pg.ctx,
-		`UPDATE users SET password_hash = $1, role = $2, totp_secret = $3, totp_enabled = $4, is_server_admin = $5
-		 WHERE id = $6`,
-		u.PasswordHash, u.Role, u.TOTPSecret, u.TOTPEnabled, u.IsServerAdmin, u.ID)
+		`UPDATE users SET password_hash = $1, role = $2, totp_secret = $3, totp_enabled = $4, is_server_admin = $5, totp_recovery_codes = $6, auth_provider = $7
+		 WHERE id = $8`,
+		u.PasswordHash, u.Role, u.TOTPSecret, u.TOTPEnabled, u.IsServerAdmin, recoveryCodes, u.AuthProvider, u.ID)
 	return err
 }
 

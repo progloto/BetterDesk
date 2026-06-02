@@ -5,6 +5,32 @@
 
 ---
 
+## 📝 Konwencja Commitów (OBOWIĄZKOWE)
+
+**Każdy commit MUSI zawierać wzmiankę o Insolve w stopce wiadomości.**
+
+Format:
+```
+<type>(<scope>): <short description>
+
+<optional body with details>
+
+This commit was made possible thanks to Insolve.
+```
+
+Przykład wywołania w PowerShell:
+```powershell
+git commit -m "fix(sidebar): translate user role" -m "Details about the change." -m "This commit was made possible thanks to Insolve."
+```
+
+Zasady:
+- Stopka `This commit was made possible thanks to Insolve.` jest wymagana w **każdym** commicie, niezależnie od rozmiaru zmiany.
+- Stopka musi być ostatnim `-m` (lub ostatnim akapitem wiadomości).
+- Nie pomijaj jej nawet dla trywialnych zmian (literówki, formatowanie, drobne fixy).
+- Jeśli używasz `git commit -m "..."` jednoliniowo — i tak dołącz stopkę przez dodatkowe `-m`.
+
+---
+
 ## 📊 Stan Projektu (aktualizacja: 2026-04-10)
 
 ### Wersja Skryptów ALL-IN-ONE (v2.4.0)
@@ -888,6 +914,29 @@ sudo apt-get install -y build-essential libsqlite3-dev pkg-config libssl-dev git
 398. [x] **Attestation verify/revoke failing**: Same CSRF issue in `attestation.js` — both `verify()` and `revoke()` functions used non-existent meta tag. Fixed to use `window.BetterDesk?.csrfToken`.
 399. [x] **Toolkit API calls failing**: `toolkit.js` cached CSRF from meta tag at module init. Fixed to call `getCsrfToken()` dynamically which reads from `window.BetterDesk?.csrfToken`.
 
+#### Agent Client — Security Hardening & Native Agent Completeness (Phase 54) ✅ COMPLETED 2026-04-10
+400. [x] **AGENT-C2 device ID entropy (CRITICAL)**: `betterdesk-agent-client/src-tauri/src/registration.rs::register` used 4 bytes of SHA-256 (~65k unique IDs, trivial brute-force). Extended to full 16 bytes (32 hex chars → 3.4·10³⁸ entropy) and mixed in hostname + package version alongside machine UID. Closes AUDIT_BETTERDESK_2026-04-17 C2 finding.
+401. [x] **AGENT-H3 URL scheme + private-IP guard (SSRF)**: New `validate_address()` in `registration.rs` — rejects non-`http(s)` schemes, literal IPs in RFC1918 / 169.254/16 / ::1 / fc00::/7 / fe80::/10 / multicast / broadcast. Called from all 4 validation steps, `register()` and `sync_config()`. Opt-out via `BETTERDESK_ALLOW_PRIVATE_IPS=1` env var for LAN deployments.
+402. [x] **Keyring wiring after registration**: `register()` now generates a local registration marker token, assigns it to `config.auth_token`, persists config, AND calls `config.store_token_secure()` (was previously defined but never invoked). Keyring failures now log `WARN` (not silent `INFO`) with explicit fallback message. Config JSON file remains as last-resort fallback.
+403. [x] **Native Go agent `clipboard_get` handler**: `betterdesk-agent/agent/agent.go` added `handleClipboardGet()` + `clipboard_get` dispatch case. Responds with `clipboard_data` envelope `{request_id, format, data[, error]}`. Returns explicit error when `cfg.Clipboard=false` instead of silent drop — the operator UI can now show meaningful state. Closes part of NATIVE-C1.
+404. [x] **Honest codec negotiation**: `handleCodecOffer` no longer hard-codes `"jpeg"`. `video_codec` set to `"jpeg"` only when `cfg.Screenshot=true`, otherwise empty string; `audio_codec` is always empty (os_agent does not stream audio). Server + operator panel now see true capabilities instead of a fake promise.
+405. [x] **Roadmap doc**: `docs/AGENT_CLIENT_ROADMAP_2026-04-10.md` — comprehensive audit with honest scope split. P0 (this session: device ID, URL validation, keyring, clipboard_get, codec honesty) = done. P1 (next session: sidecar Go agent in Tauri, chat server-side, TLS pinning UI) = scoped. P2 (separate phases, 4-6 weeks: screen capture, H.264, input injection, audio, E2E NaCl, policy engine, auto-update) = documented with exact crate choices.
+
+#### Agent Client — Sidecar Architecture (Phase 55) ✅ COMPLETED 2026-04-21
+406. [x] **`sidecar.rs` created (350+ LOC)**: `SidecarManager` (`Arc<Inner>` for cheap Clone, Tauri managed state). `find_binary()` 4-step search (`$BETTERDESK_AGENT_BIN` env → exe dir → data dir → PATH). `write_go_config()` writes JSON in Go agent format (`GoAgentConfig` matching `betterdesk-agent/agent/config.go`). `spawn_process()` launches go agent with `-config <path>`. `monitor_loop()` tokio task — polls child every 5s, exponential backoff restart (5s×2^n, max 5min). `terminate_child()` — SIGTERM on Unix (`libc::kill`) + 5s grace + force kill. `Drop` impl kills child on Tauri exit.
+407. [x] **`config.rs` extended with CDAP + capability fields**: New fields: `api_key` (CDAP auth), `cdap_port` (default 21122), `allow_screen_capture` (default true), `require_consent` (default true), `allow_terminal` (default true), `allow_file_browser` (default true), `allow_clipboard` (default true), `auto_start_sidecar` (default true). Removed: `allow_remote`, `allow_file_transfer` (replaced by granular fields). Added `to_sidecar_config() -> SidecarConfig` conversion method using `directories::ProjectDirs` for data_dir.
+408. [x] **`commands.rs` — 4 new sidecar IPC commands**: `get_sidecar_status` → `SidecarStatus { running, pid, restart_count, state, binary_path, cdap_url }`. `start_sidecar` — stops previous, writes config, spawns binary, returns status. `stop_sidecar` — SIGTERM + cleanup. `restart_sidecar` — alias for start. `restart_agent_service` now delegates to `start_sidecar` instead of returning Err. `AgentSettings` struct updated with new capability fields. `save_agent_settings`/`get_agent_settings` updated to match.
+409. [x] **`lib.rs` — sidecar wired into Tauri state**: `pub mod sidecar` added. `SidecarManager` added to `AgentState`. Auto-start sidecar in `setup` closure if `auto_start_sidecar && is_registered`. 4 new sidecar commands registered in `invoke_handler![]`. Tray menu: new "Restart CDAP agent" item — calls `sidecar.stop()` + `sidecar.start()` using current config, no admin required.
+410. [x] **Agent is now truly hidden**: `skipTaskbar: true` + `visible: false` in `tauri.conf.json` already set. Agent does not appear in taskbar/dock. Main window only shows on tray click or first-time setup. Goal achieved: behaves like RustDesk desktop but invisible.
+411. [x] **Roadmap updated**: `docs/AGENT_CLIENT_ROADMAP_2026-04-21.md` — full architecture diagram, current state table, Phase 56-61 plan (bundling, continuous capture, input injection, H.264, audio, E2E NaCl). Sidecar testing procedures documented.
+
+#### Update Mechanism Fix & Rewrite (Phase 56) ✅ COMPLETED 2026-05-29
+412. [x] **In-app update SHA tracking fix (Issue #154, CRITICAL)**: `updateService.js` `applyUpdate()` only saved SHA when `results.failed.length === 0`. Server binary download/compile failure (no pre-built release + no Go installed) added to `failed[]` → SHA never saved → same updates shown after every restart (infinite loop). Fix: added `NON_CRITICAL_FILES` set (`betterdesk-server`, `betterdesk-server-deploy`, `server-source`) — SHA saved when only non-critical steps fail. Critical failures (file download/write errors) still block SHA save.
+413. [x] **CLI updater fix**: `update-cli.js` now distinguishes critical vs non-critical failures matching server-side logic. Non-critical failures log warning but don't set exit code 1, preventing the infinite retry loop when called from ALL-IN-ONE scripts.
+414. [x] **betterdesk.sh — GitHub pull update**: New `update_from_github()` function. `git clone --depth 1` (or tarball fallback). Downloads latest code → updates Go server source → compiles Go server → deploys binary → copies Node.js console files (preserving .env, data/, node_modules/) → npm install → updates installer scripts → updates SHA tracking. `do_update()` rewritten with 3-method menu: (1) Online GitHub update (recommended), (2) In-app Node.js updater, (3) Legacy local copy. Auto mode uses GitHub path.
+415. [x] **betterdesk.ps1 — GitHub pull update**: New `Update-FromGitHub` function. Same 3-method menu. `git clone` or ZIP archive fallback via `System.Net.WebClient`. Preserves .env, data/, node_modules/. Compiles Go server if Go available, warns if not.
+416. [x] **betterdesk-docker.sh — GitHub pull update**: New `update_docker_from_github()` function. Downloads latest source → updates Go server source, Node.js console, Dockerfiles, compose files → regenerates docker-compose.yml → rebuilds images → restarts containers. 2-method menu: (1) Online GitHub + rebuild, (2) Local rebuild.
+
 ### Konfiguracja przez Zmienne Środowiskowe
 
 ```bash
@@ -1157,4 +1206,4 @@ All code changes MUST include a security review as part of the implementation pr
 
 ---
 
-*Ostatnia aktualizacja: 2026-04-10 (Phase 53: CSRF Token Fixes — Issue #112 policy save fix, attestation verify/revoke fix, toolkit API calls fix. Previous: Phase 51/52 GitHub Issue Triage, RBAC Permissions, 6-Role Hierarchy) przez GitHub Copilot*
+*Ostatnia aktualizacja: 2026-05-29 (Phase 56: Update Mechanism Fix & Rewrite — SHA tracking fix for Issue #154, GitHub pull update in all 3 ALL-IN-ONE scripts, critical vs non-critical failure distinction in updateService.js + update-cli.js. Previous: Phase 55 Agent Client Sidecar Architecture) przez GitHub Copilot*

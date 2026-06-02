@@ -22,10 +22,12 @@ const (
 	EventPeerUnbanned    EventType = "peer_unbanned"
 	EventPeerDeleted     EventType = "peer_deleted"
 	EventPeerRevoked     EventType = "peer_revoked"
+	EventPeerRestored    EventType = "peer_restored"
 	EventPeerIDChanged   EventType = "peer_id_changed"
 	EventBlocklistAdd    EventType = "blocklist_add"
 	EventBlocklistRemove EventType = "blocklist_remove"
 	EventServerStats     EventType = "server_stats"
+	EventEnrollmentPending EventType = "enrollment_pending"
 )
 
 // Event is a single notification pushed to subscribers.

@@ -12,8 +12,22 @@
         initPasswordForm();
         initTotpSection();
         initBrandingSection();
-        initBackupSection();
-        initUpdateSection();
+
+        // Only init server-config sections when the tab is visible (requires server.config permission)
+        if (document.getElementById('tab-auth') && document.getElementById('tab-auth').style.display !== 'none') {
+            initLdapSection();
+            initOidcSection();
+        }
+        if (document.getElementById('tab-backup') && document.getElementById('tab-backup').style.display !== 'none') {
+            initBackupSection();
+        }
+        if (document.getElementById('tab-updates') && document.getElementById('tab-updates').style.display !== 'none') {
+            initUpdateSection();
+        }
+        if (document.getElementById('tab-advanced') && document.getElementById('tab-advanced').style.display !== 'none') {
+            initAdvancedSection();
+        }
+
         initTutorialSection();
         loadAuditLog();
         loadServerInfo();
@@ -41,7 +55,7 @@
         
         // Check URL hash for direct tab navigation
         const hash = window.location.hash.replace('#', '');
-        if (['branding', 'server', 'backup', 'updates'].includes(hash)) {
+        if (['branding', 'server', 'backup', 'updates', 'auth', 'advanced'].includes(hash)) {
             const tab = document.querySelector(`[data-tab="${hash}"]`);
             if (tab) tab.click();
         }
@@ -478,6 +492,7 @@
             initLogoTypeSelector();
             initColorPickers();
             initFontPickers();
+            initBackgroundSelectors();
             initBrandingActions();
             
         } catch (error) {
@@ -533,8 +548,161 @@
             }
         }
         
+        // Background & appearance (console)
+        const setVal = (id, val) => { const el = document.getElementById(id); if (el != null && el) el.value = val; };
+        const setChecked = (id, val) => { const el = document.getElementById(id); if (el) el.checked = val; };
+        const checkRadio = (name, val) => {
+            const r = document.querySelector(`input[name="${name}"][value="${val}"]`);
+            if (r) r.checked = true;
+        };
+        checkRadio('bg-type', data.bgType || 'none');
+        setVal('bg-color', data.bgColor || '');
+        setVal('bg-gradient', data.bgGradient || '');
+        setVal('bg-image-url', data.bgImageUrl || '');
+        setVal('bg-blur', data.bgBlur || '0');
+        setVal('bg-overlay', data.bgOverlay || '0');
+        setVal('bg-size', data.bgSize || 'cover');
+        if (data.bgColor && document.getElementById('bg-color-picker') && /^#[0-9a-fA-F]{6}$/.test(data.bgColor)) {
+            document.getElementById('bg-color-picker').value = data.bgColor;
+        }
+        const bgBlurVal = document.getElementById('bg-blur-value');
+        if (bgBlurVal) bgBlurVal.textContent = data.bgBlur || '0';
+        const bgOverlayVal = document.getElementById('bg-overlay-value');
+        if (bgOverlayVal) bgOverlayVal.textContent = data.bgOverlay || '0';
+        showBackgroundPanel('bg', data.bgType || 'none');
+        
+        // Login page
+        setVal('login-title', data.loginTitle || '');
+        setVal('login-subtitle', data.loginSubtitle || '');
+        checkRadio('login-bg-type', data.loginBgType || 'inherit');
+        setVal('login-bg-color', data.loginBgColor || '');
+        setVal('login-bg-gradient', data.loginBgGradient || '');
+        setVal('login-bg-image-url', data.loginBgImageUrl || '');
+        setVal('login-bg-overlay', data.loginBgOverlay || '0');
+        if (data.loginBgColor && document.getElementById('login-bg-color-picker') && /^#[0-9a-fA-F]{6}$/.test(data.loginBgColor)) {
+            document.getElementById('login-bg-color-picker').value = data.loginBgColor;
+        }
+        const loginOverlayVal = document.getElementById('login-bg-overlay-value');
+        if (loginOverlayVal) loginOverlayVal.textContent = data.loginBgOverlay || '0';
+        showBackgroundPanel('login-bg', data.loginBgType || 'inherit');
+        
+        // Agent download page
+        checkRadio('agent-bg-type', data.agentBgType || 'none');
+        setVal('agent-bg-color', data.agentBgColor || '');
+        setVal('agent-bg-gradient', data.agentBgGradient || '');
+        setVal('agent-bg-image-url', data.agentBgImageUrl || '');
+        setChecked('agent-show-powered', data.agentShowPoweredBy !== 'false');
+        if (data.agentBgColor && document.getElementById('agent-bg-color-picker') && /^#[0-9a-fA-F]{6}$/.test(data.agentBgColor)) {
+            document.getElementById('agent-bg-color-picker').value = data.agentBgColor;
+        }
+        showBackgroundPanel('agent-bg', data.agentBgType || 'none');
+        
+        // Footer & custom CSS
+        setVal('footer-text', data.footerText || '');
+        setChecked('show-powered', data.showPoweredBy !== 'false');
+        setVal('custom-css', data.customCss || '');
+        
         // Update preview
         updateLogoPreview();
+    }
+    
+    /**
+     * Show the active panel for a background group (bg / login-bg / agent-bg)
+     * and hide the rest. "none"/"inherit" hide all detail panels.
+     */
+    function showBackgroundPanel(prefix, type) {
+        ['none', 'inherit', 'color', 'gradient', 'image'].forEach(t => {
+            const panel = document.getElementById(`${prefix}-${t}-panel`);
+            if (panel) panel.classList.add('hidden');
+        });
+        const active = document.getElementById(`${prefix}-${type}-panel`);
+        if (active) active.classList.remove('hidden');
+    }
+    
+    /**
+     * Wire background selectors: radio toggles, range value labels,
+     * color picker sync and image uploads for console/login/agent groups.
+     */
+    function initBackgroundSelectors() {
+        // Radio toggles for the three background groups
+        [['bg-type', 'bg'], ['login-bg-type', 'login-bg'], ['agent-bg-type', 'agent-bg']].forEach(([name, prefix]) => {
+            document.querySelectorAll(`input[name="${name}"]`).forEach(radio => {
+                radio.addEventListener('change', () => showBackgroundPanel(prefix, radio.value));
+            });
+        });
+        
+        // Color picker <-> hex text sync for the standalone background pickers
+        [['bg-color-picker', 'bg-color'], ['login-bg-color-picker', 'login-bg-color'], ['agent-bg-color-picker', 'agent-bg-color']].forEach(([pickerId, textId]) => {
+            const picker = document.getElementById(pickerId);
+            const text = document.getElementById(textId);
+            if (picker && text) {
+                picker.addEventListener('input', () => { text.value = picker.value; });
+                text.addEventListener('input', () => {
+                    if (/^#[0-9a-fA-F]{6}$/.test(text.value)) picker.value = text.value;
+                });
+            }
+        });
+        
+        // Range value labels
+        [['bg-blur', 'bg-blur-value'], ['bg-overlay', 'bg-overlay-value'], ['login-bg-overlay', 'login-bg-overlay-value']].forEach(([rangeId, labelId]) => {
+            const range = document.getElementById(rangeId);
+            const label = document.getElementById(labelId);
+            if (range && label) {
+                range.addEventListener('input', () => { label.textContent = range.value; });
+            }
+        });
+        
+        // Background image uploads (shared route, data-target picks the URL field)
+        document.querySelectorAll('.branding-bg-file').forEach(input => {
+            input.addEventListener('change', handleBackgroundFileUpload);
+        });
+    }
+    
+    /**
+     * Handle background image upload — uploads to the shared background route
+     * and fills the URL field referenced by the input's data-target attribute.
+     */
+    async function handleBackgroundFileUpload(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        const maxSize = 8 * 1024 * 1024; // 8 MB
+        if (file.size > maxSize) {
+            Utils.showNotification(_('branding.bg_image_too_large'), 'error');
+            e.target.value = '';
+            return;
+        }
+        const validTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+        if (!validTypes.includes(file.type)) {
+            Utils.showNotification(_('branding.bg_image_invalid_type'), 'error');
+            e.target.value = '';
+            return;
+        }
+        
+        const targetId = e.target.dataset.target;
+        const nameElId = e.target.id.replace('-file', '-file-name');
+        const nameEl = document.getElementById(nameElId);
+        if (nameEl) nameEl.textContent = file.name;
+        
+        const formData = new FormData();
+        formData.append('background', file);
+        
+        try {
+            const resp = await fetch('/api/settings/branding/upload-background', {
+                method: 'POST',
+                headers: { 'x-csrf-token': window.BetterDesk?.csrfToken || '' },
+                body: formData
+            });
+            const result = await resp.json();
+            if (!resp.ok || !result.success) {
+                throw new Error(result.error || 'Upload failed');
+            }
+            const urlInput = document.getElementById(targetId);
+            if (urlInput) urlInput.value = result.url;
+            Notifications.success(_('branding.bg_upload_success'));
+        } catch (err) {
+            Utils.showNotification(err.message || _('errors.server_error'), 'error');
+        }
     }
     
     /**
@@ -753,6 +921,36 @@
                 data.colors[key] = value;
             }
         });
+        
+        // Background & appearance (console)
+        data.bgType = document.querySelector('input[name="bg-type"]:checked')?.value || 'none';
+        data.bgColor = document.getElementById('bg-color')?.value.trim() || '';
+        data.bgGradient = document.getElementById('bg-gradient')?.value.trim() || '';
+        data.bgImageUrl = document.getElementById('bg-image-url')?.value.trim() || '';
+        data.bgBlur = document.getElementById('bg-blur')?.value || '';
+        data.bgOverlay = document.getElementById('bg-overlay')?.value || '';
+        data.bgSize = document.getElementById('bg-size')?.value || 'cover';
+        
+        // Login page
+        data.loginBgType = document.querySelector('input[name="login-bg-type"]:checked')?.value || 'inherit';
+        data.loginBgColor = document.getElementById('login-bg-color')?.value.trim() || '';
+        data.loginBgGradient = document.getElementById('login-bg-gradient')?.value.trim() || '';
+        data.loginBgImageUrl = document.getElementById('login-bg-image-url')?.value.trim() || '';
+        data.loginBgOverlay = document.getElementById('login-bg-overlay')?.value || '';
+        data.loginTitle = document.getElementById('login-title')?.value.trim() || '';
+        data.loginSubtitle = document.getElementById('login-subtitle')?.value.trim() || '';
+        
+        // Agent download page
+        data.agentBgType = document.querySelector('input[name="agent-bg-type"]:checked')?.value || 'none';
+        data.agentBgColor = document.getElementById('agent-bg-color')?.value.trim() || '';
+        data.agentBgGradient = document.getElementById('agent-bg-gradient')?.value.trim() || '';
+        data.agentBgImageUrl = document.getElementById('agent-bg-image-url')?.value.trim() || '';
+        data.agentShowPoweredBy = document.getElementById('agent-show-powered')?.checked ? 'true' : 'false';
+        
+        // Footer & custom CSS
+        data.footerText = document.getElementById('footer-text')?.value.trim() || '';
+        data.showPoweredBy = document.getElementById('show-powered')?.checked ? 'true' : 'false';
+        data.customCss = document.getElementById('custom-css')?.value || '';
         
         return data;
     }
@@ -1052,8 +1250,16 @@
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                const date = new Date().toISOString().slice(0, 10);
-                a.download = `betterdesk-backup-${date}.json`;
+                // Prefer the server-provided filename (full backup .tar.gz).
+                let filename = '';
+                const disp = response.headers.get('Content-Disposition') || '';
+                const match = disp.match(/filename="?([^";]+)"?/i);
+                if (match) filename = match[1];
+                if (!filename) {
+                    const date = new Date().toISOString().slice(0, 10);
+                    filename = `betterdesk-backup-${date}.tar.gz`;
+                }
+                a.download = filename;
                 a.click();
                 URL.revokeObjectURL(url);
                 
@@ -1071,8 +1277,11 @@
             const file = e.target.files[0];
             if (!file) return;
             
-            if (!file.name.endsWith('.json')) {
-                Notifications.error(_('backup.invalid_json'));
+            const name = file.name.toLowerCase();
+            const isArchive = name.endsWith('.gz') || name.endsWith('.tar.gz');
+            const isJson = name.endsWith('.json');
+            if (!isArchive && !isJson) {
+                Notifications.error(_('backup.invalid_format'));
                 e.target.value = '';
                 return;
             }
@@ -1086,32 +1295,16 @@
             const label = document.getElementById('restore-upload-label');
             
             try {
-                // Read and validate client-side first
-                const text = await file.text();
-                let data;
-                try {
-                    data = JSON.parse(text);
-                } catch {
-                    Notifications.error(_('backup.invalid_json'));
-                    e.target.value = '';
-                    return;
-                }
-                
-                if (data._format !== 'betterdesk-backup') {
-                    Notifications.error(_('backup.invalid_format'));
-                    e.target.value = '';
-                    return;
-                }
-                
-                // Build FormData with options
+                // Build FormData with restore options. The server auto-detects the
+                // archive format (gzip magic bytes) vs a legacy JSON snapshot.
                 const formData = new FormData();
                 formData.append('backup', file);
-                formData.append('restoreSettings', document.getElementById('restore-settings')?.checked ?? true);
-                formData.append('restoreBranding', document.getElementById('restore-branding')?.checked ?? true);
-                formData.append('restoreUsers', document.getElementById('restore-users')?.checked ?? false);
-                formData.append('restoreFolders', document.getElementById('restore-folders')?.checked ?? true);
-                formData.append('restoreGroups', document.getElementById('restore-groups')?.checked ?? true);
-                formData.append('restoreAddressBooks', document.getElementById('restore-addressbooks')?.checked ?? true);
+                // Full disaster-recovery archive options
+                formData.append('restoreDatabase', document.getElementById('restore-database')?.checked ?? true);
+                formData.append('restoreUploads', document.getElementById('restore-uploads')?.checked ?? true);
+                formData.append('restoreSecrets', document.getElementById('restore-secrets')?.checked ?? false);
+                formData.append('restoreEnv', document.getElementById('restore-env')?.checked ?? false);
+                formData.append('restoreGoDb', document.getElementById('restore-godb')?.checked ?? false);
                 
                 if (label) label.classList.add('loading');
                 
@@ -1132,6 +1325,9 @@
                 if (result.success) {
                     Notifications.success(_('backup.restore_success'));
                     showRestoreResult(result.data, resultEl);
+                    if (result.data && result.data.requiresRestart) {
+                        Notifications.warning(_('backup.restart_required'));
+                    }
                 } else {
                     Notifications.error(result.error || _('errors.server_error'));
                 }
@@ -1153,6 +1349,7 @@
                 const el = document.getElementById(id);
                 if (el) el.textContent = val;
             };
+            const yn = (b) => b ? _('common.yes') : _('common.no');
             
             setVal('backup-stat-users', data.users || 0);
             setVal('backup-stat-settings', data.settings || 0);
@@ -1160,6 +1357,11 @@
             setVal('backup-stat-groups', (data.userGroups || 0) + (data.deviceGroups || 0));
             setVal('backup-stat-strategies', data.strategies || 0);
             setVal('backup-stat-backend', data.backend === 'betterdesk' ? 'BetterDesk Go' : 'RustDesk');
+            const comp = data.components || {};
+            setVal('backup-stat-database', (data.dbType === 'postgres' ? 'PostgreSQL' : 'SQLite'));
+            setVal('backup-stat-keys', yn(comp.goPrivKey || comp.goApiKey));
+            setVal('backup-stat-env', yn(comp.env));
+            setVal('backup-stat-uploads', comp.uploads || 0);
         } catch { /* silent */ }
     }
     
@@ -1247,8 +1449,56 @@
         
         checkBtn.addEventListener('click', checkForUpdates);
         installBtn?.addEventListener('click', installUpdate);
-        
+
+        const rebuildBtn = document.getElementById('update-rebuild-server-btn');
+        rebuildBtn?.addEventListener('click', rebuildServerBinary);
+        loadServerBinaryStatus();
+
         loadUpdateBackups();
+        loadBackupRetention();
+    }
+
+    async function loadServerBinaryStatus() {
+        const warning = document.getElementById('update-stale-warning');
+        if (!warning) return;
+        try {
+            const status = await Utils.api('/api/settings/updates/server-binary/status');
+            if (status && status.stale) {
+                const detailEl = document.getElementById('update-stale-detail');
+                if (detailEl) {
+                    detailEl.textContent = status.detail
+                        ? `${_('updates.server_stale_desc')} (${status.detail})`
+                        : _('updates.server_stale_desc');
+                }
+                warning.style.display = '';
+            } else {
+                warning.style.display = 'none';
+            }
+        } catch (_e) {
+            warning.style.display = 'none';
+        }
+    }
+
+    async function rebuildServerBinary() {
+        const btn = document.getElementById('update-rebuild-server-btn');
+        if (!btn) return;
+        const original = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = `<span class="material-icons spinning">sync</span> ${_('updates.rebuilding_server')}`;
+        try {
+            const result = await Utils.api('/api/settings/updates/server-binary/rebuild', { method: 'POST' });
+            if (result && result.success) {
+                Notifications.success(_('updates.rebuild_server_success'));
+                await loadServerBinaryStatus();
+            } else {
+                Notifications.error((result && result.error) || _('updates.rebuild_server_failed'));
+            }
+        } catch (error) {
+            Notifications.error(error.message || _('updates.rebuild_server_failed'));
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = original;
+        }
     }
     
     async function checkForUpdates() {
@@ -1339,7 +1589,7 @@
             const grouped = changesData.grouped || {};
             const meta = {
                 console: { icon: 'web',       label: _('updates.component_console'),  auto: true },
-                server:  { icon: 'dns',       label: _('updates.component_server'),   auto: false },
+                server:  { icon: 'dns',       label: _('updates.component_server'),   auto: true },
                 agent:   { icon: 'smart_toy', label: _('updates.component_agent'),    auto: false },
                 scripts: { icon: 'terminal',  label: _('updates.component_scripts'),  auto: true },
                 other:   { icon: 'folder',    label: _('updates.component_other'),    auto: false }
@@ -1364,27 +1614,13 @@
             
             if (grouped.server?.length > 0) {
                 html += `<div class="update-server-section" style="margin-top:12px;padding:12px;border:1px solid var(--border-color, #333);border-radius:8px;">
-                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-                        <label class="restore-option" style="margin:0;">
-                            <input type="checkbox" id="update-include-server">
-                            <span>${_('updates.include_server')}</span>
-                        </label>
+                    <div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:8px;">
+                        <span class="material-icons" style="font-size:20px;color:var(--primary);">auto_mode</span>
+                        <div style="flex:1;min-width:0;">
+                            <div style="font-weight:600;color:var(--text-primary);">${_('updates.include_server')}</div>
+                            <div class="text-muted" style="font-size:12px;margin-top:2px;">${_('updates.auto_strategy_hint')}</div>
+                        </div>
                         <span id="update-server-status" class="badge badge-warning badge-sm">${_('updates.checking_go')}</span>
-                    </div>
-                    <div id="update-server-strategy" style="display:none;margin:8px 0;padding:8px;background:var(--bg-tertiary, #1a1e24);border-radius:6px;">
-                        <div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;">${_('updates.strategy_label')}</div>
-                        <label style="display:flex;align-items:center;gap:6px;margin:4px 0;cursor:pointer;font-size:13px;">
-                            <input type="radio" name="server-strategy" value="download" id="strategy-download">
-                            <span class="material-icons" style="font-size:16px;">cloud_download</span>
-                            <span>${_('updates.strategy_download')}</span>
-                            <span id="strategy-download-badge" class="badge badge-sm" style="margin-left:4px;"></span>
-                        </label>
-                        <label style="display:flex;align-items:center;gap:6px;margin:4px 0;cursor:pointer;font-size:13px;">
-                            <input type="radio" name="server-strategy" value="compile" id="strategy-compile">
-                            <span class="material-icons" style="font-size:16px;">build</span>
-                            <span>${_('updates.strategy_compile')}</span>
-                            <span id="strategy-compile-badge" class="badge badge-sm" style="margin-left:4px;"></span>
-                        </label>
                     </div>
                     <div id="update-server-info" class="text-muted" style="font-size:11px;"></div>
                 </div>`;
@@ -1402,219 +1638,491 @@
     async function checkServerBuildInfo() {
         const statusEl = document.getElementById('update-server-status');
         const infoEl = document.getElementById('update-server-info');
-        const toggleEl = document.getElementById('update-include-server');
-        const strategySection = document.getElementById('update-server-strategy');
-        const downloadRadio = document.getElementById('strategy-download');
-        const compileRadio = document.getElementById('strategy-compile');
-        const downloadBadge = document.getElementById('strategy-download-badge');
-        const compileBadge = document.getElementById('strategy-compile-badge');
-        if (!statusEl || !toggleEl) return;
-        
+        if (!statusEl) return;
+
         try {
             const info = await Utils.api('/api/settings/updates/server-info');
-            const hasGo = info.goAvailable;
+            const hasGo = !!info.goAvailable && info.goMeetsMinimum !== false;
+            const goNeedsUpgrade = !!info.goAvailable && info.goMeetsMinimum === false;
             const prebuilt = info.prebuilt || {};
-            const hasDownload = prebuilt.available;
-            const canUpdate = hasGo || hasDownload;
-            
-            // Always enable the checkbox if at least one strategy is available
-            toggleEl.disabled = !canUpdate;
-            if (!canUpdate) toggleEl.checked = false;
-            
-            // Show strategy section when checkbox is enabled
-            if (strategySection && canUpdate) {
-                strategySection.style.display = '';
-                
-                // Show/enable strategy options based on availability
-                if (downloadRadio) {
-                    downloadRadio.disabled = !hasDownload;
-                    if (downloadBadge) {
-                        if (hasDownload) {
-                            const sizeMB = prebuilt.assetSize ? (prebuilt.assetSize / (1024 * 1024)).toFixed(1) + ' MB' : '';
-                            downloadBadge.className = 'badge badge-success badge-sm';
-                            downloadBadge.textContent = prebuilt.releaseTag ? `${prebuilt.releaseTag}${sizeMB ? ' · ' + sizeMB : ''}` : _('updates.available');
-                        } else {
-                            downloadBadge.className = 'badge badge-warning badge-sm';
-                            downloadBadge.textContent = _('updates.no_release');
-                        }
-                    }
-                }
-                if (compileRadio) {
-                    compileRadio.disabled = !hasGo;
-                    if (compileBadge) {
-                        if (hasGo) {
-                            compileBadge.className = 'badge badge-success badge-sm';
-                            compileBadge.textContent = info.goVersion ? info.goVersion.replace('go version ', '') : 'Go';
-                        } else {
-                            compileBadge.className = 'badge badge-warning badge-sm';
-                            compileBadge.textContent = _('updates.go_not_found');
-                        }
-                    }
-                }
-                
-                // Auto-select the best available strategy
-                if (hasDownload && downloadRadio) downloadRadio.checked = true;
-                else if (hasGo && compileRadio) compileRadio.checked = true;
-            }
-            
+            const hasDownload = !!prebuilt.available;
+            const canInstallGo = !!info.canInstallGo;
+            const vendoredReady = !!info.vendoredGoInstalled;
+
             // Status badge
-            if (canUpdate) {
-                if (hasGo && hasDownload) {
-                    statusEl.className = 'badge badge-success badge-sm';
-                    statusEl.textContent = _('updates.both_available');
-                } else if (hasDownload) {
-                    statusEl.className = 'badge badge-info badge-sm';
-                    statusEl.textContent = _('updates.download_available');
-                } else {
-                    statusEl.className = 'badge badge-success badge-sm';
-                    statusEl.textContent = info.goVersion ? info.goVersion.replace('go version ', '') : 'Go';
-                }
+            if (hasGo && hasDownload) {
+                statusEl.className = 'badge badge-success badge-sm';
+                statusEl.textContent = _('updates.both_available');
+            } else if (hasDownload) {
+                statusEl.className = 'badge badge-info badge-sm';
+                statusEl.textContent = _('updates.download_available');
+            } else if (hasGo) {
+                statusEl.className = 'badge badge-success badge-sm';
+                statusEl.textContent = info.goVersion ? info.goVersion.replace('go version ', '') : 'Go';
+            } else if (goNeedsUpgrade || canInstallGo) {
+                statusEl.className = 'badge badge-info badge-sm';
+                statusEl.textContent = vendoredReady ? _('updates.toolchain_ready') : _('updates.auto_available');
             } else {
-                statusEl.className = 'badge badge-danger badge-sm';
+                statusEl.className = 'badge badge-warning badge-sm';
                 statusEl.textContent = _('updates.no_method');
             }
-            
+
             // Info line
             if (infoEl) {
                 const parts = [];
                 if (info.binaryPath) parts.push(`Binary: ${info.binaryPath}`);
                 if (info.sourcePresent) parts.push('Source: present');
                 if (hasDownload && prebuilt.releaseName) parts.push(`Release: ${prebuilt.releaseName}`);
-                if (!hasGo && !hasDownload) parts.push(_('updates.install_go_hint'));
+                if (info.goSource && info.goSource !== 'path') parts.push(`Go: ${info.goSource}`);
+                if (goNeedsUpgrade) parts.push(_('updates.toolchain_will_install'));
+                if (!hasGo && !hasDownload && canInstallGo) parts.push(_('updates.toolchain_will_install'));
                 infoEl.textContent = parts.join(' · ');
             }
         } catch (_e) {
             statusEl.className = 'badge badge-warning badge-sm';
             statusEl.textContent = _('updates.go_check_failed');
-            toggleEl.disabled = false; // Allow user to try anyway
         }
     }
+
+    function getUpdateScopeLabels() {
+        const grouped = _updateState.changedData?.grouped || {};
+        const labels = {
+            console: _('updates.component_console'),
+            server: _('updates.component_server'),
+            scripts: _('updates.component_scripts'),
+            agent: _('updates.component_agent'),
+            other: _('updates.component_other')
+        };
+        return Object.entries(grouped)
+            .filter(([, files]) => files?.length > 0)
+            .map(([component, files]) => `${labels[component] || labels.other}: ${files.length} ${_('updates.files')}`);
+    }
     
+    // ---------- Update progress modal ----------
+
+    const UPDATE_PHASES = [
+        { id: 'confirm',  icon: 'task_alt',          key: 'updates.phase_confirm' },
+        { id: 'backup',   icon: 'inventory',         key: 'updates.phase_backup' },
+        { id: 'console',  icon: 'cloud_download',    key: 'updates.phase_console' },
+        { id: 'server',   icon: 'memory',            key: 'updates.phase_server' },
+        { id: 'restart',  icon: 'restart_alt',       key: 'updates.phase_restart' },
+        { id: 'done',     icon: 'check_circle',      key: 'updates.phase_done' }
+    ];
+
+    function buildUpdateModalContent() {
+        const items = UPDATE_PHASES.map(p => `
+            <div class="update-phase" data-phase="${p.id}">
+                <span class="update-phase-icon material-icons">${p.icon}</span>
+                <span class="update-phase-label">${_(p.key)}</span>
+                <span class="update-phase-state" data-phase-state="${p.id}">
+                    <span class="material-icons">radio_button_unchecked</span>
+                </span>
+            </div>
+        `).join('');
+        return `
+            <div class="update-progress-modal">
+                <div class="update-progress-bar"><div class="update-progress-bar-fill" id="update-modal-bar" style="width:0%"></div></div>
+                <div class="update-phases">${items}</div>
+                <div class="update-progress-detail" id="update-modal-detail">${_('updates.preparing')}</div>
+                <pre class="update-progress-log" id="update-modal-log" aria-live="polite"></pre>
+            </div>
+        `;
+    }
+
+    function setUpdatePhase(phaseId, state, detail) {
+        // state: 'pending' | 'active' | 'done' | 'warning' | 'error' | 'skipped'
+        const stateEl = document.querySelector(`[data-phase-state="${phaseId}"]`);
+        if (stateEl) {
+            const icons = {
+                pending: 'radio_button_unchecked',
+                active:  'sync',
+                done:    'check_circle',
+                warning: 'warning',
+                error:   'error',
+                skipped: 'remove_circle_outline'
+            };
+            const cls = {
+                pending: '',
+                active:  'spinning',
+                done:    '',
+                warning: '',
+                error:   '',
+                skipped: ''
+            };
+            stateEl.innerHTML = `<span class="material-icons ${cls[state] || ''}">${icons[state] || 'help'}</span>`;
+            stateEl.dataset.state = state;
+        }
+        if (detail) {
+            const det = document.getElementById('update-modal-detail');
+            if (det) det.textContent = detail;
+        }
+        // Advance progress bar based on phase index
+        const idx = UPDATE_PHASES.findIndex(p => p.id === phaseId);
+        if (idx >= 0) {
+            const pct = state === 'done' ? Math.round(((idx + 1) / UPDATE_PHASES.length) * 100)
+                : state === 'active' ? Math.round((idx / UPDATE_PHASES.length) * 100)
+                : null;
+            const bar = document.getElementById('update-modal-bar');
+            if (bar && pct !== null) bar.style.width = pct + '%';
+        }
+    }
+
+    function logUpdate(line) {
+        const log = document.getElementById('update-modal-log');
+        if (!log) return;
+        const ts = new Date().toLocaleTimeString();
+        log.textContent += `[${ts}] ${line}\n`;
+        log.scrollTop = log.scrollHeight;
+    }
+
+    function reloadConsole() {
+        const url = new URL(window.location.href);
+        url.searchParams.set('_bd_reload', Date.now().toString());
+        window.location.replace(url.toString());
+    }
+
     async function installUpdate() {
         const installBtn = document.getElementById('update-install-btn');
-        const progressEl = document.getElementById('update-progress');
-        const progressFill = document.getElementById('update-progress-fill');
-        const progressText = document.getElementById('update-progress-text');
-        
+
         if (!_updateState.remoteSHA) {
             Notifications.error(_('updates.no_version'));
             return;
         }
-        
-        const includeServer = document.getElementById('update-include-server')?.checked || false;
-        const serverStrategy = includeServer
-            ? (document.querySelector('input[name="server-strategy"]:checked')?.value || 'auto')
-            : null;
-        const confirmMsg = includeServer
-            ? _('updates.install_confirm') + '\n\n' + (serverStrategy === 'compile' ? _('updates.server_build_note') : _('updates.server_download_note'))
-            : _('updates.install_confirm');
-        
-        if (!confirm(confirmMsg)) return;
-        
+
+        const hasServerUpdate = (_updateState.changedData?.grouped?.server || []).length > 0;
+        const createBackup = document.getElementById('update-backup-toggle')?.checked ?? true;
+
+        // Pre-flight confirmation modal
+        const scopeItems = getUpdateScopeLabels();
+        const strategyNote = hasServerUpdate ? _('updates.auto_strategy_hint') : '';
+        const confirmHtml = `
+            <p>${Utils.escapeHtml(_('updates.install_confirm'))}</p>
+            <ul style="margin:8px 0 0 0;padding-left:20px;font-size:13px;color:var(--text-secondary);">
+                <li>${Utils.escapeHtml(createBackup ? _('updates.confirm_with_backup') : _('updates.confirm_no_backup'))}</li>
+                ${scopeItems.map(item => `<li>${Utils.escapeHtml(item)}</li>`).join('')}
+                ${hasServerUpdate ? `<li>${Utils.escapeHtml(strategyNote || '')}</li>` : ''}
+            </ul>
+        `;
+        const proceed = await new Promise((resolve) => {
+            window.Modal.show({
+                title: _('updates.confirm_title'),
+                content: confirmHtml,
+                buttons: [
+                    { label: _('actions.cancel'),  class: 'btn-secondary', onClick: () => { window.Modal.close(); resolve(false); } },
+                    { label: _('updates.install'), class: 'btn-primary', icon: 'system_update', onClick: () => { window.Modal.close(); resolve(true); } }
+                ],
+                closable: true,
+                onClose: () => resolve(false)
+            });
+        });
+        if (!proceed) return;
+
         if (installBtn) installBtn.disabled = true;
-        if (progressEl) progressEl.style.display = '';
-        if (progressFill) progressFill.style.width = '10%';
-        if (progressText) progressText.textContent = _('updates.installing');
-        
+
+        // Open progress modal (non-closable while running)
+        window.Modal.show({
+            title: _('updates.modal_title'),
+            content: buildUpdateModalContent(),
+            buttons: [],
+            closable: false,
+            size: 'large'
+        });
+
+        UPDATE_PHASES.forEach(p => setUpdatePhase(p.id, 'pending'));
+        setUpdatePhase('confirm', 'done');
+        if (createBackup) setUpdatePhase('backup', 'active', _('updates.creating_backup'));
+        else setUpdatePhase('backup', 'skipped', _('updates.backup_skipped'));
+        logUpdate(`Starting update to ${_updateState.remoteSHA.slice(0, 7)}…`);
+
         try {
-            const createBackup = document.getElementById('update-backup-toggle')?.checked ?? true;
-            const components = ['console', 'scripts'];
-            if (includeServer) components.push('server');
-            
-            if (progressFill) progressFill.style.width = '20%';
-            if (progressText) progressText.textContent = createBackup ? _('updates.creating_backup') : _('updates.downloading');
-            
-            if (includeServer) {
-                // Server build/download can take time — show an informative message
+            // Console download phase indicator (we cannot stream backend
+            // progress today, so we just mark it active until response arrives)
+            setTimeout(() => {
+                setUpdatePhase('backup', 'done');
+                setUpdatePhase('console', 'active', _('updates.downloading'));
+            }, 800);
+
+            if (hasServerUpdate) {
                 setTimeout(() => {
-                    if (progressFill && progressFill.style.width !== '100%') {
-                        progressFill.style.width = '50%';
-                        if (progressText) progressText.textContent = serverStrategy === 'compile' ? _('updates.server_building') : _('updates.server_downloading');
-                    }
-                }, 5000);
+                    setUpdatePhase('console', 'done');
+                    setUpdatePhase('server', 'active', _('updates.server_processing'));
+                }, 4000);
             }
-            
+
             const result = await Utils.api('/api/settings/updates/install', {
                 method: 'POST',
-                body: { remoteSHA: _updateState.remoteSHA, createBackup, components, serverStrategy: serverStrategy || 'auto' }
+                body: { remoteSHA: _updateState.remoteSHA, createBackup }
             });
-            
-            if (progressFill) progressFill.style.width = '100%';
-            
-            let msg = `${_('updates.applied')}: ${result.applied?.length || 0}`;
-            if (result.failed?.length) msg += `, ${_('updates.failed')}: ${result.failed.length}`;
-            if (result.removed?.length) msg += `, ${_('updates.removed')}: ${result.removed.length}`;
-            
-            // Server build/deploy results
-            if (result.serverBuild) {
-                if (result.serverBuild.success) {
-                    if (result.serverBuild.method === 'download') {
-                        const sizeMB = result.serverBuild.size ? ` (${(result.serverBuild.size / (1024 * 1024)).toFixed(1)} MB)` : '';
-                        msg += `. ${_('updates.server_downloaded')}${sizeMB}`;
+
+            // Mark earlier phases done if not already
+            ['backup', 'console'].forEach(p => {
+                const st = document.querySelector(`[data-phase-state="${p}"]`)?.dataset?.state;
+                if (st !== 'done' && st !== 'skipped') setUpdatePhase(p, 'done');
+            });
+
+            // Server result
+            if (hasServerUpdate) {
+                if (result.toolchainInstall) {
+                    if (result.toolchainInstall.success) {
+                        logUpdate(`Go toolchain ready: ${result.toolchainInstall.version || ''}`.trim());
                     } else {
-                        const secs = Math.round((result.serverBuild.duration || 0) / 1000);
-                        msg += `. ${_('updates.server_built')}` + (secs ? ` (${secs}s)` : '');
+                        logUpdate(`Go toolchain install failed: ${result.toolchainInstall.error || 'unknown'}`);
+                    }
+                }
+                const deployFailed = !!(result.serverDeploy && result.serverDeploy.success === false);
+                if (result.serverBuild) {
+                    if (result.serverBuild.success && !deployFailed) {
+                        const ms = result.serverBuild.duration || 0;
+                        const secs = ms ? Math.round(ms / 1000) : 0;
+                        const sizeMB = result.serverBuild.size ? ` (${(result.serverBuild.size / (1024 * 1024)).toFixed(1)} MB)` : '';
+                        const detail = result.serverBuild.method === 'download'
+                            ? `${_('updates.server_downloaded')}${sizeMB}`
+                            : `${_('updates.server_built')}${secs ? ` · ${secs}s` : ''}`;
+                        setUpdatePhase('server', 'done', detail);
+                        logUpdate(detail);
+                    } else if (result.serverBuild.success && deployFailed) {
+                        // Build OK but deploy to service path failed — surface as error
+                        const detail = _('updates.server_deploy_failed');
+                        setUpdatePhase('server', 'error', detail);
+                        logUpdate(`${detail}: ${result.serverDeploy.error || ''}`);
+                    } else {
+                        const detail = result.serverBuild.method === 'download'
+                            ? _('updates.server_download_failed')
+                            : _('updates.server_build_failed');
+                        setUpdatePhase('server', 'error', detail);
+                        logUpdate(`${detail}: ${result.serverBuild.error || ''}`);
                     }
                 } else {
-                    msg += `. ${result.serverBuild.method === 'download' ? _('updates.server_download_failed') : _('updates.server_build_failed')}`;
-                    if (result.serverBuild.error) Notifications.error(result.serverBuild.error);
+                    setUpdatePhase('server', 'skipped', _('updates.server_skipped'));
                 }
-            }
-            if (result.serverDeploy) {
-                if (result.serverDeploy.success) {
-                    msg += `. ${_('updates.server_deployed')}`;
-                } else {
-                    msg += `. ${_('updates.server_deploy_failed')}`;
-                    if (result.serverDeploy.error) Notifications.error(result.serverDeploy.error);
+                if (deployFailed && result.serverBuild?.success) {
+                    logUpdate(`Deploy failed: ${result.serverDeploy.error || ''}`);
                 }
-            }
-            
-            if (result.needsConsoleRestart) {
-                if (progressText) progressText.textContent = _('updates.restarting');
-                Notifications.success(msg);
-                setTimeout(() => pollServerRestart(), 3000);
             } else {
-                Notifications.success(msg);
-                if (progressEl) setTimeout(() => { progressEl.style.display = 'none'; }, 5000);
+                setUpdatePhase('server', 'skipped', _('updates.server_skipped'));
+            }
+
+            const applied = result.applied?.length || 0;
+            const failed  = result.failed?.length || 0;
+            const removed = result.removed?.length || 0;
+            logUpdate(`${_('updates.applied')}: ${applied} · ${_('updates.failed')}: ${failed} · ${_('updates.removed')}: ${removed}`);
+
+            if (result.needsConsoleRestart) {
+                setUpdatePhase('restart', 'active', _('updates.restarting'));
+                logUpdate(_('updates.console_will_restart'));
+                setTimeout(() => pollConsoleRestart(), 2500);
+            } else {
+                setUpdatePhase('restart', 'skipped', _('updates.no_restart_needed'));
+                setUpdatePhase('done', 'done', _('updates.complete'));
+                showUpdateCompletionModal(result);
                 if (installBtn) installBtn.disabled = false;
+                loadServerBinaryStatus();
             }
         } catch (error) {
+            const activePhase = UPDATE_PHASES.find(p => {
+                const st = document.querySelector(`[data-phase-state="${p.id}"]`)?.dataset?.state;
+                return st === 'active';
+            });
+            if (activePhase) setUpdatePhase(activePhase.id, 'error', error.message || _('updates.install_failed'));
+            logUpdate(`ERROR: ${error.message || error}`);
+
+            // Replace empty footer with a Close button so the user can dismiss
+            window.Modal.close();
+            await window.Modal.alert({
+                title: _('updates.install_failed'),
+                message: error.message || _('errors.server_error')
+            });
             Notifications.error(error.message || _('updates.install_failed'));
-            if (progressEl) progressEl.style.display = 'none';
             if (installBtn) installBtn.disabled = false;
         }
     }
-    
-    function pollServerRestart() {
-        const progressText = document.getElementById('update-progress-text');
+
+    function showUpdateCompletionModal(result) {
+        const lines = [];
+        const deployFailed = !!(result.serverDeploy && result.serverDeploy.success === false);
+        const hasFailures = (result.failed?.length || 0) > 0 || deployFailed;
+        const summaryKey = hasFailures ? 'updates.complete_with_errors' : 'updates.complete_summary';
+        lines.push(`<p>${Utils.escapeHtml(_(summaryKey))}</p>`);
+        const stats = [
+            { label: _('updates.applied'), value: result.applied?.length || 0 },
+            { label: _('updates.failed'),  value: result.failed?.length  || 0 },
+            { label: _('updates.removed'), value: result.removed?.length || 0 }
+        ];
+        lines.push(`<ul style="margin:8px 0;padding-left:20px;font-size:13px;">${stats.map(s => `<li>${Utils.escapeHtml(s.label)}: <strong>${s.value}</strong></li>`).join('')}</ul>`);
+        if (deployFailed) {
+            const errMsg = result.serverDeploy.error || '';
+            lines.push(`<p style="font-size:13px;color:var(--danger,#e34935);"><strong>${Utils.escapeHtml(_('updates.server_deploy_failed'))}</strong></p>`);
+            if (errMsg) lines.push(`<pre style="font-size:12px;background:var(--bg-secondary,#1a1a1a);padding:8px;border-radius:4px;overflow:auto;max-height:120px;white-space:pre-wrap;">${Utils.escapeHtml(errMsg)}</pre>`);
+        } else if (result.serverBuild?.success) {
+            const note = result.serverBuild.method === 'download' ? _('updates.server_downloaded') : _('updates.server_built');
+            lines.push(`<p style="font-size:13px;color:var(--text-secondary);">${Utils.escapeHtml(note)}</p>`);
+        }
+        // Some updates require manual reload (e.g., static asset changes)
+        const needsReload = (result.applied || []).some(p => /\.(js|css|html|ejs)$/i.test(p));
+        if (needsReload) {
+            lines.push(`<p style="font-size:13px;margin-top:8px;">${Utils.escapeHtml(_('updates.refresh_recommended'))}</p>`);
+        }
+
+        window.Modal.close();
+        window.Modal.show({
+            title: _(hasFailures ? 'updates.modal_done_with_errors_title' : 'updates.modal_done_title'),
+            content: lines.join(''),
+            buttons: [
+                { label: _('updates.modal_close'),     class: 'btn-secondary', onClick: () => { window.Modal.close(); } },
+                { label: _('updates.modal_reload_now'), class: 'btn-primary', icon: 'refresh', onClick: reloadConsole }
+            ],
+            closable: true
+        });
+    }
+
+    function pollConsoleRestart() {
         let attempts = 0;
-        const maxAttempts = 30;
-        
+        const maxAttempts = 90;
+        const previousCacheVersion = window.BetterDesk?.cacheVersion || '';
         const interval = setInterval(async () => {
             attempts++;
-            if (progressText) progressText.textContent = `${_('updates.restarting')} (${attempts}/${maxAttempts})`;
-            
+            setUpdatePhase('restart', 'active', `${_('updates.restarting')} (${attempts}/${maxAttempts})`);
             try {
-                const resp = await fetch('/api/settings/info', { credentials: 'same-origin' });
+                const resp = await fetch('/api/settings/restart-status?_=' + Date.now(), {
+                    credentials: 'same-origin',
+                    cache: 'no-store',
+                    headers: { 'Cache-Control': 'no-cache' }
+                });
                 if (resp.ok) {
+                    const body = await resp.json().catch(() => null);
+                    const status = body?.data || body || {};
+                    if (previousCacheVersion && status.cacheVersion && status.cacheVersion === previousCacheVersion) {
+                        return;
+                    }
+
                     clearInterval(interval);
-                    Notifications.success(_('updates.restart_complete'));
-                    setTimeout(() => window.location.reload(), 1000);
+                    setUpdatePhase('restart', 'done', _('updates.restart_complete'));
+                    setUpdatePhase('done', 'done', _('updates.complete'));
+                    logUpdate(_('updates.restart_complete'));
+
+                    // Final modal: tell operator to refresh
+                    window.Modal.close();
+                    window.Modal.show({
+                        title: _('updates.modal_done_title'),
+                        content: `<p>${Utils.escapeHtml(_('updates.restart_complete_msg'))}</p>`,
+                        buttons: [
+                            { label: _('updates.modal_close'),     class: 'btn-secondary', onClick: () => { window.Modal.close(); } },
+                            { label: _('updates.modal_reload_now'), class: 'btn-primary', icon: 'refresh', onClick: reloadConsole }
+                        ],
+                        closable: true
+                    });
+
+                    // Auto-reload after a short grace period so operators do
+                    // not have to click — gives them time to read the modal.
+                    setTimeout(reloadConsole, 8000);
+                    return;
                 }
-            } catch {
+            } catch (_e) {
                 // Server still down, keep polling
             }
-            
             if (attempts >= maxAttempts) {
                 clearInterval(interval);
-                if (progressText) progressText.textContent = _('updates.restart_timeout');
+                setUpdatePhase('restart', 'warning', _('updates.restart_timeout'));
+                setUpdatePhase('done', 'done', _('updates.complete'));
+                logUpdate(_('updates.restart_timeout'));
+
+                const installBtn = document.getElementById('update-install-btn');
+                if (installBtn) installBtn.disabled = false;
+
+                window.Modal.close();
+                window.Modal.show({
+                    title: _('updates.modal_done_title'),
+                    content: `<p>${Utils.escapeHtml(_('updates.restart_timeout'))}</p><p>${Utils.escapeHtml(_('updates.refresh_recommended'))}</p>`,
+                    buttons: [
+                        { label: _('updates.modal_close'),     class: 'btn-secondary', onClick: () => { window.Modal.close(); } },
+                        { label: _('updates.modal_reload_now'), class: 'btn-primary', icon: 'refresh', onClick: reloadConsole }
+                    ],
+                    closable: true
+                });
             }
         }, 2000);
     }
     
+    function formatBytes(n) {
+        if (!Number.isFinite(n) || n <= 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let i = 0;
+        let v = n;
+        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+        return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+    }
+
+    async function loadBackupRetention() {
+        const input = document.getElementById('backup-retention-input');
+        if (!input) return;
+        try {
+            const data = await Utils.api('/api/settings/backup/retention');
+            const count = (data && typeof data.count === 'number') ? data.count : 0;
+            input.value = String(count);
+        } catch {
+            input.value = '0';
+        }
+    }
+
+    async function saveBackupRetention() {
+        const input = document.getElementById('backup-retention-input');
+        if (!input) return;
+        const count = parseInt(input.value, 10);
+        if (!Number.isFinite(count) || count < 0 || count > 1000) {
+            Notifications.error(_('updates.retention_invalid'));
+            return;
+        }
+        try {
+            await Utils.api('/api/settings/backup/retention', {
+                method: 'PUT',
+                body: { count }
+            });
+            Notifications.success(_('updates.retention_saved'));
+        } catch (err) {
+            Notifications.error(err.message || _('errors.server_error'));
+        }
+    }
+
+    async function pruneBackupsNow() {
+        const input = document.getElementById('backup-retention-input');
+        const count = parseInt(input?.value, 10);
+        if (!Number.isFinite(count) || count <= 0) {
+            Notifications.error(_('updates.retention_required_for_prune'));
+            return;
+        }
+        if (!confirm(_('updates.prune_confirm').replace('{n}', String(count)))) return;
+        try {
+            const data = await Utils.api('/api/settings/updates/backups/prune', {
+                method: 'POST',
+                body: { keep: count }
+            });
+            const deleted = (data && Array.isArray(data.deleted)) ? data.deleted.length : 0;
+            Notifications.success(_('updates.prune_done').replace('{n}', String(deleted)));
+            await loadUpdateBackups();
+        } catch (err) {
+            Notifications.error(err.message || _('errors.server_error'));
+        }
+    }
+
+    async function deleteBackup(name, btn) {
+        if (!confirm(_('updates.delete_confirm').replace('{name}', name))) return;
+        if (btn) btn.disabled = true;
+        try {
+            await Utils.api(`/api/settings/updates/backups/${encodeURIComponent(name)}`, {
+                method: 'DELETE'
+            });
+            Notifications.success(_('updates.delete_success'));
+            await loadUpdateBackups();
+        } catch (err) {
+            Notifications.error(err.message || _('errors.server_error'));
+            if (btn) btn.disabled = false;
+        }
+    }
+
     async function loadUpdateBackups() {
         const listEl = document.getElementById('update-backups-list');
         if (!listEl) return;
+        const summaryEl = document.getElementById('backup-summary');
         
         try {
             const data = await Utils.api('/api/settings/updates/backups');
@@ -1622,30 +2130,42 @@
             
             if (!backups.length) {
                 listEl.innerHTML = `<p class="text-muted">${_('updates.no_backups')}</p>`;
+                if (summaryEl) summaryEl.textContent = '';
                 return;
+            }
+
+            const totalBytes = backups.reduce((acc, b) => acc + (b.sizeBytes || 0), 0);
+            if (summaryEl) {
+                summaryEl.textContent = `${_('updates.total_size')}: ${formatBytes(totalBytes)} · ${backups.length} ${_('updates.backups_count')}`;
             }
             
             let html = '<div class="update-backups">';
             for (const b of backups) {
                 const date = b.timestamp ? new Date(b.timestamp).toLocaleString() : '';
                 const sha = b.sha ? ` · ${Utils.escapeHtml(b.sha)}` : '';
+                const size = formatBytes(b.sizeBytes || 0);
                 html += `<div class="update-backup-item">
                     <div class="update-backup-info">
                         <strong>${Utils.escapeHtml(b.name)}</strong>
-                        <span class="text-muted">${date}${sha} · ${b.fileCount || b.filesBackedUp || 0} ${_('updates.files')}</span>
+                        <span class="text-muted">${date}${sha} · ${b.fileCount || b.filesBackedUp || 0} ${_('updates.files')} · ${size}</span>
                     </div>
-                    <button class="btn btn-sm btn-outline" data-backup="${Utils.escapeHtml(b.name)}">
-                        <span class="material-icons">restore</span> ${_('updates.restore')}
-                    </button>
+                    <div class="update-backup-actions">
+                        <button class="btn btn-sm btn-outline" data-backup-restore="${Utils.escapeHtml(b.name)}">
+                            <span class="material-icons">restore</span> ${_('updates.restore')}
+                        </button>
+                        <button class="btn btn-sm btn-danger" data-backup-delete="${Utils.escapeHtml(b.name)}">
+                            <span class="material-icons">delete</span> ${_('updates.delete')}
+                        </button>
+                    </div>
                 </div>`;
             }
             html += '</div>';
             listEl.innerHTML = html;
             
             // Attach restore handlers
-            listEl.querySelectorAll('[data-backup]').forEach(btn => {
+            listEl.querySelectorAll('[data-backup-restore]').forEach(btn => {
                 btn.addEventListener('click', async () => {
-                    const name = btn.dataset.backup;
+                    const name = btn.dataset.backupRestore;
                     if (!confirm(_('updates.restore_confirm'))) return;
                     
                     btn.disabled = true;
@@ -1662,9 +2182,696 @@
                     }
                 });
             });
+
+            // Attach delete handlers
+            listEl.querySelectorAll('[data-backup-delete]').forEach(btn => {
+                btn.addEventListener('click', () => deleteBackup(btn.dataset.backupDelete, btn));
+            });
         } catch {
             listEl.innerHTML = `<p class="text-muted">${_('updates.no_backups')}</p>`;
+            if (summaryEl) summaryEl.textContent = '';
         }
+    }
+
+    // Wire retention controls (idempotent — handles tab re-mount)
+    document.addEventListener('click', (ev) => {
+        const target = ev.target.closest('#backup-retention-save, #backup-prune-now');
+        if (!target) return;
+        if (target.id === 'backup-retention-save') saveBackupRetention();
+        else if (target.id === 'backup-prune-now') pruneBackupsNow();
+    });
+
+    // Expose retention loader so tab activation can call it
+    window.loadBackupRetention = loadBackupRetention;
+
+    // ==================== LDAP / Authentication Section ====================
+
+    /**
+     * Initialize LDAP settings section
+     */
+    async function initLdapSection() {
+        const form = document.getElementById('ldap-form');
+        if (!form) return;
+
+        // Toggle config fields visibility based on enabled checkbox
+        const enabledCb = document.getElementById('ldap-enabled');
+        const configFields = document.getElementById('ldap-config-fields');
+        if (enabledCb && configFields) {
+            enabledCb.addEventListener('change', () => {
+                configFields.style.display = enabledCb.checked ? '' : 'none';
+            });
+        }
+
+        // Toggle direct bind vs bind+search fields
+        const directBindCb = document.getElementById('ldap-direct-bind');
+        const bindSearchFields = document.getElementById('ldap-bind-search-fields');
+        const directBindFields = document.getElementById('ldap-direct-bind-fields');
+        if (directBindCb) {
+            directBindCb.addEventListener('change', () => {
+                if (bindSearchFields) bindSearchFields.style.display = directBindCb.checked ? 'none' : '';
+                if (directBindFields) directBindFields.style.display = directBindCb.checked ? '' : 'none';
+            });
+        }
+
+        // Auto-update port when TLS checkbox changes
+        const useTlsCb = document.getElementById('ldap-use-tls');
+        const portInput = document.getElementById('ldap-port');
+        if (useTlsCb && portInput) {
+            useTlsCb.addEventListener('change', () => {
+                const current = parseInt(portInput.value, 10);
+                if (useTlsCb.checked && (current === 389 || !current)) {
+                    portInput.value = 636;
+                } else if (!useTlsCb.checked && current === 636) {
+                    portInput.value = 389;
+                }
+            });
+        }
+
+        // Load existing config
+        await loadLdapConfig();
+
+        // Test connection button
+        document.getElementById('ldap-test-btn')?.addEventListener('click', testLdapConnection);
+
+        // Form submission
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            await saveLdapConfig();
+        });
+    }
+
+    /**
+     * Load LDAP configuration from Go server (via Node.js proxy)
+     */
+    async function loadLdapConfig() {
+        try {
+            const data = await Utils.api('/api/settings/ldap');
+            populateLdapForm(data);
+        } catch (error) {
+            console.error('Failed to load LDAP config:', error);
+        }
+    }
+
+    /**
+     * Populate LDAP form fields with config data
+     */
+    function populateLdapForm(data) {
+        if (!data) return;
+
+        const setVal = (id, val) => {
+            const el = document.getElementById(id);
+            if (el) el.value = val ?? '';
+        };
+        const setChecked = (id, val) => {
+            const el = document.getElementById(id);
+            if (el) el.checked = !!val;
+        };
+
+        setChecked('ldap-enabled', data.enabled);
+        setVal('ldap-host', data.host);
+        setVal('ldap-port', data.port || 389);
+        setChecked('ldap-use-tls', data.use_tls);
+        setChecked('ldap-start-tls', data.start_tls);
+        setChecked('ldap-skip-tls-verify', data.skip_tls_verify);
+        setVal('ldap-bind-dn', data.bind_dn);
+        setVal('ldap-bind-password', data.bind_password);
+        setVal('ldap-base-dn', data.base_dn);
+        setVal('ldap-user-filter', data.user_filter);
+        setVal('ldap-user-attr-id', data.user_attr_id);
+        setVal('ldap-user-attr-email', data.user_attr_email);
+        setVal('ldap-user-attr-name', data.user_attr_name);
+        setVal('ldap-group-base-dn', data.group_base_dn);
+        setVal('ldap-group-filter', data.group_filter);
+        setVal('ldap-group-attr-name', data.group_attr_name);
+        setVal('ldap-default-role', data.default_role || 'viewer');
+        setVal('ldap-group-role-map', data.group_role_map);
+        setChecked('ldap-direct-bind', data.direct_bind);
+        setVal('ldap-direct-bind-dn', data.direct_bind_dn);
+        setVal('ldap-conn-timeout', data.conn_timeout_sec || 10);
+
+        // Update visibility
+        const configFields = document.getElementById('ldap-config-fields');
+        if (configFields) configFields.style.display = data.enabled ? '' : 'none';
+
+        const bindSearchFields = document.getElementById('ldap-bind-search-fields');
+        const directBindFields = document.getElementById('ldap-direct-bind-fields');
+        if (bindSearchFields) bindSearchFields.style.display = data.direct_bind ? 'none' : '';
+        if (directBindFields) directBindFields.style.display = data.direct_bind ? '' : 'none';
+    }
+
+    /**
+     * Collect LDAP form data
+     */
+    function collectLdapData() {
+        const getVal = (id) => {
+            const el = document.getElementById(id);
+            return el ? el.value.trim() : '';
+        };
+        const getChecked = (id) => {
+            const el = document.getElementById(id);
+            return el ? el.checked : false;
+        };
+
+        return {
+            enabled: getChecked('ldap-enabled'),
+            host: getVal('ldap-host'),
+            port: parseInt(getVal('ldap-port'), 10) || 389,
+            use_tls: getChecked('ldap-use-tls'),
+            start_tls: getChecked('ldap-start-tls'),
+            skip_tls_verify: getChecked('ldap-skip-tls-verify'),
+            bind_dn: getVal('ldap-bind-dn'),
+            bind_password: getVal('ldap-bind-password'),
+            base_dn: getVal('ldap-base-dn'),
+            user_filter: getVal('ldap-user-filter'),
+            user_attr_id: getVal('ldap-user-attr-id'),
+            user_attr_email: getVal('ldap-user-attr-email'),
+            user_attr_name: getVal('ldap-user-attr-name'),
+            group_base_dn: getVal('ldap-group-base-dn'),
+            group_filter: getVal('ldap-group-filter'),
+            group_attr_name: getVal('ldap-group-attr-name'),
+            default_role: getVal('ldap-default-role'),
+            group_role_map: getVal('ldap-group-role-map'),
+            direct_bind: getChecked('ldap-direct-bind'),
+            direct_bind_dn: getVal('ldap-direct-bind-dn'),
+            conn_timeout_sec: parseInt(getVal('ldap-conn-timeout'), 10) || 10
+        };
+    }
+
+    /**
+     * Save LDAP configuration
+     */
+    async function saveLdapConfig() {
+        try {
+            const data = collectLdapData();
+            await Utils.api('/api/settings/ldap', {
+                method: 'PUT',
+                body: data
+            });
+            Notifications.success(_('settings.ldap_saved'));
+        } catch (error) {
+            Notifications.error(error.message || _('errors.server_error'));
+        }
+    }
+
+    /**
+     * Test LDAP connection with current form values
+     */
+    async function testLdapConnection() {
+        const btn = document.getElementById('ldap-test-btn');
+        const resultEl = document.getElementById('ldap-test-result');
+        if (!btn) return;
+
+        btn.disabled = true;
+        btn.innerHTML = '<span class="material-icons spin">sync</span> ' + _('settings.ldap_testing');
+
+        if (resultEl) {
+            resultEl.innerHTML = '';
+            resultEl.style.display = 'none';
+        }
+
+        try {
+            const data = collectLdapData();
+            const result = await Utils.api('/api/settings/ldap/test', {
+                method: 'POST',
+                body: data
+            });
+
+            if (resultEl) {
+                resultEl.style.display = 'block';
+                if (result.success) {
+                    resultEl.innerHTML = '<div class="alert alert-success"><span class="material-icons">check_circle</span> ' + _('settings.ldap_test_success') + '</div>';
+                } else {
+                    resultEl.innerHTML = '<div class="alert alert-danger"><span class="material-icons">error</span> ' + Utils.escapeHtml(result.error || _('settings.ldap_test_failed')) + '</div>';
+                }
+            }
+        } catch (error) {
+            if (resultEl) {
+                resultEl.style.display = 'block';
+                resultEl.innerHTML = '<div class="alert alert-danger"><span class="material-icons">error</span> ' + Utils.escapeHtml(error.message || _('settings.ldap_test_failed')) + '</div>';
+            }
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<span class="material-icons">cable</span> ' + _('settings.ldap_test_connection');
+        }
+    }
+
+    // ==================== OIDC / OAuth2 Section ====================
+
+    async function initOidcSection() {
+        const form = document.getElementById('oidc-form');
+        if (!form) return;
+
+        // Toggle config fields visibility based on enabled checkbox
+        const enabledCb = document.getElementById('oidc-enabled');
+        const configFields = document.getElementById('oidc-config-fields');
+        if (enabledCb && configFields) {
+            enabledCb.addEventListener('change', () => {
+                configFields.style.display = enabledCb.checked ? '' : 'none';
+            });
+        }
+
+        // Toggle manual endpoints based on auto-discovery checkbox
+        const autoDiscoveryCb = document.getElementById('oidc-auto-discovery');
+        const manualEndpoints = document.getElementById('oidc-manual-endpoints');
+        if (autoDiscoveryCb && manualEndpoints) {
+            autoDiscoveryCb.addEventListener('change', () => {
+                manualEndpoints.style.display = autoDiscoveryCb.checked ? 'none' : '';
+            });
+        }
+
+        // Load existing config
+        await loadOidcConfig();
+
+        // Test discovery button
+        document.getElementById('oidc-test-btn')?.addEventListener('click', testOidcDiscovery);
+
+        // Form submission
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            await saveOidcConfig();
+        });
+    }
+
+    async function loadOidcConfig() {
+        try {
+            const data = await Utils.api('/api/settings/oidc');
+            populateOidcForm(data);
+        } catch (error) {
+            console.error('Failed to load OIDC config:', error);
+        }
+    }
+
+    function populateOidcForm(data) {
+        if (!data) return;
+
+        const setVal = (id, val) => {
+            const el = document.getElementById(id);
+            if (el) el.value = val ?? '';
+        };
+        const setChecked = (id, val) => {
+            const el = document.getElementById(id);
+            if (el) el.checked = !!val;
+        };
+
+        setChecked('oidc-enabled', data.enabled);
+        setVal('oidc-display-name', data.display_name);
+        setVal('oidc-issuer-url', data.issuer_url);
+        setVal('oidc-client-id', data.client_id);
+        setVal('oidc-client-secret', data.client_secret);
+        setVal('oidc-redirect-url', data.redirect_url);
+        setVal('oidc-scopes', data.scopes || 'openid profile email');
+        setChecked('oidc-use-pkce', data.use_pkce);
+        setChecked('oidc-auto-discovery', data.auto_discovery !== false);
+        setChecked('oidc-allow-signup', data.allow_signup !== false);
+        setVal('oidc-authorization-url', data.authorization_url);
+        setVal('oidc-token-url', data.token_url);
+        setVal('oidc-userinfo-url', data.userinfo_url);
+        setVal('oidc-claim-username', data.claim_username || 'preferred_username');
+        setVal('oidc-claim-email', data.claim_email || 'email');
+        setVal('oidc-claim-name', data.claim_name || 'name');
+        setVal('oidc-claim-groups', data.claim_groups || 'groups');
+        setVal('oidc-default-role', data.default_role || 'viewer');
+        setVal('oidc-group-role-map', data.group_role_map);
+
+        // Update visibility
+        const configFields = document.getElementById('oidc-config-fields');
+        if (configFields) configFields.style.display = data.enabled ? '' : 'none';
+        const manualEndpoints = document.getElementById('oidc-manual-endpoints');
+        if (manualEndpoints) manualEndpoints.style.display = (data.auto_discovery !== false) ? 'none' : '';
+    }
+
+    function collectOidcData() {
+        const getVal = (id) => {
+            const el = document.getElementById(id);
+            return el ? el.value.trim() : '';
+        };
+        const getChecked = (id) => {
+            const el = document.getElementById(id);
+            return el ? el.checked : false;
+        };
+
+        return {
+            enabled: getChecked('oidc-enabled'),
+            display_name: getVal('oidc-display-name'),
+            issuer_url: getVal('oidc-issuer-url'),
+            client_id: getVal('oidc-client-id'),
+            client_secret: getVal('oidc-client-secret'),
+            redirect_url: getVal('oidc-redirect-url'),
+            scopes: getVal('oidc-scopes'),
+            use_pkce: getChecked('oidc-use-pkce'),
+            auto_discovery: getChecked('oidc-auto-discovery'),
+            allow_signup: getChecked('oidc-allow-signup'),
+            authorization_url: getVal('oidc-authorization-url'),
+            token_url: getVal('oidc-token-url'),
+            userinfo_url: getVal('oidc-userinfo-url'),
+            claim_username: getVal('oidc-claim-username'),
+            claim_email: getVal('oidc-claim-email'),
+            claim_name: getVal('oidc-claim-name'),
+            claim_groups: getVal('oidc-claim-groups'),
+            default_role: getVal('oidc-default-role'),
+            group_role_map: getVal('oidc-group-role-map')
+        };
+    }
+
+    async function saveOidcConfig() {
+        try {
+            const data = collectOidcData();
+            await Utils.api('/api/settings/oidc', {
+                method: 'PUT',
+                body: data
+            });
+            Notifications.success(_('settings.oidc_saved'));
+        } catch (error) {
+            Notifications.error(error.message || _('errors.server_error'));
+        }
+    }
+
+    async function testOidcDiscovery() {
+        const btn = document.getElementById('oidc-test-btn');
+        const resultEl = document.getElementById('oidc-test-result');
+        if (!btn) return;
+
+        btn.disabled = true;
+        btn.innerHTML = '<span class="material-icons spin">sync</span> ' + _('settings.oidc_testing');
+
+        if (resultEl) {
+            resultEl.innerHTML = '';
+            resultEl.style.display = 'none';
+        }
+
+        try {
+            const issuerUrl = document.getElementById('oidc-issuer-url')?.value?.trim();
+            if (!issuerUrl) {
+                throw new Error(_('settings.oidc_issuer_required'));
+            }
+
+            const result = await Utils.api('/api/settings/oidc/test', {
+                method: 'POST',
+                body: { issuer_url: issuerUrl }
+            });
+
+            if (resultEl) {
+                resultEl.style.display = 'block';
+                if (result.success) {
+                    let details = '';
+                    if (result.authorization_endpoint) details += '<br><small>Authorization: ' + Utils.escapeHtml(result.authorization_endpoint) + '</small>';
+                    if (result.token_endpoint) details += '<br><small>Token: ' + Utils.escapeHtml(result.token_endpoint) + '</small>';
+                    if (result.userinfo_endpoint) details += '<br><small>Userinfo: ' + Utils.escapeHtml(result.userinfo_endpoint) + '</small>';
+                    resultEl.innerHTML = '<div class="alert alert-success"><span class="material-icons">check_circle</span> ' + _('settings.oidc_test_success') + details + '</div>';
+                } else {
+                    resultEl.innerHTML = '<div class="alert alert-danger"><span class="material-icons">error</span> ' + Utils.escapeHtml(result.error || _('settings.oidc_test_failed')) + '</div>';
+                }
+            }
+        } catch (error) {
+            if (resultEl) {
+                resultEl.style.display = 'block';
+                resultEl.innerHTML = '<div class="alert alert-danger"><span class="material-icons">error</span> ' + Utils.escapeHtml(error.message || _('settings.oidc_test_failed')) + '</div>';
+            }
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '<span class="material-icons">travel_explore</span> ' + _('settings.oidc_test_discovery');
+        }
+    }
+
+    // ==================== Advanced config files =================================
+
+    const advancedState = { files: [], activeId: null, dirty: false, original: '' };
+
+    /** Utils.api unwraps { success, data } — accept both shapes. */
+    function unwrapAdvancedPayload(resp) {
+        if (resp == null) return resp;
+        if (Array.isArray(resp)) return resp;
+        if (typeof resp === 'object' && resp.content !== undefined && resp.path !== undefined) {
+            return resp;
+        }
+        if (typeof resp === 'object' && resp.data !== undefined) return resp.data;
+        return resp;
+    }
+
+    function initAdvancedSection() {
+        const listEl = document.getElementById('advanced-config-file-list');
+        const textarea = document.getElementById('advanced-config-textarea');
+        const saveBtn = document.getElementById('advanced-config-save');
+        const reloadBtn = document.getElementById('advanced-config-reload');
+        const restartBtn = document.getElementById('advanced-config-restart');
+        if (!listEl) return;
+
+        loadAdvancedFileList();
+
+        saveBtn?.addEventListener('click', saveAdvancedFile);
+        restartBtn?.addEventListener('click', restartAdvancedServices);
+        reloadBtn?.addEventListener('click', () => {
+            if (advancedState.activeId) loadAdvancedFile(advancedState.activeId, true);
+        });
+
+        textarea?.addEventListener('input', () => {
+            advancedState.dirty = textarea.value !== advancedState.original;
+            if (saveBtn) saveBtn.disabled = !advancedState.dirty;
+        });
+
+        window.addEventListener('beforeunload', (e) => {
+            if (advancedState.dirty) {
+                e.preventDefault();
+                e.returnValue = '';
+            }
+        });
+    }
+
+    async function loadAdvancedFileList() {
+        const listEl = document.getElementById('advanced-config-file-list');
+        if (!listEl) return;
+        try {
+            const resp = await Utils.api('/api/settings/advanced/files');
+            advancedState.files = unwrapAdvancedPayload(resp) || [];
+            if (!Array.isArray(advancedState.files)) advancedState.files = [];
+            if (!advancedState.files.length) {
+                listEl.innerHTML = '<li class="text-muted">' + _('settings.advanced_no_files') + '</li>';
+                return;
+            }
+            listEl.innerHTML = advancedState.files.map((f) => {
+                const label = _('settings.advanced_file_' + f.id) !== 'settings.advanced_file_' + f.id
+                    ? _('settings.advanced_file_' + f.id)
+                    : f.id;
+                const status = f.exists
+                    ? (f.writable ? '' : ' <span class="badge badge-muted">' + _('settings.advanced_readonly') + '</span>')
+                    : ' <span class="badge badge-muted">' + _('settings.advanced_missing') + '</span>';
+                const disabled = !f.exists && !f.canCreate;
+                return '<li><button type="button" class="advanced-config-file-btn' +
+                    (advancedState.activeId === f.id ? ' active' : '') +
+                    '" data-id="' + Utils.escapeHtml(f.id) + '"' +
+                    (disabled ? ' disabled' : '') + '>' +
+                    Utils.escapeHtml(label) + status + '</button></li>';
+            }).join('');
+
+            listEl.querySelectorAll('.advanced-config-file-btn').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    const id = btn.getAttribute('data-id');
+                    if (!id) return;
+                    if (advancedState.dirty && !confirm(_('settings.advanced_unsaved_confirm'))) return;
+                    loadAdvancedFile(id);
+                });
+            });
+
+        } catch (err) {
+            listEl.innerHTML = '<li class="text-danger">' + Utils.escapeHtml(err.message || _('errors.server_error')) + '</li>';
+        }
+    }
+
+    function advancedRestartHint(restart) {
+        if (restart === 'none') return _('settings.advanced_restart_none');
+        const map = {
+            console: _('settings.advanced_restart_console'),
+            goserver: _('settings.advanced_restart_goserver'),
+            systemd: _('settings.advanced_restart_systemd')
+        };
+        return map[restart] || _('settings.advanced_restart_generic');
+    }
+
+    function updateAdvancedRestartButton(catalogOrData) {
+        const restartBtn = document.getElementById('advanced-config-restart');
+        if (!restartBtn) return;
+        const canRestart = catalogOrData && catalogOrData.requiresRestart !== 'none';
+        const show = canRestart && (catalogOrData.exists || catalogOrData.canCreate);
+        restartBtn.hidden = !show;
+    }
+
+    async function loadAdvancedFile(id, force) {
+        if (!force && advancedState.dirty && !confirm(_('settings.advanced_unsaved_confirm'))) return;
+
+        const placeholder = document.getElementById('advanced-config-placeholder');
+        const toolbar = document.getElementById('advanced-config-toolbar');
+        const textarea = document.getElementById('advanced-config-textarea');
+        const hint = document.getElementById('advanced-config-restart-hint');
+        const saveBtn = document.getElementById('advanced-config-save');
+        const meta = document.getElementById('advanced-config-meta');
+        const pathEl = document.getElementById('advanced-config-path');
+
+        const catalog = advancedState.files.find((f) => f.id === id);
+        if (catalog && !catalog.exists && catalog.canCreate) {
+            advancedState.activeId = id;
+            advancedState.original = '';
+            advancedState.dirty = false;
+            if (placeholder) placeholder.hidden = true;
+            if (toolbar) toolbar.hidden = false;
+            if (textarea) {
+                textarea.hidden = false;
+                textarea.value = '# ' + _('settings.advanced_new_file_hint') + '\n';
+                textarea.disabled = !catalog.writable;
+            }
+            if (pathEl) pathEl.textContent = catalog.path;
+            if (meta) meta.textContent = _('settings.advanced_new_file');
+            if (hint) {
+                hint.hidden = false;
+                hint.textContent = advancedRestartHint(catalog.requiresRestart);
+            }
+            if (saveBtn) saveBtn.disabled = !catalog.writable;
+            updateAdvancedRestartButton(catalog);
+            document.querySelectorAll('.advanced-config-file-btn').forEach((b) => {
+                b.classList.toggle('active', b.getAttribute('data-id') === id);
+            });
+            return;
+        }
+
+        try {
+            const resp = await Utils.api('/api/settings/advanced/files/' + encodeURIComponent(id));
+            const data = unwrapAdvancedPayload(resp);
+            const cat = advancedState.files.find((f) => f.id === id);
+            advancedState.activeId = id;
+            advancedState.original = data.content || '';
+            advancedState.dirty = false;
+
+            if (placeholder) placeholder.hidden = true;
+            if (toolbar) toolbar.hidden = false;
+            if (textarea) {
+                textarea.hidden = false;
+                textarea.value = advancedState.original;
+                textarea.disabled = cat ? !cat.writable : false;
+            }
+            if (pathEl) pathEl.textContent = data.path;
+            if (meta) {
+                const kb = ((data.size || 0) / 1024).toFixed(1);
+                meta.textContent = kb + ' KB · ' + (data.mtime || '');
+            }
+            if (hint) {
+                hint.hidden = false;
+                hint.textContent = advancedRestartHint(data.requiresRestart);
+            }
+            if (saveBtn) saveBtn.disabled = !cat || !cat.writable;
+            updateAdvancedRestartButton(cat || { exists: true });
+
+            document.querySelectorAll('.advanced-config-file-btn').forEach((b) => {
+                b.classList.toggle('active', b.getAttribute('data-id') === id);
+            });
+        } catch (err) {
+            Notifications.error(err.message || _('errors.server_error'));
+        }
+    }
+
+    async function saveAdvancedFile() {
+        const id = advancedState.activeId;
+        const textarea = document.getElementById('advanced-config-textarea');
+        if (!id || !textarea) return;
+
+        const catalog = advancedState.files.find((f) => f.id === id);
+        if (catalog && !catalog.writable) {
+            Notifications.error(_('settings.advanced_error_not_writable'));
+            return;
+        }
+
+        if (!confirm(_('settings.advanced_save_confirm'))) return;
+
+        const saveBtn = document.getElementById('advanced-config-save');
+        if (saveBtn) saveBtn.disabled = true;
+
+        try {
+            const resp = await Utils.api('/api/settings/advanced/files/' + encodeURIComponent(id), {
+                method: 'PUT',
+                body: { content: textarea.value }
+            });
+            advancedState.original = textarea.value;
+            advancedState.dirty = false;
+            let msg = _('settings.advanced_saved');
+            if (resp && resp.backupPath) {
+                msg += ' (' + _('settings.advanced_backup_created') + ')';
+            }
+            Notifications.success(msg);
+            await loadAdvancedFileList();
+            loadAdvancedFile(id, true);
+
+            if (confirm(_('settings.advanced_restart_after_save'))) {
+                await restartAdvancedServices(true);
+            }
+        } catch (err) {
+            Notifications.error(err.message || _('errors.server_error'));
+            if (saveBtn) saveBtn.disabled = advancedState.dirty;
+        }
+    }
+
+    async function restartAdvancedServices(skipConfirm) {
+        const id = advancedState.activeId;
+        if (!id) return;
+
+        if (advancedState.dirty && !confirm(_('settings.advanced_unsaved_confirm'))) return;
+
+        const catalog = advancedState.files.find((f) => f.id === id);
+        const isConsole = catalog && (catalog.requiresRestart === 'console' || id === 'systemd-console'
+            || id === 'console-env' || id === 'console-env-local');
+        const confirmKey = isConsole
+            ? 'settings.advanced_restart_console_confirm'
+            : 'settings.advanced_restart_confirm';
+        if (!skipConfirm && !confirm(_(confirmKey))) return;
+
+        const restartBtn = document.getElementById('advanced-config-restart');
+        if (restartBtn) restartBtn.disabled = true;
+
+        try {
+            const result = await Utils.api('/api/settings/advanced/restart', {
+                method: 'POST',
+                body: { fileId: id }
+            });
+            Notifications.success(_('settings.advanced_restart_started'));
+
+            if (result && result.needsConsolePoll) {
+                pollAdvancedConsoleRestart();
+            }
+        } catch (err) {
+            const detail = err.data && (err.data.details || err.data.error);
+            Notifications.error(detail || err.message || _('settings.advanced_restart_failed'));
+        } finally {
+            if (restartBtn) restartBtn.disabled = false;
+        }
+    }
+
+    function pollAdvancedConsoleRestart() {
+        let attempts = 0;
+        const maxAttempts = 90;
+        const previousCacheVersion = window.BetterDesk?.cacheVersion || '';
+        Notifications.info(_('settings.advanced_restart_polling'));
+
+        const interval = setInterval(async () => {
+            attempts++;
+            try {
+                const resp = await fetch('/api/settings/restart-status?_=' + Date.now(), {
+                    credentials: 'same-origin',
+                    cache: 'no-store'
+                });
+                if (resp.ok) {
+                    const body = await resp.json().catch(() => null);
+                    const status = body?.data || body || {};
+                    if (previousCacheVersion && status.cacheVersion && status.cacheVersion === previousCacheVersion) {
+                        return;
+                    }
+                    clearInterval(interval);
+                    Notifications.success(_('settings.advanced_restart_done'));
+                    setTimeout(() => window.location.reload(), 2000);
+                    return;
+                }
+            } catch (_) { /* console still restarting */ }
+            if (attempts >= maxAttempts) {
+                clearInterval(interval);
+                Notifications.warning(_('settings.advanced_restart_timeout'));
+            }
+        }, 2000);
     }
     
 })();

@@ -44,20 +44,26 @@ var configKeyRegexp = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,64}$`)
 
 // Server is the HTTP API server.
 type Server struct {
-	cfg               *config.Config
-	db                db.Database
-	peers             *peer.Map
-	relay             *relay.Server
-	blocklist         *security.Blocklist
-	bwLimiter         *ratelimit.BandwidthLimiter
-	auditLog          *audit.Logger
-	eventBus          *eventsModule.Bus
-	metrics           *metrics.Collector
-	jwtManager        *auth.JWTManager
-	loginLimiter      *ratelimit.IPLimiter
-	heartbeatLimiter  *ratelimit.IPLimiter // BD-2026-001: rate-limit heartbeat/sysinfo
-	keyPair           *crypto.KeyPair      // Ed25519 keypair for signing
-	cdapGw            *cdap.Gateway        // CDAP gateway (nil if CDAP disabled)
+	cfg              *config.Config
+	db               db.Database
+	peers            *peer.Map
+	relay            *relay.Server
+	blocklist        *security.Blocklist
+	bwLimiter        *ratelimit.BandwidthLimiter
+	auditLog         *audit.Logger
+	eventBus         *eventsModule.Bus
+	metrics          *metrics.Collector
+	jwtManager       *auth.JWTManager
+	loginLimiter     *ratelimit.IPLimiter
+	heartbeatLimiter *ratelimit.IPLimiter // BD-2026-001: rate-limit heartbeat/sysinfo
+	// SECURITY (audit fix M-07, 2026-04-10): rate-limit public enrollment and
+	// branding endpoints to deter device-ID enumeration and config probing.
+	enrollmentLimiter *ratelimit.IPLimiter
+	brandingLimiter   *ratelimit.IPLimiter
+	keyPair           *crypto.KeyPair // Ed25519 keypair for signing
+	cdapGw            *cdap.Gateway   // CDAP gateway (nil if CDAP disabled)
+	ldapProvider      *auth.LDAPProvider // LDAP auth provider (nil if not configured)
+	oidcProvider      *auth.OIDCProvider // OIDC/OAuth2 auth provider (nil if not configured)
 	clientTFASessions *tfaSessionStore
 	httpSrv           *http.Server
 	wg                sync.WaitGroup
@@ -74,8 +80,71 @@ func New(cfg *config.Config, database db.Database, peerMap *peer.Map, relaySrv *
 		version:           version,
 		loginLimiter:      ratelimit.NewIPLimiter(5, 5*time.Minute, 10*time.Minute),
 		heartbeatLimiter:  ratelimit.NewIPLimiter(20, 60*time.Second, 5*time.Minute), // BD-2026-001: 20 req/min per IP
+		enrollmentLimiter: ratelimit.NewIPLimiter(20, 1*time.Minute, 5*time.Minute),  // M-07: 20/min per IP, 5-min block
+		brandingLimiter:   ratelimit.NewIPLimiter(60, 1*time.Minute, 5*time.Minute),  // M-07: 60/min per IP
 		clientTFASessions: newTFASessionStore(),
 	}
+}
+
+// rateLimitPublic wraps a public (no-auth) handler with the supplied IP limiter.
+// Returns HTTP 429 with a JSON body when the per-IP budget is exhausted.
+// Used by audit fix M-07 (enrollment, branding endpoints).
+func (s *Server) rateLimitPublic(lim *ratelimit.IPLimiter, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if lim != nil {
+			ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if ip == "" {
+				ip = r.RemoteAddr
+			}
+			if !lim.Allow(ip) {
+				writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
+				return
+			}
+		}
+		h(w, r)
+	}
+}
+
+// metricsGuard enforces the audit fix H-03 access policy for /metrics:
+//   - cfg.MetricsPublic=true       => unrestricted (legacy/dev)
+//   - cfg.MetricsAllowlist non-empty => caller IP must match one entry
+//   - otherwise                      => caller must present a valid bearer/api-key
+func (s *Server) metricsGuard(h http.HandlerFunc) http.HandlerFunc {
+	allowlist := s.cfg.GetMetricsAllowlist()
+	public := s.cfg.MetricsPublic
+	return func(w http.ResponseWriter, r *http.Request) {
+		if public {
+			h(w, r)
+			return
+		}
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+		if len(allowlist) > 0 && ipInAllowlist(ip, allowlist) {
+			h(w, r)
+			return
+		}
+		// Fall back to standard auth middleware (JWT / API key).
+		s.authMiddleware(h).ServeHTTP(w, r)
+	}
+}
+
+// ipInAllowlist reports whether ip matches any literal IP or CIDR in list.
+func ipInAllowlist(ip string, list []string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, entry := range list {
+		if entry == ip {
+			return true
+		}
+		if _, cidr, err := net.ParseCIDR(entry); err == nil && cidr.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetBlocklist sets the blocklist instance for the API server.
@@ -116,6 +185,26 @@ func (s *Server) SetKeyPair(kp *crypto.KeyPair) {
 // SetCDAPGateway sets the CDAP gateway for serving CDAP REST endpoints.
 func (s *Server) SetCDAPGateway(gw *cdap.Gateway) {
 	s.cdapGw = gw
+}
+
+// InitLDAP initializes the LDAP provider from the database configuration.
+// Should be called after the database is ready, before Start().
+func (s *Server) InitLDAP() {
+	cfg := s.loadLDAPConfigFromDB()
+	s.ldapProvider = auth.NewLDAPProvider(cfg)
+	if cfg.Enabled {
+		log.Printf("[LDAP] Provider initialized (host=%s, port=%d, tls=%v)", cfg.Host, cfg.Port, cfg.UseTLS)
+	}
+}
+
+// InitOIDC initializes the OIDC provider from the database configuration.
+// Should be called after the database is ready, before Start().
+func (s *Server) InitOIDC() {
+	cfg := s.loadOIDCConfigFromDB()
+	s.oidcProvider = auth.NewOIDCProvider(cfg)
+	if cfg.Enabled {
+		log.Printf("[OIDC] Provider initialized (issuer=%s, client_id=%s)", cfg.IssuerURL, cfg.ClientID)
+	}
 }
 
 // Start launches the HTTP API server.
@@ -197,11 +286,12 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/org/{id}/policy/effective/{deviceId}", s.requireOrgMembership("id", s.handleGetEffectivePolicy))
 	mux.HandleFunc("GET /api/org/{id}/policy/audit", s.requireOrgMembership("id", s.handleGetPolicyAudit))
 
-	// Audit
-	mux.HandleFunc("GET /api/audit/events", s.handleAuditEvents)
+	// Audit (audit.view permission required)
+	mux.HandleFunc("GET /api/audit/events", s.requirePermission(auth.PermAuditView, s.handleAuditEvents))
 
-	// WebSocket real-time events
-	mux.HandleFunc("GET /api/ws/events", s.handleWSEvents)
+	// WebSocket real-time events (audit.view permission required — events stream
+	// includes peer/auth/system telemetry intended for audit-capable roles only)
+	mux.HandleFunc("GET /api/ws/events", s.requirePermission(auth.PermAuditView, s.handleWSEvents))
 
 	// Config (server.config permission)
 	mux.HandleFunc("GET /api/config/{key}", s.requirePermission(auth.PermServerConfig, s.handleGetConfig))
@@ -224,12 +314,30 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/ab/personal", s.handleClientAddressBookPersonal)
 	mux.HandleFunc("POST /api/ab/personal", s.handleClientAddressBookPersonal)
 	mux.HandleFunc("GET /api/ab/tags", s.handleClientAddressBookTags)
+
+	// RustDesk PRO group endpoint stubs — Flutter clients query these and expect
+	// the {total,data,msg} envelope; without them the device list never finishes
+	// loading.  We expose empty-but-valid responses so the UI gracefully falls
+	// back to address-book mode.  Idea credit: progloto (PR #81).
+	mux.HandleFunc("GET /api/group", s.handleClientGroupList)
+	mux.HandleFunc("GET /api/group/get", s.handleClientGroupList)
+	mux.HandleFunc("POST /api/group/get", s.handleClientGroupList)
+	mux.HandleFunc("GET /api/peers/list", s.handleClientGroupPeers)
+	// RustDesk Flutter group model calls /api/device-group/accessible to
+	// discover device groups.  Route to the same handler as /api/group.
+	mux.HandleFunc("GET /api/device-group/accessible", s.handleClientGroupList)
+
 	mux.HandleFunc("POST /api/heartbeat", s.handleClientHeartbeat)
 	mux.HandleFunc("POST /api/sysinfo", s.handleClientSysinfo)
 	mux.HandleFunc("POST /api/sysinfo_ver", s.handleClientSysinfoVer)
 
 	// User management (permission-based)
-	mux.HandleFunc("GET /api/users", s.requirePermission(auth.PermUserView, s.handleListUsers))
+	// Issue #138: RustDesk client calls GET /api/users?accessible&pageSize=100
+	// with operator tokens. The _getUsers() result gates the entire group pull —
+	// if it fails (403), _getPeers() is never called and the Available Devices
+	// tab stays empty. Use a wrapper that detects client requests and returns
+	// only the current user before the permission check.
+	mux.HandleFunc("GET /api/users", s.handleUsersWithClientFallback)
 	mux.HandleFunc("POST /api/users", s.requirePermission(auth.PermUserCreate, s.handleCreateUser))
 	mux.HandleFunc("PUT /api/users/{id}", s.requirePermission(auth.PermUserEdit, s.handleUpdateUser))
 	mux.HandleFunc("DELETE /api/users/{id}", s.requirePermission(auth.PermUserDelete, s.handleDeleteUser))
@@ -266,17 +374,37 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/enrollment/mode", s.requireRole(auth.RoleAdmin, s.handleGetEnrollmentMode))
 	mux.HandleFunc("PUT /api/enrollment/mode", s.requireRole(auth.RoleAdmin, s.handleSetEnrollmentMode))
 
-	// Enrollment — device self-registration (public, no auth)
-	mux.HandleFunc("POST /api/devices/register", s.handleDeviceRegister)
-	mux.HandleFunc("GET /api/devices/register/status", s.handleDeviceRegisterStatus)
+	// Enrollment — device self-registration (public, no auth, rate-limited via M-07)
+	mux.HandleFunc("POST /api/devices/register", s.rateLimitPublic(s.enrollmentLimiter, s.handleDeviceRegister))
+	mux.HandleFunc("GET /api/devices/register/status", s.rateLimitPublic(s.enrollmentLimiter, s.handleDeviceRegisterStatus))
 
 	// Enrollment — operator approval (admin/operator)
 	mux.HandleFunc("GET /api/enrollment/pending", s.requireRole(auth.RoleOperator, s.handleListPendingDevices))
 	mux.HandleFunc("POST /api/enrollment/approve/{id}", s.requireRole(auth.RoleOperator, s.handleApproveDevice))
 	mux.HandleFunc("POST /api/enrollment/reject/{id}", s.requireRole(auth.RoleOperator, s.handleRejectDevice))
 
+	// LDAP configuration (server.config permission)
+	mux.HandleFunc("GET /api/auth/ldap/config", s.requirePermission(auth.PermServerConfig, s.handleGetLDAPConfig))
+	mux.HandleFunc("PUT /api/auth/ldap/config", s.requirePermission(auth.PermServerConfig, s.handleSaveLDAPConfig))
+	mux.HandleFunc("POST /api/auth/ldap/test", s.requirePermission(auth.PermServerConfig, s.handleTestLDAPConnection))
+
+	// OIDC/OAuth2 configuration (server.config permission)
+	mux.HandleFunc("GET /api/auth/oidc/config", s.requirePermission(auth.PermServerConfig, s.handleGetOIDCConfig))
+	mux.HandleFunc("PUT /api/auth/oidc/config", s.requirePermission(auth.PermServerConfig, s.handleSaveOIDCConfig))
+	mux.HandleFunc("POST /api/auth/oidc/test", s.requirePermission(auth.PermServerConfig, s.handleTestOIDCDiscovery))
+	// OIDC public endpoints (no auth — used by login page and IdP callback)
+	mux.HandleFunc("GET /api/auth/oidc/status", s.handleOIDCLoginStatus)
+	mux.HandleFunc("GET /api/auth/oidc/authorize", s.handleOIDCAuthorize)
+	mux.HandleFunc("GET /api/auth/oidc/callback", s.handleOIDCCallback)
+	mux.HandleFunc("POST /api/auth/oidc/exchange", s.handleOIDCExchange)
+
+	// Combined SSO status — public, used by Node.js console to detect
+	// whether LDAP or OIDC is enabled and auto-provision LDAP-authenticated
+	// users on first login (#148).
+	mux.HandleFunc("GET /api/auth/sso/status", s.handleSSOStatus)
+
 	// Branding (GET is public for desktop clients, POST is admin)
-	mux.HandleFunc("GET /api/branding", s.handleGetBranding)
+	mux.HandleFunc("GET /api/branding", s.rateLimitPublic(s.brandingLimiter, s.handleGetBranding))
 	mux.HandleFunc("POST /api/branding", s.requireRole(auth.RoleAdmin, s.handleSaveBranding))
 
 	// CDAP device management (requires CDAP gateway to be enabled)
@@ -315,12 +443,25 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST /api/bd/mgmt/{device_id}/send", s.requireRole(auth.RoleOperator, s.handleBdMgmtSend))
 	mux.HandleFunc("GET /api/bd/mgmt/connected", s.handleBdMgmtConnected)
 
-	// Prometheus metrics (public, no API key required)
-	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	// Prometheus metrics. Gated via H-03 — see handleMetrics for the actual
+	// IP-allowlist / auth check. We register a wrapper here that enforces the
+	// policy before any metric data is exposed.
+	mux.HandleFunc("GET /metrics", s.metricsGuard(s.handleMetrics))
 
 	// Catch-all: return JSON 404 for unmatched routes.
 	// Go's default ServeMux returns HTML which breaks RustDesk (Dart) client parsing.
+	// Logs every miss so missing client compatibility endpoints are easy to spot.
+	// Diagnostics suggestion credit: progloto (PR #81).
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+		ua := r.Header.Get("User-Agent")
+		if len(ua) > 80 {
+			ua = ua[:80] + "…"
+		}
+		log.Printf("[api] 404 %s %s from %s ua=%q", r.Method, r.URL.Path, ip, ua)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte(`{"error":"not found"}`))
@@ -470,6 +611,17 @@ func (s *Server) handleServerStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
+	// Detect RustDesk client group model request: the Flutter client sends
+	// ?accessible=&status=1&pageSize=100 and expects {total,data} envelope
+	// with PeerPayload format (status as int, info as nested map).
+	// Issue #138: without this detection, the client gets status:"ONLINE"
+	// (string) where it expects int, causing "type 'String' is not a subtype
+	// of type 'int?'" error.
+	if r.URL.Query().Has("accessible") || r.URL.Query().Has("pageSize") {
+		s.handleClientPeersList(w, r)
+		return
+	}
+
 	includeDeleted := r.URL.Query().Get("include_deleted") == "true"
 
 	// Data scoping: org-scoped users only see their org's devices
@@ -486,9 +638,14 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enrich with live online status and status tier from memory map
+	// Enrich with live online status and status tier from memory map.
+	// Issue #138 hardening: override db.Peer.Status (string) with an int
+	// so any RustDesk client that reaches this handler without the
+	// ?accessible / ?pageSize detection still receives a valid int.
 	type peerResponse struct {
 		*db.Peer
+		Status        int         `json:"status"`      // 1=active, 0=disabled (overrides db.Peer.Status string)
+		StatusText    string      `json:"status_text"` // Original string status for admin panel
 		LiveOnline    bool        `json:"live_online"`
 		LiveStatus    peer.Status `json:"live_status"`
 		Platform      string      `json:"platform"`
@@ -510,8 +667,15 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 			liveStatus = peer.StatusOnline
 		}
 
+		statusInt := 1
+		if p.Disabled {
+			statusInt = 0
+		}
+
 		result[i] = peerResponse{
 			Peer:          p,
+			Status:        statusInt,
+			StatusText:    p.Status,
 			LiveOnline:    liveOnline,
 			LiveStatus:    liveStatus,
 			Platform:      p.OS,
@@ -520,6 +684,91 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// handleClientPeersList returns peers in the {total,data} envelope format
+// expected by the RustDesk Flutter client's group model.  The PeerPayload
+// format requires:
+//   - status: int (1=active, 0=disabled) — NOT the string "ONLINE"/"OFFLINE"
+//   - info: map with device_name, os, username — NOT flat hostname/os fields
+//   - user: string (owner username)
+//   - user_name: string (display name)
+//
+// This fixes Issue #138: "type 'String' is not a subtype of type 'int?'"
+// which occurred because the admin API returned status as a string.
+func (s *Server) handleClientPeersList(w http.ResponseWriter, r *http.Request) {
+	allPeers, err := s.db.ListPeers(false)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"total": 0,
+			"data":  []any{},
+		})
+		return
+	}
+
+	result := make([]map[string]any, 0, len(allPeers))
+	for _, p := range allPeers {
+		if p.SoftDeleted || p.Banned {
+			continue
+		}
+
+		// Convert status to int: 1=active (RustDesk convention)
+		statusInt := 1
+		if p.Disabled {
+			statusInt = 0
+		}
+
+		// Build info map matching RustDesk PeerPayload.info format
+		// Issue #138 (2.4): fallback device_name to peer ID if hostname empty
+		deviceName := p.Hostname
+		if deviceName == "" {
+			deviceName = p.ID
+		}
+		info := map[string]any{
+			"device_name": deviceName,
+			"os":          p.OS,
+			"username":    p.User,
+			"version":     p.Version,
+		}
+
+		// Build tags array
+		var tags []string
+		if p.Tags != "" {
+			for _, t := range strings.Split(p.Tags, ",") {
+				t = strings.TrimSpace(t)
+				if t != "" {
+					tags = append(tags, t)
+				}
+			}
+		}
+		if tags == nil {
+			tags = []string{}
+		}
+
+		peer := map[string]any{
+			"id":                p.ID,
+			"info":              info,
+			"status":            statusInt,
+			"user":              p.User,
+			"user_name":         p.User,
+			"note":              p.Note,
+			"device_group_name": "",
+			"tags":              tags,
+			"online":            s.peers.IsOnline(p.ID, config.RegTimeout),
+		}
+
+		// Set device_group_name from first tag (if any) for folder display
+		if len(tags) > 0 {
+			peer["device_group_name"] = tags[0]
+		}
+
+		result = append(result, peer)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": len(result),
+		"data":  result,
+	})
 }
 
 func (s *Server) handleGetPeer(w http.ResponseWriter, r *http.Request) {
@@ -556,14 +805,23 @@ func (s *Server) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 
 	type singlePeerResponse struct {
 		*db.Peer
+		Status        int         `json:"status"`      // 1=active, 0=disabled (overrides db.Peer.Status string)
+		StatusText    string      `json:"status_text"` // Original string status for admin panel
 		LiveOnline    bool        `json:"live_online"`
 		LiveStatus    peer.Status `json:"live_status"`
 		Platform      string      `json:"platform"`
 		CDAPConnected bool        `json:"cdap_connected"`
 	}
 
+	statusInt := 1
+	if p.Disabled {
+		statusInt = 0
+	}
+
 	writeJSON(w, http.StatusOK, singlePeerResponse{
 		Peer:          p,
+		Status:        statusInt,
+		StatusText:    p.Status,
 		LiveOnline:    liveOnline,
 		LiveStatus:    liveStatus,
 		Platform:      p.OS,
@@ -667,6 +925,12 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, err, "DeletePeer")
 		return
 	}
+	if revoke && !hard {
+		if err := s.db.BanPeer(id, "revoked via panel"); err != nil {
+			writeInternalError(w, err, "RevokePeer")
+			return
+		}
+	}
 
 	// Remove from memory (closes TCP/WS connections — Phase 3.9).
 	s.peers.Remove(id)
@@ -692,6 +956,9 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 				s.db.HardDeletePeer(lid)
 			} else {
 				s.db.DeletePeer(lid)
+				if revoke {
+					s.db.BanPeer(lid, "revoked via cascade")
+				}
 			}
 			s.peers.Remove(lid)
 			if revoke && s.blocklist != nil {

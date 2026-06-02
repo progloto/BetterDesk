@@ -15,7 +15,8 @@ const fontService = require('../services/fontService');
 const serverBackend = require('../services/serverBackend');
 const backupService = require('../services/backupService');
 const updateService = require('../services/updateService');
-const { requireAuth, requirePermission } = require('../middleware/auth');
+const advancedConfig = require('../services/advancedConfigService');
+const { requireAuth, requirePermission, roleHasPermission } = require('../middleware/auth');
 const os = require('os');
 const multer = require('multer');
 
@@ -23,9 +24,31 @@ const multer = require('multer');
  * GET /settings - Settings page
  */
 router.get('/settings', requireAuth, (req, res) => {
+    const userRole = req.session.user && req.session.user.role;
     res.render('settings', {
         title: req.t('nav.settings'),
-        activePage: 'settings'
+        activePage: 'settings',
+        canServerConfig: roleHasPermission(userRole, 'server.config'),
+        canBrandingEdit: roleHasPermission(userRole, 'branding.edit')
+    });
+});
+
+/**
+ * GET /api/settings/restart-status - Lightweight liveness probe used by the
+ * browser updater after the console process exits and starts again. This stays
+ * intentionally public and minimal: it only confirms that the Node.js console
+ * is serving requests from the current boot, without touching DB/Go backend
+ * dependencies that may still be warming up.
+ */
+router.get('/api/settings/restart-status', (req, res) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.json({
+        success: true,
+        data: {
+            status: 'ok',
+            cacheVersion: req.app?.locals?.cacheVersion || '',
+            uptime: Math.floor(process.uptime())
+        }
     });
 });
 
@@ -195,18 +218,75 @@ router.post('/api/settings/branding/upload-logo', requireAuth, requirePermission
         }
         const url = `/uploads/${req.file.filename}`;
 
-        // Remove previous uploaded logo if it was in the uploads dir
+        // Remove previous uploaded logo if it was in the uploads dir.
+        // Security: defense-in-depth path validation — resolve real paths and
+        // verify the candidate is (a) inside UPLOADS_DIR and (b) matches the
+        // managed filename pattern (logo-<hex>.<ext>) before unlinking.
         try {
             const branding = brandingService.getBranding();
             if (branding.logoUrl && branding.logoUrl.startsWith('/uploads/')) {
-                const prev = path.join(UPLOADS_DIR, path.basename(branding.logoUrl));
-                if (fs.existsSync(prev) && prev !== path.join(UPLOADS_DIR, req.file.filename)) {
-                    fs.unlinkSync(prev);
+                const baseName = path.basename(branding.logoUrl);
+                // Managed logos use crypto.randomBytes(8).toString('hex') => 16 hex chars
+                const managedPattern = /^logo-[0-9a-f]{16}\.(png|jpg|jpeg|gif|webp|svg)$/i;
+                if (managedPattern.test(baseName)) {
+                    const prev = path.resolve(UPLOADS_DIR, baseName);
+                    const uploadsRoot = path.resolve(UPLOADS_DIR);
+                    const newPath = path.resolve(UPLOADS_DIR, req.file.filename);
+                    if (prev.startsWith(uploadsRoot + path.sep) && prev !== newPath && fs.existsSync(prev)) {
+                        // Final guard: stat must be a regular file (not symlink to elsewhere)
+                        const st = fs.lstatSync(prev);
+                        if (st.isFile() && !st.isSymbolicLink()) {
+                            fs.unlinkSync(prev);
+                        }
+                    }
                 }
             }
         } catch (_) { /* ignore cleanup errors */ }
 
         await db.logAction(req.session?.userId, 'branding_logo_upload', `Uploaded logo: ${req.file.filename}`, req.ip);
+        res.json({ success: true, url });
+    });
+});
+
+// ── Background image upload (disk storage) ───────────────────────────────────
+const bgUpload = multer({
+    storage: multer.diskStorage({
+        destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+        filename: (_req, file, cb) => {
+            const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+            const hash = crypto.randomBytes(8).toString('hex');
+            cb(null, `bg-${hash}${ext}`);
+        }
+    }),
+    limits: { fileSize: 8 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+        const allowed = /^image\/(png|jpeg|gif|webp|svg\+xml)$/;
+        if (allowed.test(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type'));
+        }
+    }
+});
+
+/**
+ * POST /api/settings/branding/upload-background - Upload a background image.
+ * Used by the console / login / agent-portal wallpaper pickers. Returns the
+ * served URL; the caller decides which branding field to assign it to. Old
+ * background files are not auto-removed because a single image may be shared
+ * across console/login/agent backgrounds.
+ */
+router.post('/api/settings/branding/upload-background', requireAuth, requirePermission('branding.edit'), (req, res) => {
+    bgUpload.single('background')(req, res, async (err) => {
+        if (err) {
+            const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File too large (max 8 MB)' : (err.message || 'Upload failed');
+            return res.status(400).json({ success: false, error: msg });
+        }
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No file provided' });
+        }
+        const url = `/uploads/${req.file.filename}`;
+        await db.logAction(req.session?.userId, 'branding_bg_upload', `Uploaded background: ${req.file.filename}`, req.ip);
         res.json({ success: true, url });
     });
 });
@@ -430,18 +510,19 @@ router.get('/branding/favicon.svg', (req, res) => {
 
 // ==================== Backup & Restore API ====================
 
-// multer configured for in-memory buffer (max 10 MB)
+// multer configured for in-memory buffer. Full disaster-recovery archives may
+// embed the raw SQLite databases and branding uploads, so allow up to 200 MB.
 const backupUpload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 }
+    limits: { fileSize: 200 * 1024 * 1024 }
 });
 
 /**
  * GET /api/settings/backup/stats - Preview backup size/contents
  */
-router.get('/api/settings/backup/stats', requireAuth, requirePermission('server.config'), (req, res) => {
+router.get('/api/settings/backup/stats', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
-        const stats = backupService.getBackupStats();
+        const stats = await backupService.getFullBackupStats();
         res.json({ success: true, data: stats });
     } catch (err) {
         console.error('Backup stats error:', err);
@@ -450,19 +531,26 @@ router.get('/api/settings/backup/stats', requireAuth, requirePermission('server.
 });
 
 /**
- * GET /api/settings/backup - Download full backup as JSON file
+ * GET /api/settings/backup - Download a full disaster-recovery backup (.tar.gz).
+ * Pass ?format=json for the legacy JSON configuration snapshot.
  */
 router.get('/api/settings/backup', requireAuth, requirePermission('server.config'), async (req, res) => {
     try {
-        const backup = await backupService.createBackup();
-        const json = JSON.stringify(backup, null, 2);
-        const filename = `betterdesk-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        if (req.query.format === 'json') {
+            const backup = await backupService.createBackup();
+            const json = JSON.stringify(backup, null, 2);
+            const filename = `betterdesk-config-${new Date().toISOString().slice(0, 10)}.json`;
+            await db.logAction(req.session?.userId, 'backup_created', `Config snapshot downloaded (${(json.length / 1024).toFixed(1)} KB)`, req.ip);
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+            return res.send(json);
+        }
 
-        await db.logAction(req.session?.userId, 'backup_created', `Backup downloaded (${(json.length / 1024).toFixed(1)} KB)`, req.ip);
-
-        res.setHeader('Content-Type', 'application/json');
+        const { buffer, filename } = await backupService.createFullBackup();
+        await db.logAction(req.session?.userId, 'backup_created', `Full backup downloaded (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`, req.ip);
+        res.setHeader('Content-Type', 'application/gzip');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-        res.send(json);
+        res.send(buffer);
     } catch (err) {
         console.error('Backup download error:', err);
         res.status(500).json({ success: false, error: req.t('errors.server_error') });
@@ -470,9 +558,10 @@ router.get('/api/settings/backup', requireAuth, requirePermission('server.config
 });
 
 /**
- * POST /api/settings/restore - Upload and restore from backup JSON
- * Expects multipart/form-data with field "backup" (JSON file)
- * Optional JSON body fields: restoreSettings, restoreBranding, restoreUsers, etc.
+ * POST /api/settings/restore - Upload and restore from a backup.
+ * Accepts either a full .tar.gz disaster-recovery archive (auto-detected via
+ * the gzip magic bytes) or a legacy JSON configuration snapshot.
+ * Expects multipart/form-data with field "backup".
  */
 router.post('/api/settings/restore', requireAuth, requirePermission('server.config'), backupUpload.single('backup'), async (req, res) => {
     try {
@@ -480,21 +569,57 @@ router.post('/api/settings/restore', requireAuth, requirePermission('server.conf
             return res.status(400).json({ success: false, error: req.t('backup.no_file') });
         }
 
-        // Parse JSON from uploaded file buffer
+        const buf = req.file.buffer;
+        const isGzip = buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+
+        if (isGzip) {
+            // --- Full disaster-recovery archive ---
+            const opts = {
+                restoreDatabase: req.body.restoreDatabase !== 'false',
+                restoreUploads: req.body.restoreUploads !== 'false',
+                restoreSecrets: req.body.restoreSecrets === 'true',  // Off by default — overwrites keys
+                restoreEnv: req.body.restoreEnv === 'true',          // Off by default — needs restart
+                restoreGoDb: req.body.restoreGoDb === 'true'         // Off by default — needs restart
+            };
+
+            let result;
+            try {
+                result = await backupService.restoreFullBackup(buf, opts);
+            } catch (err) {
+                return res.status(400).json({ success: false, error: err.message });
+            }
+
+            await db.logAction(
+                req.session?.userId, 'backup_restored',
+                `Full restore | Restored: ${result.restored.join(', ')} | Skipped: ${result.skipped.join(', ')}`,
+                req.ip
+            );
+
+            return res.json({
+                success: true,
+                data: {
+                    type: 'full',
+                    restored: result.restored,
+                    skipped: result.skipped,
+                    warnings: result.warnings,
+                    requiresRestart: result.requiresRestart
+                }
+            });
+        }
+
+        // --- Legacy JSON configuration snapshot ---
         let data;
         try {
-            data = JSON.parse(req.file.buffer.toString('utf-8'));
+            data = JSON.parse(buf.toString('utf-8'));
         } catch {
             return res.status(400).json({ success: false, error: req.t('backup.invalid_json') });
         }
 
-        // Validate
         const validation = backupService.validateBackup(data);
         if (!validation.valid) {
             return res.status(400).json({ success: false, error: validation.errors.join('; ') });
         }
 
-        // Parse restore options from query params or body
         const opts = {
             restoreSettings: req.body.restoreSettings !== 'false',
             restoreBranding: req.body.restoreBranding !== 'false',
@@ -504,17 +629,18 @@ router.post('/api/settings/restore', requireAuth, requirePermission('server.conf
             restoreAddressBooks: req.body.restoreAddressBooks !== 'false'
         };
 
-        const result = backupService.restoreBackup(data, opts);
+        const result = await backupService.restoreBackup(data, opts);
 
         await db.logAction(
             req.session?.userId, 'backup_restored',
-            `Restored: ${result.restored.join(', ')} | Skipped: ${result.skipped.join(', ')}`,
+            `Config restore | Restored: ${result.restored.join(', ')} | Skipped: ${result.skipped.join(', ')}`,
             req.ip
         );
 
         res.json({
             success: true,
             data: {
+                type: 'config',
                 restored: result.restored,
                 skipped: result.skipped,
                 warnings: result.warnings,
@@ -540,6 +666,32 @@ router.get('/api/settings/updates/server-info', requireAuth, requirePermission('
         res.json({ success: true, data: { ...info, prebuilt } });
     } catch (err) {
         console.error('Server info error:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+/**
+ * POST /api/settings/updates/install-go - Download & install the Go toolchain
+ * into data/go-toolchain/ so the console can compile the Go server even when
+ * Go is not present on the host. Idempotent.
+ */
+router.post('/api/settings/updates/install-go', requireAuth, requirePermission('server.config'), async (req, res) => {
+    req.setTimeout(600000);
+    res.setTimeout(600000);
+    try {
+        const result = await updateService.installGoToolchain();
+        await db.logAction(
+            req.session?.userId,
+            'system_install_go',
+            result.success ? `Installed Go toolchain (${result.version})` : `Go toolchain install failed: ${result.error}`,
+            req.ip
+        );
+        if (!result.success) {
+            return res.status(500).json({ success: false, error: result.error || 'Toolchain install failed' });
+        }
+        res.json({ success: true, data: { version: result.version, binPath: result.binPath } });
+    } catch (err) {
+        console.error('Go toolchain install error:', err);
         res.status(500).json({ success: false, error: err.message });
     }
 });
@@ -576,7 +728,10 @@ router.get('/api/settings/updates/changes', requireAuth, requirePermission('serv
 
 /**
  * POST /api/settings/updates/install - Apply the update
- * Body: { remoteSHA, createBackup: true/false, components: ['console','scripts'] }
+ * Body: { remoteSHA, createBackup: true/false }
+ * The update scope is detected server-side from the changed files. Supported
+ * changed components are always applied together so operators cannot
+ * accidentally skip the Go server when its source changed.
  */
 router.post('/api/settings/updates/install', requireAuth, requirePermission('server.config'), async (req, res) => {
     // Extend timeout for server compilation (up to 10 minutes)
@@ -584,7 +739,7 @@ router.post('/api/settings/updates/install', requireAuth, requirePermission('ser
     res.setTimeout(600000);
 
     try {
-        const { remoteSHA, createBackup, components, serverStrategy } = req.body;
+        const { remoteSHA, createBackup } = req.body;
         if (!remoteSHA || !/^[0-9a-f]{7,40}$/i.test(remoteSHA)) {
             return res.status(400).json({ success: false, error: 'Valid remoteSHA is required' });
         }
@@ -598,8 +753,7 @@ router.post('/api/settings/updates/install', requireAuth, requirePermission('ser
         // Apply update
         const result = await updateService.applyUpdate(remoteSHA, changedData, {
             createBackup: createBackup !== false,
-            components: components || ['console', 'scripts'],
-            serverStrategy: serverStrategy || 'auto'
+            serverStrategy: 'auto'
         });
 
         await db.logAction(
@@ -609,8 +763,8 @@ router.post('/api/settings/updates/install', requireAuth, requirePermission('ser
             req.ip
         );
 
-        // Restart Go server if changes detected and component selected
-        if (result.needsServerRestart && (components || []).includes('server')) {
+        // Restart Go server when its binary was updated.
+        if (result.needsServerRestart) {
             const svc = updateService.restartService(
                 process.platform === 'win32' ? 'BetterDeskServer' : 'betterdesk-server'
             );
@@ -630,6 +784,50 @@ router.post('/api/settings/updates/install', requireAuth, requirePermission('ser
     } catch (err) {
         console.error('Update install error:', err);
         res.status(500).json({ success: false, error: 'Update failed: ' + err.message });
+    }
+});
+
+/**
+ * GET /api/settings/updates/server-binary/status - Report whether the running
+ * Go server binary is out of date (server source updated but binary not
+ * rebuilt). Lets the panel surface a security warning instead of silently
+ * reporting "up to date".
+ */
+router.get('/api/settings/updates/server-binary/status', requireAuth, requirePermission('server.config'), (req, res) => {
+    try {
+        const status = updateService.getServerBinaryStatus();
+        res.json({ success: true, data: status });
+    } catch (err) {
+        console.error('Server binary status error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/settings/updates/server-binary/rebuild - Explicitly rebuild the Go
+ * server binary from local source with the current dependency versions
+ * (go.mod/go.sum) and deploy it. Bootstraps a vendored Go toolchain when one
+ * is not installed.
+ */
+router.post('/api/settings/updates/server-binary/rebuild', requireAuth, requirePermission('server.config'), async (req, res) => {
+    // Compilation may take several minutes.
+    req.setTimeout(600000);
+    res.setTimeout(600000);
+    try {
+        const result = await updateService.rebuildServerBinary({ restart: true });
+        await db.logAction(
+            req.session?.userId,
+            'system_update',
+            `Rebuilt server binary (${result.success ? 'success' : 'failed: ' + (result.error || 'unknown')})`,
+            req.ip
+        );
+        if (!result.success) {
+            return res.status(500).json({ success: false, error: result.error || 'Rebuild failed', data: result });
+        }
+        res.json({ success: true, data: result });
+    } catch (err) {
+        console.error('Server binary rebuild error:', err);
+        res.status(500).json({ success: false, error: 'Rebuild failed: ' + err.message });
     }
 });
 
@@ -676,6 +874,328 @@ router.post('/api/settings/updates/restore', requireAuth, requirePermission('ser
     } catch (err) {
         console.error('Restore error:', err);
         res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+/**
+ * DELETE /api/settings/updates/backups/:name - Delete a single pre-update backup
+ */
+router.delete('/api/settings/updates/backups/:name', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const name = req.params.name;
+        const result = updateService.deleteBackup(name);
+        await db.logAction(req.session?.userId, 'backup_deleted', `Deleted update backup: ${name}`, req.ip);
+        res.json({ success: true, data: result });
+    } catch (err) {
+        console.error('Delete backup error:', err);
+        // 400 for validation errors, 500 for unexpected ones
+        const status = /invalid|not found|outside/i.test(err.message) ? 400 : 500;
+        res.status(status).json({ success: false, error: err.message });
+    }
+});
+
+/**
+ * POST /api/settings/updates/backups/prune - Apply retention now
+ * Body: { keep: number } — keep N newest, delete the rest
+ */
+router.post('/api/settings/updates/backups/prune', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const keep = parseInt(req.body?.keep, 10);
+        if (!Number.isFinite(keep) || keep <= 0) {
+            return res.status(400).json({ success: false, error: 'keep must be a positive integer' });
+        }
+        const result = updateService.pruneBackups(keep);
+        if (result.deleted.length) {
+            await db.logAction(
+                req.session?.userId, 'backup_pruned',
+                `Manual prune: kept ${keep}, deleted ${result.deleted.length} backup(s)`,
+                req.ip
+            );
+        }
+        res.json({ success: true, data: result });
+    } catch (err) {
+        console.error('Prune backups error:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+/**
+ * GET /api/settings/backup/retention - Read current retention count
+ * Resolution: DB setting → env var BACKUP_RETENTION_COUNT → 0 (unlimited)
+ */
+router.get('/api/settings/backup/retention', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const dbVal = await db.getSetting('backup_retention_count');
+        let count = 0;
+        let source = 'unset';
+        if (dbVal !== null && dbVal !== undefined && dbVal !== '') {
+            const parsed = parseInt(dbVal, 10);
+            if (Number.isFinite(parsed)) { count = parsed; source = 'database'; }
+        } else if (process.env.BACKUP_RETENTION_COUNT) {
+            const parsed = parseInt(process.env.BACKUP_RETENTION_COUNT, 10);
+            if (Number.isFinite(parsed)) { count = parsed; source = 'environment'; }
+        }
+        res.json({ success: true, data: { count, source } });
+    } catch (err) {
+        console.error('Get retention error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * PUT /api/settings/backup/retention - Update retention count
+ * Body: { count: number } — 0 means "keep all"
+ */
+router.put('/api/settings/backup/retention', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const count = parseInt(req.body?.count, 10);
+        if (!Number.isFinite(count) || count < 0 || count > 1000) {
+            return res.status(400).json({ success: false, error: 'count must be an integer between 0 and 1000' });
+        }
+        await db.setSetting('backup_retention_count', String(count));
+        await db.logAction(
+            req.session?.userId, 'backup_retention_changed',
+            `Backup retention set to ${count === 0 ? 'unlimited' : count}`,
+            req.ip
+        );
+        res.json({ success: true, data: { count } });
+    } catch (err) {
+        console.error('Set retention error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+// ==================== LDAP Configuration API (proxy to Go server) ===========
+
+const betterdeskApi = require('../services/betterdeskApi');
+
+/**
+ * GET /api/settings/ldap - Get LDAP configuration from Go server
+ */
+router.get('/api/settings/ldap', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await betterdeskApi.getLDAPConfig();
+        if (!result.success) {
+            return res.status(500).json({ success: false, error: result.error || 'Failed to load LDAP config' });
+        }
+        res.json(result.data);
+    } catch (err) {
+        console.error('Get LDAP config error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * PUT /api/settings/ldap - Save LDAP configuration to Go server
+ */
+router.put('/api/settings/ldap', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await betterdeskApi.saveLDAPConfig(req.body);
+        if (!result.success) {
+            return res.status(400).json({ success: false, error: result.error || 'Failed to save LDAP config' });
+        }
+
+        await db.logAction(req.session?.userId, 'ldap_config_updated', 'Updated LDAP configuration', req.ip);
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Save LDAP config error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/settings/ldap/test - Test LDAP connection via Go server
+ */
+router.post('/api/settings/ldap/test', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await betterdeskApi.testLDAPConnection(req.body);
+        if (!result.success) {
+            return res.json({ success: false, error: result.error || 'Connection test failed' });
+        }
+        res.json(result.data);
+    } catch (err) {
+        console.error('Test LDAP connection error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+// ==================== OIDC Configuration API (proxy to Go server) ===========
+
+/**
+ * GET /api/settings/oidc - Get OIDC configuration from Go server
+ */
+router.get('/api/settings/oidc', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await betterdeskApi.getOIDCConfig();
+        if (!result.success) {
+            return res.status(500).json({ success: false, error: result.error || 'Failed to load OIDC config' });
+        }
+        res.json(result.data);
+    } catch (err) {
+        console.error('Get OIDC config error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * PUT /api/settings/oidc - Save OIDC configuration to Go server
+ */
+router.put('/api/settings/oidc', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await betterdeskApi.saveOIDCConfig(req.body);
+        if (!result.success) {
+            return res.status(400).json({ success: false, error: result.error || 'Failed to save OIDC config' });
+        }
+
+        await db.logAction(req.session?.userId, 'oidc_config_updated', 'Updated OIDC configuration', req.ip);
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Save OIDC config error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/settings/oidc/test - Test OIDC discovery via Go server
+ */
+router.post('/api/settings/oidc/test', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const result = await betterdeskApi.testOIDCDiscovery(req.body);
+        if (!result.success) {
+            return res.json({ success: false, error: result.error || 'Discovery test failed' });
+        }
+        res.json(result.data);
+    } catch (err) {
+        console.error('Test OIDC discovery error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+// ==================== Advanced config files ==================================
+
+function advancedConfigError(req, res, err) {
+    const map = {
+        unknown_file: 'settings.advanced_error_unknown',
+        not_found: 'settings.advanced_error_not_found',
+        not_a_file: 'settings.advanced_error_not_file',
+        file_too_large: 'settings.advanced_error_too_large',
+        binary_file: 'settings.advanced_error_binary',
+        invalid_content: 'settings.advanced_error_invalid',
+        not_writable: 'settings.advanced_error_not_writable',
+        no_restart: 'settings.advanced_error_no_restart'
+    };
+    const key = map[err.message];
+    const status = err.message === 'unknown_file' ? 404
+        : (err.message === 'not_found' ? 404 : 400);
+    res.status(status).json({
+        success: false,
+        error: key ? req.t(key) : (err.message || req.t('errors.server_error'))
+    });
+}
+
+/**
+ * GET /api/settings/advanced/files - List editable config files
+ */
+router.get('/api/settings/advanced/files', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const files = await advancedConfig.listFiles();
+        res.json({ success: true, data: files });
+    } catch (err) {
+        console.error('List advanced config files error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * GET /api/settings/advanced/files/:id - Read a config file
+ */
+router.get('/api/settings/advanced/files/:id', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const data = await advancedConfig.readFile(req.params.id);
+        res.json({ success: true, data });
+    } catch (err) {
+        if (['unknown_file', 'not_found', 'not_a_file', 'file_too_large', 'binary_file'].includes(err.message)) {
+            return advancedConfigError(req, res, err);
+        }
+        console.error('Read advanced config file error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * PUT /api/settings/advanced/files/:id - Save a config file (backup created when overwriting)
+ */
+router.put('/api/settings/advanced/files/:id', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const { content } = req.body || {};
+        const result = await advancedConfig.writeFile(req.params.id, content);
+        await db.logAction(
+            req.session?.userId,
+            'advanced_config_saved',
+            `Saved advanced config: ${result.path}${result.backupPath ? ` (backup: ${result.backupPath})` : ''}`,
+            req.ip
+        );
+        res.json({
+            success: true,
+            data: result,
+            message: req.t('settings.advanced_saved')
+        });
+    } catch (err) {
+        if (['unknown_file', 'not_found', 'not_a_file', 'file_too_large', 'invalid_content', 'not_writable'].includes(err.message)) {
+            return advancedConfigError(req, res, err);
+        }
+        console.error('Write advanced config file error:', err);
+        res.status(500).json({ success: false, error: err.message || req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/settings/advanced/restart - Restart services for the given config file
+ * Body: { fileId }
+ */
+router.post('/api/settings/advanced/restart', requireAuth, requirePermission('server.config'), async (req, res) => {
+    try {
+        const fileId = req.body && req.body.fileId;
+        if (!fileId || typeof fileId !== 'string') {
+            return res.status(400).json({ success: false, error: req.t('settings.advanced_error_unknown') });
+        }
+
+        const result = advancedConfig.restartForFile(fileId);
+        const failed = (result.restarts || []).filter((r) => !r.success);
+        const daemonFailed = result.daemonReload && result.daemonReload.success === false;
+
+        await db.logAction(
+            req.session?.userId,
+            'advanced_config_restart',
+            `Restart after advanced config (${fileId}): ${JSON.stringify(result.restarts)}`,
+            req.ip
+        );
+
+        if (daemonFailed || failed.length) {
+            const parts = [];
+            if (daemonFailed && result.daemonReload.error) parts.push(result.daemonReload.error);
+            failed.forEach((f) => { if (f.error) parts.push(`${f.service}: ${f.error}`); });
+            return res.status(500).json({
+                success: false,
+                error: req.t('settings.advanced_restart_failed'),
+                data: result,
+                details: parts.join('; ')
+            });
+        }
+
+        res.json({
+            success: true,
+            data: result,
+            message: req.t('settings.advanced_restart_started')
+        });
+    } catch (err) {
+        if (['unknown_file', 'no_restart'].includes(err.message)) {
+            return advancedConfigError(req, res, err);
+        }
+        console.error('Advanced config restart error:', err);
+        res.status(500).json({ success: false, error: err.message || req.t('errors.server_error') });
     }
 });
 

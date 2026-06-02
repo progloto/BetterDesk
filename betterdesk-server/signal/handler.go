@@ -1,6 +1,7 @@
 package signal
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -9,9 +10,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/unitronix/betterdesk-server/audit"
 	"github.com/unitronix/betterdesk-server/config"
 	"github.com/unitronix/betterdesk-server/crypto"
 	"github.com/unitronix/betterdesk-server/db"
+	"github.com/unitronix/betterdesk-server/events"
 	"github.com/unitronix/betterdesk-server/peer"
 	pb "github.com/unitronix/betterdesk-server/proto"
 )
@@ -45,6 +48,30 @@ func (s *Server) handleUDPMessage(msg *pb.RendezvousMessage, raddr *net.UDPAddr)
 	default:
 		log.Printf("[signal] UDP: unhandled message type from %s", raddr)
 	}
+}
+
+func signalLimiterKey(kind, clientHost, peerID string) string {
+	if peerID == "" {
+		return fmt.Sprintf("%s:%s", kind, clientHost)
+	}
+	return fmt.Sprintf("%s:%s:%s", kind, clientHost, peerID)
+}
+
+func (s *Server) allowRegistration(clientHost, peerID string, knownPeer bool) bool {
+	if s.limiter == nil {
+		return true
+	}
+	if !knownPeer {
+		return s.limiter.Allow(signalLimiterKey("reg-new", clientHost, ""))
+	}
+	return s.limiter.Allow(signalLimiterKey("reg", clientHost, peerID))
+}
+
+func (s *Server) allowSignalConnection(clientHost string) bool {
+	if s.limiter == nil {
+		return true
+	}
+	return s.limiter.Allow(signalLimiterKey("conn", clientHost, ""))
 }
 
 // handleMessage dispatches a TCP/WS message. Returns a response or nil.
@@ -110,6 +137,14 @@ func isValidPeerID(id string) bool {
 	return peerIDRegexp.MatchString(id)
 }
 
+func hostFromAddrString(addrStr string) string {
+	host, _, err := net.SplitHostPort(addrStr)
+	if err == nil && host != "" {
+		return host
+	}
+	return addrStr
+}
+
 // handleRegisterPeer processes a heartbeat registration from a client.
 // This is the most frequent message — called every ~12 seconds per device.
 func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
@@ -124,15 +159,10 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 		return
 	}
 
-	// IP rate limiting check
-	if s.limiter != nil && !s.limiter.Allow(raddr.IP.String()) {
-		log.Printf("[signal] Rate limited registration from %s", raddr.IP)
-		return
-	}
-
 	// Blocklist check (IP and ID)
+	clientHost := raddr.IP.String()
 	if s.blocklist != nil {
-		if s.blocklist.IsIPBlocked(raddr.IP.String()) {
+		if s.blocklist.IsIPBlocked(clientHost) {
 			log.Printf("[signal] Blocked IP %s tried to register", raddr.IP)
 			return
 		}
@@ -144,6 +174,22 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 
 	// Check if peer exists in memory map
 	existing := s.peers.Get(id)
+	var dbPeer *db.Peer
+	knownPeer := existing != nil
+	if !knownPeer {
+		if loadedPeer, err := s.db.GetPeer(id); err == nil && loadedPeer != nil {
+			dbPeer = loadedPeer
+			knownPeer = true
+		}
+	}
+	if !s.allowRegistration(clientHost, id, knownPeer) {
+		if knownPeer {
+			log.Printf("[signal] Rate limited registration from %s for peer %s", clientHost, id)
+		} else {
+			log.Printf("[signal] Rate limited new registration from %s for peer %s", clientHost, id)
+		}
+		return
+	}
 	if existing != nil {
 		// Reject banned peers — do not heartbeat or respond
 		if existing.Banned {
@@ -173,9 +219,31 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 		return
 	}
 
-	// NEW PEER — Dual Key System enrollment check
+	// SECURITY (GHSA-3v82-3gf8-fxx8): A soft-deleted peer is one that an
+	// administrator explicitly removed. It must NOT silently re-enroll —
+	// otherwise an attacker who knows the deleted ID can re-register it
+	// (bypassing managed/locked enrollment policy) and take over the
+	// identity, because the old PK is no longer loaded (Trust-on-First-Use
+	// bypass). The device must be explicitly restored via the API/UI before
+	// it can come back online.
+	if softDeleted, _ := s.db.IsPeerSoftDeleted(id); softDeleted {
+		log.Printf("[signal] Rejected registration of deleted peer: %s from %s", id, raddr.IP)
+		if s.auditLog != nil {
+			s.auditLog.Log(audit.ActionPeerRegistrationRejected, raddr.IP.String(), id, map[string]string{
+				"reason": "soft_deleted",
+			})
+		}
+		return
+	}
+
+	// NEW PEER — Dual Key System enrollment check.
 	if !s.checkEnrollmentPermission(id, raddr.IP.String()) {
 		log.Printf("[signal] Rejected new peer %s from %s (enrollment policy)", id, raddr.IP)
+		if s.auditLog != nil {
+			s.auditLog.Log(audit.ActionPeerRegistrationRejected, raddr.IP.String(), id, map[string]string{
+				"reason": "enrollment_policy",
+			})
+		}
 		return
 	}
 
@@ -183,12 +251,11 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 	// map after ban but trying to re-register)
 	if banned, _ := s.db.IsPeerBanned(id); banned {
 		log.Printf("[signal] Rejected banned peer registration: %s from %s", id, raddr.IP)
-		return
-	}
-
-	// Check if this peer was soft-deleted — do not allow re-registration
-	if deleted, _ := s.db.IsPeerSoftDeleted(id); deleted {
-		log.Printf("[signal] Rejected soft-deleted peer registration: %s from %s", id, raddr.IP)
+		if s.auditLog != nil {
+			s.auditLog.Log(audit.ActionPeerRegistrationRejected, raddr.IP.String(), id, map[string]string{
+				"reason": "banned",
+			})
+		}
 		return
 	}
 
@@ -216,7 +283,10 @@ func (s *Server) handleRegisterPeer(msg *pb.RegisterPeer, raddr *net.UDPAddr) {
 	}
 
 	// Load PK and UUID from database if available (survives server restarts)
-	if dbPeer, err := s.db.GetPeer(id); err == nil && dbPeer != nil {
+	if dbPeer == nil {
+		dbPeer, _ = s.db.GetPeer(id)
+	}
+	if dbPeer != nil {
 		if len(dbPeer.PK) > 0 {
 			entry.PK = dbPeer.PK
 			log.Printf("[signal] Loaded PK from database for %s (%d bytes)", id, len(entry.PK))
@@ -260,6 +330,7 @@ func (s *Server) processRegisterPk(msg *pb.RegisterPk, addrStr string) *pb.Rende
 	if id == "" {
 		return registerPkResponse(pb.RegisterPkResponse_SERVER_ERROR)
 	}
+	clientHost := hostFromAddrString(addrStr)
 
 	// Validate peer ID format (S7)
 	if !isValidPeerID(id) {
@@ -269,12 +340,8 @@ func (s *Server) processRegisterPk(msg *pb.RegisterPk, addrStr string) *pb.Rende
 
 	// IP blocklist check
 	if s.blocklist != nil {
-		host, _, _ := net.SplitHostPort(addrStr)
-		if host == "" {
-			host = addrStr
-		}
-		if s.blocklist.IsIPBlocked(host) {
-			log.Printf("[signal] Blocked IP %s tried RegisterPk", host)
+		if s.blocklist.IsIPBlocked(clientHost) {
+			log.Printf("[signal] Blocked IP %s tried RegisterPk", clientHost)
 			return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
 		}
 		if s.blocklist.IsIDBlocked(id) {
@@ -293,16 +360,42 @@ func (s *Server) processRegisterPk(msg *pb.RegisterPk, addrStr string) *pb.Rende
 		return registerPkResponse(pb.RegisterPkResponse_OK)
 	}
 
+	// RegisterPk can be the first persistence point for stock RustDesk clients.
+	// Enforce enrollment before creating a new peer row, otherwise managed/locked
+	// mode can be bypassed by sending PK registration without a prior heartbeat.
+	softDeleted, _ := s.db.IsPeerSoftDeleted(id)
+
+	// SECURITY (GHSA-3v82-3gf8-fxx8): Reject PK registration for soft-deleted
+	// peers. UpsertPeer would otherwise silently restore the row AND overwrite
+	// the previously-stored PK with the attacker's key, completing an identity
+	// takeover of a device the admin explicitly removed.
+	if softDeleted {
+		log.Printf("[signal] Rejected PK registration of deleted peer: %s from %s", id, clientHost)
+		if s.auditLog != nil {
+			s.auditLog.Log(audit.ActionPeerRegistrationRejected, clientHost, id, map[string]string{
+				"reason": "soft_deleted",
+				"stage":  "register_pk",
+			})
+		}
+		s.peers.Remove(id)
+		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+	}
+
+	existingPeer, err := s.db.GetPeer(id)
+	if err != nil {
+		log.Printf("[signal] Failed to check peer %s before RegisterPk enrollment: %v", id, err)
+		return registerPkResponse(pb.RegisterPkResponse_SERVER_ERROR)
+	}
+	if existingPeer == nil && !s.checkEnrollmentPermission(id, clientHost) {
+		log.Printf("[signal] Rejected new peer PK registration: %s from %s (enrollment policy)", id, clientHost)
+		s.peers.Remove(id)
+		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
+	}
+
 	// Check ban status
 	banned, _ := s.db.IsPeerBanned(id)
 	if banned {
 		log.Printf("[signal] Rejected banned peer: %s", id)
-		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
-	}
-
-	// Check soft-deleted status — do not allow re-registration
-	if deleted, _ := s.db.IsPeerSoftDeleted(id); deleted {
-		log.Printf("[signal] Rejected soft-deleted peer PK registration: %s", id)
 		return registerPkResponse(pb.RegisterPkResponse_NOT_SUPPORT)
 	}
 
@@ -438,29 +531,23 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 		return
 	}
 
-	relayServer := s.getRelayServer()
-
-	// Early LAN detection for ForceRelay path (needs relay before the check).
-	if target.UDPAddr != nil && isSameNetwork(raddr, target.UDPAddr) {
-		relayServer = s.getLANRelayServer()
+	relayServer, sameNetwork, hairpin := s.selectPeerRelayServer(s.getRelayServer(), raddr, target.UDPAddr)
+	if sameNetwork {
+		log.Printf("[signal] LAN detected: %s and %s on same network, relay=%s", raddr.IP, target.UDPAddr.IP, relayServer)
+	}
+	if hairpin {
+		log.Printf("[signal] PunchHole: shared public IP %s detected (issue #121 hairpin) → forcing relay for %s",
+			raddr.IP, targetID)
 	}
 
 	log.Printf("[signal] PunchHole: target %s found (addr=%s, status=%s, lastReg=%v ago), relay=%s",
 		targetID, target.UDPAddr, target.StatusTier, time.Since(target.LastReg), relayServer)
 
 	// If force relay or always use relay
-	if msg.ForceRelay || s.cfg.AlwaysUseRelay {
+	if msg.ForceRelay || s.cfg.AlwaysUseRelay || hairpin {
 		log.Printf("[signal] PunchHole: force relay for %s", targetID)
 		s.sendRelayResponse(target, raddr, msg, relayServer)
 		return
-	}
-
-	// LAN detection: if both peers share the same public IP or are on the same
-	// private /24 subnet, they are on the same local network (matching Rust hbbs).
-	sameNetwork := isSameNetwork(raddr, target.UDPAddr)
-	if sameNetwork {
-		relayServer = s.getLANRelayServer()
-		log.Printf("[signal] LAN detected: %s and %s on same network, relay=%s", raddr.IP, target.UDPAddr.IP, relayServer)
 	}
 
 	// Send PunchHole to the TARGET peer (tell it the initiator's address)
@@ -480,6 +567,10 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 
 	if target.UDPAddr != nil {
 		s.sendUDP(punchHole, target.UDPAddr)
+	} else {
+		// Target is connected via TCP/WS (e.g. logged in): forward PunchHole
+		// over its active connection so it can still open its NAT for P2P.
+		s.sendToPeer(targetID, punchHole)
 	}
 
 	// Send PunchHoleResponse to the INITIATOR with signed PK for E2E.
@@ -521,6 +612,24 @@ func (s *Server) handlePunchHoleRequest(msg *pb.PunchHoleRequest, raddr *net.UDP
 			PunchHoleResponse: phr,
 		},
 	}
+
+	// P2P-first (issue #157): when the peers are not on the same LAN, defer
+	// this response and wait for the target's PunchHoleSent, which carries the
+	// target's actual punched address and lets direct P2P succeed. If the
+	// target stays silent past the grace period, the scheduled fallback sends
+	// this relay-capable response so the client can fall back to relay instead
+	// of hanging. handlePunchHoleSent cancels the fallback once the genuine
+	// response is forwarded.
+	if s.cfg.P2PFirst && !sameNetwork {
+		raddrCopy := *raddr
+		s.schedulePunchFallback(normalizeAddrKey(raddr.String()), func() {
+			log.Printf("[signal] P2P-first: target %s did not complete hole punch in time, sending relay fallback to %s",
+				targetID, raddrCopy.String())
+			s.sendUDP(resp, &raddrCopy)
+		})
+		return
+	}
+
 	s.sendUDP(resp, raddr)
 }
 
@@ -578,11 +687,13 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 		}
 	}
 
-	relayServer := s.getRelayServer()
-
-	// Early LAN detection (needed before ForceRelay check).
-	if target.UDPAddr != nil && isSameNetwork(raddr, target.UDPAddr) {
-		relayServer = s.getLANRelayServer()
+	relayServer, sameNetwork, hairpin := s.selectPeerRelayServer(s.getRelayServer(), raddr, target.UDPAddr)
+	if sameNetwork {
+		log.Printf("[signal] LAN detected (TCP): %s and %s on same network, relay=%s", raddr.IP, target.UDPAddr.IP, relayServer)
+	}
+	if hairpin {
+		log.Printf("[signal] PunchHole (TCP): shared public IP %s detected (issue #121 hairpin) → forcing relay for %s",
+			raddr.IP, targetID)
 	}
 
 	log.Printf("[signal] PunchHole (TCP): target %s found (addr=%s, status=%s), relay=%s",
@@ -603,7 +714,7 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	// PunchHoleResponse), generate their own UUID, and connect to relay with it
 	// — while the target connects with the server's UUID. This broke relay
 	// pairing every time (Issue #66).
-	if msg.ForceRelay || s.cfg.AlwaysUseRelay {
+	if msg.ForceRelay || s.cfg.AlwaysUseRelay || hairpin {
 		log.Printf("[signal] PunchHole (TCP): force relay for %s (returning SYMMETRIC to let client drive relay UUID)", targetID)
 
 		var signedPk []byte
@@ -650,14 +761,6 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 	s.sendToPeer(targetID, punchHole)
 	log.Printf("[signal] PunchHole (TCP): forwarded to target %s (connType=%s)", targetID, target.ConnType)
 
-	// LAN detection: if both peers share the same public IP or are on the same
-	// private /24 subnet, they are on the same local network.
-	sameNetwork := isSameNetwork(raddr, target.UDPAddr)
-	if sameNetwork {
-		relayServer = s.getLANRelayServer()
-		log.Printf("[signal] LAN detected (TCP): %s and %s on same network, relay=%s", raddr.IP, target.UDPAddr.IP, relayServer)
-	}
-
 	// Sign the target's PK with server's Ed25519 key for E2E verification.
 	var signedPk []byte
 	if len(target.PK) > 0 {
@@ -689,11 +792,31 @@ func (s *Server) handlePunchHoleRequestTCP(msg *pb.PunchHoleRequest, raddr *net.
 		phr.Union = &pb.PunchHoleResponse_NatType{NatType: pb.NatType(target.NATType)}
 	}
 
-	return &pb.RendezvousMessage{
+	resp := &pb.RendezvousMessage{
 		Union: &pb.RendezvousMessage_PunchHoleResponse{
 			PunchHoleResponse: phr,
 		},
 	}
+
+	// P2P-first (issue #157): for non-LAN peers, defer this response and wait
+	// for the target's PunchHoleSent, which carries the target's actual punched
+	// address and lets direct P2P succeed. The TCP connection is already kept
+	// alive (keepAlive via logAndCheckKeepAlive) and registered in
+	// tcpPunchConns, so handlePunchHoleSent can forward the genuine response
+	// over it. If the target stays silent past the grace period, the scheduled
+	// fallback forwards this relay-capable response so the client can fall back
+	// to relay instead of hanging (preserving the Phase 7 timeout fix).
+	if s.cfg.P2PFirst && !sameNetwork {
+		initiatorKey := normalizeAddrKey(raddr.String())
+		s.schedulePunchFallback(initiatorKey, func() {
+			log.Printf("[signal] P2P-first (TCP): target %s did not complete hole punch in time, forwarding relay fallback to %s",
+				targetID, initiatorKey)
+			s.forwardToTCPInitiator(initiatorKey, resp)
+		})
+		return nil
+	}
+
+	return resp
 }
 
 // handlePunchHoleSent processes a PunchHoleSent message from the target peer.
@@ -761,12 +884,18 @@ func (s *Server) handlePunchHoleSent(phs *pb.PunchHoleSent, senderAddr *net.UDPA
 
 	// Build PunchHoleResponse for the initiator.
 	// socket_addr = target's (sender's) address, pk = SIGNED target's public key.
-	// LAN detection: set is_local when sender and initiator are on the same network.
+	// LAN detection: set is_local only for genuine LAN cases. Shared public IP
+	// peers keep the public relay to avoid NAT hairpin failures (#121).
 	relayServer := phs.RelayServer
-	sameNetwork := isSameNetwork(senderAddr, initiatorAddr)
+	if relayServer == "" {
+		relayServer = s.getRelayServer()
+	}
+	relayServer, sameNetwork, hairpin := s.selectPeerRelayServer(relayServer, senderAddr, initiatorAddr)
 	if sameNetwork {
-		relayServer = s.getLANRelayServer()
 		log.Printf("[signal] PunchHoleSent LAN detected: %s and %s on same network, relay=%s", senderAddr.IP, initiatorAddr.IP, relayServer)
+	}
+	if hairpin {
+		log.Printf("[signal] PunchHoleSent shared public IP %s detected (issue #121 hairpin) → keeping public relay=%s", senderAddr.IP, relayServer)
 	}
 
 	phr := &pb.PunchHoleResponse{
@@ -787,6 +916,13 @@ func (s *Server) handlePunchHoleSent(phs *pb.PunchHoleSent, senderAddr *net.UDPA
 	}
 
 	addrStr := normalizeAddrKey(initiatorAddr.String())
+
+	// P2P-first (issue #157): the target completed hole punching, so cancel any
+	// scheduled relay fallback for this initiator before delivering the genuine
+	// PunchHoleResponse (which carries the target's real punched address).
+	if s.cancelPunchFallback(addrStr) {
+		log.Printf("[signal] P2P-first: cancelled relay fallback for %s — direct P2P response incoming", addrStr)
+	}
 
 	// Try TCP delivery first (initiator may have an open TCP connection).
 	if s.forwardToTCPInitiator(addrStr, resp) {
@@ -863,10 +999,14 @@ func (s *Server) handleRequestRelay(msg *pb.RequestRelay, raddr *net.UDPAddr) {
 		return
 	}
 
-	// LAN detection: use server's LAN IP for relay when both peers are on same network.
-	if target.UDPAddr != nil && isSameNetwork(raddr, target.UDPAddr) {
-		relayServer = s.getLANRelayServer()
+	// LAN detection: use server's LAN IP only for genuine LAN cases. Shared
+	// public IP peers keep the public relay to avoid NAT hairpin failures (#121).
+	relayServer, sameNetwork, hairpin := s.selectPeerRelayServer(relayServer, raddr, target.UDPAddr)
+	if sameNetwork {
 		log.Printf("[signal] RequestRelay LAN detected: %s and %s on same network, relay=%s", raddr.IP, target.UDPAddr.IP, relayServer)
+	}
+	if hairpin {
+		log.Printf("[signal] RequestRelay shared public IP %s detected (issue #121 hairpin) → keeping public relay=%s", raddr.IP, relayServer)
 	}
 
 	// Forward relay request to target peer (supports UDP, TCP, and WebSocket targets).
@@ -965,11 +1105,15 @@ func (s *Server) handleRequestRelayTCP(msg *pb.RequestRelay, raddr *net.UDPAddr)
 		}
 	}
 
-	// LAN detection: use server's LAN IP for relay when both peers are on same network.
+	// LAN detection: use server's LAN IP only for genuine LAN cases. Shared
+	// public IP peers keep the public relay to avoid NAT hairpin failures (#121).
 	// Only applicable when target has a known UDP address for comparison.
-	if target.UDPAddr != nil && isSameNetwork(raddr, target.UDPAddr) {
-		relayServer = s.getLANRelayServer()
+	var sameNetwork, hairpin bool
+	relayServer, sameNetwork, hairpin = s.selectPeerRelayServer(relayServer, raddr, target.UDPAddr)
+	if sameNetwork {
 		log.Printf("[signal] RequestRelay (TCP) LAN detected: %s and %s on same network, relay=%s", raddr.IP, target.UDPAddr.IP, relayServer)
+	} else if hairpin {
+		log.Printf("[signal] RequestRelay (TCP) shared public IP %s detected (issue #121 hairpin) → keeping public relay=%s", raddr.IP, relayServer)
 	} else {
 		// Debug: log why LAN detection failed
 		if target.UDPAddr == nil {
@@ -1104,10 +1248,15 @@ func (s *Server) handleRelayResponseForward(msg *pb.RendezvousMessage, senderAdd
 	rr.SocketAddr = nil
 	rr.SocketAddrV6 = nil
 
-	// LAN detection: use LAN relay when both peers are on same network.
+	// LAN detection: use LAN relay only for genuine LAN cases. Shared public IP
+	// peers keep the public relay to avoid NAT hairpin failures (#121).
 	relayServer := s.getRelayServer()
-	if senderAddr != nil && isSameNetwork(senderAddr, initiatorAddr) {
-		relayServer = s.getLANRelayServer()
+	relayServer, sameNetwork, hairpin := s.selectPeerRelayServer(relayServer, senderAddr, initiatorAddr)
+	if sameNetwork {
+		log.Printf("[signal] RelayResponse LAN detected: %s and %s on same network, relay=%s", senderAddr.IP, initiatorAddr.IP, relayServer)
+	}
+	if hairpin && senderAddr != nil {
+		log.Printf("[signal] RelayResponse shared public IP %s detected (issue #121 hairpin) → keeping public relay=%s", senderAddr.IP, relayServer)
 	}
 	rr.RelayServer = relayServer
 
@@ -1329,11 +1478,22 @@ func (s *Server) getRelayServer() string {
 // getLANRelayServer returns the relay server address suitable for LAN peers.
 // Uses the server's detected LAN IP (from OS routing table) rather than public IP.
 // This ensures LAN peers can reach the relay without NAT hairpin support.
-func (s *Server) getLANRelayServer() string {
-	// For LAN peers, ALWAYS prefer the server's LAN IP — even when admin
-	// configured a public relay address.  NAT hairpin (LAN → public IP → LAN)
-	// is unreliable on many routers, causing relay pair timeouts (#102).
+func (s *Server) getLANRelayServer(defaultRelay string, peers ...*net.UDPAddr) string {
+	if defaultRelay == "" {
+		defaultRelay = s.getRelayServer()
+	}
+
+	// For LAN peers, prefer the server's LAN IP only when it is actually in the
+	// peers' private subnet. NAT hairpin (LAN → public IP → LAN) is unreliable
+	// on many routers (#102), but Docker bridge IPs are not reachable from LAN
+	// clients and must not be advertised as relay addresses (#142).
 	if ip, ok := s.lanIP.Load().(string); ok && ip != "" {
+		lanIP := net.ParseIP(ip)
+		if !isLANRelayReachableFromPeers(lanIP, peers...) {
+			log.Printf("[signal] LAN relay %s is outside peer subnet; using configured/default relay=%s", ip, defaultRelay)
+			return defaultRelay
+		}
+
 		// Determine relay port: prefer admin-configured port, fall back to default.
 		relayPort := s.cfg.RelayPort
 		relays := s.cfg.GetRelayServers()
@@ -1346,12 +1506,45 @@ func (s *Server) getLANRelayServer() string {
 		}
 		return fmt.Sprintf("%s:%d", ip, relayPort)
 	}
-	// LAN IP unknown — fall back to configured relay (public)
-	relays := s.cfg.GetRelayServers()
-	if len(relays) > 0 {
-		return relays[0]
+	// LAN IP unknown — fall back to configured/default relay.
+	return defaultRelay
+}
+
+func (s *Server) selectPeerRelayServer(defaultRelay string, a, b *net.UDPAddr) (relay string, sameLAN bool, samePublicIP bool) {
+	if defaultRelay == "" {
+		defaultRelay = s.getRelayServer()
 	}
-	return s.getRelayServer()
+	if a == nil || b == nil {
+		return defaultRelay, false, false
+	}
+
+	if s.cfg.SameNATRelay && isSamePublicIP(a, b) {
+		return s.getRelayServer(), false, true
+	}
+	if isSameNetwork(a, b) {
+		return s.getLANRelayServer(defaultRelay, a, b), true, false
+	}
+	return defaultRelay, false, false
+}
+
+func isLANRelayReachableFromPeers(lanIP net.IP, peers ...*net.UDPAddr) bool {
+	lan4 := lanIP.To4()
+	if lan4 == nil || !isPrivateIP(lan4) {
+		return false
+	}
+	for _, peerAddr := range peers {
+		if peerAddr == nil {
+			continue
+		}
+		peer4 := peerAddr.IP.To4()
+		if peer4 == nil || peer4.IsLoopback() || !isPrivateIP(peer4) {
+			continue
+		}
+		if lan4.Equal(peer4) || (lan4[0] == peer4[0] && lan4[1] == peer4[1] && lan4[2] == peer4[2]) {
+			return true
+		}
+	}
+	return false
 }
 
 // registerPkResponse is a helper to create a RegisterPkResponse message.
@@ -1427,6 +1620,31 @@ func isSameNetwork(a, b *net.UDPAddr) bool {
 	return false
 }
 
+// isSamePublicIP returns true when both peers connect from the exact same
+// non-private IP address.  This is the classic "behind the same NAT gateway"
+// scenario: many consumer/cellular routers refuse hairpin NAT, so direct LAN
+// exchange between such peers silently times out.  When this returns true the
+// signal handler should force the relay path (issue #121).
+func isSamePublicIP(a, b *net.UDPAddr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	aIP := a.IP
+	bIP := b.IP
+	if a4 := aIP.To4(); a4 != nil {
+		aIP = a4
+	}
+	if b4 := bIP.To4(); b4 != nil {
+		bIP = b4
+	}
+	if !aIP.Equal(bIP) {
+		return false
+	}
+	// Only treat genuinely public addresses as a hairpin scenario; same-LAN
+	// peers (private IPs) keep the existing direct path.
+	return !isPrivateIP(aIP) && !aIP.IsLoopback() && !aIP.IsUnspecified()
+}
+
 // isPrivateIP returns true if the IP is in a private/local range.
 // Handles both 4-byte and 16-byte IP representations.
 func isPrivateIP(ip net.IP) bool {
@@ -1494,8 +1712,11 @@ func (s *Server) checkEnrollmentPermission(peerID, clientIP string) bool {
 				return true
 			}
 		}
-		// In managed mode, reject unknown devices
-		log.Printf("[signal] Enrollment: rejected unknown peer %s (managed mode, no token)", peerID)
+		// In managed mode, unknown devices are placed into the pending
+		// enrollment queue so an operator can review and approve/reject them.
+		// The connection is still denied until approval.
+		s.recordPendingEnrollment(peerID, clientIP)
+		log.Printf("[signal] Enrollment: queued unknown peer %s for approval (managed mode)", peerID)
 		return false
 	}
 
@@ -1512,4 +1733,67 @@ func (s *Server) checkEnrollmentPermission(peerID, clientIP string) bool {
 	}
 
 	return true
+}
+
+// pendingEnrollmentInfo mirrors the JSON schema used by the API package
+// (pendingDeviceInfo) so that entries created here are readable by the
+// enrollment approve/list handlers.
+type pendingEnrollmentInfo struct {
+	DeviceID  string `json:"device_id"`
+	Hostname  string `json:"hostname"`
+	Platform  string `json:"platform"`
+	Version   string `json:"version"`
+	IP        string `json:"ip"`
+	CreatedAt string `json:"created_at"`
+}
+
+// recordPendingEnrollment stores an unknown peer in the pending enrollment
+// queue (server_config key "pending_device_<id>") so operators can review it.
+// It is idempotent: existing pending entries are preserved (to keep their
+// original timestamp) and already-rejected devices are never re-queued.
+func (s *Server) recordPendingEnrollment(peerID, clientIP string) {
+	if s.db == nil {
+		return
+	}
+
+	// Never re-queue a device that was explicitly rejected.
+	if v, err := s.db.GetConfig("rejected_device_" + peerID); err == nil && v != "" {
+		return
+	}
+
+	// Preserve an existing pending entry (keeps the original created_at).
+	key := "pending_device_" + peerID
+	if v, err := s.db.GetConfig(key); err == nil && v != "" {
+		return
+	}
+
+	info := pendingEnrollmentInfo{
+		DeviceID:  peerID,
+		IP:        clientIP,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		log.Printf("[signal] recordPendingEnrollment: marshal failed for %s: %v", peerID, err)
+		return
+	}
+	if err := s.db.SetConfig(key, string(data)); err != nil {
+		log.Printf("[signal] recordPendingEnrollment: store failed for %s: %v", peerID, err)
+		return
+	}
+
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.ActionEnrollmentPending, peerID, clientIP, map[string]string{
+			"reason": "queued for approval (managed mode)",
+		})
+	}
+	if s.eventBus != nil {
+		s.eventBus.Publish(events.Event{
+			Type: events.EventEnrollmentPending,
+			Data: map[string]string{
+				"device_id": peerID,
+				"ip":        clientIP,
+			},
+		})
+	}
 }

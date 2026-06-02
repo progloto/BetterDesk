@@ -78,6 +78,9 @@ const facade = {
     hasUsers:         () => adapter.hasUsers(),
     getAllUsers:       () => adapter.getAllUsers(),
     updateUserRole:   (id, role) => adapter.updateUserRole(id, role),
+    updateUserLanguage: (id, lang) => typeof adapter.updateUserLanguage === 'function'
+        ? adapter.updateUserLanguage(id, lang)
+        : Promise.resolve(),
     deleteUser:       (id) => adapter.deleteUser(id),
     countAdmins:      () => adapter.countAdmins(),
     resetAdminPassword: (hash) => adapter.resetAdminPassword(hash),
@@ -160,6 +163,9 @@ const facade = {
     getAllAddressBooks:   () => adapter.getAllAddressBooks(),
     restoreUsers:        (users) => adapter.restoreUsers(users),
     getBackupStats:      () => adapter.getBackupStats(),
+    dumpAllTables:       () => adapter.dumpAllTables(),
+    importAllTables:     (dump) => adapter.importAllTables(dump),
+    getDatabaseFilePath: () => adapter.getDatabaseFilePath(),
 
     // ---- Pending Registrations ----
     getPendingRegistrations:        (filters) => adapter.getPendingRegistrations(filters),
@@ -171,12 +177,26 @@ const facade = {
     deletePendingRegistration:      (id) => adapter.deletePendingRegistration(id),
     getPendingRegistrationCount:    () => adapter.getPendingRegistrationCount(),
 
+    // ---- Agent installer bundles (Generator) ----
+    listAgentBundles:           (opts) => adapter.listAgentBundles(opts),
+    getAgentBundle:             (bundleId) => adapter.getAgentBundle(bundleId),
+    createAgentBundle:          (data) => adapter.createAgentBundle(data),
+    updateAgentBundle:          (bundleId, data) => adapter.updateAgentBundle(bundleId, data),
+    setAgentBundleRevoked:      (bundleId, revoked) => adapter.setAgentBundleRevoked(bundleId, revoked),
+    deleteAgentBundle:          (bundleId) => adapter.deleteAgentBundle(bundleId),
+    incrementAgentBundleDownload: (bundleId) => adapter.incrementAgentBundleDownload(bundleId),
+    listAgentBundleBuildsForHash: (hash) => adapter.listAgentBundleBuildsForHash(hash),
+    getAgentBundleBuild:        (q) => adapter.getAgentBundleBuild(q),
+    upsertAgentBundleBuild:     (data) => adapter.upsertAgentBundleBuild(data),
+
     // ---- User Groups ----
     getAllUserGroups:    () => adapter.getAllUserGroups(),
     getUserGroupByGuid: (guid) => adapter.getUserGroupByGuid(guid),
     createUserGroup:    (data) => adapter.createUserGroup(data),
     updateUserGroup:    (guid, data) => adapter.updateUserGroup(guid, data),
     deleteUserGroup:    (guid) => adapter.deleteUserGroup(guid),
+    getUserGroupsForUser: (userId) => adapter.getUserGroupsForUser(userId),
+    setUserGroupMemberships: (userId, groupGuids) => adapter.setUserGroupMemberships(userId, groupGuids),
 
     // ---- Device Groups ----
     getAllDeviceGroups:    () => adapter.getAllDeviceGroups(),
@@ -188,6 +208,9 @@ const facade = {
     removeDeviceFromGroup: (groupGuid, peerId) => adapter.removeDeviceFromGroup(groupGuid, peerId),
     getDeviceGroupMembers: (groupGuid) => adapter.getDeviceGroupMembers(groupGuid),
     getDeviceGroupsForPeer: (peerId) => adapter.getDeviceGroupsForPeer(peerId),
+    setDeviceGroupUserAccess: (groupGuid, usernames) => adapter.setDeviceGroupUserAccess(groupGuid, usernames),
+    setDeviceGroupUserGroupAccess: (groupGuid, groupGuids) => adapter.setDeviceGroupUserGroupAccess(groupGuid, groupGuids),
+    getDeviceGroupAccessForUser: (userId) => adapter.getDeviceGroupAccessForUser(userId),
 
     // ---- Strategies / Policies ----
     getAllStrategies:  () => adapter.getAllStrategies(),

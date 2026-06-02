@@ -22,6 +22,7 @@
 package api
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -41,6 +42,34 @@ import (
 )
 
 var slugRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,62}[a-z0-9]$`)
+
+type orgIDInput string
+
+func (id *orgIDInput) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		*id = ""
+		return nil
+	}
+
+	if data[0] == '"' {
+		var value string
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		*id = orgIDInput(strings.TrimSpace(value))
+		return nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value json.Number
+	if err := decoder.Decode(&value); err != nil {
+		return fmt.Errorf("org_id must be a string or number")
+	}
+	*id = orgIDInput(value.String())
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 //  Organizations
@@ -1082,8 +1111,38 @@ func (s *Server) handleListUserOrganizations(w http.ResponseWriter, r *http.Requ
 		orgs = []*db.Organization{}
 	}
 
+	type userOrgView struct {
+		ID        string    `json:"id"`
+		OrgID     string    `json:"org_id"`
+		Name      string    `json:"name"`
+		OrgName   string    `json:"org_name"`
+		Slug      string    `json:"slug"`
+		LogoURL   string    `json:"logo_url,omitempty"`
+		Settings  string    `json:"settings,omitempty"`
+		Role      string    `json:"role,omitempty"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+
+	views := make([]userOrgView, 0, len(orgs))
+	for _, org := range orgs {
+		view := userOrgView{
+			ID:        org.ID,
+			OrgID:     org.ID,
+			Name:      org.Name,
+			OrgName:   org.Name,
+			Slug:      org.Slug,
+			LogoURL:   org.LogoURL,
+			Settings:  org.Settings,
+			CreatedAt: org.CreatedAt,
+		}
+		if membership, err := s.db.GetOrgUserByServerUserID(org.ID, userID); err == nil && membership != nil {
+			view.Role = membership.Role
+		}
+		views = append(views, view)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"organizations": orgs})
+	json.NewEncoder(w).Encode(map[string]interface{}{"organizations": views})
 }
 
 // POST /api/users/{id}/organizations
@@ -1102,15 +1161,16 @@ func (s *Server) handleAssignUserToOrg(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		OrgID string `json:"org_id"`
-		Role  string `json:"role"`
+		OrgID orgIDInput `json:"org_id"`
+		Role  string     `json:"role"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
 		return
 	}
 
-	if body.OrgID == "" {
+	orgID := string(body.OrgID)
+	if orgID == "" {
 		http.Error(w, `{"error":"org_id is required"}`, http.StatusBadRequest)
 		return
 	}
@@ -1123,7 +1183,7 @@ func (s *Server) handleAssignUserToOrg(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify org exists
-	org, _ := s.db.GetOrganization(body.OrgID)
+	org, _ := s.db.GetOrganization(orgID)
 	if org == nil {
 		http.Error(w, `{"error":"organization not found"}`, http.StatusNotFound)
 		return
@@ -1134,7 +1194,7 @@ func (s *Server) handleAssignUserToOrg(w http.ResponseWriter, r *http.Request) {
 	callerUsername := getUsernameFromCtx(r)
 
 	if !auth.IsSuperAdminRole(callerRole) && callerRole != auth.RoleGlobalAdmin {
-		callerOrgUser, _ := s.db.GetOrgUserByUsername(body.OrgID, callerUsername)
+		callerOrgUser, _ := s.db.GetOrgUserByUsername(orgID, callerUsername)
 		if callerOrgUser == nil {
 			http.Error(w, `{"error":"you are not a member of this organization"}`, http.StatusForbidden)
 			return
@@ -1145,7 +1205,7 @@ func (s *Server) handleAssignUserToOrg(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	orgUser, err := s.db.LinkUserToOrg(body.OrgID, userID, body.Role)
+	orgUser, err := s.db.LinkUserToOrg(orgID, userID, body.Role)
 	if err != nil {
 		log.Printf("[org] LinkUserToOrg (from users) error: %v", err)
 		if strings.Contains(err.Error(), "already linked") {
@@ -1164,7 +1224,7 @@ func (s *Server) handleAssignUserToOrg(w http.ResponseWriter, r *http.Request) {
 	if s.auditLog != nil {
 		s.auditLog.Log("user_org_assigned", s.remoteIP(r), callerUsername, map[string]string{
 			"user_id": userIDStr,
-			"org_id":  body.OrgID,
+			"org_id":  orgID,
 			"role":    body.Role,
 		})
 	}

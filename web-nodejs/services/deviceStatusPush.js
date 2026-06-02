@@ -26,7 +26,7 @@ const RECONNECT_MAX = 60000;
  * Initialize real-time device status push.
  * @param {import('http').Server} httpServer - The HTTP server to attach WS to
  * @param {Function} sessionMiddleware - Express session middleware for auth
- * @param {string} goApiUrl - Go server base URL (e.g. http://localhost:21114/api)
+ * @param {string} goApiUrl - Go server base URL (e.g. http://localhost:21121/api)
  * @param {string} apiKey - API key for Go server authentication
  */
 function initDeviceStatusPush(httpServer, sessionMiddleware, goApiUrl, apiKey) {
@@ -95,9 +95,13 @@ function initDeviceStatusPush(httpServer, sessionMiddleware, goApiUrl, apiKey) {
 
         log.info('Connecting to Go event bus...');
 
-        const goWs = new WebSocket(url, {
-            headers: { 'X-API-Key': apiKey },
-        });
+        // Only set TLS options when connecting via wss://
+        const wsOpts = { headers: { 'X-API-Key': apiKey } };
+        if (wsUrl.startsWith('wss://')) {
+            wsOpts.rejectUnauthorized = !require('../config/config').allowSelfSignedCerts;
+        }
+
+        const goWs = new WebSocket(url, wsOpts);
 
         goWs.on('open', () => {
             log.info('Connected to Go event bus');

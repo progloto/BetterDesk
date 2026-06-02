@@ -19,8 +19,11 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Python distutils 'lib/' build output (root-level only — must NOT match
+# Tauri/SolidJS client src/lib directories like
+# betterdesk-agent-client/src/lib or betterdesk-mgmt/src/lib).
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -33,7 +36,7 @@ instance/
 
 # --- Rust ---
 target/
-Cargo.lock
+# Note: Cargo.lock is committed for application crates (reproducible builds + Dependabot)
 **/*.rs.bk
 *.pdb
 
@@ -59,7 +62,20 @@ logs/
 
 # --- Database files ---
 *.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 *.db
+*.db-shm
+*.db-wal
+
+# --- Runtime state (must NEVER be committed; corrupts user installs on update) ---
+web-nodejs/data/
+!web-nodejs/data/.gitkeep
+.session_secret
+.update_sha
+.api_key
+.admin_credentials
+.force_password_update
 
 # --- Temporary files & caches ---
 *.tmp
@@ -147,13 +163,13 @@ web-nodejs/_fix_*.sh
 betterdesk-mgmt/node_modules/
 betterdesk-mgmt/dist/
 betterdesk-mgmt/src-tauri/target/
-betterdesk-mgmt/src-tauri/Cargo.lock
+# betterdesk-mgmt/src-tauri/Cargo.lock  # committed for reproducible builds
 
 # --- BetterDesk Agent Client (Tauri + SolidJS, build artifacts) ---
 betterdesk-agent-client/node_modules/
 betterdesk-agent-client/dist/
 betterdesk-agent-client/src-tauri/target/
-betterdesk-agent-client/src-tauri/Cargo.lock
+# betterdesk-agent-client/src-tauri/Cargo.lock  # committed for reproducible builds
 
 # --- BetterDesk Agent binaries & config (compiled locally) ---
 betterdesk-agent/betterdesk-agent
@@ -212,3 +228,5 @@ web-nodejs/wallpapers/
 tasks/todo.md
 t
 k-server
+
+docs/security/PROJECT_SECURITY_ANALYSIS_2026-05-19.md

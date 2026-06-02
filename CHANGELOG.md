@@ -5,6 +5,33 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased] — Security hardening (2026-04-26)
+
+### Added
+- **Czech console translation completed** — `web-nodejs/lang/cs.json` now contains Czech UI text instead of the previous English fallback content and has the correct `meta.lang` value. Community contribution by [Karel Lowprize K](https://github.com/lowprize) ([PR #133](https://github.com/UNITRONIX/BetterDesk/pull/133)).
+- **RustDesk PRO group endpoint stubs** — `betterdesk-server/api/server.go` now exposes `GET /api/group`, `GET|POST /api/group/get`, and `GET /api/peers/list` returning the `{total, data, msg}` envelope expected by RustDesk Flutter clients. Without these endpoints the Flutter UI aborted device-list loading and never fell back to address-book mode. Idea credit: [progloto](https://github.com/progloto) ([PR #81](https://github.com/UNITRONIX/BetterDesk/pull/81)).
+- **Catch-all 404 logging** — Both `betterdesk-server/api/server.go` (Go API) and `web-nodejs/server.js` (RustDesk-compatible API + main panel) now log unmatched routes with method, path, client IP, and User-Agent. Makes missing client-compatibility endpoints easy to spot during deployments. Diagnostics suggestion credit: [progloto](https://github.com/progloto) ([PR #81](https://github.com/UNITRONIX/BetterDesk/pull/81)).
+- **Defensive list parsing in panel** — `web-nodejs/services/betterdeskApi.js` and `web-nodejs/public/js/devices.js` already accepted both `[…]` and `{ peers: […] }` shapes; this stays unchanged so admin UI works regardless of which endpoint envelope a future RustDesk version returns.
+
+### Changed
+- **Docker quick-start admin credential lookup** — README and `docker-compose.quick.yml` now point users to the secure `.admin_credentials` file shared with the console container instead of grepping logs that do not reliably contain the generated password. Documentation suggestion by [Karel Lowprize K](https://github.com/lowprize) ([PR #134](https://github.com/UNITRONIX/BetterDesk/pull/134)).
+
+### Fixed
+- **Live device-status updates on the Devices page** — The WebSocket status handler now updates the current device state array and visible status badge without referencing a stale `allDevices` variable. This was found while reviewing Rafael Monteiro's heartbeat/status contribution ([PR #35](https://github.com/UNITRONIX/BetterDesk/pull/35)).
+- **RustDesk WSS rendezvous timeout behind reverse proxies** — The Go signal WebSocket endpoint now sends RustDesk-compatible empty binary keepalive frames and ignores empty keepalive replies from clients. This prevents `Rendezvous connection is timeout` after a successful WSS handshake when Nginx proxies `/ws/id` to port `21118`. Reported by [odixz](https://github.com/odixz) ([#144](https://github.com/UNITRONIX/BetterDesk/issues/144)).
+- **RustDesk WSS peer cleanup after keepalive** — Empty RustDesk WebSocket keepalive replies now refresh the in-memory peer heartbeat, preventing the signal server from marking an active WSS peer offline after the 30-second cleanup window. Follow-up logs and retest by [odixz](https://github.com/odixz) ([#144](https://github.com/UNITRONIX/BetterDesk/issues/144)).
+
+### Security
+- **Brute-force protection on RustDesk client API** — `web-nodejs/routes/rustdesk-api.routes.js` now `await`s `authService.checkBruteForce(...)`. Previously the async result was treated as truthy/undefined, making the lockout effectively unenforceable on the RustDesk-compatible login route. (Audit finding #1, High)
+- **TOTP login session fixation** — `web-nodejs/routes/auth.routes.js` regenerates the session via `req.session.regenerate(...)` after successful 2FA verification, mirroring the standard login flow. Previously the pre-2FA session ID was reused for the post-2FA authenticated session. Cookie name is unchanged; existing browser sessions continue to work. (Audit finding #2, Medium)
+- **Audit endpoints now require explicit RBAC** — `betterdesk-server/api/server.go` wraps `GET /api/audit/events` and `GET /api/ws/events` in `requirePermission(auth.PermAuditView, ...)`. All built-in roles that previously consumed these endpoints (`super_admin`, `admin`, `server_admin`, `global_admin`, `operator`, `viewer`) already grant `audit.view` by default — no behavioural change for them. **Behavioural change:** the `pro` role no longer receives `200` from these endpoints (it never had `audit.view` in `DefaultRolePermissions`). If a deployment relied on this implicit access, grant `audit.view` explicitly via the role-permission overrides table. (Audit finding #3, Medium)
+- **Generic 500 responses from Go auth handlers** — `betterdesk-server/api/auth_handlers.go` no longer leaks `err.Error()` strings on 9 internal-server-error paths (list/update/delete users, TOTP setup/confirm/disable, list/create/delete API keys). Full error detail is now logged server-side via `log.Printf`. Status codes and non-500 responses are unchanged. (Audit finding #4, Medium)
+
+### Deferred
+- Plaintext storage of RustDesk client access tokens (audit finding #5) and CSP `'unsafe-inline'`/`'unsafe-eval'` exceptions (audit finding #6) are intentionally **not** included in this batch. They require a phased rollout that would otherwise break existing installations or active client sessions. Tracked in [docs/security/LOGIN_API_SECURITY_AUDIT_2026-04-26.md](docs/security/LOGIN_API_SECURITY_AUDIT_2026-04-26.md#deferred-patches).
+
+---
+
 ## [3.0.0-alpha] — 2026-04-01
 
 ### Added

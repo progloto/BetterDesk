@@ -35,11 +35,27 @@
 .PARAMETER NodeJs
     Install Node.js web console (default)
 
+.PARAMETER Protocol
+    Set protocol mode: 'http' or 'https'
+
 .PARAMETER PostgreSQL
     Use PostgreSQL instead of SQLite
 
 .PARAMETER PgUri
     PostgreSQL connection URI (implies -PostgreSQL)
+
+.PARAMETER RelayMode
+    Relay IP selection mode: 'auto' (detect public IP, default), 'local'/'lan'
+    (use the server's LAN IP for LAN-only deployments), or 'public'/'wan'
+    (force public IP detection). Overridden by -RelayServers / RELAY_SERVERS.
+
+.PARAMETER RelayServers
+    Force a fixed relay server address (IP or host[:port]). Always overrides
+    -RelayMode. Equivalent to the RELAY_SERVERS environment variable.
+
+.PARAMETER RunAsRoot
+    Run the Windows services as LocalSystem (legacy). By default the services
+    run under low-privilege per-service virtual accounts (privilege separation).
 
 .EXAMPLE
     .\betterdesk.ps1
@@ -54,6 +70,14 @@
     Automatic installation with PostgreSQL
 
 .EXAMPLE
+    .\betterdesk.ps1 -Auto -RelayMode local
+    Automatic LAN-only installation (relay uses the server's local IP)
+
+.EXAMPLE
+    .\betterdesk.ps1 -Auto -RelayServers 203.0.113.10
+    Automatic installation with a fixed public relay address
+
+.EXAMPLE
     .\betterdesk.ps1 -SkipVerify
     Skip binary verification
 #>
@@ -65,6 +89,12 @@ param(
     [switch]$NodeJs,
     [switch]$PostgreSQL,
     [string]$PgUri = "",
+    [ValidateSet('http', 'https', '')]
+    [string]$Protocol = "",
+    [ValidateSet('auto', 'local', 'lan', 'public', 'wan', '')]
+    [string]$RelayMode = "",
+    [string]$RelayServers = "",
+    [switch]$RunAsRoot,
     [switch]$Flask  # Deprecated, kept for backward compatibility
 )
 
@@ -79,6 +109,12 @@ $script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:AUTO_MODE = $Auto
 $script:SKIP_VERIFY = $SkipVerify
 $script:MINIMAL_MODE = $Minimal
+
+# Privilege separation (default). The installer needs Administrator, but the
+# services run under low-privilege per-service virtual accounts (NT SERVICE\...)
+# instead of LocalSystem. Use -RunAsRoot or BETTERDESK_RUN_AS_ROOT=1 to keep the
+# legacy behavior of running services as LocalSystem.
+$script:RUN_AS_ROOT = $RunAsRoot -or ($env:BETTERDESK_RUN_AS_ROOT -eq "1") -or ($env:BETTERDESK_RUN_AS_ROOT -eq "true")
 
 # Console type preference
 $script:PREFERRED_CONSOLE_TYPE = "nodejs"  # Always Node.js (Flask removed in v2.3.0)
@@ -96,6 +132,16 @@ $script:POSTGRESQL_DB = if ($env:POSTGRESQL_DB) { $env:POSTGRESQL_DB } else { "b
 $script:POSTGRESQL_HOST = if ($env:POSTGRESQL_HOST) { $env:POSTGRESQL_HOST } else { "localhost" }
 $script:POSTGRESQL_PORT = if ($env:POSTGRESQL_PORT) { $env:POSTGRESQL_PORT } else { "5432" }
 
+# Relay server configuration
+#   auto   - detect public IP (default, best for internet-facing servers)
+#   local  - use the server's LAN IP (best for LAN-only deployments)
+#   public - force public IP detection
+# RELAY_SERVERS env var (or -RelayServers) always overrides this with a fixed value.
+$script:RELAY_MODE = if ($RelayMode) { $RelayMode } elseif ($env:RELAY_MODE) { $env:RELAY_MODE } else { "auto" }
+if ($script:RELAY_MODE -eq "lan") { $script:RELAY_MODE = "local" }
+if ($script:RELAY_MODE -eq "wan") { $script:RELAY_MODE = "public" }
+$script:RELAY_SERVERS = if ($RelayServers) { $RelayServers } elseif ($env:RELAY_SERVERS) { $env:RELAY_SERVERS } else { "" }
+
 # Go server configuration
 $script:GO_SERVER_SOURCE = Join-Path $script:ScriptDir "betterdesk-server"
 $script:GO_MIN_VERSION = "1.25"
@@ -110,7 +156,7 @@ $script:BACKUP_DIR = if ($env:BACKUP_DIR) { $env:BACKUP_DIR } else { "C:\BetterD
 $script:DB_PATH = "$script:RUSTDESK_PATH\db_v2.sqlite3"
 
 # API configuration
-$script:API_PORT = if ($env:API_PORT) { $env:API_PORT } else { "21114" }
+$script:API_PORT = if ($env:API_PORT) { $env:API_PORT } else { "21121" }
 $script:STORE_ADMIN_CREDENTIALS = ($env:STORE_ADMIN_CREDENTIALS -eq "true")
 
 # Common installation paths to search
@@ -144,7 +190,9 @@ $script:BINARIES_OK = $false
 $script:DATABASE_OK = $false
 $script:CONSOLE_TYPE = "none"  # none, nodejs
 $script:SERVER_TYPE = "none"    # none, go, rust
-
+# FRESH_INSTALL gates new-install defaults (e.g. managed enrollment mode). It
+# stays $false for UPDATE/REPAIR so existing installs keep their current policy.
+$script:FRESH_INSTALL = $false
 # Logging
 $script:LOG_FILE = "$env:TEMP\betterdesk_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -236,18 +284,201 @@ function Confirm-Action {
     return $response -match "^[YyTt]"
 }
 
-function Get-PublicIP {
+#===============================================================================
+# Interactive TUI (arrow-key navigable menu) — no external dependencies
+#===============================================================================
+$script:TUI_RESULT = -1
+$script:MENU_CHOICE = ''
+
+function Test-TuiAvailable {
+    if ($env:BETTERDESK_CLASSIC_MENU -eq '1') { return $false }
+    if ($script:AUTO_MODE) { return $false }
     try {
-        $ip = (Invoke-WebRequest -Uri "https://ifconfig.me/ip" -UseBasicParsing -TimeoutSec 10).Content.Trim()
-        return $ip
-    } catch {
+        if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { return $false }
+    } catch { return $false }
+    return $true
+}
+
+# Invoke-TuiSelect -Title T -Subtitle S -Items @("Label`tDesc", ...)
+# Navigation: Up/Down or k/j to move, Enter/Right to choose, q/Esc/0 to cancel.
+# Returns $true and sets $script:TUI_RESULT on selection, $false on cancel.
+function Invoke-TuiSelect {
+    param(
+        [string]$Title,
+        [string]$Subtitle,
+        [string[]]$Items
+    )
+    $script:TUI_RESULT = -1
+    $count = $Items.Count
+    if (-not (Test-TuiAvailable) -or $count -eq 0) { return $false }
+
+    $sel = 0
+    try { [Console]::CursorVisible = $false } catch {}
+    Clear-Host
+    try {
+        while ($true) {
+            try { [Console]::SetCursorPosition(0, 0) } catch {}
+            Write-Host "+--------------------------------------------------------------+" -ForegroundColor Cyan
+            Write-Host ("| {0,-60} |" -f $Title) -ForegroundColor White
+            if ($Subtitle) { Write-Host ("| {0,-60} |" -f $Subtitle) -ForegroundColor DarkGray }
+            Write-Host "+--------------------------------------------------------------+" -ForegroundColor Cyan
+            Write-Host ""
+
+            for ($i = 0; $i -lt $count; $i++) {
+                $parts = $Items[$i] -split "`t", 2
+                $label = $parts[0]
+                $desc  = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+                if ($i -eq $sel) {
+                    $line = ("  > {0,-30}{1}" -f $label, $desc)
+                    Write-Host ($line.PadRight(78)) -ForegroundColor Green
+                } else {
+                    $line = ("    {0,-30}{1}" -f $label, $desc)
+                    Write-Host ($line.PadRight(78)) -ForegroundColor White
+                }
+            }
+
+            Write-Host ""
+            Write-Host ("  Up/Down navigate   Enter select   q/Esc back".PadRight(78)) -ForegroundColor DarkGray
+
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'UpArrow'    { $sel = (($sel - 1 + $count) % $count) }
+                'DownArrow'  { $sel = (($sel + 1) % $count) }
+                'Enter'      { $script:TUI_RESULT = $sel; return $true }
+                'RightArrow' { $script:TUI_RESULT = $sel; return $true }
+                'Escape'     { return $false }
+                default {
+                    $ch = $key.KeyChar
+                    if     ($ch -eq 'k') { $sel = (($sel - 1 + $count) % $count) }
+                    elseif ($ch -eq 'j') { $sel = (($sel + 1) % $count) }
+                    elseif ($ch -eq 'q' -or $ch -eq 'Q' -or $ch -eq '0') { return $false }
+                    elseif ($ch -ge '1' -and $ch -le '9') {
+                        $idx = [int]::Parse($ch) - 1
+                        if ($idx -lt $count) { $script:TUI_RESULT = $idx; return $true }
+                    }
+                }
+            }
+        }
+    } finally {
+        try { [Console]::CursorVisible = $true } catch {}
+    }
+}
+
+function Show-PanelHeader {
+    param([string]$Title, [string]$Subtitle)
+    Clear-Host
+    Write-Host "+--------------------------------------------------------------+" -ForegroundColor Cyan
+    Write-Host ("| {0,-60} |" -f $Title) -ForegroundColor White
+    if ($Subtitle) { Write-Host ("| {0,-60} |" -f $Subtitle) -ForegroundColor DarkGray }
+    Write-Host "+--------------------------------------------------------------+" -ForegroundColor Cyan
+    Write-Host ""
+}
+
+# Invoke-MenuChoose -Title T -Subtitle S -Items @(...) -Returns @(...)
+# Uses the arrow-key TUI when available, a styled numeric prompt otherwise.
+# The chosen token is stored in $script:MENU_CHOICE; on cancel the last entry
+# is returned so existing switch blocks can treat it as "back".
+function Invoke-MenuChoose {
+    param(
+        [string]$Title,
+        [string]$Subtitle,
+        [string[]]$Items,
+        [string[]]$Returns
+    )
+    $script:MENU_CHOICE = ''
+    $lastIdx = $Returns.Count - 1
+    if ($lastIdx -lt 0) { $lastIdx = 0 }
+
+    if (Test-TuiAvailable) {
+        if (Invoke-TuiSelect -Title $Title -Subtitle $Subtitle -Items $Items) {
+            $script:MENU_CHOICE = $Returns[$script:TUI_RESULT]
+        } else {
+            $script:MENU_CHOICE = $Returns[$lastIdx]
+        }
+        return
+    }
+
+    Show-PanelHeader $Title $Subtitle
+    for ($i = 0; $i -lt $Items.Count; $i++) {
+        $parts = $Items[$i] -split "`t", 2
+        $label = $parts[0]
+        $desc  = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+        Write-Host ("  {0,2}) " -f $Returns[$i]) -ForegroundColor Green -NoNewline
+        Write-Host ("{0,-28}" -f $label) -NoNewline
+        Write-Host " $desc" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    $script:MENU_CHOICE = Read-Host "  Select option"
+}
+
+function Get-PublicIP {
+    # Prefer IPv4 endpoints first: many RustDesk clients cannot use IPv6-only relay.
+    $endpoints = @(
+        "https://ipv4.icanhazip.com",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com"
+    )
+    foreach ($url in $endpoints) {
         try {
-            $ip = (Invoke-WebRequest -Uri "https://icanhazip.com" -UseBasicParsing -TimeoutSec 10).Content.Trim()
-            return $ip
-        } catch {
-            return "127.0.0.1"
+            $ip = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10).Content.Trim()
+            if ($ip) { return $ip }
+        } catch {}
+    }
+    return "127.0.0.1"
+}
+
+# Detect the server's primary LAN/private IPv4 address.
+# Used for LAN-only deployments where the public IP is unreachable by clients.
+function Get-LocalIP {
+    try {
+        # Primary: source address used to reach an external destination
+        $route = Get-NetIPConfiguration -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
+            Select-Object -First 1
+        if ($route -and $route.IPv4Address) {
+            return $route.IPv4Address.IPAddress
+        }
+    } catch {}
+    try {
+        # Fallback: first non-loopback, non-APIPA IPv4 address
+        $ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' -and $_.PrefixOrigin -ne 'WellKnown' } |
+            Select-Object -First 1
+        if ($ip) { return $ip.IPAddress }
+    } catch {}
+    return "127.0.0.1"
+}
+
+# Resolve the relay server address according to RELAY_MODE / RELAY_SERVERS.
+# Returns the resolved address; warnings are written to the host (not the value).
+function Resolve-RelayIp {
+    # Explicit override always wins
+    if ($script:RELAY_SERVERS) {
+        Print-Info "Using fixed relay address (RelayServers): $($script:RELAY_SERVERS)"
+        return $script:RELAY_SERVERS
+    }
+
+    $ip = ""
+    switch ($script:RELAY_MODE) {
+        "local" {
+            $ip = Get-LocalIP
+            Print-Info "Relay mode 'local': using LAN IP $ip (LAN-only deployment)"
+        }
+        "public" {
+            $ip = Get-PublicIP
+            Print-Info "Relay mode 'public': using public IP $ip"
+        }
+        default {
+            $ip = Get-PublicIP
+            if ($ip -eq "127.0.0.1" -or $ip -match '^10\.' -or $ip -match '^192\.168\.' -or $ip -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.') {
+                Print-Warning "Auto-detected private/loopback IP: $ip"
+                Print-Warning "Remote (internet) clients will NOT connect via relay with this address."
+                Print-Warning "For LAN-only use this is fine. For internet access run with: -RelayServers YOUR.PUBLIC.IP"
+                Print-Warning "To use the LAN IP explicitly run with: -RelayMode local"
+            }
         }
     }
+    return $ip
 }
 
 function Generate-RandomPassword {
@@ -870,21 +1101,13 @@ function Choose-DatabaseType {
     }
     
     Write-Host ""
-    Write-Host "Select Database Type:" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  1. SQLite (default)" -ForegroundColor Green
-    Write-Host "     Single-file database, zero setup. Good for " -ForegroundColor DarkGray -NoNewline
-    Write-Host ([char]0x2264) -NoNewline -ForegroundColor DarkGray
-    Write-Host "100 devices." -ForegroundColor DarkGray
-    Write-Host "     Data stored in $RUSTDESK_PATH\db_v2.sqlite3" -ForegroundColor DarkGray
-    Write-Host ""
-    Write-Host "  2. PostgreSQL (production)" -ForegroundColor Green
-    Write-Host "     Full SQL database with connection pooling. Recommended for" -ForegroundColor DarkGray
-    Write-Host "     multi-server setups, >100 devices, or high availability." -ForegroundColor DarkGray
-    Write-Host "     Requires PostgreSQL 14+ (installed automatically if missing)." -ForegroundColor DarkGray
-    Write-Host ""
-    
-    $dbChoice = Read-Host "Choose database type [1]"
+    $items = @(
+        "SQLite`tSingle-file DB, zero setup (recommended)",
+        "PostgreSQL`tProduction backend with connection pooling"
+    )
+    $returns = @("1", "2")
+    Invoke-MenuChoose -Title "Select Database Type" -Subtitle "SQLite is recommended for most installs" -Items $items -Returns $returns
+    $dbChoice = $script:MENU_CHOICE
     if ([string]::IsNullOrEmpty($dbChoice)) { $dbChoice = "1" }
     
     switch ($dbChoice) {
@@ -1041,6 +1264,17 @@ function Install-NodeJsConsole {
             Pop-Location
             return $false
         }
+
+        # Best-effort install of node-pty for Server Management terminal (BETA).
+        # Optional native module — falls back to pipe spawn if build fails.
+        Print-Step "Installing optional node-pty (Server Management terminal - BETA)..."
+        $ptyOutput = npm install --no-audit --no-fund --no-save node-pty 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Print-Success "node-pty installed (real PTY available)"
+        } else {
+            Print-Warning "node-pty install failed - Server Management terminal will use pipe fallback"
+            $ptyOutput | Select-Object -Last 5 | ForEach-Object { Write-Host "[node-pty] $_" }
+        }
         
         # Create data directory for databases
         $dataDir = Join-Path $script:CONSOLE_PATH "data"
@@ -1079,7 +1313,13 @@ function Install-NodeJsConsole {
             }
             
             # Generate admin password for Node.js console
-            $nodejsAdminPassword = Generate-RandomPassword
+            # Respect user-provided ADMIN_PASSWORD env var if set
+            if ($env:ADMIN_PASSWORD) {
+                $nodejsAdminPassword = $env:ADMIN_PASSWORD
+                Print-Info "Using custom admin password from ADMIN_PASSWORD env var"
+            } else {
+                $nodejsAdminPassword = Generate-RandomPassword
+            }
             
             # Create sentinel file so ensureDefaultAdmin() force-updates the password
             # even if auth.db was somehow preserved (e.g. shared volume, manual copy)
@@ -1125,8 +1365,11 @@ DATA_DIR=$dataDir
 # HBBS API
 HBBS_API_URL=http://localhost:$script:API_PORT/api
 
-# RustDesk Client API listener
+# RustDesk Client API (consolidated onto the Go server, port $script:API_PORT)
+# The Node.js console no longer runs its own client API listener.
+API_ENABLED=false
 API_HOST=0.0.0.0
+RUSTDESK_API_TLS=auto
 
 # Server backend (betterdesk = Go server, rustdesk = legacy Rust)
 SERVER_BACKEND=betterdesk
@@ -1161,7 +1404,8 @@ BETTERDESK_API_URL=http://localhost:$script:API_PORT/api
         # Persist credentials only when explicitly requested.
         if ($script:STORE_ADMIN_CREDENTIALS) {
             $credsFile = Join-Path $dataDir ".admin_credentials"
-            "admin:$nodejsAdminPassword" | Out-File -FilePath $credsFile -Encoding UTF8
+            $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            @("Admin Username: admin", "Admin Password: $nodejsAdminPassword", "Generated by: BetterDesk installer", "Timestamp: $timestamp") | Out-File -FilePath $credsFile -Encoding UTF8
         }
         
         $script:CONSOLE_TYPE = "nodejs"
@@ -1349,11 +1593,9 @@ function Update-EnvForTLS {
         $content = $content -replace 'HTTPS_ENABLED=.*', 'HTTPS_ENABLED=true'
         $content = $content -replace 'SSL_CERT_PATH=.*', "SSL_CERT_PATH=$CertPath"
         $content = $content -replace 'SSL_KEY_PATH=.*', "SSL_KEY_PATH=$KeyPath"
-        # Only update API URLs to HTTPS when --tls-api is active (proper certs, not self-signed)
-        if ($UpdateApiUrls) {
-            $content = $content -replace 'HBBS_API_URL=http://localhost', 'HBBS_API_URL=https://localhost'
-            $content = $content -replace 'BETTERDESK_API_URL=http://localhost', 'BETTERDESK_API_URL=https://localhost'
-        }
+        # Internal Go API URLs must stay HTTP for RustDesk client compatibility.
+        $content = $content -replace 'HBBS_API_URL=https://localhost', 'HBBS_API_URL=http://localhost'
+        $content = $content -replace 'BETTERDESK_API_URL=https://localhost', 'BETTERDESK_API_URL=http://localhost'
         if ($content -match 'NODE_EXTRA_CA_CERTS=') {
             $content = $content -replace 'NODE_EXTRA_CA_CERTS=.*', "NODE_EXTRA_CA_CERTS=$CertPath"
         } else {
@@ -1417,7 +1659,7 @@ function Generate-SSLCertificates {
         # Clean up certificate from store
         Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
         
-        # Enable HTTPS in .env so Node.js console (port 5000 + 21121) uses TLS
+        # Enable HTTPS in .env so Node.js console (admin panel port 5000/5443) uses TLS
         Update-EnvForTLS -CertPath $certPath -KeyPath $keyPath
         
         Print-Success "Self-signed TLS certificate generated"
@@ -1455,6 +1697,36 @@ function Generate-SSLCertificates {
     }
 }
 
+function Set-ServiceLeastPrivilege {
+    param(
+        [string]$ServiceName,
+        [string]$NssmPath,
+        [string[]]$Paths
+    )
+    # Privilege separation: run the NSSM service under its per-service virtual
+    # account (NT SERVICE\<service>) instead of the default LocalSystem. Virtual
+    # accounts are unprivileged, auto-managed, need no password, and already hold
+    # the "Log on as a service" right. Skipped when -RunAsRoot is set.
+    if ($script:RUN_AS_ROOT) {
+        & $NssmPath set $ServiceName ObjectName "LocalSystem" 2>$null | Out-Null
+        return
+    }
+
+    $account = "NT SERVICE\$ServiceName"
+    & $NssmPath set $ServiceName ObjectName $account "" 2>$null | Out-Null
+
+    foreach ($p in $Paths) {
+        if ($p -and (Test-Path $p)) {
+            try {
+                & icacls "$p" /grant "${account}:(OI)(CI)M" /T /C /Q 2>$null | Out-Null
+            } catch {
+                Print-Warning "Could not grant $account access to $p"
+            }
+        }
+    }
+    Print-Info "Service $ServiceName runs under least-privilege account ($account)"
+}
+
 function Setup-Services {
     Print-Step "Configuring Windows services..."
     
@@ -1478,53 +1750,38 @@ function Setup-Services {
         }
     }
     
-    $serverIP = Get-PublicIP
-    
-    # IPv6-only relay detection: many RustDesk clients cannot connect via IPv6-only relay.
-    # If the detected IP is IPv6, try to also resolve an IPv4 address for dual-stack support.
-    if ($serverIP -match ':') {
-        Print-Warning "Detected IPv6 address: $serverIP"
-        try {
-            $ipv4Addr = (Invoke-WebRequest -Uri "https://ipv4.icanhazip.com" -UseBasicParsing -TimeoutSec 5).Content.Trim()
-            if ($ipv4Addr -and $ipv4Addr -notmatch ':') {
-                $serverIP = $ipv4Addr
-                Print-Info "Using IPv4 address for relay compatibility: $serverIP"
-                Print-Info "(IPv6-only relay causes connection failures on many RustDesk clients)"
-            } else {
-                Print-Warning "No IPv4 address found. Relay connections may fail for clients without IPv6 support."
-                Print-Warning "If clients report 'Relay connection failed', set RELAY_SERVERS to an IPv4 address manually."
-            }
-        } catch {
-            Print-Warning "Could not detect IPv4 address. If relay fails, configure RELAY_SERVERS manually."
+    # Resolve relay server IP according to RELAY_MODE / RELAY_SERVERS
+    # Interactive relay mode selection (skipped in auto mode or when explicitly set)
+    if (-not $script:AUTO_MODE -and -not $script:RELAY_SERVERS -and $script:RELAY_MODE -eq "auto") {
+        $localIp = Get-LocalIP
+        Write-Host ""
+        Print-Info "Relay server address controls how clients connect for remote sessions."
+        Write-Host "  1) Internet / public  (auto-detect public IP - default)" -ForegroundColor Cyan
+        Write-Host "  2) LAN only           (use this server's local IP: $localIp)" -ForegroundColor Cyan
+        Write-Host "  3) Custom address     (enter a specific IP or host)" -ForegroundColor Cyan
+        $relayChoice = Read-Host "  Select relay mode [1]"
+        switch ($relayChoice) {
+            "2" { $script:RELAY_MODE = "local" }
+            "3" { $script:RELAY_SERVERS = Read-Host "  Enter relay address (IP or host[:port])" }
+            default { $script:RELAY_MODE = "auto" }
         }
-    }
-    
-    # Warn if public IP detection failed -- relay will not work for remote clients
-    if ($serverIP -eq "127.0.0.1" -or $serverIP -match "^10\." -or $serverIP -match "^192\.168\." -or $serverIP -match "^172\.(1[6-9]|2[0-9]|3[0-1])\.") {
-        Print-Warning "Detected private/loopback IP: $serverIP"
-        Print-Warning "Remote clients will NOT be able to connect via relay!"
-        Print-Warning "If this is a public-facing server, set RELAY_SERVERS env var to your public IP."
-        Write-Host ""
-        Write-Host "  Example: `$env:RELAY_SERVERS='YOUR.PUBLIC.IP'; .\betterdesk.ps1" -ForegroundColor Yellow
         Write-Host ""
     }
-    
-    # Allow manual override via RELAY_SERVERS env var
-    if ($env:RELAY_SERVERS) {
-        $serverIP = $env:RELAY_SERVERS
-        Print-Info "Using RELAY_SERVERS override: $serverIP"
-    }
-    
-    Print-Info "Server IP: $serverIP"
+
+    $serverIP = Resolve-RelayIp
+
+    Print-Info "Relay server IP: $serverIP (mode: $(if ($script:RELAY_SERVERS) { 'fixed' } else { $script:RELAY_MODE }))"
     Print-Info "API Port: $script:API_PORT"
     
-    # Build database argument
-    $dbArg = ""
+    # Build database value (raw). The DSN is passed to the Go server through NSSM
+    # AppEnvironmentExtra (DB_URL env var), never as a CLI argument, so the
+    # PostgreSQL password does not appear in the process command line.
+    $dbValue = ""
     if ($script:USE_POSTGRESQL -and $script:POSTGRESQL_URI) {
-        $dbArg = "-db `"$($script:POSTGRESQL_URI)`""
+        $dbValue = $script:POSTGRESQL_URI
         Print-Info "Database: PostgreSQL"
     } else {
-        $dbArg = "-db `"$($script:DB_PATH)`""
+        $dbValue = $script:DB_PATH
         Print-Info "Database: SQLite"
     }
     
@@ -1578,9 +1835,16 @@ function Setup-Services {
     
     # BetterDesk Go Server (single binary: signal + relay + API)
     $serverExe = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
-    $serverArgs = "-mode all -relay-servers $serverIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
+    $signalRateLimit = if ($env:SIGNAL_RATE_LIMIT_PER_IP) { $env:SIGNAL_RATE_LIMIT_PER_IP } else { "20" }
+    if ($signalRateLimit -notmatch '^\d+$') {
+        Print-Warning "Invalid SIGNAL_RATE_LIMIT_PER_IP='$signalRateLimit'; using 20"
+        $signalRateLimit = "20"
+    }
+    $serverArgs = "-mode all -relay-servers $serverIP -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT -signal-rate-limit-per-ip $signalRateLimit"
     
-    # Add -init-admin-pass to sync admin password with Node.js console
+    # Discover admin password to sync the Go server initial admin with the
+    # Node.js console. It is passed via NSSM AppEnvironmentExtra (INIT_ADMIN_PASS),
+    # never as a CLI argument, to keep it out of the process command line.
     $adminPass = $null
     $credsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
     if (Test-Path $credsFile) {
@@ -1597,9 +1861,6 @@ function Setup-Services {
                 $adminPass = ($line -split '=', 2)[1].Trim()
             }
         }
-    }
-    if ($adminPass) {
-        $serverArgs += " -init-admin-pass `"$adminPass`""
     }
     
     # Add TLS flags if certificates exist
@@ -1619,12 +1880,11 @@ function Setup-Services {
         }
         
         # Enable TLS on signal/relay for client encryption.
-        # API port (21114) MUST stay HTTP -- RustDesk desktop clients always send
+        # API port (21121) MUST stay HTTP -- RustDesk desktop clients always send
         # plain HTTP to signal_port-2 and do not support HTTPS for API endpoints.
         $serverArgs += " -tls-cert `"$certPath`" -tls-key `"$keyPath`" -tls-signal -tls-relay"
         
-        # Only add -tls-api and -force-https for proper (non-self-signed) certificates
-        # DISABLED: RustDesk clients always send HTTP to API port. API stays HTTP for all cert types.
+        # RustDesk clients always send HTTP to API port. API stays HTTP for all cert types.
         if (-not $tlsIsSelfSigned) {
             $apiScheme = "http"
             Print-Info "TLS: Enabled for signal/relay (proper certificate, API stays HTTP)"
@@ -1643,6 +1903,19 @@ function Setup-Services {
     & $nssm set $script:SERVER_SERVICE Start SERVICE_AUTO_START
     & $nssm set $script:SERVER_SERVICE AppStdout "$script:RUSTDESK_PATH\logs\server.log"
     & $nssm set $script:SERVER_SERVICE AppStderr "$script:RUSTDESK_PATH\logs\server_error.log"
+    
+    # Server secrets via environment (DB_URL / INIT_ADMIN_PASS) instead of CLI
+    # arguments, so the PostgreSQL and admin passwords stay out of the process
+    # command line (NSSM stores these in the ACL-protected service registry key).
+    $serverEnvExtra = @("DB_URL=$dbValue")
+    if ($adminPass) { $serverEnvExtra += "INIT_ADMIN_PASS=$adminPass" }
+    # New installs default to "managed" enrollment so stock RustDesk clients are
+    # queued for operator approval. Existing installs are left untouched.
+    if ($script:FRESH_INSTALL) { $serverEnvExtra += "ENROLLMENT_MODE=managed" }
+    & $nssm set $script:SERVER_SERVICE AppEnvironmentExtra $serverEnvExtra
+    
+    # Privilege separation: drop the Go server to its low-privilege virtual account.
+    Set-ServiceLeastPrivilege -ServiceName $script:SERVER_SERVICE -NssmPath $nssm -Paths @($script:RUSTDESK_PATH)
     
     Print-Success "Created BetterDesk Go Server service"
     
@@ -1685,6 +1958,7 @@ function Setup-Services {
             $envExtra += "HTTPS_ENABLED=true"
             $envExtra += "SSL_CERT_PATH=$certPath"
             $envExtra += "SSL_KEY_PATH=$keyPath"
+            $envExtra += "RUSTDESK_API_TLS=$(if ($tlsIsSelfSigned) { 'false' } else { 'auto' })"
         }
         # Trust self-signed cert for localhost API communication
         if ($tlsIsSelfSigned -and (Test-Path $certPath)) {
@@ -1693,6 +1967,11 @@ function Setup-Services {
         & $nssm set $script:CONSOLE_SERVICE AppEnvironmentExtra $envExtra
         & $nssm set $script:CONSOLE_SERVICE AppStdout "$script:CONSOLE_PATH\logs\console.log"
         & $nssm set $script:CONSOLE_SERVICE AppStderr "$script:CONSOLE_PATH\logs\console_error.log"
+        
+        # Privilege separation: the console's virtual account needs read/write on
+        # its own dir and read access to the server keys / API key in RUSTDESK_PATH.
+        Set-ServiceLeastPrivilege -ServiceName $script:CONSOLE_SERVICE -NssmPath $nssm -Paths @($script:CONSOLE_PATH, $script:RUSTDESK_PATH)
+        
         Print-Success "Created Node.js console service"
     }
     
@@ -1709,12 +1988,13 @@ function Setup-ScheduledTasks {
     
     Print-Step "Creating scheduled tasks as service alternative..."
     
-    # Build database argument
-    $dbArg = ""
+    # Build database value (raw). Injected into the launcher below as an env var,
+    # never as a task action argument (those are visible in Task Scheduler).
+    $dbValue = ""
     if ($script:USE_POSTGRESQL -and $script:POSTGRESQL_URI) {
-        $dbArg = "-db `"$($script:POSTGRESQL_URI)`""
+        $dbValue = $script:POSTGRESQL_URI
     } else {
-        $dbArg = "-db `"$($script:DB_PATH)`""
+        $dbValue = $script:DB_PATH
     }
     
     # Remove existing tasks
@@ -1725,9 +2005,15 @@ function Setup-ScheduledTasks {
     
     # BetterDesk Go Server Task
     $serverExe = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
-    $serverArgs = "-mode all -relay-servers $ServerIP $dbArg -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT"
+    $signalRateLimit = if ($env:SIGNAL_RATE_LIMIT_PER_IP) { $env:SIGNAL_RATE_LIMIT_PER_IP } else { "20" }
+    if ($signalRateLimit -notmatch '^\d+$') {
+        Print-Warning "Invalid SIGNAL_RATE_LIMIT_PER_IP='$signalRateLimit'; using 20"
+        $signalRateLimit = "20"
+    }
+    $serverArgs = "-mode all -relay-servers $ServerIP -key-file `"$script:RUSTDESK_PATH\id_ed25519`" -api-port $script:API_PORT -signal-rate-limit-per-ip $signalRateLimit"
     
-    # Add -init-admin-pass to sync admin password with Node.js console
+    # Discover admin password (synced with Node.js console). Injected via the
+    # protected launcher as INIT_ADMIN_PASS, never as a task action argument.
     $adminPass = $null
     $credsFile = Join-Path $script:CONSOLE_PATH "data\.admin_credentials"
     if (Test-Path $credsFile) {
@@ -1744,9 +2030,6 @@ function Setup-ScheduledTasks {
                 $adminPass = ($line -split '=', 2)[1].Trim()
             }
         }
-    }
-    if ($adminPass) {
-        $serverArgs += " -init-admin-pass `"$adminPass`""
     }
     
     # Add TLS flags if certificates exist
@@ -1771,7 +2054,19 @@ function Setup-ScheduledTasks {
         }
     }
     
-    $serverAction = New-ScheduledTaskAction -Execute $serverExe -Argument $serverArgs -WorkingDirectory $script:RUSTDESK_PATH
+    # Secrets (DB_URL / INIT_ADMIN_PASS) are injected via a launcher script that
+    # is restricted to Administrators/SYSTEM, never via the task action arguments
+    # (which are visible in Task Scheduler and the process command line).
+    $serverLauncher = Join-Path $script:RUSTDESK_PATH "start-betterdesk-server.cmd"
+    $launcherLines = @("@echo off")
+    $launcherLines += "set `"DB_URL=$dbValue`""
+    if ($adminPass) { $launcherLines += "set `"INIT_ADMIN_PASS=$adminPass`"" }
+    # New installs default to "managed" enrollment; existing installs untouched.
+    if ($script:FRESH_INSTALL) { $launcherLines += "set `"ENROLLMENT_MODE=managed`"" }
+    $launcherLines += "`"$serverExe`" $serverArgs"
+    Set-Content -Path $serverLauncher -Value $launcherLines -Encoding ASCII
+    & icacls $serverLauncher /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" 2>$null | Out-Null
+    $serverAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$serverLauncher`"" -WorkingDirectory $script:RUSTDESK_PATH
     $serverTrigger = New-ScheduledTaskTrigger -AtStartup
     $serverPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
     $serverSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
@@ -2212,7 +2507,7 @@ function Do-InstallMinimal {
     
     Print-Info "BetterDesk Minimal installs the Go server binary only."
     Print-Info "No web console, no Node.js, no npm dependencies."
-    Print-Info "Manage via REST API on port 21114 or TCP admin console."
+    Print-Info "Manage via REST API on port $script:API_PORT or TCP admin console."
     Write-Host ""
     
     Detect-Installation
@@ -2265,7 +2560,7 @@ function Do-InstallMinimal {
     
     # Configure firewall rules (server ports only)
     Print-Step "Configuring firewall rules..."
-    $ports = @(21114, 21115, 21116, 21117, 21118, 21119)
+    $ports = @(21121, 21115, 21116, 21117, 21118, 21119)
     foreach ($port in $ports) {
         try {
             New-NetFirewallRule -DisplayName "BetterDesk Port $port" -Direction Inbound -LocalPort $port -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
@@ -2301,9 +2596,9 @@ function Do-InstallMinimal {
     
     $serverIP = Get-PublicIP
     Write-Host "Server: $serverIP" -ForegroundColor Green
-    Write-Host "API: http://${serverIP}:21114" -ForegroundColor Green
+    Write-Host "API: http://${serverIP}:$($script:API_PORT)" -ForegroundColor Green
     Write-Host ""
-    Write-Host "Ports: 21114 (API), 21115-21117 (Signal/Relay), 21118-21119 (WS)" -ForegroundColor Yellow
+    Write-Host "Ports: $($script:API_PORT) (API), 21115-21117 (Signal/Relay), 21118-21119 (WS)" -ForegroundColor Yellow
     Write-Host "No web console installed. Use REST API or TCP admin for management." -ForegroundColor Yellow
     Write-Host ""
     
@@ -2320,8 +2615,8 @@ function Setup-ServicesMinimal {
     # Build arguments
     $serverArgs = "-key `"$keyDir`" -db `"$dbDir`""
     
-    # Add relay servers
-    $serverIP = Get-PublicIP
+    # Add relay servers (honors RELAY_MODE / RelayServers)
+    $serverIP = Resolve-RelayIp
     if ($serverIP) {
         $serverArgs += " -relay-servers $serverIP"
     }
@@ -2373,6 +2668,9 @@ function Setup-ServicesMinimal {
     }
     nssm set $svcName AppEnvironmentExtra $envExtra
     
+    # Privilege separation: drop the Go server to its low-privilege virtual account.
+    Set-ServiceLeastPrivilege -ServiceName $svcName -NssmPath "nssm" -Paths @($script:INSTALL_DIR)
+    
     Print-Success "BetterDesk server service created (Minimal mode)"
 }
 
@@ -2396,6 +2694,10 @@ function Do-Install {
         }
         Do-BackupSilent
     }
+    
+    # Treat as fresh only when no database exists yet. Reinstalls over an
+    # existing database preserve the operator's current enrollment policy.
+    $script:FRESH_INSTALL = -not $script:DATABASE_OK
     
     Write-Host ""
     Print-Info "Starting BetterDesk Console v$script:VERSION installation..."
@@ -2492,8 +2794,8 @@ function Do-Install {
     # Offer HTTPS Enterprise configuration for fresh installs
     if (-not $script:AUTO_MODE) {
         Write-Host ""
-        Print-Info "Enterprise TLS enables full HTTPS on ALL ports (panel, signal, relay, API)"
-        Print-Info "Recommended for production. Requires RustDesk client >= 1.3.x"
+        Print-Info "Enterprise TLS enables HTTPS for panel/signal/relay; Go API stays HTTP for compatibility"
+        Print-Info "Recommended for production deployments behind trusted operator access"
         Write-Host ""
         if (Confirm-Action "Would you like to configure HTTPS Enterprise now? (Option 5 in SSL menu)") {
             Do-ConfigureSSL
@@ -2508,6 +2810,260 @@ function Do-Install {
 #===============================================================================
 # Update Functions
 #===============================================================================
+
+# GitHub repository configuration for online updates
+$script:UPDATE_GITHUB_OWNER = if ($env:UPDATE_GITHUB_OWNER) { $env:UPDATE_GITHUB_OWNER } else { "UNITRONIX" }
+$script:UPDATE_GITHUB_REPO = if ($env:UPDATE_GITHUB_REPO) { $env:UPDATE_GITHUB_REPO } else { "BetterDesk" }
+$script:UPDATE_GITHUB_BRANCH = if ($env:UPDATE_GITHUB_BRANCH) { $env:UPDATE_GITHUB_BRANCH } else { "main" }
+
+function Invoke-TerminalProjectUpdate {
+    $script:TerminalUpdateExitCode = 2
+    $cliPath = Join-Path $script:CONSOLE_PATH "scripts\update-cli.js"
+    $node = Get-Command node -ErrorAction SilentlyContinue
+
+    if (-not $node -or -not (Test-Path $cliPath)) {
+        return
+    }
+
+    Print-Step "Running commit-aware project updater..."
+    Print-Info "Updater CLI: $cliPath"
+
+    $args = @()
+    if ($script:AUTO_MODE) { $args += "--yes" }
+
+    & $node.Source $cliPath @args
+    $script:TerminalUpdateExitCode = $LASTEXITCODE
+}
+
+# Pull latest project from GitHub and apply update to local installation.
+# Downloads latest code, rebuilds Go server, reinstalls Node.js console.
+# All local state (databases, keys, .env, auth.db) is preserved.
+function Update-FromGitHub {
+    $cloneDir = Join-Path $env:TEMP "betterdesk-update-$PID"
+
+    # Clean up any leftover clone from a previous failed run
+    if (Test-Path $cloneDir) { Remove-Item -Recurse -Force $cloneDir -ErrorAction SilentlyContinue }
+
+    # ---- Step 1: Clone or download latest code ----
+    Print-Step "Downloading latest BetterDesk from GitHub..."
+    $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+    $downloaded = $false
+
+    if ($gitCmd) {
+        $repoUrl = "https://github.com/$($script:UPDATE_GITHUB_OWNER)/$($script:UPDATE_GITHUB_REPO).git"
+        try {
+            & git clone --depth 1 --single-branch --branch $script:UPDATE_GITHUB_BRANCH $repoUrl $cloneDir 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Print-Success "Repository cloned (branch: $($script:UPDATE_GITHUB_BRANCH))"
+                $downloaded = $true
+            }
+        } catch { }
+    }
+
+    if (-not $downloaded) {
+        # Fallback: download ZIP archive
+        $zipUrl = "https://github.com/$($script:UPDATE_GITHUB_OWNER)/$($script:UPDATE_GITHUB_REPO)/archive/refs/heads/$($script:UPDATE_GITHUB_BRANCH).zip"
+        $zipPath = Join-Path $env:TEMP "betterdesk-update-$PID.zip"
+        Print-Info "git not available, downloading ZIP archive..."
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($zipUrl, $zipPath)
+            $wc.Dispose()
+
+            New-Item -ItemType Directory -Path $cloneDir -Force | Out-Null
+            Expand-Archive -Path $zipPath -DestinationPath $cloneDir -Force
+
+            # GitHub ZIP extracts into a subdirectory like "BetterDesk-main/"
+            $subDir = Get-ChildItem -Path $cloneDir -Directory | Select-Object -First 1
+            if ($subDir) {
+                Get-ChildItem -Path $subDir.FullName | Move-Item -Destination $cloneDir -Force
+                Remove-Item -Path $subDir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+            Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
+            Print-Success "Source downloaded and extracted"
+            $downloaded = $true
+        } catch {
+            Print-Error "Download failed: $($_.Exception.Message)"
+            Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force $cloneDir -ErrorAction SilentlyContinue
+            return $false
+        }
+    }
+
+    if (-not $downloaded) {
+        Print-Error "Failed to download source code"
+        return $false
+    }
+
+    # Validate downloaded source
+    $goModPath = Join-Path $cloneDir "betterdesk-server\go.mod"
+    $serverJsPath = Join-Path $cloneDir "web-nodejs\server.js"
+    if (-not (Test-Path $goModPath) -or -not (Test-Path $serverJsPath)) {
+        Print-Error "Downloaded source is incomplete or invalid"
+        Remove-Item -Recurse -Force $cloneDir -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    # Read remote version
+    $remoteVersion = ""
+    $versionFile = Join-Path $cloneDir "VERSION"
+    if (Test-Path $versionFile) {
+        $remoteVersion = (Get-Content $versionFile -Raw).Trim()
+    }
+    if ($remoteVersion) {
+        Print-Info "Remote version: $remoteVersion"
+    }
+
+    # ---- Step 2: Update Go server source & compile ----
+    Print-Step "Updating Go server source..."
+    $goServerSource = $script:GO_SERVER_SOURCE
+    if (Test-Path $goServerSource) {
+        $backupName = "$goServerSource.pre-update.$PID"
+        Rename-Item -Path $goServerSource -NewName $backupName -ErrorAction SilentlyContinue
+    }
+    $sourceDir = Join-Path $cloneDir "betterdesk-server"
+    # Copy the *contents* into a guaranteed-existing destination. Copying the
+    # directory itself would nest the new tree inside an existing
+    # $goServerSource if the rename above failed (e.g. a momentarily locked
+    # file), leaving the old inconsistent source in place and breaking
+    # `go build` with "undefined" errors (issue #158).
+    New-Item -ItemType Directory -Path $goServerSource -Force | Out-Null
+    Copy-Item -Path "$sourceDir\*" -Destination $goServerSource -Recurse -Force
+
+    # Restore any local data/ directory from old source
+    $oldDataDir = "$goServerSource.pre-update.$PID\data"
+    if (Test-Path $oldDataDir) {
+        Copy-Item -Path "$oldDataDir\*" -Destination (Join-Path $goServerSource "data") -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path "$goServerSource.pre-update.$PID" -Recurse -Force -ErrorAction SilentlyContinue
+    Print-Success "Go server source updated"
+
+    # Compile Go server
+    Print-Step "Building Go server..."
+    $goAvailable = Test-GoInstalled
+    if (-not $goAvailable) {
+        Print-Info "Installing Go toolchain..."
+        Install-Golang
+        $goAvailable = Test-GoInstalled
+    }
+
+    if ($goAvailable) {
+        if (Compile-GoServer) {
+            Print-Success "Go server compiled successfully"
+            $builtBinary = Join-Path $goServerSource "betterdesk-server.exe"
+            if (Test-Path $builtBinary) {
+                $targetBinary = Join-Path $script:RUSTDESK_PATH "betterdesk-server.exe"
+                if (Test-Path $targetBinary) {
+                    $ts = Get-Date -Format "yyyyMMddHHmmss"
+                    Copy-Item $targetBinary "$targetBinary.bak.$ts" -ErrorAction SilentlyContinue
+                }
+                Copy-Item $builtBinary $targetBinary -Force
+                Print-Success "Go server binary deployed to $($script:RUSTDESK_PATH)"
+            }
+        } else {
+            Print-Warning "Go server compilation failed -- keeping existing binary"
+            Print-Info "You can retry with option 7 (Build & deploy server)"
+        }
+    } else {
+        Print-Warning "Go toolchain not available -- server binary not updated"
+        Print-Info "Install Go manually from https://go.dev/dl/ and re-run update"
+    }
+
+    # ---- Step 3: Update Node.js console files ----
+    Print-Step "Updating Node.js web console..."
+
+    # Files/directories to preserve during console update
+    $preserveItems = @(".env", ".env.local", "data", "node_modules")
+    $preservedDir = Join-Path $env:TEMP "betterdesk-console-state-$PID"
+    New-Item -ItemType Directory -Path $preservedDir -Force | Out-Null
+
+    foreach ($item in $preserveItems) {
+        $src = Join-Path $script:CONSOLE_PATH $item
+        if (Test-Path $src) {
+            $dst = Join-Path $preservedDir $item
+            Copy-Item -Path $src -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Copy new console files
+    $consoleSrc = Join-Path $cloneDir "web-nodejs"
+    Copy-Item -Path "$consoleSrc\*" -Destination $script:CONSOLE_PATH -Recurse -Force
+
+    # Restore preserved state files
+    foreach ($item in $preserveItems) {
+        $src = Join-Path $preservedDir $item
+        if (Test-Path $src) {
+            $dst = Join-Path $script:CONSOLE_PATH $item
+            if (Test-Path $src -PathType Container) {
+                if (-not (Test-Path $dst)) { New-Item -ItemType Directory -Path $dst -Force | Out-Null }
+                Copy-Item -Path "$src\*" -Destination $dst -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                Copy-Item -Path $src -Destination $dst -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    Remove-Item -Path $preservedDir -Recurse -Force -ErrorAction SilentlyContinue
+    Print-Success "Console files updated"
+
+    # Install npm dependencies
+    Print-Step "Installing npm dependencies..."
+    Push-Location $script:CONSOLE_PATH
+    try {
+        & npm install --production --no-audit --no-fund 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Print-Success "npm dependencies installed"
+        } else {
+            Print-Warning "npm install had issues (non-critical)"
+        }
+    } catch {
+        Print-Warning "npm install failed (non-critical): $($_.Exception.Message)"
+    }
+    Pop-Location
+
+    # ---- Step 4: Update installer scripts ----
+    Print-Step "Updating installer scripts..."
+    $scriptFiles = @(
+        "betterdesk.sh", "betterdesk.ps1", "betterdesk-docker.sh",
+        "docker-compose.yml", "docker-compose.single.yml", "docker-compose.quick.yml",
+        "Dockerfile", "Dockerfile.server", "Dockerfile.console", "VERSION"
+    )
+    $scriptsUpdated = 0
+    foreach ($sf in $scriptFiles) {
+        $src = Join-Path $cloneDir $sf
+        if (Test-Path $src) {
+            Copy-Item -Path $src -Destination (Join-Path $script:ScriptDir $sf) -Force -ErrorAction SilentlyContinue
+            $scriptsUpdated++
+        }
+    }
+    Print-Success "$scriptsUpdated installer files updated"
+
+    # ---- Step 5: Update SHA tracking for in-app updater ----
+    $gitCmd2 = Get-Command git -ErrorAction SilentlyContinue
+    if ($gitCmd2 -and (Test-Path (Join-Path $cloneDir ".git"))) {
+        try {
+            $remoteSha = (& git -C $cloneDir rev-parse HEAD 2>$null).Trim()
+            if ($remoteSha) {
+                $dataDir = Join-Path $script:CONSOLE_PATH "data"
+                if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Path $dataDir -Force | Out-Null }
+                Set-Content -Path (Join-Path $dataDir ".update_sha") -Value $remoteSha
+                Print-Info "SHA tracking updated: $($remoteSha.Substring(0, 7))"
+            }
+        } catch { }
+    }
+
+    # ---- Step 6: Update VERSION file ----
+    if ($remoteVersion -and (Test-Path (Join-Path $cloneDir "VERSION"))) {
+        Copy-Item -Path (Join-Path $cloneDir "VERSION") -Destination (Join-Path $script:ScriptDir "VERSION") -Force -ErrorAction SilentlyContinue
+    }
+
+    # Cleanup
+    Remove-Item -Recurse -Force $cloneDir -ErrorAction SilentlyContinue
+
+    Print-Success "All project files updated from GitHub"
+    return $true
+}
 
 function Do-Update {
     Print-Header
@@ -2547,20 +3103,80 @@ function Do-Update {
     # CRITICAL: Preserve database configuration before reinstalling console
     # This prevents PostgreSQL -> SQLite switch during updates
     Preserve-DatabaseConfig
-    
+
+    # ---- Update method selection ----
+    if ($script:AUTO_MODE) {
+        Print-Info "Auto mode: using GitHub pull update"
+    } else {
+        $items = @(
+            "Online update from GitHub`tDownload latest code + rebuild (recommended)",
+            "In-app updater`tBuilt-in Node.js commit-aware updater",
+            "Local update`tCopy files from this script's directory",
+            "Back`tReturn to the main menu"
+        )
+        $returns = @("1", "2", "3", "0")
+        Invoke-MenuChoose -Title "Update Method" -Subtitle "Online GitHub update is recommended" -Items $items -Returns $returns
+        $updateMethod = $script:MENU_CHOICE
+        if (-not $updateMethod) { $updateMethod = "1" }
+
+        switch ($updateMethod) {
+            "0" {
+                return
+            }
+            "2" {
+                Invoke-TerminalProjectUpdate
+                if ($script:TerminalUpdateExitCode -eq 0) {
+                    Print-Success "Online project update completed"
+                } elseif ($script:TerminalUpdateExitCode -ne 2) {
+                    Print-Error "In-app update failed (exit code: $($script:TerminalUpdateExitCode))"
+                } else {
+                    Print-Error "In-app updater not available (Node.js or CLI script missing)"
+                }
+                Press-Enter
+                return
+            }
+            "3" {
+                # Legacy local update path
+                Print-Info "Using local files from: $($script:ScriptDir)"
+                Print-Info "Creating backup before update..."
+                Do-BackupSilent
+                Stop-AllServices
+                if (-not (Install-Binaries -ForceRecompile)) { Print-Error "Binary update failed"; return }
+                if (-not (Install-Console)) { Print-Error "Console update failed"; return }
+                Run-Migrations
+                Setup-Services
+                Create-AdminUser | Out-Null
+                Start-Services
+                Print-Success "Local update completed!"
+                Press-Enter
+                return
+            }
+        }
+    }
+
+    # ---- GitHub Pull Update ----
     Print-Info "Creating backup before update..."
     Do-BackupSilent
-    
+
+    # Stop services before updating files
     Stop-AllServices
-    
-    if (-not (Install-Binaries -ForceRecompile)) { Print-Error "Binary update failed"; return }
-    if (-not (Install-Console)) { Print-Error "Console update failed"; return }
+
+    $result = Update-FromGitHub
+    if (-not $result) {
+        Print-Error "GitHub update failed"
+        Print-Info "Attempting to restart services with existing files..."
+        Start-Services
+        Press-Enter
+        return
+    }
+
+    # Run database migrations
     Run-Migrations
     
     # Update services with latest configuration
     Setup-Services
     
-    # Ensure admin user exists (especially for Node.js console migration)
+    # Ensure admin user exists
     Create-AdminUser | Out-Null
     
     Start-Services
@@ -2586,17 +3202,16 @@ function Do-Repair {
     
     Print-Status
     
-    Write-Host ""
-    Write-Host "What do you want to repair?" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  1. Repair binaries (replace with BetterDesk)"
-    Write-Host "  2. Repair database (add missing columns)"
-    Write-Host "  3. Repair Windows services"
-    Write-Host "  4. Full repair (all of the above)"
-    Write-Host "  0. Back"
-    Write-Host ""
-    
-    $choice = Read-Host "Select option"
+    $items = @(
+        "Repair binaries`tReplace the server binary with BetterDesk",
+        "Repair database`tAdd any missing columns",
+        "Repair services`tRecreate the Windows services",
+        "Full repair`tDo everything above",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("1", "2", "3", "4", "0")
+    Invoke-MenuChoose -Title "Repair Installation" -Subtitle "Choose what to repair" -Items $items -Returns $returns
+    $choice = $script:MENU_CHOICE
     
     switch ($choice) {
         "1" { Repair-Binaries }
@@ -2839,12 +3454,11 @@ function Do-Validate {
     Write-Host ""
     
     $ports = @(
-        @{Port=21114; Desc="HBBS API"; Expected="hbbs"},
+        @{Port=21121; Desc="Go API"; Expected="betterdesk-server"},
         @{Port=21115; Desc="NAT Test"; Expected="hbbs"},
         @{Port=21116; Desc="ID Server"; Expected="hbbs"},
         @{Port=21117; Desc="Relay"; Expected="hbbr"},
-        @{Port=5000;  Desc="Web Console"; Expected="node"},
-        @{Port=21121; Desc="Client API"; Expected="node"}
+        @{Port=5000;  Desc="Web Console"; Expected="node"}
     )
     foreach ($p in $ports) {
         $status = Check-PortStatus -Port $p.Port -Protocol "TCP" -ExpectedService $p.Expected
@@ -2870,7 +3484,7 @@ function Do-Validate {
     $firewallProfile = Get-NetFirewallProfile -ErrorAction SilentlyContinue
     $activeProfiles = $firewallProfile | Where-Object { $_.Enabled -eq $true }
     if ($activeProfiles) {
-        $fwPorts = @(21114, 21115, 21116, 21117, 21118, 21119, 5000, 5443, 21121)
+        $fwPorts = @(21115, 21116, 21117, 21118, 21119, 5000, 5443, 21121)
         $fwMissing = 0
         foreach ($fwPort in $fwPorts) {
             $rules = Get-NetFirewallRule -Direction Inbound -Enabled True -ErrorAction SilentlyContinue | 
@@ -2992,18 +3606,14 @@ function Do-ResetPassword {
         return
     }
     
-    Write-Host "Detected console type: " -NoNewline
-    Write-Host "Node.js" -ForegroundColor Cyan
-    Write-Host ""
-    
-    Write-Host "Select option:"
-    Write-Host ""
-    Write-Host "  1. Generate new random password"
-    Write-Host "  2. Set custom password"
-    Write-Host "  0. Back"
-    Write-Host ""
-    
-    $choice = Read-Host "Choice"
+    $items = @(
+        "Generate random password`tCreate a new strong password",
+        "Set custom password`tType the password yourself",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("1", "2", "0")
+    Invoke-MenuChoose -Title "Admin Password Reset" -Subtitle "Console type: Node.js" -Items $items -Returns $returns
+    $choice = $script:MENU_CHOICE
     
     $newPassword = $null
     
@@ -3026,6 +3636,33 @@ function Do-ResetPassword {
     $success = $false
     
     if ($script:CONSOLE_TYPE -eq "nodejs") {
+        # --- Hotfix: detect broken Go-first auth flow (commit 188991d) ---
+        $authServicePath = Join-Path $script:CONSOLE_PATH "services\authService.js"
+        if (Test-Path $authServicePath) {
+            $authContent = Get-Content $authServicePath -Raw -ErrorAction SilentlyContinue
+            if ($authContent -match 'const health = await checkGoServerHealth') {
+                Print-Warning "Detected broken authentication flow (Go-first delegation bug)"
+                Print-Info "Downloading fixed authService.js from GitHub..."
+                $fixUrl = "https://raw.githubusercontent.com/UNITRONIX/BetterDesk/main/web-nodejs/services/authService.js"
+                $tmpPath = "$authServicePath.tmp"
+                try {
+                    Invoke-WebRequest -Uri $fixUrl -OutFile $tmpPath -UseBasicParsing -ErrorAction Stop
+                    $tmpContent = Get-Content $tmpPath -Raw
+                    if ($tmpContent -match 'Step 1: Check local database FIRST') {
+                        Move-Item -Path $tmpPath -Destination $authServicePath -Force
+                        Print-Success "Fixed authentication flow (restored local-first login)"
+                    } else {
+                        Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+                        Print-Warning "Downloaded file does not contain expected fix - skipped"
+                    }
+                } catch {
+                    Remove-Item $tmpPath -Force -ErrorAction SilentlyContinue
+                    Print-Warning "Could not download fix (no internet?) - password reset will proceed but login may still fail"
+                    Print-Info "Manual fix: download $fixUrl to $authServicePath"
+                }
+            }
+        }
+
         # Detect database type from console .env
         $dbType = "sqlite"
         $envFile = Join-Path $script:CONSOLE_PATH ".env"
@@ -3144,8 +3781,9 @@ print("Password updated successfully")
                 New-Item -ItemType Directory -Path $consoleDataDir -Force | Out-Null
             }
 
-            "admin:$newPassword" | Out-File -FilePath $consoleCredsFile -Encoding UTF8
-            "admin:$newPassword" | Out-File -FilePath $rustdeskCredsFile -Encoding UTF8
+            $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            @("Admin Username: admin", "Admin Password: $newPassword", "Generated by: BetterDesk password reset", "Timestamp: $timestamp") | Out-File -FilePath $consoleCredsFile -Encoding UTF8
+            @("Admin Username: admin", "Admin Password: $newPassword", "Generated by: BetterDesk password reset", "Timestamp: $timestamp") | Out-File -FilePath $rustdeskCredsFile -Encoding UTF8
             Print-Info "Credentials saved to: $consoleCredsFile"
         } else {
             Print-Warning "Credentials are not persisted by default (security hardening)."
@@ -3229,10 +3867,9 @@ function Check-FirewallRules {
         @{Port=21117; Proto="TCP";  Name="Relay Server"},
         @{Port=21118; Proto="TCP";  Name="WebSocket Signal"},
         @{Port=21119; Proto="TCP";  Name="WebSocket Relay"},
-        @{Port=21114; Proto="TCP";  Name="HBBS API"},
         @{Port=5000;  Proto="TCP";  Name="Web Console"},
         @{Port=5443;  Proto="TCP";  Name="Web Console HTTPS"},
-        @{Port=21121; Proto="TCP";  Name="Client API"}
+        @{Port=21121; Proto="TCP";  Name="Go API (RustDesk client + REST)"}
     )
     
     $missingRules = @()
@@ -3268,10 +3905,9 @@ function Configure-Firewall {
             @{Port=21117; Proto="TCP";  Name="BetterDesk Relay Server"},
             @{Port=21118; Proto="TCP";  Name="BetterDesk WebSocket Signal"},
             @{Port=21119; Proto="TCP";  Name="BetterDesk WebSocket Relay"},
-            @{Port=21114; Proto="TCP";  Name="BetterDesk HBBS API"},
             @{Port=5000;  Proto="TCP";  Name="BetterDesk Web Console"},
             @{Port=5443;  Proto="TCP";  Name="BetterDesk Console HTTPS"},
-            @{Port=21121; Proto="TCP";  Name="BetterDesk Client API"}
+            @{Port=21121; Proto="TCP";  Name="BetterDesk Go API"}
         )
         
         foreach ($p in $requiredPorts) {
@@ -3394,13 +4030,12 @@ conn.close()
     Write-Host ""
     
     $portDefs = @(
-        @{Port=21114; Proto="TCP"; Expected="betterdesk-server"; Desc="Server API"},
+        @{Port=21121; Proto="TCP"; Expected="betterdesk-server"; Desc="Go API (RustDesk client + REST)"},
         @{Port=21115; Proto="TCP"; Expected="betterdesk-server"; Desc="NAT Test"},
         @{Port=21116; Proto="TCP"; Expected="betterdesk-server"; Desc="ID Server (TCP)"},
         @{Port=21116; Proto="UDP"; Expected="betterdesk-server"; Desc="ID Server (UDP)"},
         @{Port=21117; Proto="TCP"; Expected="betterdesk-server"; Desc="Relay Server"},
-        @{Port=5000;  Proto="TCP"; Expected="node"; Desc="Web Console"},
-        @{Port=21121; Proto="TCP"; Expected="node"; Desc="Client API (WAN)"}
+        @{Port=5000;  Proto="TCP"; Expected="node"; Desc="Web Console"}
     )
     
     $portIssues = 0
@@ -3428,7 +4063,7 @@ conn.close()
         Write-Host ""
         Print-Warning "$portIssues port conflict(s) detected!"
         Write-Host "  Tip: Stop conflicting processes or change ports in configuration" -ForegroundColor Yellow
-        Write-Host "  Common fix: Ensure no other app uses ports 21114-21117, 5000, 21121" -ForegroundColor Yellow
+        Write-Host "  Common fix: Ensure no other app uses ports 21115-21117, 5000, 21121" -ForegroundColor Yellow
     }
     
     # --- Firewall diagnostics ---
@@ -3467,14 +4102,14 @@ conn.close()
     
     # --- Diagnostics sub-menu ---
     Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  F. Configure firewall rules (auto-create missing rules)"
-    Write-Host "  P. Test port connectivity from outside (requires internet)"
-    Write-Host "  0. Back to main menu"
-    Write-Host ""
-    
-    $subChoice = Read-Host "  Select option"
+    $items = @(
+        "Configure firewall rules`tAuto-create any missing rules",
+        "Test port connectivity`tProbe ports from outside",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("F", "P", "0")
+    Invoke-MenuChoose -Title "Diagnostics Actions" -Subtitle "Optional follow-up checks" -Items $items -Returns $returns
+    $subChoice = $script:MENU_CHOICE
     
     switch ($subChoice) {
         "F" {
@@ -3580,15 +4215,16 @@ function Configure-Paths {
     Write-Host "  Database path:         " -NoNewline; Write-Host $script:DB_PATH -ForegroundColor Cyan
     Write-Host ""
     
-    Write-Host "Options:" -ForegroundColor Yellow
-    Write-Host "  1. Auto-detect installation paths"
-    Write-Host "  2. Set RustDesk server path manually"
-    Write-Host "  3. Set Console path manually"
-    Write-Host "  4. Reset to defaults"
-    Write-Host "  0. Back to main menu"
-    Write-Host ""
-    
-    $choice = Read-Host "Select option [0-4]"
+    $items = @(
+        "Auto-detect paths`tProbe for an existing installation",
+        "Set server path`tEnter the BetterDesk server path",
+        "Set console path`tEnter the web console path",
+        "Reset to defaults`tRestore the default paths",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("1", "2", "3", "4", "0")
+    Invoke-MenuChoose -Title "Path Configuration" -Subtitle "Server: $script:RUSTDESK_PATH" -Items $items -Returns $returns
+    $choice = $script:MENU_CHOICE
     
     switch ($choice) {
         "1" {
@@ -3661,14 +4297,15 @@ function Configure-Paths {
 
 function Do-Build {
     Print-Header
-    Write-Host "========== BUILD & DEPLOY ==========" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  1. Rebuild & deploy Go server (compile, stop, replace, start)"
-    Write-Host "  2. Compile Go server only (do not deploy)"
-    Write-Host "  3. Build legacy Rust binaries (archived, hbbs/hbbr)"
-    Write-Host "  0. Back to main menu"
-    Write-Host ""
-    $buildChoice = Read-Host "Select option [1]"
+    $items = @(
+        "Rebuild & deploy Go server`tCompile, stop, replace, start",
+        "Compile Go server only`tBuild without deploying",
+        "Build legacy Rust binaries`tArchived hbbs/hbbr",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("1", "2", "3", "0")
+    Invoke-MenuChoose -Title "Build & Deploy" -Subtitle "Compile the BetterDesk server" -Items $items -Returns $returns
+    $buildChoice = $script:MENU_CHOICE
     if ([string]::IsNullOrEmpty($buildChoice)) { $buildChoice = "1" }
 
     switch ($buildChoice) {
@@ -3897,23 +4534,24 @@ function Do-ConfigureSSL {
         return
     }
     
-    Write-Host "  ─── Standard Options ───" -ForegroundColor Cyan
-    Write-Host "  1. Let's Encrypt (ACME)" -ForegroundColor Green
-    Write-Host "  2. Custom certificate (provide cert + key files)" -ForegroundColor Green
-    Write-Host "  3. Self-signed certificate (for testing)" -ForegroundColor Green
-    Write-Host "  4. Disable SSL (revert to HTTP)" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "  ─── Enterprise Options ───" -ForegroundColor Cyan
-    Write-Host "  5. Enterprise TLS (full HTTPS: panel + signal + relay + API)" -ForegroundColor Yellow
-    Write-Host ""
-    
-    $sslChoice = Read-Host "Choice [3]"
+    $items = @(
+        "Let's Encrypt`tACME certificate (manual on Windows)",
+        "Custom certificate`tProvide your own cert + key files",
+        "Self-signed certificate`tQuick HTTPS for testing",
+        "Disable SSL`tRevert the panel back to HTTP",
+        "Enterprise TLS`tPanel + signal + relay (API stays HTTP)",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("1", "2", "3", "4", "5", "0")
+    Invoke-MenuChoose -Title "SSL Certificate Configuration" -Subtitle "Enables HTTPS for the admin panel" -Items $items -Returns $returns
+    $sslChoice = $script:MENU_CHOICE
     if ([string]::IsNullOrEmpty($sslChoice)) { $sslChoice = "3" }
     
     $envContent = Get-Content $envFile -Raw
     $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
     
     switch ($sslChoice) {
+        "0" { return }
         "1" {
             # Let's Encrypt
             Print-Warning "Let's Encrypt is not yet supported on Windows via this script."
@@ -3946,6 +4584,11 @@ function Do-ConfigureSSL {
                 $envContent = $envContent -replace 'SSL_CA_PATH=.*', "SSL_CA_PATH=$caPath"
             }
             $envContent = $envContent -replace 'HTTP_REDIRECT_HTTPS=.*', 'HTTP_REDIRECT_HTTPS=true'
+            if ($envContent -match 'RUSTDESK_API_TLS=') {
+                $envContent = $envContent -replace 'RUSTDESK_API_TLS=.*', 'RUSTDESK_API_TLS=true'
+            } else {
+                $envContent = $envContent.TrimEnd() + "`nRUSTDESK_API_TLS=true`n"
+            }
             
             Set-Content $envFile -Value $envContent -NoNewline
             Print-Success "Custom SSL certificate configured"
@@ -4027,6 +4670,11 @@ function Do-ConfigureSSL {
             $envContent = $envContent -replace 'SSL_CERT_PATH=.*', "SSL_CERT_PATH=$certPath"
             $envContent = $envContent -replace 'SSL_KEY_PATH=.*', "SSL_KEY_PATH=$keyPath"
             $envContent = $envContent -replace 'HTTP_REDIRECT_HTTPS=.*', 'HTTP_REDIRECT_HTTPS=true'
+            if ($envContent -match 'RUSTDESK_API_TLS=') {
+                $envContent = $envContent -replace 'RUSTDESK_API_TLS=.*', 'RUSTDESK_API_TLS=false'
+            } else {
+                $envContent = $envContent.TrimEnd() + "`nRUSTDESK_API_TLS=false`n"
+            }
             
             # Configure NODE_EXTRA_CA_CERTS for self-signed
             if ($envContent -match 'NODE_EXTRA_CA_CERTS=') {
@@ -4070,6 +4718,11 @@ function Do-ConfigureSSL {
             $envContent = $envContent -replace 'SSL_CERT_PATH=.*', 'SSL_CERT_PATH='
             $envContent = $envContent -replace 'SSL_KEY_PATH=.*', 'SSL_KEY_PATH='
             $envContent = $envContent -replace 'HTTP_REDIRECT_HTTPS=.*', 'HTTP_REDIRECT_HTTPS=false'
+            if ($envContent -match 'RUSTDESK_API_TLS=') {
+                $envContent = $envContent -replace 'RUSTDESK_API_TLS=.*', 'RUSTDESK_API_TLS=false'
+            } else {
+                $envContent = $envContent.TrimEnd() + "`nRUSTDESK_API_TLS=false`n"
+            }
             
             # Remove TLS args from Go server
             $nssm = Get-Command nssm -ErrorAction SilentlyContinue
@@ -4092,13 +4745,12 @@ function Do-ConfigureSSL {
             Print-Success "SSL disabled. Running in HTTP mode."
         }
         "5" {
-            # Enterprise TLS - full HTTPS on ALL channels including API
+            # Enterprise TLS - HTTPS for panel/signal/relay, Go API remains HTTP
             Print-Header
             Write-Host "========== ENTERPRISE TLS CONFIGURATION ==========" -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "  WARNING: Enterprise TLS enables HTTPS on ALL ports including API." -ForegroundColor Yellow
-            Write-Host "  This requires RustDesk client >= 1.3.x for full compatibility." -ForegroundColor Yellow
-            Write-Host "  Legacy clients may have connectivity issues." -ForegroundColor Yellow
+            Write-Host "  WARNING: Go API port 21121 stays HTTP for RustDesk client compatibility." -ForegroundColor Yellow
+            Write-Host "  Panel, signal and relay channels can still use TLS." -ForegroundColor Yellow
             Write-Host ""
             
             New-Item -ItemType Directory -Path $sslDir -Force | Out-Null
@@ -4167,6 +4819,11 @@ function Do-ConfigureSSL {
             $envContent = $envContent -replace 'SSL_CERT_PATH=.*', "SSL_CERT_PATH=$certPath"
             $envContent = $envContent -replace 'SSL_KEY_PATH=.*', "SSL_KEY_PATH=$keyPath"
             $envContent = $envContent -replace 'HTTP_REDIRECT_HTTPS=.*', 'HTTP_REDIRECT_HTTPS=true'
+            if ($envContent -match 'RUSTDESK_API_TLS=') {
+                $envContent = $envContent -replace 'RUSTDESK_API_TLS=.*', 'RUSTDESK_API_TLS=true'
+            } else {
+                $envContent = $envContent.TrimEnd() + "`nRUSTDESK_API_TLS=true`n"
+            }
             
             # Set ALLOW_SELF_SIGNED_CERTS
             if ($envContent -match 'ALLOW_SELF_SIGNED_CERTS=') {
@@ -4182,9 +4839,9 @@ function Do-ConfigureSSL {
                 $envContent = $envContent.TrimEnd() + "`nNODE_EXTRA_CA_CERTS=$certPath`n"
             }
             
-            # Update API URLs to HTTPS
-            $envContent = $envContent -replace 'HBBS_API_URL=http://', 'HBBS_API_URL=https://'
-            $envContent = $envContent -replace 'BETTERDESK_API_URL=http://', 'BETTERDESK_API_URL=https://'
+            # Keep internal Go API URLs on HTTP for RustDesk client compatibility
+            $envContent = $envContent -replace 'HBBS_API_URL=https://localhost', 'HBBS_API_URL=http://localhost'
+            $envContent = $envContent -replace 'BETTERDESK_API_URL=https://localhost', 'BETTERDESK_API_URL=http://localhost'
             
             # Set ENTERPRISE_TLS marker
             if ($envContent -match 'ENTERPRISE_TLS=') {
@@ -4195,7 +4852,7 @@ function Do-ConfigureSSL {
             
             Set-Content $envFile -Value $envContent -NoNewline
             
-            # === Configure Go server with FULL TLS ===
+            # === Configure Go server with TLS for signal + relay only ===
             $nssm = Get-Command nssm -ErrorAction SilentlyContinue
             if ($nssm) {
                 $goSvcName = $script:SERVER_SERVICE
@@ -4208,8 +4865,9 @@ function Do-ConfigureSSL {
                         $goArgs = $goArgs -replace ' -tls-signal', ''
                         $goArgs = $goArgs -replace ' -tls-relay', ''
                         $goArgs = $goArgs -replace ' -tls-api', ''
-                        # Add FULL TLS args including -tls-api
-                        $goArgs = "$goArgs -tls-cert $certPath -tls-key $keyPath -tls-signal -tls-relay -tls-api"
+                        $goArgs = $goArgs -replace ' -force-https', ''
+                        # Add TLS args without -tls-api
+                        $goArgs = "$goArgs -tls-cert $certPath -tls-key $keyPath -tls-signal -tls-relay"
                         & nssm set $goSvcName AppParameters $goArgs 2>$null
                     }
                 } catch { }
@@ -4223,11 +4881,11 @@ function Do-ConfigureSSL {
                 Print-Info "LAN IP: $lanIp"
             }
             Write-Host ""
-            Write-Host "  All connections now use TLS:" -ForegroundColor Yellow
+            Write-Host "  TLS configured for external channels:" -ForegroundColor Yellow
             Print-Info "  - Panel HTTPS: :5443 (or configured port)"
             Print-Info "  - Signal TLS: :21116"
             Print-Info "  - Relay TLS: :21117"
-            Print-Info "  - API HTTPS: :21114"
+            Print-Info "  - Go API HTTP: :21121 (required for RustDesk clients)"
             Write-Host ""
             Print-Warning "For browsers/clients, you may need to import $certPath as trusted CA"
         }
@@ -4239,14 +4897,15 @@ function Do-ConfigureSSL {
     }
     
     # ── Update API URLs in .env when SSL is enabled/disabled ──
-    # API TLS (--tls-api) is only enabled for Enterprise TLS (option 5).
-    # Standard options (1-3): API stays HTTP, only signal/relay use TLS.
-    # Option 5 (Enterprise): ALL channels use TLS including API.
+    # Go API TLS (--tls-api) is intentionally not enabled by SSL options.
+    # RustDesk desktop clients always use plain HTTP on the api-server (21121).
     $envContent = Get-Content $envFile -Raw
     
     if ($sslChoice -eq "5") {
-        # === Enterprise TLS: Keep HTTPS for API (already configured in option handler) ===
-        Print-Info "Enterprise TLS mode: ALL connections use HTTPS/TLS"
+        # === Enterprise TLS compatibility mode: Go API stays HTTP ===
+        Print-Info "Enterprise TLS mode: panel/signal/relay use TLS; Go API stays HTTP"
+        $envContent = $envContent -replace 'HBBS_API_URL=https://localhost', 'HBBS_API_URL=http://localhost'
+        $envContent = $envContent -replace 'BETTERDESK_API_URL=https://localhost', 'BETTERDESK_API_URL=http://localhost'
         
         # Ensure NSSM service has ALLOW_SELF_SIGNED_CERTS
         $nssm = Get-Command nssm -ErrorAction SilentlyContinue
@@ -4254,9 +4913,28 @@ function Do-ConfigureSSL {
             $svcName = $script:CONSOLE_SERVICE
             try {
                 $currentEnv = & nssm get $svcName AppEnvironmentExtra 2>$null
-                if ($currentEnv -and $currentEnv -notmatch 'ALLOW_SELF_SIGNED_CERTS=') {
-                    $currentEnv = "$currentEnv`nALLOW_SELF_SIGNED_CERTS=true"
+                if ($currentEnv) {
+                    if ($currentEnv -notmatch 'ALLOW_SELF_SIGNED_CERTS=') {
+                        $currentEnv = "$currentEnv`nALLOW_SELF_SIGNED_CERTS=true"
+                    }
+                    if ($currentEnv -match 'RUSTDESK_API_TLS=') {
+                        $currentEnv = $currentEnv -replace 'RUSTDESK_API_TLS=.*', 'RUSTDESK_API_TLS=true'
+                    } else {
+                        $currentEnv = "$currentEnv`nRUSTDESK_API_TLS=true"
+                    }
+                    $currentEnv = $currentEnv -replace 'HBBS_API_URL=https://localhost', 'HBBS_API_URL=http://localhost'
+                    $currentEnv = $currentEnv -replace 'BETTERDESK_API_URL=https://localhost', 'BETTERDESK_API_URL=http://localhost'
                     & nssm set $svcName AppEnvironmentExtra $currentEnv 2>$null
+                }
+            } catch { }
+
+            $goSvcName = $script:SERVER_SERVICE
+            try {
+                $goArgs = & nssm get $goSvcName AppParameters 2>$null
+                if ($goArgs) {
+                    $goArgs = $goArgs -replace ' -tls-api', ''
+                    $goArgs = $goArgs -replace ' -force-https', ''
+                    & nssm set $goSvcName AppParameters $goArgs 2>$null
                 }
             } catch { }
         }
@@ -4287,6 +4965,12 @@ function Do-ConfigureSSL {
                     # Ensure API URLs stay HTTP in NSSM service
                     $currentEnv = $currentEnv -replace 'HBBS_API_URL=https://localhost', 'HBBS_API_URL=http://localhost'
                     $currentEnv = $currentEnv -replace 'BETTERDESK_API_URL=https://localhost', 'BETTERDESK_API_URL=http://localhost'
+                    $apiTlsMode = if ($sslChoice -eq "3") { 'false' } else { 'true' }
+                    if ($currentEnv -match 'RUSTDESK_API_TLS=') {
+                        $currentEnv = $currentEnv -replace 'RUSTDESK_API_TLS=.*', "RUSTDESK_API_TLS=$apiTlsMode"
+                    } else {
+                        $currentEnv = "$currentEnv`nRUSTDESK_API_TLS=$apiTlsMode"
+                    }
                     & nssm set $svcName AppEnvironmentExtra $currentEnv 2>$null
                 }
             } catch { }
@@ -4315,6 +4999,19 @@ function Do-ConfigureSSL {
         # Remove ALL TLS args from Go server service
         $nssm = Get-Command nssm -ErrorAction SilentlyContinue
         if ($nssm) {
+            $svcName = $script:CONSOLE_SERVICE
+            try {
+                $currentEnv = & nssm get $svcName AppEnvironmentExtra 2>$null
+                if ($currentEnv) {
+                    if ($currentEnv -match 'RUSTDESK_API_TLS=') {
+                        $currentEnv = $currentEnv -replace 'RUSTDESK_API_TLS=.*', 'RUSTDESK_API_TLS=false'
+                    } else {
+                        $currentEnv = "$currentEnv`nRUSTDESK_API_TLS=false"
+                    }
+                    & nssm set $svcName AppEnvironmentExtra $currentEnv 2>$null
+                }
+            } catch { }
+
             $goSvcName = $script:SERVER_SERVICE
             try {
                 $goArgs = & nssm get $goSvcName AppParameters 2>$null
@@ -4348,6 +5045,242 @@ function Do-ConfigureSSL {
         Print-Success "BetterDesk services restarted"
     }
     
+    Press-Enter
+}
+
+#===============================================================================
+# HTTP/HTTPS Protocol Toggle
+#===============================================================================
+
+function Do-ToggleProtocol {
+    Print-Header
+    Write-Host "========== PROTOCOL TOGGLE (HTTP / HTTPS) ==========" -ForegroundColor White
+    Write-Host ""
+
+    $envFile = Join-Path $script:CONSOLE_PATH ".env"
+    $sslDir = Join-Path $script:RUSTDESK_PATH "ssl"
+
+    # Detect current mode from NSSM or .env
+    $currentMode = "HTTP"
+    $nssmConsole = "BetterDeskConsole"
+    try {
+        $nssmEnv = (nssm get $nssmConsole AppEnvironmentExtra 2>$null) -join "`n"
+        if ($nssmEnv -match "HTTPS_ENABLED=true") {
+            $currentMode = "HTTPS"
+        }
+    } catch {
+        if (Test-Path $envFile) {
+            $envContent = Get-Content $envFile -Raw
+            if ($envContent -match "HTTPS_ENABLED=true") {
+                $currentMode = "HTTPS"
+            }
+        }
+    }
+
+    $tlsSignal = "no"
+    $tlsRelay = "no"
+    $nssmServer = "BetterDeskServer"
+    try {
+        $serverArgs = nssm get $nssmServer AppParameters 2>$null
+        if ($serverArgs -match "-tls-signal") { $tlsSignal = "yes" }
+        if ($serverArgs -match "-tls-relay") { $tlsRelay = "yes" }
+    } catch {}
+
+    Write-Host "  Current mode: $currentMode" -ForegroundColor White
+    Write-Host "  Signal TLS:   $tlsSignal"
+    Write-Host "  Relay TLS:    $tlsRelay"
+    Write-Host ""
+    $items = @(
+        "Switch to HTTP`tEverything plain - LAN / testing",
+        "Switch to HTTPS`tPanel HTTPS + signal/relay TLS",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("1", "2", "0")
+    Invoke-MenuChoose -Title "Protocol Mode" -Subtitle "Current mode: $currentMode" -Items $items -Returns $returns
+    $protoChoice = $script:MENU_CHOICE
+
+    switch ($protoChoice) {
+        "1" {
+            # --- Switch to HTTP ---
+            Write-Host ""
+            Print-Step "Switching to HTTP mode..."
+
+            # Update .env
+            if (Test-Path $envFile) {
+                $content = Get-Content $envFile -Raw
+                $content = $content -replace "(?m)^HTTPS_ENABLED=.*$", "HTTPS_ENABLED=false"
+                $content = $content -replace "(?m)^RUSTDESK_API_TLS=.*$", "RUSTDESK_API_TLS=false"
+                $content = $content -replace "(?m)^ALLOW_SELF_SIGNED_CERTS=.*$", "ALLOW_SELF_SIGNED_CERTS=false"
+                $content = $content -replace "(?m)^HBBS_API_URL=https://localhost", "HBBS_API_URL=http://localhost"
+                $content = $content -replace "(?m)^BETTERDESK_API_URL=https://localhost", "BETTERDESK_API_URL=http://localhost"
+                $content = $content -replace "(?m)^HTTP_REDIRECT_HTTPS=.*$", "HTTP_REDIRECT_HTTPS=false"
+                $content = $content -replace "(?m)^NODE_EXTRA_CA_CERTS=.*`n?", ""
+                $content = $content -replace "(?m)^ENTERPRISE_TLS=.*`n?", ""
+                Set-Content -Path $envFile -Value $content.TrimEnd() -Encoding UTF8
+            }
+
+            # Update NSSM console service
+            try {
+                $env = (nssm get $nssmConsole AppEnvironmentExtra 2>$null) -join "`n"
+                $env = $env -replace "HTTPS_ENABLED=true", "HTTPS_ENABLED=false"
+                $env = $env -replace "ALLOW_SELF_SIGNED_CERTS=true", "ALLOW_SELF_SIGNED_CERTS=false"
+                $env = $env -replace "RUSTDESK_API_TLS=[^\s]+", "RUSTDESK_API_TLS=false"
+                $env = $env -replace "HBBS_API_URL=https://localhost", "HBBS_API_URL=http://localhost"
+                $env = $env -replace "BETTERDESK_API_URL=https://localhost", "BETTERDESK_API_URL=http://localhost"
+                $env = $env -replace "(?m)^NODE_EXTRA_CA_CERTS=.*$", ""
+                $env = $env -replace "(?m)^ENTERPRISE_TLS=.*$", ""
+                $env = ($env -split "`n" | Where-Object { $_.Trim() -ne "" }) -join "`n"
+                nssm set $nssmConsole AppEnvironmentExtra $env 2>$null | Out-Null
+            } catch {}
+
+            # Remove TLS args from Go server
+            try {
+                $args = nssm get $nssmServer AppParameters 2>$null
+                $args = $args -replace '\s*-tls-cert\s+[^\s]+', ''
+                $args = $args -replace '\s*-tls-key\s+[^\s]+', ''
+                $args = $args -replace '\s*-tls-signal', ''
+                $args = $args -replace '\s*-tls-relay', ''
+                $args = $args -replace '\s*-tls-api', ''
+                $args = $args -replace '\s*-force-https', ''
+                nssm set $nssmServer AppParameters $args.Trim() 2>$null | Out-Null
+            } catch {}
+
+            Print-Success "Switched to HTTP mode"
+            Write-Host ""
+            Print-Info "  Panel:         HTTP :5000"
+            Print-Info "  Signal:        TCP  :21116"
+            Print-Info "  Relay:         TCP  :21117"
+            Print-Info "  Go API:        HTTP :21121 (RustDesk client + REST)"
+            Print-Info "  Client API:    HTTP :21121"
+            Write-Host ""
+            Print-Warning "SSL certificates were NOT deleted (use option C > 4 to remove)"
+        }
+        "2" {
+            # --- Switch to HTTPS ---
+            Write-Host ""
+
+            $certFile = Join-Path $sslDir "betterdesk.crt"
+            $keyFile = Join-Path $sslDir "betterdesk.key"
+
+            # Check for SSL certificates
+            if (-not (Test-Path $certFile) -or -not (Test-Path $keyFile)) {
+                Print-Warning "No SSL certificates found at $sslDir"
+                Write-Host ""
+                $gen = Read-Host "Generate self-signed certificate now? [Y/n]"
+                if ($gen -ne "n" -and $gen -ne "N") {
+                    if (-not (Test-Path $sslDir)) { New-Item -ItemType Directory -Path $sslDir -Force | Out-Null }
+
+                    $serverIp = try {
+                        (Invoke-WebRequest -Uri "https://api.ipify.org" -TimeoutSec 5 -UseBasicParsing).Content.Trim()
+                    } catch { "127.0.0.1" }
+
+                    & openssl req -x509 -nodes -days 3650 -newkey rsa:4096 `
+                        -keyout $keyFile -out $certFile `
+                        -subj "/CN=$serverIp/O=BetterDesk/C=PL" 2>$null
+
+                    if (Test-Path $certFile) {
+                        Print-Success "Self-signed certificate generated"
+                    } else {
+                        Print-Error "Failed to generate certificate (is openssl installed?)"
+                        Press-Enter
+                        return
+                    }
+                } else {
+                    Print-Error "Cannot enable HTTPS without certificates"
+                    Print-Info "Use option C (SSL config) to set up certificates first"
+                    Press-Enter
+                    return
+                }
+            }
+
+            Print-Step "Switching to HTTPS mode..."
+
+            # Update .env
+            if (Test-Path $envFile) {
+                $content = Get-Content $envFile -Raw
+                $content = $content -replace "(?m)^HTTPS_ENABLED=.*$", "HTTPS_ENABLED=true"
+                $content = $content -replace "(?m)^SSL_CERT_PATH=.*$", "SSL_CERT_PATH=$certFile"
+                $content = $content -replace "(?m)^SSL_KEY_PATH=.*$", "SSL_KEY_PATH=$keyFile"
+                $content = $content -replace "(?m)^HTTP_REDIRECT_HTTPS=.*$", "HTTP_REDIRECT_HTTPS=true"
+                # Keep Go API on HTTP
+                $content = $content -replace "(?m)^HBBS_API_URL=https://localhost", "HBBS_API_URL=http://localhost"
+                $content = $content -replace "(?m)^BETTERDESK_API_URL=https://localhost", "BETTERDESK_API_URL=http://localhost"
+                if ($content -notmatch "ALLOW_SELF_SIGNED_CERTS=") {
+                    $content += "`nALLOW_SELF_SIGNED_CERTS=true"
+                } else {
+                    $content = $content -replace "(?m)^ALLOW_SELF_SIGNED_CERTS=.*$", "ALLOW_SELF_SIGNED_CERTS=true"
+                }
+                if ($content -notmatch "NODE_EXTRA_CA_CERTS=") {
+                    $content += "`nNODE_EXTRA_CA_CERTS=$certFile"
+                } else {
+                    $content = $content -replace "(?m)^NODE_EXTRA_CA_CERTS=.*$", "NODE_EXTRA_CA_CERTS=$certFile"
+                }
+                Set-Content -Path $envFile -Value $content.TrimEnd() -Encoding UTF8
+            }
+
+            # Update NSSM console service
+            try {
+                $env = (nssm get $nssmConsole AppEnvironmentExtra 2>$null) -join "`n"
+                $env = $env -replace "HTTPS_ENABLED=false", "HTTPS_ENABLED=true"
+                if ($env -notmatch "HTTPS_ENABLED=") { $env += "`nHTTPS_ENABLED=true" }
+                $env = $env -replace "ALLOW_SELF_SIGNED_CERTS=false", "ALLOW_SELF_SIGNED_CERTS=true"
+                if ($env -notmatch "ALLOW_SELF_SIGNED_CERTS=") { $env += "`nALLOW_SELF_SIGNED_CERTS=true" }
+                # Go API stays HTTP
+                $env = $env -replace "HBBS_API_URL=https://localhost", "HBBS_API_URL=http://localhost"
+                $env = $env -replace "BETTERDESK_API_URL=https://localhost", "BETTERDESK_API_URL=http://localhost"
+                if ($env -notmatch "NODE_EXTRA_CA_CERTS=") { $env += "`nNODE_EXTRA_CA_CERTS=$certFile" }
+                else { $env = $env -replace "(?m)^NODE_EXTRA_CA_CERTS=.*$", "NODE_EXTRA_CA_CERTS=$certFile" }
+                $env = ($env -split "`n" | Where-Object { $_.Trim() -ne "" }) -join "`n"
+                nssm set $nssmConsole AppEnvironmentExtra $env 2>$null | Out-Null
+            } catch {}
+
+            # Add TLS to Go server (signal + relay only, NOT API)
+            try {
+                $args = nssm get $nssmServer AppParameters 2>$null
+                # Remove old TLS args
+                $args = $args -replace '\s*-tls-cert\s+[^\s]+', ''
+                $args = $args -replace '\s*-tls-key\s+[^\s]+', ''
+                $args = $args -replace '\s*-tls-signal', ''
+                $args = $args -replace '\s*-tls-relay', ''
+                $args = $args -replace '\s*-tls-api', ''
+                $args = $args -replace '\s*-force-https', ''
+                # Add signal + relay TLS (API stays HTTP)
+                $args = "$($args.Trim()) -tls-cert $certFile -tls-key $keyFile -tls-signal -tls-relay"
+                nssm set $nssmServer AppParameters $args 2>$null | Out-Null
+            } catch {}
+
+            Print-Success "Switched to HTTPS mode"
+            Write-Host ""
+            Print-Info "  Panel:         HTTPS :5443"
+            Print-Info "  Signal:        TLS   :21116"
+            Print-Info "  Relay:         TLS   :21117"
+            Print-Info "  Go API:        HTTP  :21121 (RustDesk client + REST, always HTTP)"
+            Print-Info "  Client API:    auto  :21121"
+        }
+        default { return }
+    }
+
+    Write-Host ""
+    $restart = Read-Host "Restart BetterDesk services now? [Y/n]"
+    if ($restart -ne "n" -and $restart -ne "N") {
+        try {
+            nssm restart $nssmServer 2>$null | Out-Null
+            nssm restart $nssmConsole 2>$null | Out-Null
+            Start-Sleep -Seconds 2
+            Print-Success "BetterDesk services restarted"
+            Write-Host ""
+            # Quick status check
+            $serverStatus = (nssm status $nssmServer 2>$null)
+            $consoleStatus = (nssm status $nssmConsole 2>$null)
+            if ($serverStatus -match "Running") { Print-Success "Go Server:   running" }
+            else { Print-Error "Go Server:   $serverStatus" }
+            if ($consoleStatus -match "Running") { Print-Success "Web Console: running" }
+            else { Print-Error "Web Console: $consoleStatus" }
+        } catch {
+            Print-Error "Failed to restart services: $_"
+        }
+    }
+
     Press-Enter
 }
 
@@ -4386,19 +5319,17 @@ function Do-MigrateDatabase {
 
     Print-Info "Migration binary: $migrateBin"
     Write-Host ""
-    Write-Host "  Migrate databases between different BetterDesk components." -ForegroundColor White
-    Write-Host ""
-    Write-Host "  Migration Modes:" -ForegroundColor Yellow
-    Write-Host "  1. Rust -> Go          Migrate from legacy Rust hbbs database to Go server" -ForegroundColor Green
-    Write-Host "  2. Node.js -> Go       Migrate from Node.js web console to Go server" -ForegroundColor Green
-    Write-Host "  3. SQLite -> PostgreSQL Migrate BetterDesk Go SQLite to PostgreSQL" -ForegroundColor Green
-    Write-Host "  4. PostgreSQL -> SQLite Migrate PostgreSQL back to SQLite" -ForegroundColor Green
-    Write-Host "  5. Backup              Create timestamped backup of SQLite database" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  0. Back to main menu" -ForegroundColor Red
-    Write-Host ""
-
-    $migChoice = Read-Host "Select migration mode"
+    $items = @(
+        "Rust -> Go`tLegacy Rust hbbs database to Go server",
+        "Node.js -> Go`tNode.js web console to Go server",
+        "SQLite -> PostgreSQL`tBetterDesk Go SQLite to PostgreSQL",
+        "PostgreSQL -> SQLite`tPostgreSQL back to SQLite",
+        "Backup`tCreate a timestamped SQLite backup",
+        "Back`tReturn to the main menu"
+    )
+    $returns = @("1", "2", "3", "4", "5", "0")
+    Invoke-MenuChoose -Title "Database Migration" -Subtitle "Move data between BetterDesk components" -Items $items -Returns $returns
+    $migChoice = $script:MENU_CHOICE
 
     switch ($migChoice) {
         "1" {
@@ -4592,6 +5523,7 @@ function Show-Menu {
     Write-Host ""
     Write-Host "  L. MINIMAL INSTALLATION (server only)"
     Write-Host "  C. Configure SSL certificates"
+    Write-Host "  T. Toggle HTTP/HTTPS mode"
     Write-Host "  M. Database migration"
     Write-Host "  S. Settings (paths)"
     Write-Host "  0. Exit"
@@ -4617,8 +5549,37 @@ function Main {
     }
     
     while ($true) {
-        Show-Menu
-        $choice = Read-Host "Select option"
+        $menuLabels = @(
+            "Fresh installation`tFull install from scratch",
+            "Update`tUpdate an existing installation",
+            "Repair installation`tFix common problems",
+            "Validate installation`tCheck correctness",
+            "Backup`tCreate a backup",
+            "Reset admin password`tReset the console admin",
+            "Build & deploy server`tCompile and deploy the Go server",
+            "Diagnostics`tDetailed problem analysis",
+            "Uninstall`tRemove BetterDesk",
+            "Minimal installation`tServer only",
+            "Configure SSL certificates`tLet's Encrypt / custom / self-signed",
+            "Toggle HTTP/HTTPS`tSwitch protocol mode",
+            "Database migration`tMigrate between backends",
+            "Settings (paths)`tConfigure install paths",
+            "Exit`tQuit the manager"
+        )
+        $menuActions = @("1", "2", "3", "4", "5", "6", "7", "8", "9", "L", "C", "T", "M", "S", "0")
+
+        $choice = ""
+        if (Test-TuiAvailable) {
+            $statusLine = "BetterDesk Console Manager v$VERSION"
+            if (Invoke-TuiSelect -Title "BetterDesk Console Manager v$VERSION" -Subtitle "Use arrow keys, Enter to select" -Items $menuLabels) {
+                $choice = $menuActions[$script:TUI_RESULT]
+            } else {
+                $choice = "0"
+            }
+        } else {
+            Show-Menu
+            $choice = Read-Host "Select option"
+        }
         
         switch ($choice) {
             "1" { Do-Install }
@@ -4634,6 +5595,8 @@ function Main {
             "l" { Do-InstallMinimal }
             "C" { Do-ConfigureSSL }
             "c" { Do-ConfigureSSL }
+            "T" { Do-ToggleProtocol }
+            "t" { Do-ToggleProtocol }
             "M" { Do-MigrateDatabase }
             "m" { Do-MigrateDatabase }
             "S" { Configure-Paths }

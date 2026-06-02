@@ -26,6 +26,8 @@ import (
 
 	"github.com/unitronix/betterdesk-server/audit"
 	"github.com/unitronix/betterdesk-server/auth"
+	"github.com/unitronix/betterdesk-server/config"
+	"github.com/unitronix/betterdesk-server/db"
 )
 
 // tfaSession holds temporary state for a two-factor auth flow in progress.
@@ -304,6 +306,7 @@ func (s *Server) handleClientCurrentUser(w http.ResponseWriter, r *http.Request)
 // POST /api/ab — update legacy address book
 func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request) {
 	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
 	if username == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
@@ -351,6 +354,7 @@ func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
 			return
 		}
+		s.syncAddressBookTagsToPeers(username, role, "legacy", dataStr)
 		log.Printf("[api] Saved legacy address book for %s (%d bytes)", username, len(dataStr))
 		writeJSON(w, http.StatusOK, map[string]any{})
 
@@ -364,6 +368,7 @@ func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request)
 // POST /api/ab/personal — update personal address book
 func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.Request) {
 	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
 	if username == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
@@ -408,6 +413,7 @@ func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
 			return
 		}
+		s.syncAddressBookTagsToPeers(username, role, "personal", dataStr)
 		log.Printf("[api] Saved personal address book for %s (%d bytes)", username, len(dataStr))
 		writeJSON(w, http.StatusOK, map[string]any{})
 
@@ -416,27 +422,144 @@ func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.
 	}
 }
 
+func normalizeClientTags(value any) []string {
+	var raw []string
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			if tag, ok := item.(string); ok {
+				raw = append(raw, tag)
+			}
+		}
+	case []string:
+		raw = append(raw, v...)
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return nil
+		}
+		if strings.HasPrefix(strings.TrimSpace(v), "[") {
+			var arr []string
+			if err := json.Unmarshal([]byte(v), &arr); err == nil {
+				raw = append(raw, arr...)
+			} else {
+				raw = strings.Split(v, ",")
+			}
+		} else {
+			raw = strings.Split(v, ",")
+		}
+	default:
+		return nil
+	}
+
+	seen := make(map[string]bool, len(raw))
+	tags := make([]string, 0, len(raw))
+	for _, tag := range raw {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		if len(tag) > 50 {
+			tag = tag[:50]
+		}
+		if seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		tags = append(tags, tag)
+		if len(tags) >= 20 {
+			break
+		}
+	}
+	return tags
+}
+
+func (s *Server) syncAddressBookTagsToPeers(username, role, abType, data string) {
+	if role == auth.RolePro || !auth.RoleHasPermission(role, auth.PermDeviceEdit) {
+		return
+	}
+
+	var ab struct {
+		Peers []map[string]any `json:"peers"`
+	}
+	if err := json.Unmarshal([]byte(data), &ab); err != nil || len(ab.Peers) == 0 {
+		return
+	}
+
+	synced := 0
+	seenPeers := make(map[string]bool, len(ab.Peers))
+	for _, peer := range ab.Peers {
+		id, _ := peer["id"].(string)
+		id = strings.TrimSpace(id)
+		if id == "" || seenPeers[id] {
+			continue
+		}
+		if _, hasTags := peer["tags"]; !hasTags {
+			continue
+		}
+		seenPeers[id] = true
+		tags := normalizeClientTags(peer["tags"])
+		if err := s.db.UpdatePeerTags(id, strings.Join(tags, ",")); err != nil {
+			log.Printf("[api] Address book tag sync failed for peer %s user=%s: %v", id, username, err)
+			continue
+		}
+		synced++
+	}
+	if synced > 0 {
+		log.Printf("[api] Synced %d peer tag set(s) from %s address book for %s", synced, abType, username)
+	}
+}
+
 // mergeAdminTagsIntoAB merges admin-set tags from the peers table into the
 // address book data.  For each peer in the AB that also exists in the peers
 // table with non-empty tags, the admin tags are added to the peer's tag list.
 // The global tags[] array is also extended with any new admin tags.
-// This implements TAG sync (Issue #76).
+// Peer hostname/platform/alias are enriched from the peers table if missing.
+// This implements TAG sync (Issue #76) and sysinfo enrichment (Issue #138).
+//
+// IMPORTANT: We use map[string]any for the top-level AB object to preserve
+// ALL fields (including tag_colors, rule, etc.) that the RustDesk client
+// sends/expects.  A typed struct would silently drop unknown fields on
+// re-serialization, causing "type 'String' is not a subtype of type 'int'"
+// errors in the Dart client when tag_colors disappears.
 func (s *Server) mergeAdminTagsIntoAB(data string) string {
 	if data == "" || data == "{}" {
 		return data
 	}
 
-	var ab struct {
-		Peers []map[string]any `json:"peers"`
-		Tags  []string         `json:"tags"`
-	}
-	if err := json.Unmarshal([]byte(data), &ab); err != nil || len(ab.Peers) == 0 {
+	// Unmarshal into a generic map to preserve ALL fields (tag_colors, etc.)
+	var ab map[string]any
+	if err := json.Unmarshal([]byte(data), &ab); err != nil {
 		return data
 	}
 
+	// Extract peers array
+	peersRaw, _ := ab["peers"].([]any)
+	if len(peersRaw) == 0 {
+		return data
+	}
+	peers := make([]map[string]any, 0, len(peersRaw))
+	for _, p := range peersRaw {
+		if pm, ok := p.(map[string]any); ok {
+			peers = append(peers, pm)
+		}
+	}
+	if len(peers) == 0 {
+		return data
+	}
+
+	// Extract existing tags array
+	var existingTags []string
+	if tagsRaw, ok := ab["tags"].([]any); ok {
+		for _, t := range tagsRaw {
+			if ts, ok := t.(string); ok {
+				existingTags = append(existingTags, ts)
+			}
+		}
+	}
+
 	// Collect all peer IDs from the AB
-	ids := make([]string, 0, len(ab.Peers))
-	for _, p := range ab.Peers {
+	ids := make([]string, 0, len(peers))
+	for _, p := range peers {
 		if id, ok := p["id"].(string); ok && id != "" {
 			ids = append(ids, id)
 		}
@@ -445,11 +568,22 @@ func (s *Server) mergeAdminTagsIntoAB(data string) string {
 		return data
 	}
 
-	// Build a map of peer_id → admin tags from the peers table
+	// Build maps of peer_id → admin tags and peer_id → sysinfo from the peers table
 	adminTags := make(map[string][]string)
+	peerInfo := make(map[string]*db.Peer)
+	bannedPeers := make(map[string]bool)
 	for _, id := range ids {
 		peer, err := s.db.GetPeer(id)
-		if err != nil || peer == nil || peer.Tags == "" {
+		if err != nil || peer == nil {
+			continue
+		}
+		// Issue #138: track banned/deleted peers so they can be stripped from the AB
+		if peer.Banned || peer.SoftDeleted {
+			bannedPeers[id] = true
+			continue
+		}
+		peerInfo[id] = peer
+		if peer.Tags == "" {
 			continue
 		}
 		tags := strings.Split(peer.Tags, ",")
@@ -464,24 +598,58 @@ func (s *Server) mergeAdminTagsIntoAB(data string) string {
 			adminTags[id] = cleaned
 		}
 	}
-	if len(adminTags) == 0 {
+	if len(adminTags) == 0 && len(peerInfo) == 0 {
 		return data
 	}
 
 	// Build a set of existing global tags
 	tagSet := make(map[string]bool)
-	for _, t := range ab.Tags {
+	for _, t := range existingTags {
 		tagSet[t] = true
 	}
 
-	// Merge admin tags into each peer's tag list
-	for i, p := range ab.Peers {
+	// Merge admin tags and sysinfo into each peer; strip banned/deleted peers
+	modified := false
+	filtered := make([]map[string]any, 0, len(peers))
+	for _, p := range peers {
 		id, ok := p["id"].(string)
 		if !ok || id == "" {
+			filtered = append(filtered, p)
 			continue
 		}
-		atags, ok := adminTags[id]
-		if !ok {
+
+		// Issue #138: remove banned/deleted peers from the address book entirely
+		if bannedPeers[id] {
+			modified = true
+			continue
+		}
+		filtered = append(filtered, p)
+
+		// Enrich peer with sysinfo from peers table (Issue #138: OS icon/name not showing)
+		if info, ok := peerInfo[id]; ok {
+			if _, hasHostname := p["hostname"]; !hasHostname || p["hostname"] == "" {
+				if info.Hostname != "" {
+					p["hostname"] = info.Hostname
+					modified = true
+				}
+			}
+			if _, hasPlatform := p["platform"]; !hasPlatform || p["platform"] == "" {
+				if info.OS != "" {
+					p["platform"] = info.OS
+					modified = true
+				}
+			}
+			if _, hasUsername := p["username"]; !hasUsername || p["username"] == "" {
+				if info.User != "" {
+					p["username"] = info.User
+					modified = true
+				}
+			}
+		}
+
+		// Merge admin tags
+		atags, hasAdminTags := adminTags[id]
+		if !hasAdminTags {
 			continue
 		}
 		// Get existing peer tags
@@ -509,15 +677,35 @@ func (s *Server) mergeAdminTagsIntoAB(data string) string {
 			}
 			// Add to global tags if new
 			if !tagSet[t] {
-				ab.Tags = append(ab.Tags, t)
+				existingTags = append(existingTags, t)
 				tagSet[t] = true
 			}
 		}
-		ab.Peers[i]["tags"] = merged
+		p["tags"] = merged
+		modified = true
 	}
 
-	// Re-serialize
-	out, err := json.Marshal(&ab)
+	if !modified {
+		return data
+	}
+
+	// Write back the modified peers and tags into the original map
+	// Use filtered list (banned/deleted peers removed)
+	peersAny := make([]any, len(filtered))
+	for i, p := range filtered {
+		peersAny[i] = p
+	}
+	ab["peers"] = peersAny
+
+	// Convert tags to []any
+	tagsAny := make([]any, len(existingTags))
+	for i, t := range existingTags {
+		tagsAny[i] = t
+	}
+	ab["tags"] = tagsAny
+
+	// Re-serialize — all other fields (tag_colors, rule, etc.) are preserved
+	out, err := json.Marshal(ab)
 	if err != nil {
 		return data
 	}
@@ -528,6 +716,7 @@ func (s *Server) mergeAdminTagsIntoAB(data string) string {
 // GET /api/ab/tags
 func (s *Server) handleClientAddressBookTags(w http.ResponseWriter, r *http.Request) {
 	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
 	if username == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
 		return
@@ -539,16 +728,252 @@ func (s *Server) handleClientAddressBookTags(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusOK, map[string]any{"data": []string{}})
 		return
 	}
+	data = s.mergeAdminTagsIntoAB(data)
 
 	// Extract tags from the address book JSON
 	var ab struct {
 		Tags []string `json:"tags"`
 	}
 	if err := json.Unmarshal([]byte(data), &ab); err != nil || ab.Tags == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"data": []string{}})
-		return
+		ab.Tags = []string{}
+	}
+
+	if role != auth.RolePro && auth.RoleHasPermission(role, auth.PermDeviceView) {
+		if peers, err := s.db.ListPeers(false); err == nil {
+			seen := make(map[string]bool, len(ab.Tags))
+			for _, tag := range ab.Tags {
+				seen[tag] = true
+			}
+			for _, p := range peers {
+				for _, tag := range strings.Split(p.Tags, ",") {
+					tag = strings.TrimSpace(tag)
+					if tag != "" && !seen[tag] {
+						ab.Tags = append(ab.Tags, tag)
+						seen[tag] = true
+					}
+				}
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": ab.Tags})
+}
+
+// handleClientGroupList returns tags from the peers table as groups in the
+// {total,data,msg} envelope expected by RustDesk PRO Flutter clients.
+// Each tag is exposed as a group so the RustDesk client can show folder-like
+// organization of devices.  The "team" field is required by the client and
+// must contain "peers" as a list with peer_id references.
+//
+// GET  /api/group, /api/group/get
+// POST /api/group/get
+//
+// Compatibility shim suggested by progloto in PR #81, enhanced for Issue #138.
+func (s *Server) handleClientGroupList(w http.ResponseWriter, r *http.Request) {
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+	if username == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	// Only users with device view permission get real groups
+	if role == auth.RolePro || !auth.RoleHasPermission(role, auth.PermDeviceView) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"total": 0,
+			"data":  []any{},
+			"msg":   "success",
+		})
+		return
+	}
+
+	// Collect all tags from the peers table and group peers by tag
+	allPeers, err := s.db.ListPeers(false)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"total": 0,
+			"data":  []any{},
+			"msg":   "success",
+		})
+		return
+	}
+
+	// Build tag → peer IDs map (skip banned/deleted peers)
+	tagPeers := make(map[string][]string)
+	tagOrder := make([]string, 0)
+	for _, p := range allPeers {
+		if p.Banned || p.SoftDeleted {
+			continue
+		}
+		if p.Tags == "" {
+			continue
+		}
+		for _, tag := range strings.Split(p.Tags, ",") {
+			tag = strings.TrimSpace(tag)
+			if tag == "" {
+				continue
+			}
+			if _, exists := tagPeers[tag]; !exists {
+				tagOrder = append(tagOrder, tag)
+			}
+			tagPeers[tag] = append(tagPeers[tag], p.ID)
+		}
+	}
+
+	// Build group entries that the RustDesk Flutter client can parse
+	groups := make([]map[string]any, 0, len(tagOrder))
+	for i, tag := range tagOrder {
+		peerRefs := make([]map[string]any, 0, len(tagPeers[tag]))
+		for _, pid := range tagPeers[tag] {
+			peerRefs = append(peerRefs, map[string]any{
+				"id": pid,
+			})
+		}
+		groups = append(groups, map[string]any{
+			"guid":        tag,
+			"name":        tag,
+			"team":        map[string]any{"peers": peerRefs},
+			"access_perm": 1, // read-write
+			"note":        "",
+			"created_at":  "",
+			"sort":        i,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": len(groups),
+		"data":  groups,
+		"msg":   "success",
+	})
+}
+
+// handleClientGroupPeers returns all registered peers in the {total,data,msg}
+// envelope expected by RustDesk PRO Flutter clients.  Peers are enriched with
+// hostname, platform, and username from the peers table so the RustDesk client
+// can display OS icons and system names.
+//
+// GET /api/peers/list
+//
+// Compatibility shim suggested by progloto in PR #81, enhanced for Issue #138.
+func (s *Server) handleClientGroupPeers(w http.ResponseWriter, r *http.Request) {
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+	if username == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Not authenticated"})
+		return
+	}
+
+	if role == auth.RolePro || !auth.RoleHasPermission(role, auth.PermDeviceView) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"total": 0,
+			"data":  []any{},
+			"msg":   "success",
+		})
+		return
+	}
+
+	// Fetch all peers from the database
+	allPeers, err := s.db.ListPeers(false)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"total": 0,
+			"data":  []any{},
+			"msg":   "success",
+		})
+		return
+	}
+
+	// Build a map of peer_id → data from the user's address book for extra fields
+	abPeerMap := make(map[string]map[string]any)
+	data, _ := s.db.GetAddressBook(username, "legacy")
+	if data != "" && data != "{}" {
+		var abData struct {
+			Peers []map[string]any `json:"peers"`
+		}
+		if json.Unmarshal([]byte(data), &abData) == nil {
+			for _, p := range abData.Peers {
+				if id, ok := p["id"].(string); ok && id != "" {
+					abPeerMap[id] = p
+				}
+			}
+		}
+	}
+
+	// Build peer list enriched with sysinfo from peers table, matching
+	// PeerPayload format: info as nested map, status as int.
+	result := make([]map[string]any, 0, len(allPeers))
+	for _, p := range allPeers {
+		if p.SoftDeleted || p.Banned {
+			continue
+		}
+
+		// Convert status to int: 1=active (RustDesk convention)
+		statusInt := 1
+		if p.Disabled {
+			statusInt = 0
+		}
+
+		// Build info map matching RustDesk PeerPayload.info format
+		// Issue #138 (2.4): fallback device_name to peer ID if hostname empty
+		deviceName := p.Hostname
+		if deviceName == "" {
+			deviceName = p.ID
+		}
+		info := map[string]any{
+			"device_name": deviceName,
+			"os":          p.OS,
+			"username":    p.User,
+			"version":     p.Version,
+		}
+
+		// Build tags list
+		var tags []string
+		if p.Tags != "" {
+			for _, t := range strings.Split(p.Tags, ",") {
+				t = strings.TrimSpace(t)
+				if t != "" {
+					tags = append(tags, t)
+				}
+			}
+		}
+		if tags == nil {
+			tags = []string{}
+		}
+
+		peer := map[string]any{
+			"id":                p.ID,
+			"info":              info,
+			"status":            statusInt,
+			"user":              p.User,
+			"user_name":         p.User,
+			"note":              p.Note,
+			"device_group_name": "",
+			"tags":              tags,
+			"online":            s.peers.IsOnline(p.ID, config.RegTimeout),
+		}
+
+		// Set device_group_name from first tag (if any)
+		if len(tags) > 0 {
+			peer["device_group_name"] = tags[0]
+		}
+
+		// Merge alias/hash from AB if present
+		if abPeer, ok := abPeerMap[p.ID]; ok {
+			if alias, ok := abPeer["alias"].(string); ok && alias != "" {
+				peer["alias"] = alias
+			}
+			if hash, ok := abPeer["hash"].(string); ok && hash != "" {
+				peer["hash"] = hash
+			}
+		}
+
+		result = append(result, peer)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total": len(result),
+		"data":  result,
+		"msg":   "success",
+	})
 }
 
 // handleClientHeartbeat accepts heartbeat pings from RustDesk clients.

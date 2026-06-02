@@ -44,6 +44,14 @@ POSTGRESQL_HOST="${POSTGRESQL_HOST:-postgres}"  # Container name as host
 POSTGRESQL_PORT="${POSTGRESQL_PORT:-5432}"
 STORE_ADMIN_CREDENTIALS="${STORE_ADMIN_CREDENTIALS:-false}"
 
+# Relay server configuration
+#   auto   - detect public IP (default, best for internet-facing servers)
+#   local  - use the host's LAN IP (best for LAN-only deployments)
+#   public - force public IP detection
+# RELAY_SERVERS env var always overrides this with a fixed value.
+RELAY_MODE="${RELAY_MODE:-auto}"
+RELAY_SERVERS="${RELAY_SERVERS:-}"
+
 # Common data directory paths to search
 COMMON_DATA_PATHS=(
     "/opt/betterdesk-data"
@@ -70,6 +78,7 @@ MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
 NC='\033[0m'
 BOLD='\033[1m'
+DIM='\033[2m'
 
 # Logging
 LOG_FILE="/tmp/betterdesk_docker_$(date +%Y%m%d_%H%M%S).log"
@@ -155,6 +164,148 @@ confirm() {
     [[ "$response" =~ ^[TtYy]$ ]]
 }
 
+#===============================================================================
+# Interactive TUI (arrow-key navigable menu) — pure bash, no dependencies
+#===============================================================================
+# Result of tui_select() is returned in the global TUI_RESULT.
+TUI_RESULT=""
+
+tui_available() {
+    [ "${BETTERDESK_CLASSIC_MENU:-0}" = "1" ] && return 1
+    [ -t 0 ] && [ -t 1 ] || return 1
+    return 0
+}
+
+_tui_restore() { printf '\033[?25h' 2>/dev/null; stty echo 2>/dev/null; }
+
+# tui_select "Title" "Subtitle" item1 item2 ...
+# Each item may embed a description after a literal $'\t' (tab).
+# Navigation: Up/Down or k/j to move, Enter/Right to choose, q/Esc/0 to cancel.
+tui_select() {
+    local title="$1"; shift
+    local subtitle="$1"; shift
+    local items=("$@")
+    local count=${#items[@]}
+    local sel=0 key rest
+
+    if ! tui_available || [ "$count" -eq 0 ]; then
+        TUI_RESULT=""
+        return 1
+    fi
+
+    printf '\033[?25l'
+    trap '_tui_restore' INT TERM
+
+    clear
+    while true; do
+        # Build the whole frame in a single buffer, then emit it with one write
+        # to avoid renderers (notably the VS Code integrated terminal with GPU
+        # acceleration) dropping individual glyphs on full-screen redraws.
+        local buf=""
+        buf+="\033[H"
+        buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\033[K\n"
+        buf+="$(printf "${CYAN}${BOLD}|${NC} ${WHITE}${BOLD}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$title")\033[K\n"
+        if [ -n "$subtitle" ]; then
+            buf+="$(printf "${CYAN}${BOLD}|${NC} ${DIM}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$subtitle")\033[K\n"
+        fi
+        buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\033[K\n"
+        buf+="\033[K\n"
+
+        local i label desc pad line
+        for i in "${!items[@]}"; do
+            label="${items[$i]%%$'\t'*}"
+            desc=""
+            [[ "${items[$i]}" == *$'\t'* ]] && desc="${items[$i]#*$'\t'}"
+            pad=$(( 32 - ${#label} ))
+            [ "$pad" -lt 1 ] && pad=1
+            if [ "$i" -eq "$sel" ]; then
+                line="$(printf "  ${GREEN}${BOLD}>${NC} ${GREEN}${BOLD}%s${NC}%*s${DIM}%s${NC}" "$label" "$pad" "" "$desc")"
+            else
+                line="$(printf "    ${WHITE}%s${NC}%*s${DIM}%s${NC}" "$label" "$pad" "" "$desc")"
+            fi
+            buf+="${line}\033[K\n"
+        done
+
+        buf+="\033[K\n"
+        buf+="  ${DIM}Up/Down navigate   Enter select   q/Esc back${NC}\033[K\n"
+        buf+="\033[J"
+
+        printf '%b' "$buf"
+
+        IFS= read -rsn1 key 2>/dev/null
+        if [[ "$key" == $'\033' ]]; then
+            read -rsn2 -t 0.05 rest 2>/dev/null
+            key+="$rest"
+        fi
+
+        case "$key" in
+            $'\033[A'|'k') sel=$(( (sel - 1 + count) % count )) ;;
+            $'\033[B'|'j') sel=$(( (sel + 1) % count )) ;;
+            ''|$'\033[C') TUI_RESULT="$sel"; _tui_restore; trap - INT TERM; return 0 ;;
+            'q'|'Q'|'0'|$'\033') TUI_RESULT=""; _tui_restore; trap - INT TERM; return 2 ;;
+            [1-9])
+                local idx=$(( key - 1 ))
+                if [ "$idx" -lt "$count" ]; then
+                    TUI_RESULT="$idx"; _tui_restore; trap - INT TERM; return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# Modern UI helpers shared by every sub-menu
+#===============================================================================
+ui_panel_header() {
+    local title="$1" subtitle="$2"
+    clear 2>/dev/null || true
+    local buf=""
+    buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\n"
+    buf+="$(printf "${CYAN}${BOLD}|${NC} ${WHITE}${BOLD}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$title")\n"
+    if [ -n "$subtitle" ]; then
+        buf+="$(printf "${CYAN}${BOLD}|${NC} ${DIM}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$subtitle")\n"
+    fi
+    buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\n"
+    printf '%b' "$buf"
+    echo ""
+}
+
+# menu_choose "Title" "Subtitle"
+# Caller pre-populates parallel arrays _menu_items (Label\tDescription) and
+# _menu_returns. The chosen value lands in MENU_CHOICE; on cancel the last
+# entry's value is returned. Arrow-key TUI when available, styled numeric else.
+MENU_CHOICE=""
+menu_choose() {
+    local title="$1" subtitle="$2"
+    MENU_CHOICE=""
+    local last_idx=$(( ${#_menu_returns[@]} - 1 ))
+    [ "$last_idx" -lt 0 ] && last_idx=0
+
+    if tui_available; then
+        tui_select "$title" "$subtitle" "${_menu_items[@]}"
+        local rc=$?
+        if [ "$rc" -eq 0 ] && [ -n "$TUI_RESULT" ]; then
+            MENU_CHOICE="${_menu_returns[$TUI_RESULT]}"
+        else
+            MENU_CHOICE="${_menu_returns[$last_idx]}"
+        fi
+        return 0
+    fi
+
+    ui_panel_header "$title" "$subtitle"
+    local i label desc
+    for i in "${!_menu_items[@]}"; do
+        label="${_menu_items[$i]%%$'\t'*}"
+        desc=""
+        [[ "${_menu_items[$i]}" == *$'\t'* ]] && desc="${_menu_items[$i]#*$'\t'}"
+        printf "  ${GREEN}${BOLD}%2s${NC}) ${WHITE}%-28s${NC} ${DIM}%s${NC}\n" \
+            "${_menu_returns[$i]}" "$label" "$desc"
+    done
+    echo ""
+    echo -ne "  ${CYAN}Select option:${NC} "
+    read -r MENU_CHOICE
+}
+
 get_public_ip() {
     local ip
     ip=$(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
@@ -162,6 +313,54 @@ get_public_ip() {
     ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     ip=$(curl -s --max-time 5 icanhazip.com 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     echo "127.0.0.1"
+}
+
+# Detect the host's primary LAN/private IPv4 address (for LAN-only deployments).
+get_local_ip() {
+    local ip
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1)
+    [ -n "$ip" ] && echo "$ip" && return
+    ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+    [ -n "$ip" ] && echo "$ip" && return
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$ip" ] && echo "$ip" && return
+    echo "127.0.0.1"
+}
+
+# Resolve the relay server address according to RELAY_MODE / RELAY_SERVERS.
+# Prints the address to stdout; warnings/info go to stderr.
+#   auto   - detect public IP (default)
+#   local  - use the host's LAN IP (LAN-only deployments)
+#   public - force public IP detection
+# RELAY_SERVERS env var always overrides this with a fixed value.
+resolve_relay_ip() {
+    if [ -n "$RELAY_SERVERS" ]; then
+        echo "Using fixed relay address (RELAY_SERVERS): $RELAY_SERVERS" >&2
+        echo "$RELAY_SERVERS"
+        return
+    fi
+
+    local ip
+    case "${RELAY_MODE:-auto}" in
+        local|lan)
+            ip=$(get_local_ip)
+            echo "Relay mode 'local': using LAN IP $ip (LAN-only deployment)" >&2
+            ;;
+        public|wan)
+            ip=$(get_public_ip)
+            echo "Relay mode 'public': using public IP $ip" >&2
+            ;;
+        auto|*)
+            ip=$(get_public_ip)
+            if [ "$ip" = "127.0.0.1" ] || [[ "$ip" == 10.* ]] || [[ "$ip" == 192.168.* ]] || [[ "$ip" == 172.1[6-9].* ]] || [[ "$ip" == 172.2[0-9].* ]] || [[ "$ip" == 172.3[0-1].* ]]; then
+                echo "WARNING: Auto-detected private/loopback IP: $ip" >&2
+                echo "WARNING: Remote (internet) clients will NOT connect via relay with this address." >&2
+                echo "         For internet access set RELAY_SERVERS=YOUR.PUBLIC.IP, or for LAN-only" >&2
+                echo "         deployments set RELAY_MODE=local to silence this warning." >&2
+            fi
+            ;;
+    esac
+    echo "$ip"
 }
 
 sql_escape_literal() {
@@ -246,26 +445,18 @@ auto_detect_docker_paths() {
 
 # Interactive path configuration for Docker
 configure_docker_paths() {
-    clear
-    print_header
-    echo ""
-    echo -e "${WHITE}${BOLD}═══ Docker Path Configuration ═══${NC}"
-    echo ""
-    echo -e "  Data directory:     ${CYAN}${DATA_DIR:-Not set}${NC}"
-    echo -e "  Backup directory:   ${CYAN}${BACKUP_DIR:-Not set}${NC}"
-    echo -e "  Docker Compose file: ${CYAN}${COMPOSE_FILE:-Not set}${NC}"
-    echo ""
-    
-    echo -e "${YELLOW}Options:${NC}"
-    echo "  1. Auto-detect data directory"
-    echo "  2. Set data directory manually"
-    echo "  3. Set backup directory manually"
-    echo "  4. Set docker-compose.yml path"
-    echo "  5. Reset to defaults"
-    echo "  0. Back to main menu"
-    echo ""
-    echo -n "Select option [0-5]: "
-    read -r choice
+    local subtitle="data: ${DATA_DIR:-unset} | backup: ${BACKUP_DIR:-unset}"
+    local _menu_items=(
+        $'Auto-detect data directory\tProbe for an existing deployment'
+        $'Set data directory\tEnter the data path manually'
+        $'Set backup directory\tEnter the backup path manually'
+        $'Set docker-compose.yml path\tPoint at a specific compose file'
+        $'Reset to defaults\tRestore the default paths'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 4 5 0 )
+    menu_choose "Docker Path Configuration" "$subtitle"
+    local choice="$MENU_CHOICE"
     
     case $choice in
         1)
@@ -492,12 +683,13 @@ choose_database_type() {
     fi
     
     echo ""
-    echo -e "${WHITE}${BOLD}Choose database type:${NC}"
-    echo ""
-    echo -e "  ${WHITE}1)${NC} SQLite (default, simple, no extra setup)"
-    echo -e "  ${WHITE}2)${NC} PostgreSQL (recommended for production, Docker container)"
-    echo ""
-    read -p "Choice [1]: " db_choice
+    local _menu_items=(
+        $'SQLite\tDefault, simple, no extra setup'
+        $'PostgreSQL\tRecommended for production (Docker container)'
+    )
+    local _menu_returns=( 1 2 )
+    menu_choose "Select Database Type" "SQLite is recommended for most installs"
+    local db_choice="$MENU_CHOICE"
     
     case "$db_choice" in
         2)
@@ -596,10 +788,21 @@ EOF
         # Generate or preserve admin password (shared between Go server and Node.js console)
         local admin_password
         if [ -f "$DATA_DIR/.admin_credentials" ] && [ -s "$DATA_DIR/.admin_credentials" ]; then
-            admin_password=$(cut -d: -f2 "$DATA_DIR/.admin_credentials" 2>/dev/null)
+            # Support both old format (admin:pass) and new format (Admin Password: pass)
+            admin_password=$(grep -m1 '^Admin Password:' "$DATA_DIR/.admin_credentials" 2>/dev/null | sed 's/^Admin Password:[[:space:]]*//')
+            if [ -z "$admin_password" ]; then
+                admin_password=$(cut -d: -f2 "$DATA_DIR/.admin_credentials" 2>/dev/null)
+            fi
         fi
         if [ -z "$admin_password" ]; then
-            admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+            # Respect user-provided ADMIN_PASSWORD env var if set
+            if [ -n "$ADMIN_PASSWORD" ]; then
+                admin_password="$ADMIN_PASSWORD"
+                print_info "Using custom admin password from ADMIN_PASSWORD env var"
+            else
+                # SECURITY (audit fix M-05, 2026-04-10): full hex entropy
+                admin_password=$(openssl rand -hex 16)
+            fi
             # Only clean auth.db on FRESH install (no existing credentials)
             if docker volume inspect "${PROJECT_NAME:-betterdesk}_console_data" >/dev/null 2>&1; then
                 print_info "Cleaning old auth database from console_data volume..."
@@ -611,9 +814,15 @@ EOF
         fi
         DOCKER_ADMIN_PASSWORD="$admin_password"
 
-        # Get server public IP for relay-servers
+        # Get relay server address according to RELAY_MODE / RELAY_SERVERS
         local server_ip
-        server_ip=$(get_public_ip)
+        server_ip=$(resolve_relay_ip)
+
+        local signal_rate_limit="${SIGNAL_RATE_LIMIT_PER_IP:-20}"
+        if ! [[ "$signal_rate_limit" =~ ^[0-9]+$ ]]; then
+            print_warning "Invalid SIGNAL_RATE_LIMIT_PER_IP='$signal_rate_limit'; using 20"
+            signal_rate_limit="20"
+        fi
 
         # Add BetterDesk server (Go single binary - signal + relay + API)
         cat >> "$COMPOSE_FILE" << EOF
@@ -623,8 +832,9 @@ EOF
             context: .
             dockerfile: Dockerfile.server
         pull_policy: never
+        command: ["/usr/local/bin/betterdesk-server", "-mode", "all", "-api-port", "21121", "-key-file", "/opt/rustdesk/id_ed25519"]
         ports:
-            - "21114:21114"
+            - "21121:21121"
             - "21115:21115"
             - "21116:21116"
             - "21116:21116/udp"
@@ -636,6 +846,7 @@ EOF
         environment:
             - RELAY_SERVERS=$server_ip
             - INIT_ADMIN_PASS=$admin_password
+            - SIGNAL_RATE_LIMIT_PER_IP=$signal_rate_limit
 EOF
 
         if [ "$DB_TYPE" = "postgresql" ]; then
@@ -649,7 +860,7 @@ EOF
 
         cat >> "$COMPOSE_FILE" << EOF
         healthcheck:
-            test: ["CMD", "curl", "-sf", "http://localhost:21114/api/health"]
+            test: ["CMD", "curl", "-sf", "http://localhost:21121/api/health"]
             interval: 30s
             timeout: 10s
             retries: 3
@@ -666,7 +877,6 @@ EOF
         pull_policy: never
         ports:
             - "5000:5000"
-            - "21121:21121"
         volumes:
             - $DATA_DIR:/opt/rustdesk:ro
             - console_data:/app/data
@@ -675,9 +885,10 @@ EOF
             - PORT=5000
             - HOST=0.0.0.0
             - API_HOST=0.0.0.0
+            - API_ENABLED=false
             - RUSTDESK_PATH=/opt/rustdesk
-            - HBBS_API_URL=http://$SERVER_CONTAINER:21114/api
-            - BETTERDESK_API_URL=http://$SERVER_CONTAINER:21114/api
+            - HBBS_API_URL=http://$SERVER_CONTAINER:21121/api
+            - BETTERDESK_API_URL=http://$SERVER_CONTAINER:21121/api
             - SERVER_BACKEND=betterdesk
             - DATA_DIR=/app/data
             - DB_PATH=/opt/rustdesk/db_v2.sqlite3
@@ -810,7 +1021,8 @@ create_admin_user() {
     # Use the password generated during compose file creation
     local admin_password="${DOCKER_ADMIN_PASSWORD}"
     if [ -z "$admin_password" ]; then
-        admin_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+        # M-05: full hex entropy
+        admin_password=$(openssl rand -hex 16)
     fi
     
     # Wait for database to be created
@@ -848,7 +1060,12 @@ create_admin_user() {
     # Save credentials
     mkdir -p "$DATA_DIR"
     if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
-        echo "admin:$admin_password" > "$DATA_DIR/.admin_credentials"
+        cat > "$DATA_DIR/.admin_credentials" << CREDEOF
+Admin Username: admin
+Admin Password: $admin_password
+Generated by: BetterDesk Docker installer
+Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+CREDEOF
         chmod 600 "$DATA_DIR/.admin_credentials"
         print_info "Credentials saved in: $DATA_DIR/.admin_credentials"
     else
@@ -966,6 +1183,120 @@ do_install() {
 # Update Functions
 #===============================================================================
 
+# GitHub repository configuration for online updates
+UPDATE_GITHUB_OWNER="${UPDATE_GITHUB_OWNER:-UNITRONIX}"
+UPDATE_GITHUB_REPO="${UPDATE_GITHUB_REPO:-BetterDesk}"
+UPDATE_GITHUB_BRANCH="${UPDATE_GITHUB_BRANCH:-main}"
+
+# Pull latest project files from GitHub before rebuilding Docker images.
+# This ensures the Dockerfiles, compose files, and source code (Go server,
+# Node.js console) are up-to-date before docker compose build.
+update_docker_from_github() {
+    local clone_dir="/tmp/betterdesk-docker-update-$$"
+    rm -rf "$clone_dir"
+
+    print_step "Downloading latest BetterDesk from GitHub..."
+    if command -v git &>/dev/null; then
+        local repo_url="https://github.com/${UPDATE_GITHUB_OWNER}/${UPDATE_GITHUB_REPO}.git"
+        if ! git clone --depth 1 --single-branch --branch "$UPDATE_GITHUB_BRANCH" "$repo_url" "$clone_dir" 2>/dev/null; then
+            print_error "git clone failed"
+            rm -rf "$clone_dir"
+            return 1
+        fi
+        print_success "Repository cloned (branch: $UPDATE_GITHUB_BRANCH)"
+    else
+        local tarball_url="https://github.com/${UPDATE_GITHUB_OWNER}/${UPDATE_GITHUB_REPO}/archive/refs/heads/${UPDATE_GITHUB_BRANCH}.tar.gz"
+        local tarball_path="/tmp/betterdesk-docker-update-$$.tar.gz"
+        print_info "git not available, downloading tarball..."
+        if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "$tarball_path" "$tarball_url"; then
+            print_error "Download failed. Check internet connection."
+            rm -f "$tarball_path"
+            return 1
+        fi
+        mkdir -p "$clone_dir"
+        if ! tar -xzf "$tarball_path" -C "$clone_dir" --strip-components=1; then
+            print_error "Failed to extract update archive"
+            rm -f "$tarball_path" && rm -rf "$clone_dir"
+            return 1
+        fi
+        rm -f "$tarball_path"
+        print_success "Source downloaded and extracted"
+    fi
+
+    # Validate
+    if [ ! -f "$clone_dir/betterdesk-server/go.mod" ] || [ ! -f "$clone_dir/web-nodejs/server.js" ]; then
+        print_error "Downloaded source is incomplete or invalid"
+        rm -rf "$clone_dir"
+        return 1
+    fi
+
+    local remote_version=""
+    if [ -f "$clone_dir/VERSION" ]; then
+        remote_version=$(cat "$clone_dir/VERSION" | tr -d '[:space:]')
+        print_info "Remote version: $remote_version"
+    fi
+
+    # Update project files that Docker build needs
+    print_step "Updating project files..."
+    local files_updated=0
+
+    # Update Go server source
+    if [ -d "$SCRIPT_DIR/betterdesk-server" ]; then
+        rm -rf "$SCRIPT_DIR/betterdesk-server.pre-update" 2>/dev/null || true
+        mv "$SCRIPT_DIR/betterdesk-server" "$SCRIPT_DIR/betterdesk-server.pre-update" 2>/dev/null || true
+    fi
+    # Copy *contents* into a guaranteed dir. Copying the directory itself would
+    # nest the new tree inside an existing betterdesk-server/ if the rename
+    # above failed (e.g. a locked file), leaving inconsistent source that breaks
+    # the Docker build with "undefined" Go errors (issue #158).
+    mkdir -p "$SCRIPT_DIR/betterdesk-server"
+    cp -rf "$clone_dir/betterdesk-server/." "$SCRIPT_DIR/betterdesk-server/"
+    files_updated=$((files_updated + 1))
+
+    # Update Node.js console source
+    if [ -d "$SCRIPT_DIR/web-nodejs" ]; then
+        # Preserve data/ and node_modules/ if they exist locally
+        local preserve_dirs=("data" "node_modules")
+        for pd in "${preserve_dirs[@]}"; do
+            if [ -d "$SCRIPT_DIR/web-nodejs/$pd" ]; then
+                mv "$SCRIPT_DIR/web-nodejs/$pd" "/tmp/betterdesk-docker-preserve-$$-$pd" 2>/dev/null || true
+            fi
+        done
+        rm -rf "$SCRIPT_DIR/web-nodejs.pre-update" 2>/dev/null || true
+        mv "$SCRIPT_DIR/web-nodejs" "$SCRIPT_DIR/web-nodejs.pre-update" 2>/dev/null || true
+    fi
+    # Copy *contents* into a guaranteed dir (see issue #158 note above).
+    mkdir -p "$SCRIPT_DIR/web-nodejs"
+    cp -rf "$clone_dir/web-nodejs/." "$SCRIPT_DIR/web-nodejs/"
+    # Restore preserved directories
+    for pd in "${preserve_dirs[@]}"; do
+        if [ -d "/tmp/betterdesk-docker-preserve-$$-$pd" ]; then
+            mv "/tmp/betterdesk-docker-preserve-$$-$pd" "$SCRIPT_DIR/web-nodejs/$pd" 2>/dev/null || true
+        fi
+    done
+    rm -rf "$SCRIPT_DIR/web-nodejs.pre-update" 2>/dev/null || true
+    rm -rf "$SCRIPT_DIR/betterdesk-server.pre-update" 2>/dev/null || true
+    files_updated=$((files_updated + 1))
+
+    # Update Dockerfiles and compose files
+    for df in Dockerfile Dockerfile.server Dockerfile.console \
+              docker-compose.yml docker-compose.single.yml docker-compose.quick.yml \
+              docker/entrypoint.sh docker/supervisord.conf docker/server-entrypoint.sh docker/console-entrypoint.sh \
+              betterdesk-docker.sh betterdesk.sh betterdesk.ps1 VERSION; do
+        if [ -f "$clone_dir/$df" ]; then
+            mkdir -p "$(dirname "$SCRIPT_DIR/$df")"
+            cp "$clone_dir/$df" "$SCRIPT_DIR/$df"
+            if [[ "$df" == *.sh ]]; then chmod +x "$SCRIPT_DIR/$df" 2>/dev/null || true; fi
+            files_updated=$((files_updated + 1))
+        fi
+    done
+
+    print_success "$files_updated project components updated from GitHub"
+
+    rm -rf "$clone_dir"
+    return 0
+}
+
 do_update() {
     print_header
     echo -e "${WHITE}${BOLD}══════════ DOCKER UPDATE ══════════${NC}"
@@ -980,8 +1311,41 @@ do_update() {
         return
     fi
     
+    local _menu_items=(
+        $'Online update from GitHub\tDownload latest code + rebuild images'
+        $'Local rebuild\tRebuild images from current local files'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 0 )
+    menu_choose "Update Method" "Online GitHub update is recommended"
+    local update_method="${MENU_CHOICE:-1}"
+
+    case "$update_method" in
+        0) return ;;
+        2)
+            # Legacy local rebuild
+            print_info "Creating backup before update..."
+            do_backup_silent
+            preserve_compose_database_config
+            create_compose_file
+            stop_containers
+            build_images
+            start_containers
+            print_success "Local update completed!"
+            press_enter
+            return
+            ;;
+    esac
+
+    # ---- GitHub Pull + Docker Rebuild ----
     print_info "Creating backup before update..."
     do_backup_silent
+
+    if ! update_docker_from_github; then
+        print_error "GitHub download failed. Try option 2 (local rebuild) instead."
+        press_enter
+        return
+    fi
 
     preserve_compose_database_config
     print_info "Regenerating docker-compose.yml with latest template..."
@@ -991,7 +1355,7 @@ do_update() {
     build_images
     start_containers
     
-    print_success "Update completed!"
+    print_success "Docker update completed!"
     press_enter
 }
 
@@ -1000,25 +1364,19 @@ do_update() {
 #===============================================================================
 
 do_repair() {
-    print_header
-    echo -e "${WHITE}${BOLD}══════════ DOCKER REPAIR ══════════${NC}"
-    echo ""
-    
     detect_installation
-    print_status
     
-    echo ""
-    echo -e "${WHITE}What do you want to repair?${NC}"
-    echo ""
-    echo "  1. 🔄 Rebuild images"
-    echo "  2. 🔃 Restart containers"
-    echo "  3. 🗃️  Repair database"
-    echo "  4. 🧹 Clean Docker (images, volumes)"
-    echo "  5. 🔄 Full repair (everything)"
-    echo "  0. ↩️  Back"
-    echo ""
-    
-    read -p "Select option: " repair_choice
+    local _menu_items=(
+        $'Rebuild images\tRecreate the Docker images'
+        $'Restart containers\tStop and start the stack'
+        $'Repair database\tRun database repair routines'
+        $'Clean Docker\tPrune images and volumes'
+        $'Full repair\tDo everything above'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 4 5 0 )
+    menu_choose "Docker Repair" "Choose what to repair"
+    local repair_choice="$MENU_CHOICE"
     
     case $repair_choice in
         1) 
@@ -1173,7 +1531,7 @@ do_validate() {
     echo -e "${WHITE}Checking ports...${NC}"
     echo ""
     
-    for port in 21114 21115 21116 21117 5000 21121; do
+    for port in 21115 21116 21117 5000 21121; do
         echo -n "  Port $port: "
         if ss -tlnp 2>/dev/null | grep -q ":$port " || netstat -tlnp 2>/dev/null | grep -q ":$port "; then
             echo -e "${GREEN}● Listening${NC}"
@@ -1248,10 +1606,6 @@ do_backup_silent() {
 #===============================================================================
 
 do_reset_password() {
-    print_header
-    echo -e "${WHITE}${BOLD}══════════ ADMIN PASSWORD RESET ══════════${NC}"
-    echo ""
-    
     detect_installation
     
     if [ "$CONSOLE_RUNNING" != true ]; then
@@ -1260,20 +1614,21 @@ do_reset_password() {
         return
     fi
     
-    echo "Select option:"
-    echo ""
-    echo "  1. Generate new random password"
-    echo "  2. Set custom password"
-    echo "  0. Back"
-    echo ""
-    
-    read -p "Choice: " pw_choice
+    local _menu_items=(
+        $'Generate random password\tCreate a new strong password'
+        $'Set custom password\tType the password yourself'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 0 )
+    menu_choose "Admin Password Reset" "Console container: running"
+    local pw_choice="$MENU_CHOICE"
     
     local new_password
     
     case $pw_choice in
         1)
-            new_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+            # M-05: full hex entropy
+            new_password=$(openssl rand -hex 16)
             ;;
         2)
             echo ""
@@ -1334,7 +1689,12 @@ db.close();
     
     # Save credentials
     if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
-        echo "admin:$new_password" > "$DATA_DIR/.admin_credentials"
+        cat > "$DATA_DIR/.admin_credentials" << CREDEOF
+Admin Username: admin
+Admin Password: $new_password
+Generated by: BetterDesk Docker password reset
+Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+CREDEOF
         chmod 600 "$DATA_DIR/.admin_credentials"
     fi
     
@@ -1346,19 +1706,15 @@ db.close();
 #===============================================================================
 
 do_build() {
-    print_header
-    echo -e "${WHITE}${BOLD}══════════ BUILD IMAGES ══════════${NC}"
-    echo ""
-    
-    echo "Select option:"
-    echo ""
-    echo "  1. Rebuild all images"
-    echo "  2. Rebuild Server (Go)"
-    echo "  3. Rebuild Console (Node.js)"
-    echo "  0. Back"
-    echo ""
-    
-    read -p "Choice: " build_choice
+    local _menu_items=(
+        $'Rebuild all images\tServer + console containers'
+        $'Rebuild server (Go)\tOnly the Go server image'
+        $'Rebuild console (Node.js)\tOnly the console image'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 0 )
+    menu_choose "Build Images" "Rebuild Docker images"
+    local build_choice="$MENU_CHOICE"
     
     cd "$SCRIPT_DIR"
     
@@ -1512,7 +1868,7 @@ do_diagnostics() {
         '
         if [ "$SERVER_RUNNING" = true ]; then
             docker exec "$SERVER_CONTAINER" sh -c '
-                RESP=$(curl -sf http://localhost:21114/api/peers 2>/dev/null)
+                RESP=$(curl -sf http://localhost:21121/api/peers 2>/dev/null)
                 if [ -n "$RESP" ]; then
                     echo "  Server API: responding"
                 else
@@ -1536,7 +1892,7 @@ do_diagnostics() {
         "21116:UDP:betterdesk-server:ID Server (UDP)"
         "21117:TCP:betterdesk-server:Relay Server"
         "5000:TCP:betterdesk-console:Web Console"
-        "21121:TCP:betterdesk-console:Client API (WAN)"
+        "21121:TCP:betterdesk-server:HTTP API (client + REST, WAN)"
     )
 
     for entry in "${port_defs[@]}"; do
@@ -1643,8 +1999,8 @@ do_diagnostics() {
     echo -e "${WHITE}${BOLD}═══ API connectivity ═══${NC}"
     echo ""
 
-    printf "  Server API (21114):  "
-    if curl -sfo /dev/null --connect-timeout 3 "http://127.0.0.1:21114/api/server-info" 2>/dev/null; then
+    printf "  Server API (21121):  "
+    if curl -sfo /dev/null --connect-timeout 3 "http://127.0.0.1:21121/api/server-info" 2>/dev/null; then
         echo -e "${GREEN}OK${NC}"
     else
         echo -e "${RED}UNREACHABLE${NC}"
@@ -1659,14 +2015,14 @@ do_diagnostics() {
 
     # --- Diagnostics sub-menu ---
     echo ""
-    echo -e "${WHITE}════════════════════════════════════════${NC}"
-    echo ""
-    echo "  F. Configure firewall rules (auto-create missing rules)"
-    echo "  P. Test port connectivity from outside"
-    echo "  0. Back to main menu"
-    echo ""
-    echo -n "  Select option: "
-    read -r sub_choice
+    local _menu_items=(
+        $'Configure firewall rules\tAuto-create any missing rules'
+        $'Test port connectivity\tProbe ports from outside'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( F P 0 )
+    menu_choose "Diagnostics Actions" "Optional follow-up checks"
+    local sub_choice="$MENU_CHOICE"
 
     case "$sub_choice" in
         [Ff])
@@ -2412,10 +2768,6 @@ EOSQL
 #===============================================================================
 
 do_configure_ssl() {
-    print_header
-    echo -e "${WHITE}${BOLD}══════════ SSL CERTIFICATE CONFIGURATION ══════════${NC}"
-    echo ""
-    
     detect_installation
     
     if [ "$INSTALL_STATUS" = "none" ]; then
@@ -2428,21 +2780,20 @@ do_configure_ssl() {
     local ssl_dir="$DATA_DIR/ssl"
     local env_file="$DATA_DIR/.env"
     
-    echo -e "${CYAN}  ─── Standard Options ───${NC}"
-    echo "  1. Let's Encrypt (ACME auto-renewal)"
-    echo "  2. Custom certificate (provide cert + key files)"
-    echo -e "${GREEN}  3. Self-signed certificate (for testing)${NC}"
-    echo -e "${RED}  4. Disable SSL (revert to HTTP)${NC}"
-    echo ""
-    echo -e "${CYAN}  ─── Enterprise Options ───${NC}"
-    echo -e "${YELLOW}  5. Enterprise TLS (full HTTPS: panel + signal + relay + API)${NC}"
-    echo ""
-    
-    local ssl_choice
-    read -p "Choice [3]: " ssl_choice
-    ssl_choice="${ssl_choice:-3}"
+    local _menu_items=(
+        $'Let'"'"'s Encrypt\tACME certificate with auto-renewal'
+        $'Custom certificate\tProvide your own cert + key files'
+        $'Self-signed certificate\tQuick HTTPS for testing'
+        $'Disable SSL\tRevert the panel back to HTTP'
+        $'Enterprise TLS\tFull HTTPS: panel + signal + relay'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 4 5 0 )
+    menu_choose "SSL Certificate Configuration" "Enables HTTPS for the admin panel"
+    local ssl_choice="${MENU_CHOICE:-3}"
     
     case "$ssl_choice" in
+        0) return ;;
         1)
             print_warning "Let's Encrypt for Docker requires additional setup."
             print_info "Recommended: Use a reverse proxy (nginx/traefik) with Let's Encrypt."
@@ -2586,7 +2937,7 @@ do_configure_ssl() {
             print_info "  • Panel HTTPS: :5443"
             print_info "  • Signal TLS: :21116"
             print_info "  • Relay TLS: :21117"
-            print_info "  • API HTTPS: :21114"
+            print_info "  • API HTTPS: :21121"
             echo ""
             print_warning "For browsers/clients, you may need to import $ssl_dir/betterdesk.crt as trusted CA"
             ;;
@@ -2693,10 +3044,41 @@ main() {
     echo ""
     sleep 1
     
+    # Action tokens map 1:1 to the classic case dispatch below, so both the
+    # arrow-key TUI and the numeric fallback share the exact same handlers.
+    local menu_labels=(
+        $'Fresh installation\tFull Docker install from scratch'
+        $'Update\tUpdate an existing installation'
+        $'Repair\tFix common problems'
+        $'Validate\tCheck correctness'
+        $'Backup\tCreate a backup'
+        $'Reset admin password\tReset the console admin'
+        $'Build images\tRebuild Docker images'
+        $'Diagnostics\tDetailed problem analysis'
+        $'Uninstall\tRemove BetterDesk'
+        $'Configure SSL/TLS\tEnable HTTPS for the panel'
+        $'Migrate from RustDesk\tImport an existing RustDesk deployment'
+        $'SQLite -> PostgreSQL\tMigrate the database backend'
+        $'Settings (paths)\tConfigure install paths'
+        $'Exit\tQuit the manager'
+    )
+    local menu_actions=( 1 2 3 4 5 6 7 8 9 C M P S 0 )
+
     while true; do
-        show_menu
-        read -p "Select option: " choice
-        
+        local choice=""
+        if tui_available; then
+            local status_line="Docker Compose manager v${VERSION}"
+            [ -n "$DATA_DIR" ] && status_line="$status_line  |  data: ${DATA_DIR}"
+            if tui_select "BetterDesk Console Manager (Docker)" "$status_line" "${menu_labels[@]}"; then
+                choice="${menu_actions[$TUI_RESULT]}"
+            else
+                choice="0"
+            fi
+        else
+            show_menu
+            read -p "Select option: " choice
+        fi
+
         case $choice in
             1) do_install ;;
             2) do_update ;;

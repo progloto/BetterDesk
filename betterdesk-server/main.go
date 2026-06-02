@@ -76,6 +76,22 @@ func main() {
 	}
 	if cfg.HasTLSCert() {
 		log.Printf("  TLS Cert:   %s", cfg.TLSCertFile)
+		// Validate cert files actually exist — a missing file silently disables TLS
+		// without any error, which is a common misconfiguration (e.g. typo in path).
+		if _, err := os.Stat(cfg.TLSCertFile); os.IsNotExist(err) {
+			log.Printf("  ⚠ WARNING:  TLS certificate file NOT FOUND: %s", cfg.TLSCertFile)
+			log.Printf("              TLS_SIGNAL and TLS_RELAY will be silently disabled.")
+			log.Printf("              Check TLS_CERT env var or --tls-cert flag for typos.")
+		}
+		if _, err := os.Stat(cfg.TLSKeyFile); os.IsNotExist(err) {
+			log.Printf("  ⚠ WARNING:  TLS key file NOT FOUND: %s", cfg.TLSKeyFile)
+			log.Printf("              TLS_SIGNAL and TLS_RELAY will be silently disabled.")
+			log.Printf("              Check TLS_KEY env var or --tls-key flag for typos.")
+		}
+	} else if cfg.TLSSignal || cfg.TLSRelay {
+		// User set TLS_SIGNAL=Y or TLS_RELAY=Y but forgot to set cert/key paths
+		log.Printf("  ⚠ WARNING:  TLS_SIGNAL=%v TLS_RELAY=%v but TLS_CERT/TLS_KEY are not set.", cfg.TLSSignal, cfg.TLSRelay)
+		log.Printf("              Signal and relay will run without TLS. Set TLS_CERT and TLS_KEY env vars.")
 	}
 	log.Printf("========================================")
 
@@ -127,7 +143,7 @@ func main() {
 	}
 
 	ipLimiter := ratelimit.NewIPLimiter(
-		config.IPRateLimitRegistrations,
+		cfg.SignalRateLimitPerIP,
 		config.IPRateLimitWindow,
 		config.IPRateLimitCleanup,
 	)
@@ -138,8 +154,12 @@ func main() {
 		config.DefaultSingleBandwidth,
 	)
 
-	log.Printf("Security modules initialized (blocklist=%d entries, rate-limit=%d/min)",
-		blocklist.Count(), config.IPRateLimitRegistrations)
+	rateLimitDesc := fmt.Sprintf("%d/min", cfg.SignalRateLimitPerIP)
+	if cfg.SignalRateLimitPerIP <= 0 {
+		rateLimitDesc = "disabled"
+	}
+	log.Printf("Security modules initialized (blocklist=%d entries, rate-limit=%s)",
+		blocklist.Count(), rateLimitDesc)
 
 	// Initialize JWT manager for API authentication
 	jwtSecret := cfg.JWTSecret
@@ -274,6 +294,7 @@ func main() {
 		sig := sigServer.New(cfg, kp, database)
 		sig.SetBlocklist(blocklist)
 		sig.SetRateLimiter(ipLimiter)
+		sig.SetAuditLogger(auditLogger)
 		if err := sig.Start(ctx); err != nil {
 			log.Fatalf("Failed to start signal server: %v", err)
 		}
@@ -297,6 +318,11 @@ func main() {
 		apiSrv.SetMetrics(mc)
 		apiSrv.SetJWTManager(jwtManager)
 		apiSrv.SetKeyPair(kp)
+
+		// LDAP provider (loads config from DB, hot-reloadable via API)
+		apiSrv.InitLDAP()
+		// OIDC/OAuth2 provider (loads config from DB, hot-reloadable via API)
+		apiSrv.InitOIDC()
 
 		// CDAP Gateway (optional — custom device automation protocol)
 		var cdapGw *cdap.Gateway
@@ -335,6 +361,7 @@ func main() {
 		sig := sigServer.New(cfg, kp, database)
 		sig.SetBlocklist(blocklist)
 		sig.SetRateLimiter(ipLimiter)
+		sig.SetAuditLogger(auditLogger)
 		if err := sig.Start(ctx); err != nil {
 			log.Fatalf("Failed to start signal server: %v", err)
 		}
@@ -348,6 +375,8 @@ func main() {
 		apiSrv.SetMetrics(mc)
 		apiSrv.SetJWTManager(jwtManager)
 		apiSrv.SetKeyPair(kp)
+		apiSrv.InitLDAP()
+		apiSrv.InitOIDC()
 		if err := apiSrv.Start(ctx); err != nil {
 			log.Fatalf("Failed to start API server: %v", err)
 		}
@@ -534,6 +563,10 @@ func parseFlags() *config.Config {
 	flag.BoolVar(&cfg.ForceHTTPS, "force-https", cfg.ForceHTTPS, "Reject non-TLS API requests")
 	flag.BoolVar(&cfg.TrustProxy, "trust-proxy", cfg.TrustProxy, "Trust X-Forwarded-For/X-Real-IP headers from reverse proxy")
 	flag.IntVar(&cfg.RelayMaxConnsIP, "relay-max-conns-ip", cfg.RelayMaxConnsIP, "Max relay connections per IP (0 = unlimited)")
+	flag.IntVar(&cfg.SignalRateLimitPerIP, "signal-rate-limit-per-ip", cfg.SignalRateLimitPerIP, "Max signal registrations per IP per minute (0 = unlimited; raise for large NAT deployments — issue #122)")
+	flag.BoolVar(&cfg.SameNATRelay, "same-nat-relay", cfg.SameNATRelay, "Auto-fallback to relay when both peers share the same public IP (avoids NAT hairpin failures — issue #121)")
+	flag.BoolVar(&cfg.P2PFirst, "p2p-first", cfg.P2PFirst, "Wait for the target's hole punch before answering the initiator so direct P2P can succeed (issue #157; disable to always answer immediately)")
+	flag.IntVar(&cfg.P2PFallbackMs, "p2p-fallback-ms", cfg.P2PFallbackMs, "Grace period (ms) to wait for the target's PunchHoleSent before sending the relay fallback response (only with --p2p-first)")
 	flag.StringVar(&cfg.InitAdminUser, "init-admin-user", cfg.InitAdminUser, "Initial admin username (default: admin)")
 	flag.StringVar(&cfg.InitAdminPass, "init-admin-pass", cfg.InitAdminPass, "Initial admin password (auto-generated if empty)")
 	flag.BoolVar(&cfg.TLSSignal, "tls-signal", cfg.TLSSignal, "Enable TLS on signal TCP/WS ports (requires --tls-cert and --tls-key)")

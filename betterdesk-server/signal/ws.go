@@ -16,6 +16,8 @@ import (
 	pb "github.com/unitronix/betterdesk-server/proto"
 )
 
+var wsSignalKeepAliveInterval = time.Duration(config.HeartbeatSuggestion) * time.Second / 2
+
 // serveWS starts the WebSocket signal listener (e.g., port 21118).
 // RustDesk web clients connect here for the same signal protocol,
 // using raw protobuf in binary WS frames (no 2-byte TCP header).
@@ -28,10 +30,9 @@ func (s *Server) serveWS() {
 
 	addr := fmt.Sprintf(":%d", s.cfg.WSSignalPort())
 	s.wsHTTP = &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  config.WSConnTimeout,
-		WriteTimeout: config.WSConnTimeout,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: config.WSConnTimeout,
 		BaseContext: func(l net.Listener) context.Context {
 			return s.ctx
 		},
@@ -108,6 +109,15 @@ func (s *Server) wsSignalLoop(wsc *codec.WSConn) {
 	defer wsc.Close()
 
 	remoteAddr := wsc.RemoteAddr()
+	peerID := ""
+	wsc.SetKeepAliveHandler(func() {
+		if peerID != "" {
+			s.peers.TouchHeartbeat(peerID)
+		}
+	})
+	keepAliveDone := make(chan struct{})
+	go s.wsSignalKeepAlive(wsc, keepAliveDone)
+	defer close(keepAliveDone)
 
 	for {
 		msg, err := wsc.ReadMessage()
@@ -125,12 +135,14 @@ func (s *Server) wsSignalLoop(wsc *codec.WSConn) {
 
 		switch {
 		case msg.GetRegisterPeer() != nil:
+			peerID = msg.GetRegisterPeer().Id
 			resp := s.handleRegisterPeerWS(msg.GetRegisterPeer(), remoteAddr)
 			if resp != nil {
 				wsc.WriteMessage(resp)
 			}
 
 		case msg.GetRegisterPk() != nil:
+			peerID = msg.GetRegisterPk().Id
 			fakeAddr, _ := net.ResolveUDPAddr("udp", remoteAddr)
 			resp := s.processRegisterPk(msg.GetRegisterPk(), remoteAddr)
 			if fakeAddr != nil {
@@ -204,6 +216,31 @@ func (s *Server) wsSignalLoop(wsc *codec.WSConn) {
 	}
 }
 
+func (s *Server) wsSignalKeepAlive(wsc *codec.WSConn, done <-chan struct{}) {
+	if wsSignalKeepAliveInterval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(wsSignalKeepAliveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := wsc.WriteKeepAlive(); err != nil {
+				if !isNormalClose(err) {
+					log.Printf("[signal] WS keepalive write to %s: %v", wsc.RemoteAddr(), err)
+				}
+				return
+			}
+		}
+	}
+}
+
 // handleRegisterPeerWS processes a heartbeat over WebSocket.
 // Similar to handleRegisterPeer but uses the WS remote address.
 func (s *Server) handleRegisterPeerWS(msg *pb.RegisterPeer, remoteAddr string) *pb.RendezvousMessage {
@@ -211,8 +248,39 @@ func (s *Server) handleRegisterPeerWS(msg *pb.RegisterPeer, remoteAddr string) *
 	if id == "" {
 		return nil
 	}
+	clientHost := hostFromAddrString(remoteAddr)
+
+	if !isValidPeerID(id) {
+		log.Printf("[signal] Rejected invalid WS peer ID format: %q from %s", id, clientHost)
+		return nil
+	}
+
+	if s.blocklist != nil {
+		if s.blocklist.IsIPBlocked(clientHost) {
+			log.Printf("[signal] Blocked IP %s tried WS registration", clientHost)
+			return nil
+		}
+		if s.blocklist.IsIDBlocked(id) {
+			log.Printf("[signal] Blocked ID %s tried WS registration", id)
+			return nil
+		}
+	}
 
 	existing := s.peers.Get(id)
+	knownPeer := existing != nil
+	if !knownPeer {
+		if dbPeer, err := s.db.GetPeer(id); err == nil && dbPeer != nil {
+			knownPeer = true
+		}
+	}
+	if !s.allowRegistration(clientHost, id, knownPeer) {
+		if knownPeer {
+			log.Printf("[signal] Rate limited WS registration from %s for peer %s", clientHost, id)
+		} else {
+			log.Printf("[signal] Rate limited new WS registration from %s for peer %s", clientHost, id)
+		}
+		return nil
+	}
 	if existing != nil {
 		// Reject banned peers — do not heartbeat or respond
 		if existing.Banned {
@@ -238,10 +306,21 @@ func (s *Server) handleRegisterPeerWS(msg *pb.RegisterPeer, remoteAddr string) *
 		}
 	}
 
+	softDeleted, _ := s.db.IsPeerSoftDeleted(id)
+	if !softDeleted && !s.checkEnrollmentPermission(id, clientHost) {
+		log.Printf("[signal] Rejected new WS peer %s from %s (enrollment policy)", id, clientHost)
+		return nil
+	}
+
 	// Check if this peer is banned in the database (e.g. removed from memory
 	// map after ban but trying to re-register via WS)
 	if banned, _ := s.db.IsPeerBanned(id); banned {
 		log.Printf("[signal] Rejected banned WS peer registration: %s from %s", id, remoteAddr)
+		return nil
+	}
+
+	if renamed, _ := s.db.IsRenamedPeerID(id); renamed {
+		log.Printf("[signal] Rejected WS registration for renamed peer ID: %s from %s", id, remoteAddr)
 		return nil
 	}
 

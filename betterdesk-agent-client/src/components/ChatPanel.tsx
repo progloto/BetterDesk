@@ -47,7 +47,7 @@ const ChatPanel: Component = () => {
     if (!text) return;
 
     try {
-      await invoke("send_chat_message", { text });
+      await invoke("send_chat_message", { message: text });
       const msg: ChatMessage = {
         id: crypto.randomUUID(),
         from: "user",
@@ -71,7 +71,18 @@ const ChatPanel: Component = () => {
 
   return (
     <div class="page-content chat-page">
-      <h2 class="page-title">{t("chat.title")}</h2>
+      <div class="page-header">
+        <button
+          class="page-back-btn"
+          onClick={() => {
+            if (typeof window !== "undefined") window.location.hash = "/";
+          }}
+          title={t("common.back")}
+        >
+          <span class="material-symbols-rounded">arrow_back</span>
+        </button>
+        <h2 class="page-title">{t("chat.title")}</h2>
+      </div>
 
       <Show when={connected()} fallback={
         <div class="empty-state">

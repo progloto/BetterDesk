@@ -45,6 +45,13 @@ SKIP_VERIFY=false
 MINIMAL_MODE=false
 PREFERRED_CONSOLE_TYPE="nodejs"  # Always Node.js (Flask removed in v2.3.0)
 
+# Relay server selection mode:
+#   auto   - detect public IP (default, best for internet-facing servers)
+#   local  - use the server's LAN IP (best for LAN-only deployments)
+#   public - force public IP detection
+# RELAY_SERVERS env var (or --relay-servers) always overrides this with a fixed value.
+RELAY_MODE="${RELAY_MODE:-auto}"
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -67,6 +74,26 @@ while [[ $# -gt 0 ]]; do
         --postgresql|--postgres)
             USE_POSTGRESQL=true
             shift
+            ;;
+        --relay-mode)
+            RELAY_MODE="$2"
+            if [ "$RELAY_MODE" != "auto" ] && [ "$RELAY_MODE" != "local" ] && [ "$RELAY_MODE" != "lan" ] && [ "$RELAY_MODE" != "public" ] && [ "$RELAY_MODE" != "wan" ]; then
+                echo "ERROR: --relay-mode must be 'auto', 'local' (lan) or 'public' (wan)"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --relay-servers|--relay)
+            RELAY_SERVERS="$2"
+            shift 2
+            ;;
+        --protocol)
+            PROTOCOL_MODE="$2"
+            if [ "$PROTOCOL_MODE" != "http" ] && [ "$PROTOCOL_MODE" != "https" ]; then
+                echo "ERROR: --protocol must be 'http' or 'https'"
+                exit 1
+            fi
+            shift 2
             ;;
         --pg-uri)
             POSTGRESQL_URI="$2"
@@ -91,6 +118,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --nodejs         Install Node.js web console (default)"
             echo "  --postgresql     Use PostgreSQL instead of SQLite"
             echo "  --pg-uri URI     PostgreSQL connection URI (implies --postgresql)"
+            echo "  --protocol MODE  Set protocol mode: 'http' or 'https'"
+            echo "  --relay-mode M   Relay IP selection: 'auto' (public, default), 'local' (LAN), 'public'"
+            echo "  --relay-servers IP  Force a fixed relay server address (IP or host[:port])"
             echo "  --help, -h       Show this help message"
             echo ""
             echo "Environment variables:"
@@ -101,7 +131,10 @@ while [[ $# -gt 0 ]]; do
             echo "  POSTGRESQL_DB=...       PostgreSQL database (default: betterdesk)"
             echo "  POSTGRESQL_HOST=...     PostgreSQL host (default: localhost)"
             echo "  POSTGRESQL_PORT=...     PostgreSQL port (default: 5432)"
+            echo "  RELAY_MODE=auto|local|public  Relay IP selection mode (default: auto)"
+            echo "  RELAY_SERVERS=...       Force a fixed relay server address (overrides RELAY_MODE)"
             echo "  STORE_ADMIN_CREDENTIALS=true  Persist admin password to .admin_credentials (not recommended)"
+            echo "  ADMIN_PASSWORD=...      Set custom admin password (default: auto-generated)"
             exit 0
             ;;
         *)
@@ -218,6 +251,168 @@ confirm() {
     [[ "$response" =~ ^[TtYy]$ ]]
 }
 
+#===============================================================================
+# Interactive TUI (arrow-key navigable menu) — pure bash, no dependencies
+#===============================================================================
+# Result of tui_select() is returned in the global TUI_RESULT.
+# Returns 0 on selection, 1 when TUI is unavailable (caller falls back to text).
+TUI_RESULT=""
+
+# Detect whether the modern arrow-key interface can be used.
+tui_available() {
+    [ "${BETTERDESK_CLASSIC_MENU:-0}" = "1" ] && return 1
+    [ -t 0 ] && [ -t 1 ] || return 1
+    return 0
+}
+
+# Cleanup helper: always restore the cursor when leaving the TUI.
+_tui_restore() { printf '\033[?25h' 2>/dev/null; stty echo 2>/dev/null; }
+
+# tui_select "Title" "Subtitle" item1 item2 ...
+# Each item may embed a description after a literal $'\t' (tab).
+# Navigation: ↑/↓ or k/j to move, Enter/→ to choose, q/Esc/0 to cancel.
+tui_select() {
+    local title="$1"; shift
+    local subtitle="$1"; shift
+    local items=("$@")
+    local count=${#items[@]}
+    local sel=0 key rest
+
+    if ! tui_available || [ "$count" -eq 0 ]; then
+        TUI_RESULT=""
+        return 1
+    fi
+
+    printf '\033[?25l'                       # hide cursor
+    trap '_tui_restore' INT TERM
+
+    clear
+    while true; do
+        # Build the whole frame in a single buffer, then emit it with one
+        # write. Terminals (notably the VS Code integrated terminal with GPU
+        # acceleration) drop individual glyphs when a full-screen TUI is redrawn
+        # via many separate printf calls after each keypress. One write avoids it.
+        local buf=""
+        buf+="\033[H"   # move cursor home instead of clearing (less flicker)
+        buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\033[K\n"
+        buf+="$(printf "${CYAN}${BOLD}|${NC} ${WHITE}${BOLD}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$title")\033[K\n"
+        if [ -n "$subtitle" ]; then
+            buf+="$(printf "${CYAN}${BOLD}|${NC} ${DIM}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$subtitle")\033[K\n"
+        fi
+        buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\033[K\n"
+        buf+="\033[K\n"
+
+        local i label desc pad line
+        for i in "${!items[@]}"; do
+            label="${items[$i]%%$'\t'*}"
+            desc=""
+            [[ "${items[$i]}" == *$'\t'* ]] && desc="${items[$i]#*$'\t'}"
+            # Manual padding by character count keeps columns aligned reliably.
+            pad=$(( 32 - ${#label} ))
+            [ "$pad" -lt 1 ] && pad=1
+            if [ "$i" -eq "$sel" ]; then
+                line="$(printf "  ${GREEN}${BOLD}>${NC} ${GREEN}${BOLD}%s${NC}%*s${DIM}%s${NC}" "$label" "$pad" "" "$desc")"
+            else
+                line="$(printf "    ${WHITE}%s${NC}%*s${DIM}%s${NC}" "$label" "$pad" "" "$desc")"
+            fi
+            buf+="${line}\033[K\n"
+        done
+
+        buf+="\033[K\n"
+        buf+="  ${DIM}Up/Down navigate   Enter select   q/Esc back${NC}\033[K\n"
+        buf+="\033[J"   # clear anything below the menu
+
+        printf '%b' "$buf"
+
+        # Read a single keypress (with escape-sequence handling)
+        IFS= read -rsn1 key 2>/dev/null
+        if [[ "$key" == $'\033' ]]; then
+            read -rsn2 -t 0.05 rest 2>/dev/null
+            key+="$rest"
+        fi
+
+        case "$key" in
+            $'\033[A'|'k') sel=$(( (sel - 1 + count) % count )) ;;
+            $'\033[B'|'j') sel=$(( (sel + 1) % count )) ;;
+            ''|$'\033[C') TUI_RESULT="$sel"; _tui_restore; trap - INT TERM; return 0 ;;  # Enter / →
+            'q'|'Q'|'0'|$'\033') TUI_RESULT=""; _tui_restore; trap - INT TERM; return 2 ;;
+            [1-9])
+                # Numeric shortcut jumps straight to that 1-based entry
+                local idx=$(( key - 1 ))
+                if [ "$idx" -lt "$count" ]; then
+                    TUI_RESULT="$idx"; _tui_restore; trap - INT TERM; return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+#===============================================================================
+# Modern UI helpers shared by every sub-menu
+#===============================================================================
+# ui_panel_header "Title" "Subtitle"
+# Draws a clean ASCII box header (single buffered write to avoid glyph drops).
+ui_panel_header() {
+    local title="$1" subtitle="$2"
+    clear 2>/dev/null || true
+    local buf=""
+    buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\n"
+    buf+="$(printf "${CYAN}${BOLD}|${NC} ${WHITE}${BOLD}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$title")\n"
+    if [ -n "$subtitle" ]; then
+        buf+="$(printf "${CYAN}${BOLD}|${NC} ${DIM}%-60s${NC} ${CYAN}${BOLD}|${NC}" "$subtitle")\n"
+    fi
+    buf+="${CYAN}${BOLD}+--------------------------------------------------------------+${NC}\n"
+    printf '%b' "$buf"
+    echo ""
+}
+
+# ui_section "Title"  — a lightweight section divider for output screens.
+ui_section() {
+    echo ""
+    echo -e "  ${CYAN}${BOLD}== $1 ==${NC}"
+    echo ""
+}
+
+# menu_choose "Title" "Subtitle"
+# Caller must pre-populate two parallel arrays:
+#   _menu_items=( "Label\tDescription" ... )   # what the user sees
+#   _menu_returns=( "1" "2" ... "0" )          # value returned for each entry
+# The chosen value is stored in MENU_CHOICE. On cancel (q/Esc) the LAST entry's
+# value is returned (by convention the final item is "Back"/"Exit").
+# Uses the arrow-key TUI when available, otherwise a styled numeric menu.
+MENU_CHOICE=""
+menu_choose() {
+    local title="$1" subtitle="$2"
+    MENU_CHOICE=""
+    local last_idx=$(( ${#_menu_returns[@]} - 1 ))
+    [ "$last_idx" -lt 0 ] && last_idx=0
+
+    if tui_available; then
+        tui_select "$title" "$subtitle" "${_menu_items[@]}"
+        local rc=$?
+        if [ "$rc" -eq 0 ] && [ -n "$TUI_RESULT" ]; then
+            MENU_CHOICE="${_menu_returns[$TUI_RESULT]}"
+        else
+            MENU_CHOICE="${_menu_returns[$last_idx]}"
+        fi
+        return 0
+    fi
+
+    # Styled numeric fallback (no TTY / classic mode)
+    ui_panel_header "$title" "$subtitle"
+    local i label desc
+    for i in "${!_menu_items[@]}"; do
+        label="${_menu_items[$i]%%$'\t'*}"
+        desc=""
+        [[ "${_menu_items[$i]}" == *$'\t'* ]] && desc="${_menu_items[$i]#*$'\t'}"
+        printf "  ${GREEN}${BOLD}%2s${NC}) ${WHITE}%-28s${NC} ${DIM}%s${NC}\n" \
+            "${_menu_returns[$i]}" "$label" "$desc"
+    done
+    echo ""
+    echo -ne "  ${CYAN}Select option:${NC} "
+    read -r MENU_CHOICE
+}
+
 get_public_ip() {
     local ip
     ip=$(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
@@ -225,6 +420,60 @@ get_public_ip() {
     ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     ip=$(curl -s --max-time 5 icanhazip.com 2>/dev/null) && [ -n "$ip" ] && echo "$ip" && return
     echo "127.0.0.1"
+}
+
+# Detect the server's primary LAN/private IPv4 address.
+# Used for LAN-only deployments where the public IP is unreachable by clients.
+get_local_ip() {
+    local ip
+    # Primary: source address used to reach the default gateway
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1)
+    [ -n "$ip" ] && echo "$ip" && return
+    # Fallback: first non-loopback global-scope address
+    ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1)
+    [ -n "$ip" ] && echo "$ip" && return
+    # Last resort: hostname resolution
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$ip" ] && echo "$ip" && return
+    echo "127.0.0.1"
+}
+
+# Resolve the relay server address according to RELAY_MODE / RELAY_SERVERS.
+# Prints the resolved address to stdout; warnings/info go to stderr so the
+# captured value (server_ip=$(resolve_relay_ip)) stays clean.
+resolve_relay_ip() {
+    # Explicit override always wins
+    if [ -n "$RELAY_SERVERS" ]; then
+        echo "Using fixed relay address (RELAY_SERVERS): $RELAY_SERVERS" >&2
+        echo "$RELAY_SERVERS"
+        return
+    fi
+
+    local ip
+    case "${RELAY_MODE:-auto}" in
+        local|lan)
+            ip=$(get_local_ip)
+            echo "Relay mode 'local': using LAN IP $ip (LAN-only deployment)" >&2
+            ;;
+        public|wan)
+            ip=$(get_public_ip)
+            echo "Relay mode 'public': using public IP $ip" >&2
+            ;;
+        auto|*)
+            ip=$(get_public_ip)
+            # Warn if auto-detection returned a private/loopback address — relay
+            # will not work for remote clients unless this is a LAN-only setup.
+            if [ "$ip" = "127.0.0.1" ] || [[ "$ip" == 10.* ]] || [[ "$ip" == 192.168.* ]] || [[ "$ip" == 172.1[6-9].* ]] || [[ "$ip" == 172.2[0-9].* ]] || [[ "$ip" == 172.3[0-1].* ]]; then
+                echo "WARNING: Auto-detected private/loopback IP: $ip" >&2
+                echo "WARNING: Remote (internet) clients will NOT connect via relay with this address." >&2
+                echo "         For LAN-only use, this is fine. For internet access, run with:" >&2
+                echo "           --relay-servers YOUR.PUBLIC.IP   (or RELAY_SERVERS env var)" >&2
+                echo "         To silence this and use the LAN IP explicitly, run with:" >&2
+                echo "           --relay-mode local" >&2
+            fi
+            ;;
+    esac
+    echo "$ip"
 }
 
 sql_escape_literal() {
@@ -598,9 +847,8 @@ detect_architecture() {
 
 detect_os() {
     if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_NAME="$NAME"
-        OS_VERSION="$VERSION_ID"
+        OS_NAME=$(grep -m1 '^NAME=' /etc/os-release | cut -d= -f2- | sed 's/^"//; s/"$//' || echo "Unknown")
+        OS_VERSION=$(grep -m1 '^VERSION_ID=' /etc/os-release | cut -d= -f2- | sed 's/^"//; s/"$//' || echo "")
     else
         OS_NAME="Unknown"
         OS_VERSION=""
@@ -689,26 +937,18 @@ auto_detect_paths() {
 
 # Interactive path configuration
 configure_paths() {
-    clear
-    print_header
-    echo ""
-    echo -e "${WHITE}${BOLD}═══ Path Configuration ═══${NC}"
-    echo ""
-    echo -e "  Current RustDesk path: ${CYAN}${RUSTDESK_PATH:-Not set}${NC}"
-    echo -e "  Current Console path:  ${CYAN}${CONSOLE_PATH:-Not set}${NC}"
-    echo -e "  Database path:         ${CYAN}${DB_PATH:-Not set}${NC}"
-    echo ""
-    
-    echo -e "${YELLOW}Options:${NC}"
-    echo "  1. Auto-detect installation paths"
-    echo "  2. Set RustDesk server path manually"
-    echo "  3. Set Console path manually"
-    echo "  4. Reset to defaults"
-    echo "  0. Back to main menu"
-    echo ""
-    echo -n "Select option [0-4]: "
-    read -r choice
-    
+    local _menu_items=(
+        $'Auto-detect paths\tScan common install locations'
+        $'Set server path\tManually set the RustDesk server path'
+        $'Set console path\tManually set the web console path'
+        $'Reset to defaults\t/opt/betterdesk + /opt/BetterDeskConsole'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 4 0 )
+    local subtitle="server: ${RUSTDESK_PATH:-unset} | console: ${CONSOLE_PATH:-unset}"
+    menu_choose "Path Configuration" "$subtitle"
+    local choice="$MENU_CHOICE"
+
     case $choice in
         1)
             RUSTDESK_PATH=""
@@ -1195,7 +1435,10 @@ setup_postgresql_database() {
     
     # Generate password if not set
     if [ -z "$POSTGRESQL_PASS" ]; then
-        POSTGRESQL_PASS=$(openssl rand -base64 16 | tr -d '/+=' | head -c 16)
+        # SECURITY (audit fix M-05, 2026-04-10): use hex (4 bits/char, no
+        # alphabet shrinking) instead of base64+tr+truncate which lost a few
+        # entropy bits per character.
+        POSTGRESQL_PASS=$(openssl rand -hex 16)
         print_info "Generated PostgreSQL password"
     fi
     
@@ -1251,20 +1494,13 @@ choose_database_type() {
     fi
     
     echo ""
-    echo -e "${WHITE}${BOLD}Select Database Type:${NC}"
-    echo ""
-    echo -e "  ${GREEN}1.${NC} SQLite (default)"
-    echo -e "     ${DIM}Single-file database, zero setup. Good for ≤100 devices.${NC}"
-    echo -e "     ${DIM}Data stored in /opt/rustdesk/db_v2.sqlite3${NC}"
-    echo ""
-    echo -e "  ${GREEN}2.${NC} PostgreSQL (production)"
-    echo -e "     ${DIM}Full SQL database with connection pooling. Recommended for${NC}"
-    echo -e "     ${DIM}multi-server setups, >100 devices, or high availability.${NC}"
-    echo -e "     ${DIM}Requires PostgreSQL 14+ (installed automatically if missing).${NC}"
-    echo ""
-    
-    read -p "Choose database type [1]: " db_choice
-    db_choice="${db_choice:-1}"
+    local _menu_items=(
+        $'SQLite (default)\tSingle-file DB, zero setup, good for <=100 devices'
+        $'PostgreSQL (production)\tPooled SQL DB, multi-server / >100 devices / HA'
+    )
+    local _menu_returns=( 1 2 )
+    menu_choose "Select Database Type" "SQLite is recommended for most installs"
+    local db_choice="${MENU_CHOICE:-1}"
     
     case $db_choice in
         2)
@@ -1389,19 +1625,72 @@ install_nodejs() {
     fi
     
     print_step "Installing Node.js 20 LTS..."
-    
+
+    # Detect OS and install Node.js. The NodeSource setup script is downloaded
+    # to a temp file and validated before execution (H5 audit fix): we do NOT
+    # pipe `curl | bash` blindly. Optional pinning: set $NODESOURCE_SHA256 to
+    # require an exact SHA-256 match before running the installer.
+    _fetch_and_run_nodesource() {
+        local url="$1"
+        local tmp
+        tmp=$(mktemp --suffix=.sh) || { print_error "mktemp failed"; return 1; }
+        trap "rm -f '$tmp'" RETURN
+
+        if ! curl -fsSL --max-time 60 --proto '=https' --tlsv1.2 -o "$tmp" "$url"; then
+            print_error "Failed to download NodeSource setup script from $url"
+            return 1
+        fi
+
+        # Size sanity check: NodeSource setup script is ~15-40 KB. Reject anything
+        # outside [1 KB, 500 KB] (catches HTML error pages and tampered payloads).
+        local size
+        size=$(stat -c%s "$tmp" 2>/dev/null || wc -c <"$tmp")
+        if [ "${size:-0}" -lt 1024 ] || [ "${size:-0}" -gt 512000 ]; then
+            print_error "Downloaded NodeSource script has unexpected size (${size} bytes). Aborting."
+            return 1
+        fi
+
+        # Header sanity check: must be a bash/sh script.
+        local first_line
+        first_line=$(head -n 1 "$tmp")
+        case "$first_line" in
+            "#!/bin/bash"*|"#!/usr/bin/env bash"*|"#!/bin/sh"*|"#!/usr/bin/env sh"*) ;;
+            *)
+                print_error "Downloaded NodeSource script has unexpected shebang: '$first_line'"
+                return 1
+                ;;
+        esac
+
+        # Optional pinned SHA-256 verification.
+        local actual_sha
+        if command -v sha256sum &> /dev/null; then
+            actual_sha=$(sha256sum "$tmp" | awk '{print $1}')
+        elif command -v shasum &> /dev/null; then
+            actual_sha=$(shasum -a 256 "$tmp" | awk '{print $1}')
+        fi
+        if [ -n "$actual_sha" ]; then
+            print_info "NodeSource setup script SHA-256: $actual_sha"
+            if [ -n "${NODESOURCE_SHA256:-}" ] && [ "$actual_sha" != "$NODESOURCE_SHA256" ]; then
+                print_error "NodeSource SHA-256 mismatch (expected $NODESOURCE_SHA256, got $actual_sha)"
+                return 1
+            fi
+        fi
+
+        bash "$tmp"
+    }
+
     # Detect OS and install Node.js
     if command -v apt-get &> /dev/null; then
         # Debian/Ubuntu - use NodeSource
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        _fetch_and_run_nodesource "https://deb.nodesource.com/setup_20.x" || return 1
         apt-get install -y -qq nodejs
     elif command -v dnf &> /dev/null; then
         # Fedora/RHEL 8+
-        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+        _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_20.x" || return 1
         dnf install -y -q nodejs
     elif command -v yum &> /dev/null; then
         # RHEL/CentOS 7
-        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+        _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_20.x" || return 1
         yum install -y -q nodejs
     elif command -v pacman &> /dev/null; then
         # Arch Linux
@@ -1467,6 +1756,23 @@ install_nodejs_console() {
     fi
     rm -f "$npm_log"
     echo ""
+
+    # Best-effort install of node-pty for Server Management terminal (BETA).
+    # node-pty is an optional dependency: if the native build fails the
+    # console falls back to plain pipe spawn (no PTY).
+    print_step "Installing optional node-pty (Server Management terminal — BETA)..."
+    if npm install --no-audit --no-fund --no-save node-pty >>"$npm_log" 2>&1; then
+        print_success "node-pty installed (real PTY available)"
+    else
+        print_warn "node-pty install failed — Server Management terminal will use pipe fallback"
+    fi
+    rm -f "$npm_log"
+
+    # Server Management Terminal sudo hint (BETA — manual step, NOT automated):
+    #   echo 'betterdesk-console ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/journalctl' \
+    #       | sudo tee /etc/sudoers.d/betterdesk-console
+    # The installer never modifies sudoers; admins opt in manually.
+    echo ""
     
     # Create data directory for databases
     mkdir -p "$CONSOLE_PATH/data"
@@ -1495,8 +1801,13 @@ install_nodejs_console() {
             rm -f "$CONSOLE_PATH/data/auth.db" "$CONSOLE_PATH/data/auth.db-wal" "$CONSOLE_PATH/data/auth.db-shm"
         fi
         
-        # Generate admin password for Node.js console
-        ADMIN_PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+        # Generate admin password for Node.js console (M-05: full hex entropy)
+        # Respect user-provided ADMIN_PASSWORD env var if set
+        if [ -z "$ADMIN_PASSWORD" ]; then
+            ADMIN_PASSWORD=$(openssl rand -hex 16)
+        else
+            print_info "Using custom admin password from ADMIN_PASSWORD env var"
+        fi
         local nodejs_admin_password="$ADMIN_PASSWORD"
         
         # Create sentinel file so ensureDefaultAdmin() force-updates the password
@@ -1521,55 +1832,72 @@ DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3"
     fi
     
     # Create .env file (always update to ensure correct paths)
-    cat > "$CONSOLE_PATH/.env" << EOF
+    # Use quoted heredoc ('ENVEOF') to prevent shell expansion of $, `, ! in passwords.
+    # Then patch in the dynamic values safely with awk.
+    cat > "$CONSOLE_PATH/.env" << 'ENVEOF'
 # BetterDesk Node.js Console Configuration
 PORT=5000
 HOST=0.0.0.0
 NODE_ENV=production
+ENVEOF
 
-# RustDesk paths (critical for key/QR code generation)
-RUSTDESK_DIR=$RUSTDESK_PATH
-KEYS_PATH=$RUSTDESK_PATH
-PUB_KEY_PATH=$RUSTDESK_PATH/id_ed25519.pub
-API_KEY_PATH=$RUSTDESK_PATH/.api_key
-
-$db_config
-
-# Auth database location
-DATA_DIR=$CONSOLE_PATH/data
-
-# HBBS API
-HBBS_API_URL=http://localhost:$API_PORT/api
-
-# RustDesk Client API listener
-API_HOST=0.0.0.0
-
-# Server backend (betterdesk = Go server, rustdesk = legacy Rust)
-SERVER_BACKEND=betterdesk
-
-# Default admin credentials (used only on first startup)
-DEFAULT_ADMIN_USERNAME=admin
-DEFAULT_ADMIN_PASSWORD=$nodejs_admin_password
-
-# Session
-SESSION_SECRET=$session_secret
-
-# HTTPS (set to true and provide certificate paths to enable)
-HTTPS_ENABLED=false
-HTTPS_PORT=5443
-SSL_CERT_PATH=$RUSTDESK_PATH/ssl/betterdesk.crt
-SSL_KEY_PATH=$RUSTDESK_PATH/ssl/betterdesk.key
-SSL_CA_PATH=
-HTTP_REDIRECT_HTTPS=true
-
-# Go server API URL (uses HTTPS when TLS certificates are present)
-BETTERDESK_API_URL=http://localhost:$API_PORT/api
-EOF
+    # Append dynamic values safely (no shell expansion issues with special chars)
+    {
+        echo ""
+        echo "# RustDesk paths (critical for key/QR code generation)"
+        echo "RUSTDESK_DIR=$RUSTDESK_PATH"
+        echo "KEYS_PATH=$RUSTDESK_PATH"
+        echo "PUB_KEY_PATH=$RUSTDESK_PATH/id_ed25519.pub"
+        echo "API_KEY_PATH=$RUSTDESK_PATH/.api_key"
+        echo ""
+        echo "$db_config"
+        echo ""
+        echo "# Auth database location"
+        echo "DATA_DIR=$CONSOLE_PATH/data"
+        echo ""
+        echo "# HBBS API"
+        echo "HBBS_API_URL=http://localhost:$API_PORT/api"
+        echo ""
+        echo "# RustDesk Client API listener"
+        echo "API_HOST=0.0.0.0"
+        echo "RUSTDESK_API_TLS=auto"
+        echo ""
+        echo "# Server backend (betterdesk = Go server, rustdesk = legacy Rust)"
+        echo "SERVER_BACKEND=betterdesk"
+        echo ""
+        echo "# Default admin credentials (used only on first startup)"
+        echo "DEFAULT_ADMIN_USERNAME=admin"
+    } >> "$CONSOLE_PATH/.env"
+    # Write password on its own line — printf %s avoids interpreting backslashes/specials
+    printf 'DEFAULT_ADMIN_PASSWORD=%s\n' "$nodejs_admin_password" >> "$CONSOLE_PATH/.env"
+    {
+        echo ""
+        echo "# Session"
+    } >> "$CONSOLE_PATH/.env"
+    printf 'SESSION_SECRET=%s\n' "$session_secret" >> "$CONSOLE_PATH/.env"
+    {
+        echo ""
+        echo "# HTTPS (set to true and provide certificate paths to enable)"
+        echo "HTTPS_ENABLED=false"
+        echo "HTTPS_PORT=5443"
+        echo "SSL_CERT_PATH=$RUSTDESK_PATH/ssl/betterdesk.crt"
+        echo "SSL_KEY_PATH=$RUSTDESK_PATH/ssl/betterdesk.key"
+        echo "SSL_CA_PATH="
+        echo "HTTP_REDIRECT_HTTPS=true"
+        echo ""
+        echo "# Go server API URL (uses HTTPS when TLS certificates are present)"
+        echo "BETTERDESK_API_URL=http://localhost:$API_PORT/api"
+    } >> "$CONSOLE_PATH/.env"
     print_info "Created .env configuration file"
     
     # Persist credentials only when explicitly requested.
     if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
-        echo "admin:$nodejs_admin_password" > "$CONSOLE_PATH/data/.admin_credentials"
+        cat > "$CONSOLE_PATH/data/.admin_credentials" << CREDEOF
+Admin Username: admin
+Admin Password: $nodejs_admin_password
+Generated by: BetterDesk installer
+Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+CREDEOF
         chmod 600 "$CONSOLE_PATH/data/.admin_credentials"
     fi
     
@@ -1796,27 +2124,25 @@ generate_ssl_certificates() {
             sed -i "s|^HTTPS_ENABLED=.*|HTTPS_ENABLED=true|" "$env_file"
             sed -i "s|^SSL_CERT_PATH=.*|SSL_CERT_PATH=$ssl_dir/betterdesk.crt|" "$env_file"
             sed -i "s|^SSL_KEY_PATH=.*|SSL_KEY_PATH=$ssl_dir/betterdesk.key|" "$env_file"
-            # Note: Do NOT change API URLs to https:// here for self-signed certs
-            # API TLS is only enabled with --tls-api (proper certs or ENTERPRISE_TLS=true)
-            # Self-signed: Node.js needs to trust the CA
+            # Note: Do NOT change internal Go API URLs to https:// here.
+            # API TLS breaks RustDesk clients; Node.js only needs the CA for its own HTTPS endpoints.
             if grep -q '^NODE_EXTRA_CA_CERTS=' "$env_file" 2>/dev/null; then
                 sed -i "s|^NODE_EXTRA_CA_CERTS=.*|NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt|" "$env_file"
             else
                 echo "NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt" >> "$env_file"
             fi
             
-            # Enterprise TLS: Enable HTTPS for Go API communication
+            # Enterprise TLS compatibility: Go API must remain HTTP because
+            # RustDesk desktop clients use plain HTTP on signal_port-2.
             if [ "${ENTERPRISE_TLS:-false}" = "true" ]; then
-                # Add ALLOW_SELF_SIGNED_CERTS for Node.js → Go API HTTPS
                 if grep -q '^ALLOW_SELF_SIGNED_CERTS=' "$env_file" 2>/dev/null; then
                     sed -i "s|^ALLOW_SELF_SIGNED_CERTS=.*|ALLOW_SELF_SIGNED_CERTS=true|" "$env_file"
                 else
                     echo "ALLOW_SELF_SIGNED_CERTS=true" >> "$env_file"
                 fi
-                # Update API URLs to HTTPS
-                sed -i "s|^HBBS_API_URL=http://localhost|HBBS_API_URL=https://localhost|" "$env_file"
-                sed -i "s|^BETTERDESK_API_URL=http://localhost|BETTERDESK_API_URL=https://localhost|" "$env_file"
-                print_info "Enterprise TLS: API URLs set to HTTPS"
+                sed -i "s|^HBBS_API_URL=https://localhost|HBBS_API_URL=http://localhost|" "$env_file"
+                sed -i "s|^BETTERDESK_API_URL=https://localhost|BETTERDESK_API_URL=http://localhost|" "$env_file"
+                print_info "Enterprise TLS: Go API stays HTTP for RustDesk client compatibility"
             fi
         fi
     fi
@@ -1847,28 +2173,42 @@ setup_services() {
         fi
     fi
     
-    # Get server IP (prefers IPv4 for relay compatibility)
+    # Get relay server IP according to RELAY_MODE / RELAY_SERVERS
+    # (auto = public IP, local = LAN IP, public = forced public, RELAY_SERVERS = fixed)
+    # Interactive relay mode selection (skipped in auto mode or when explicitly set)
+    if [ "$AUTO_MODE" = false ] && [ -z "$RELAY_SERVERS" ] && [ "${RELAY_MODE:-auto}" = "auto" ]; then
+        local _local_ip _public_ip
+        _local_ip=$(get_local_ip)
+        echo ""
+        print_info "Relay server address controls how clients connect for remote sessions."
+        echo -e "  ${CYAN}1)${NC} Internet / public  ${DIM}(auto-detect public IP — default)${NC}"
+        echo -e "  ${CYAN}2)${NC} LAN only           ${DIM}(use this server's local IP: $_local_ip)${NC}"
+        echo -e "  ${CYAN}3)${NC} Custom address     ${DIM}(enter a specific IP or host)${NC}"
+        echo -ne "  ${CYAN}Select relay mode [1]:${NC} "
+        read -r _relay_choice
+        case "$_relay_choice" in
+            2) RELAY_MODE="local" ;;
+            3)
+                echo -ne "  ${CYAN}Enter relay address (IP or host[:port]):${NC} "
+                read -r RELAY_SERVERS
+                ;;
+            *) RELAY_MODE="auto" ;;
+        esac
+        echo ""
+    fi
+
     local server_ip
-    server_ip=$(get_public_ip)
-    
-    # Warn if public IP detection failed — relay will not work for remote clients
-    if [ "$server_ip" = "127.0.0.1" ] || [[ "$server_ip" == 10.* ]] || [[ "$server_ip" == 192.168.* ]] || [[ "$server_ip" == 172.1[6-9].* ]] || [[ "$server_ip" == 172.2[0-9].* ]] || [[ "$server_ip" == 172.3[0-1].* ]]; then
-        print_warning "Detected private/loopback IP: $server_ip"
-        print_warning "Remote clients will NOT be able to connect via relay!"
-        print_warning "If this is a public-facing server, set RELAY_SERVERS env var to your public IP."
-        echo ""
-        echo -e "  ${YELLOW}Example: RELAY_SERVERS=YOUR.PUBLIC.IP sudo ./betterdesk.sh${NC}"
-        echo ""
-    fi
-    
-    # Allow manual override via RELAY_SERVERS env var
-    if [ -n "$RELAY_SERVERS" ]; then
-        server_ip="$RELAY_SERVERS"
-        print_info "Using RELAY_SERVERS override: $server_ip"
-    fi
-    
-    print_info "Server IP: $server_ip"
+    server_ip=$(resolve_relay_ip)
+
+    print_info "Relay server IP: $server_ip (mode: ${RELAY_SERVERS:+fixed}${RELAY_SERVERS:-$RELAY_MODE})"
     print_info "API Port: $API_PORT"
+
+    local signal_rate_limit="${SIGNAL_RATE_LIMIT_PER_IP:-20}"
+    if ! [[ "$signal_rate_limit" =~ ^[0-9]+$ ]]; then
+        print_warning "Invalid SIGNAL_RATE_LIMIT_PER_IP='$signal_rate_limit'; using 20"
+        signal_rate_limit="20"
+    fi
+    print_info "Signal registration rate limit: $signal_rate_limit/min (0 = disabled)"
     
     # Build database configuration
     local db_arg=""
@@ -1947,7 +2287,7 @@ After=network.target postgresql.service
 Type=simple
 User=root
 WorkingDirectory=$RUSTDESK_PATH
-ExecStart=$RUSTDESK_PATH/betterdesk-server -mode all -relay-servers $server_ip $systemd_db_arg -key-file $RUSTDESK_PATH/id_ed25519 -api-port $API_PORT $init_admin_arg $tls_arg
+ExecStart=$RUSTDESK_PATH/betterdesk-server -mode all -relay-servers $server_ip $systemd_db_arg -key-file $RUSTDESK_PATH/id_ed25519 -api-port $API_PORT -signal-rate-limit-per-ip $signal_rate_limit $init_admin_arg $tls_arg
 Restart=always
 RestartSec=5
 LimitNOFILE=1000000
@@ -2008,11 +2348,15 @@ Environment=DB_PATH=$RUSTDESK_PATH/db_v2.sqlite3"
         local api_scheme="http"
         local tls_env=""
         if [ -n "$tls_arg" ]; then
-            # Enable HTTPS on Node.js console (admin panel port 5443 + Client API port 21121)
-            # so that RustDesk desktop clients can connect via HTTPS to port 21121.
+                # Enable HTTPS on Node.js console (admin panel port 5443). The
+                # RustDesk Client API port 21121 has its own TLS switch because
+                # stock clients cannot trust self-signed certs here.
+                local rustdesk_api_tls="auto"
+                [ "$tls_is_selfsigned" = true ] && rustdesk_api_tls="false"
             tls_env="Environment=HTTPS_ENABLED=true
 Environment=SSL_CERT_PATH=$ssl_dir/betterdesk.crt
-Environment=SSL_KEY_PATH=$ssl_dir/betterdesk.key"
+        Environment=SSL_KEY_PATH=$ssl_dir/betterdesk.key
+        Environment=RUSTDESK_API_TLS=$rustdesk_api_tls"
         fi
         
         # Detect node binary path dynamically (NodeSource, nvm, system, etc.)
@@ -2127,7 +2471,12 @@ create_admin_user() {
         echo ""
 
         if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
-            echo "admin:$admin_password" > "$RUSTDESK_PATH/.admin_credentials"
+            cat > "$RUSTDESK_PATH/.admin_credentials" << CREDEOF
+Admin Username: admin
+Admin Password: $admin_password
+Generated by: BetterDesk installer
+Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+CREDEOF
             chmod 600 "$RUSTDESK_PATH/.admin_credentials"
             print_info "Credentials saved in: $RUSTDESK_PATH/.admin_credentials"
         else
@@ -2263,10 +2612,17 @@ setup_services_minimal() {
     
     # Add relay servers argument
     local SERVER_IP
-    SERVER_IP=$(get_public_ip)
+    SERVER_IP=$(resolve_relay_ip)
     if [ -n "$SERVER_IP" ]; then
         SERVER_ARGS="$SERVER_ARGS -relay-servers $SERVER_IP"
     fi
+
+    local signal_rate_limit="${SIGNAL_RATE_LIMIT_PER_IP:-20}"
+    if ! [[ "$signal_rate_limit" =~ ^[0-9]+$ ]]; then
+        print_warning "Invalid SIGNAL_RATE_LIMIT_PER_IP='$signal_rate_limit'; using 20"
+        signal_rate_limit="20"
+    fi
+    SERVER_ARGS="$SERVER_ARGS -signal-rate-limit-per-ip $signal_rate_limit"
     
     # Database configuration for Go server
     # Escape $ -> $$ for systemd (PostgreSQL passwords can contain $)
@@ -2291,11 +2647,10 @@ setup_services_minimal() {
     if [ -f "$TLS_CERT_PATH" ] && [ -f "$TLS_KEY_PATH" ]; then
         SERVER_ARGS="$SERVER_ARGS -tls-cert $TLS_CERT_PATH -tls-key $TLS_KEY_PATH -tls-signal -tls-relay"
         
-        # Enterprise TLS: Also enable API HTTPS if ENTERPRISE_TLS=true
-        # This requires RustDesk clients >= 1.3.x which support HTTPS API
+        # Enterprise TLS still keeps the Go API HTTP for RustDesk client
+        # compatibility. Only signal/relay receive TLS flags here.
         if [ "${ENTERPRISE_TLS:-false}" = "true" ]; then
-            SERVER_ARGS="$SERVER_ARGS -tls-api"
-            print_info "Enterprise TLS enabled: API port 21114 will use HTTPS"
+            print_info "Enterprise TLS enabled: API port 21114 stays HTTP"
         fi
     fi
     
@@ -2462,8 +2817,8 @@ do_install() {
     # Offer HTTPS Enterprise configuration for fresh installs
     if [ "$install_ok" = true ] && [ "$AUTO_MODE" = false ]; then
         echo ""
-        print_info "🔒 Enterprise TLS enables full HTTPS on ALL ports (panel, signal, relay, API)"
-        print_info "   Recommended for production. Requires RustDesk client >= 1.3.x"
+        print_info "🔒 Enterprise TLS enables HTTPS for panel/signal/relay; Go API stays HTTP for compatibility"
+        print_info "   Recommended for production deployments behind trusted operator access"
         echo ""
         if confirm "Would you like to configure HTTPS Enterprise now? (Option 5 in SSL menu)"; then
             do_configure_ssl
@@ -2478,6 +2833,245 @@ do_install() {
 #===============================================================================
 # Update Functions
 #===============================================================================
+
+# GitHub repository configuration for online updates
+UPDATE_GITHUB_OWNER="${UPDATE_GITHUB_OWNER:-UNITRONIX}"
+UPDATE_GITHUB_REPO="${UPDATE_GITHUB_REPO:-BetterDesk}"
+UPDATE_GITHUB_BRANCH="${UPDATE_GITHUB_BRANCH:-main}"
+UPDATE_CLONE_DIR="/tmp/betterdesk-update-$$"
+
+run_terminal_project_update() {
+    local cli_path="$CONSOLE_PATH/scripts/update-cli.js"
+    local node_bin=""
+    node_bin=$(command -v node 2>/dev/null || true)
+
+    if [ -z "$node_bin" ] || [ ! -f "$cli_path" ]; then
+        return 2
+    fi
+
+    print_step "Running commit-aware project updater..."
+    print_info "Updater CLI: $cli_path"
+
+    local args=()
+    if [ "${AUTO_MODE:-false}" = "true" ]; then
+        args+=("--yes")
+    fi
+
+    "$node_bin" "$cli_path" "${args[@]}"
+    return $?
+}
+
+# Pull latest project from GitHub and apply update to local installation.
+# This is the primary update path — it fetches the full repo, rebuilds
+# the Go server, and reinstalls the Node.js console from fresh source.
+# All local state (databases, keys, .env, auth.db) is preserved.
+update_from_github() {
+    local clone_dir="$UPDATE_CLONE_DIR"
+
+    # Clean up any leftover clone from a previous failed run
+    rm -rf "$clone_dir"
+
+    # ---- Step 1: Clone or download latest code ----
+    print_step "Downloading latest BetterDesk from GitHub..."
+    if command -v git &>/dev/null; then
+        local repo_url="https://github.com/${UPDATE_GITHUB_OWNER}/${UPDATE_GITHUB_REPO}.git"
+        if ! git clone --depth 1 --single-branch --branch "$UPDATE_GITHUB_BRANCH" "$repo_url" "$clone_dir" 2>/dev/null; then
+            print_error "git clone failed"
+            rm -rf "$clone_dir"
+            return 1
+        fi
+        print_success "Repository cloned (branch: $UPDATE_GITHUB_BRANCH)"
+    else
+        # Fallback: download tarball via curl
+        local tarball_url="https://github.com/${UPDATE_GITHUB_OWNER}/${UPDATE_GITHUB_REPO}/archive/refs/heads/${UPDATE_GITHUB_BRANCH}.tar.gz"
+        local tarball_path="/tmp/betterdesk-update-$$.tar.gz"
+        print_info "git not available, downloading tarball..."
+        if ! curl -fsSL --connect-timeout 15 --max-time 120 -o "$tarball_path" "$tarball_url"; then
+            print_error "Download failed. Check internet connection."
+            rm -f "$tarball_path"
+            return 1
+        fi
+        mkdir -p "$clone_dir"
+        if ! tar -xzf "$tarball_path" -C "$clone_dir" --strip-components=1; then
+            print_error "Failed to extract update archive"
+            rm -f "$tarball_path" && rm -rf "$clone_dir"
+            return 1
+        fi
+        rm -f "$tarball_path"
+        print_success "Source downloaded and extracted"
+    fi
+
+    # Validate downloaded source
+    if [ ! -f "$clone_dir/betterdesk-server/go.mod" ] || [ ! -f "$clone_dir/web-nodejs/server.js" ]; then
+        print_error "Downloaded source is incomplete or invalid"
+        rm -rf "$clone_dir"
+        return 1
+    fi
+
+    # Read remote version
+    local remote_version=""
+    if [ -f "$clone_dir/VERSION" ]; then
+        remote_version=$(cat "$clone_dir/VERSION" | tr -d '[:space:]')
+    fi
+    if [ -n "$remote_version" ]; then
+        print_info "Remote version: $remote_version"
+    fi
+
+    # ---- Step 2: Update Go server source & compile ----
+    print_step "Updating Go server source..."
+    if [ -d "$GO_SERVER_SOURCE" ]; then
+        # Backup existing source (lightweight — just rename)
+        mv "$GO_SERVER_SOURCE" "${GO_SERVER_SOURCE}.pre-update.$$" 2>/dev/null || true
+    fi
+    # Copy the *contents* into a guaranteed-existing destination. Copying the
+    # directory itself would nest the new tree inside an existing
+    # $GO_SERVER_SOURCE if the rename above failed (e.g. a locked/busy file),
+    # leaving the old inconsistent source in place and breaking `go build`
+    # with "undefined" errors (issue #158).
+    mkdir -p "$GO_SERVER_SOURCE"
+    cp -rf "$clone_dir/betterdesk-server/." "$GO_SERVER_SOURCE/"
+
+    # Restore any local data/ directory that existed in the old source dir
+    if [ -d "${GO_SERVER_SOURCE}.pre-update.$$/data" ]; then
+        cp -rn "${GO_SERVER_SOURCE}.pre-update.$$/data" "$GO_SERVER_SOURCE/" 2>/dev/null || true
+    fi
+    rm -rf "${GO_SERVER_SOURCE}.pre-update.$$"
+    print_success "Go server source updated"
+
+    # Compile Go server
+    print_step "Building Go server..."
+    if ! check_go_installed; then
+        print_info "Installing Go toolchain..."
+        if ! install_golang; then
+            print_warning "Go toolchain not available — server binary not updated"
+            print_info "Install Go manually from https://go.dev/dl/ and re-run update"
+            # Non-critical: source files were updated, binary can be built later
+        fi
+    fi
+
+    if check_go_installed; then
+        if compile_go_server; then
+            print_success "Go server compiled successfully"
+            # Deploy binary to installation path
+            if [ -f "$GO_SERVER_SOURCE/betterdesk-server" ]; then
+                # Backup existing binary
+                if [ -f "$RUSTDESK_PATH/betterdesk-server" ]; then
+                    cp "$RUSTDESK_PATH/betterdesk-server" \
+                       "$RUSTDESK_PATH/betterdesk-server.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+                fi
+                cp "$GO_SERVER_SOURCE/betterdesk-server" "$RUSTDESK_PATH/betterdesk-server"
+                chmod +x "$RUSTDESK_PATH/betterdesk-server"
+                print_success "Go server binary deployed to $RUSTDESK_PATH"
+            fi
+        else
+            print_warning "Go server compilation failed — keeping existing binary"
+            print_info "You can retry with option 7 (Build & deploy server)"
+        fi
+    fi
+
+    # ---- Step 3: Update Node.js console files ----
+    print_step "Updating Node.js web console..."
+
+    # Preserve critical local state files before overwriting
+    local state_files=(".env" "data" "node_modules")
+    local preserved_dir="/tmp/betterdesk-console-state-$$"
+    mkdir -p "$preserved_dir"
+
+    for item in "${state_files[@]}"; do
+        if [ -e "$CONSOLE_PATH/$item" ]; then
+            cp -a "$CONSOLE_PATH/$item" "$preserved_dir/$item" 2>/dev/null || true
+        fi
+    done
+
+    # Copy new console files (overwrite code, but not state)
+    # Use rsync if available for selective copy, otherwise cp
+    if command -v rsync &>/dev/null; then
+        rsync -a --delete \
+            --exclude='data/' \
+            --exclude='node_modules/' \
+            --exclude='.env' \
+            --exclude='.env.local' \
+            --exclude='*.sqlite3' \
+            --exclude='*.sqlite3-wal' \
+            --exclude='*.sqlite3-shm' \
+            --exclude='*.db' \
+            --exclude='*.db-wal' \
+            --exclude='*.db-shm' \
+            --exclude='.session_secret' \
+            --exclude='.update_sha' \
+            --exclude='.api_key' \
+            --exclude='.admin_credentials' \
+            --exclude='.force_password_update' \
+            "$clone_dir/web-nodejs/" "$CONSOLE_PATH/"
+    else
+        # cp fallback: copy everything then restore state
+        cp -r "$clone_dir/web-nodejs/"* "$CONSOLE_PATH/"
+        # Restore preserved state files
+        for item in "${state_files[@]}"; do
+            if [ -e "$preserved_dir/$item" ]; then
+                if [ -d "$preserved_dir/$item" ]; then
+                    # For directories (data/, node_modules/), don't delete the new
+                    # copy — just ensure old files are restored
+                    cp -a "$preserved_dir/$item/"* "$CONSOLE_PATH/$item/" 2>/dev/null || true
+                else
+                    cp -a "$preserved_dir/$item" "$CONSOLE_PATH/$item" 2>/dev/null || true
+                fi
+            fi
+        done
+    fi
+    rm -rf "$preserved_dir"
+    print_success "Console files updated"
+
+    # Install npm dependencies if package.json changed
+    print_step "Installing npm dependencies..."
+    cd "$CONSOLE_PATH"
+    local npm_log="/tmp/betterdesk_npm_install.log"
+    if npm install --production --no-audit --no-fund > "$npm_log" 2>&1; then
+        print_success "npm dependencies installed"
+    else
+        print_warning "npm install had issues (non-critical):"
+        tail -5 "$npm_log"
+    fi
+    rm -f "$npm_log"
+
+    # ---- Step 4: Update installer scripts ----
+    print_step "Updating installer scripts..."
+    local scripts_updated=0
+    for script_file in betterdesk.sh betterdesk.ps1 betterdesk-docker.sh \
+                       docker-compose.yml docker-compose.single.yml docker-compose.quick.yml \
+                       Dockerfile Dockerfile.server Dockerfile.console VERSION; do
+        if [ -f "$clone_dir/$script_file" ]; then
+            cp "$clone_dir/$script_file" "$SCRIPT_DIR/$script_file" 2>/dev/null || true
+            if [[ "$script_file" == *.sh ]]; then
+                chmod +x "$SCRIPT_DIR/$script_file" 2>/dev/null || true
+            fi
+            scripts_updated=$((scripts_updated + 1))
+        fi
+    done
+    print_success "$scripts_updated installer files updated"
+
+    # ---- Step 5: Update SHA tracking for in-app updater ----
+    if command -v git &>/dev/null && [ -d "$clone_dir/.git" ]; then
+        local remote_sha
+        remote_sha=$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null)
+        if [ -n "$remote_sha" ]; then
+            mkdir -p "$CONSOLE_PATH/data"
+            echo "$remote_sha" > "$CONSOLE_PATH/data/.update_sha"
+            print_info "SHA tracking updated: ${remote_sha:0:7}"
+        fi
+    fi
+
+    # ---- Step 6: Update VERSION file in project root ----
+    if [ -f "$clone_dir/VERSION" ] && [ -n "$remote_version" ]; then
+        cp "$clone_dir/VERSION" "$SCRIPT_DIR/VERSION" 2>/dev/null || true
+    fi
+
+    # Cleanup
+    rm -rf "$clone_dir"
+
+    print_success "All project files updated from GitHub"
+    return 0
+}
 
 do_update() {
     print_header
@@ -2518,28 +3112,99 @@ do_update() {
     # CRITICAL: Preserve database configuration before reinstalling console
     # This prevents PostgreSQL → SQLite switch during updates
     preserve_database_config
-    
+
+    # ---- Update method selection ----
+    # Method 1 (preferred): Pull from GitHub, rebuild Go server, reinstall console
+    # Method 2 (fallback):  Node.js in-app updater CLI (commit-aware)
+    # Method 3 (legacy):    Copy from local SCRIPT_DIR (only works if script dir has new files)
+
+    if [ "${AUTO_MODE:-false}" = "true" ]; then
+        print_info "Auto mode: using GitHub pull update"
+    else
+        local _menu_items=(
+            $'Online update from GitHub\tDownload latest code, rebuild server, update console'
+            $'In-app updater\tBuilt-in Node.js commit-aware updater'
+            $'Local update\tCopy files from this script\'s directory'
+            $'Back\tReturn to the main menu'
+        )
+        local _menu_returns=( 1 2 3 0 )
+        menu_choose "Update Method" "Online GitHub update is recommended"
+        update_method="${MENU_CHOICE:-1}"
+
+        case "$update_method" in
+            0)
+                return
+                ;;
+            2)
+                if run_terminal_project_update; then
+                    print_success "Online project update completed"
+                    press_enter
+                    return
+                else
+                    update_rc=$?
+                    if [ "$update_rc" -ne 2 ]; then
+                        print_error "In-app update failed (exit code: $update_rc)"
+                    else
+                        print_error "In-app updater not available (Node.js or CLI script missing)"
+                    fi
+                    press_enter
+                    return
+                fi
+                ;;
+            3)
+                # Legacy local update path
+                print_info "Using local files from: $SCRIPT_DIR"
+                print_info "Creating backup before update..."
+                do_backup_silent
+                graceful_stop_services
+                detect_architecture
+                install_binaries true
+                install_console
+                run_migrations
+                setup_services
+                create_admin_user
+                start_services_with_verification
+                print_success "Local update completed!"
+                press_enter
+                return
+                ;;
+            1|*)
+                # Fall through to GitHub update below
+                ;;
+        esac
+    fi
+
+    # ---- GitHub Pull Update ----
     print_info "Creating backup before update..."
     do_backup_silent
-    
-    # Stop services gracefully
+
+    # Stop services gracefully before updating files
     graceful_stop_services
-    
-    detect_architecture
-    install_binaries true
-    install_console
+
+    if ! update_from_github; then
+        print_error "GitHub update failed"
+        print_info "Attempting to restart services with existing files..."
+        start_services_with_verification
+        press_enter
+        return
+    fi
+
+    # Run database migrations (adds missing columns etc.)
     run_migrations
     
     # Update systemd services with latest configuration
     setup_services
     
-    # Ensure admin user exists (especially for Node.js console migration)
+    # Ensure admin user exists
     create_admin_user
     
     # Start services with verification
     start_services_with_verification
     
     print_success "Update completed!"
+    if [ -n "${remote_version:-}" ]; then
+        print_info "BetterDesk is now at version $remote_version"
+    fi
     press_enter
 }
 
@@ -2560,18 +3225,17 @@ do_repair() {
     
     print_status
     
-    echo ""
-    echo -e "${WHITE}What do you want to repair?${NC}"
-    echo ""
-    echo "  1. 🔧 Repair binaries (replace with BetterDesk)"
-    echo "  2. 🗃️  Repair database (add missing columns)"
-    echo "  3. ⚙️  Repair systemd services"
-    echo "  4. 🔐 Repair file permissions"
-    echo "  5. 🔄 Full repair (all of the above)"
-    echo "  0. ↩️  Back"
-    echo ""
-    
-    read -p "Select option: " repair_choice
+    local _menu_items=(
+        $'Repair binaries\tReplace the server binary with BetterDesk Go'
+        $'Repair database\tAdd missing columns / run migrations'
+        $'Repair services\tRegenerate systemd service units'
+        $'Repair permissions\tFix file ownership and permissions'
+        $'Full repair\tRun all repair steps above'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 4 5 0 )
+    menu_choose "Repair Installation" "Choose what to repair"
+    local repair_choice="$MENU_CHOICE"
     
     case $repair_choice in
         1) repair_binaries ;;
@@ -3025,20 +3689,21 @@ do_reset_password() {
     echo -e "Detected console type: ${CYAN}${CONSOLE_TYPE}${NC}"
     echo ""
     
-    echo "Select option:"
-    echo ""
-    echo "  1. Generate new random password"
-    echo "  2. Set custom password"
-    echo "  0. Back"
-    echo ""
-    
-    read -p "Choice: " pw_choice
+    local _menu_items=(
+        $'Generate random password\tCreate a strong random admin password'
+        $'Set custom password\tType a new password (min. 8 characters)'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 0 )
+    menu_choose "Admin Password Reset" "Console type: ${CONSOLE_TYPE}"
+    local pw_choice="$MENU_CHOICE"
     
     local new_password
     
     case $pw_choice in
         1)
-            new_password=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
+            # M-05: full hex entropy
+            new_password=$(openssl rand -hex 16)
             ;;
         2)
             echo ""
@@ -3061,6 +3726,33 @@ do_reset_password() {
     local success=false
     
     if [ "$CONSOLE_TYPE" = "nodejs" ]; then
+        # --- Hotfix: detect broken Go-first auth flow (commit 188991d) ---
+        # If authService.js contains the broken Go-first authenticate() function,
+        # auto-download the fixed version. Without this, NO password will work.
+        local auth_service="$CONSOLE_PATH/services/authService.js"
+        if [ -f "$auth_service" ] && grep -q 'checkGoServerHealth.*authenticateViaGo' "$auth_service" 2>/dev/null; then
+            # Check if authenticate() delegates to Go first (broken pattern)
+            if grep -q 'const health = await checkGoServerHealth' "$auth_service" 2>/dev/null; then
+                print_warning "Detected broken authentication flow (Go-first delegation bug)"
+                print_info "Downloading fixed authService.js from GitHub..."
+                local fixed_url="https://raw.githubusercontent.com/UNITRONIX/BetterDesk/main/web-nodejs/services/authService.js"
+                if curl -fsSL "$fixed_url" -o "$auth_service.tmp" 2>/dev/null; then
+                    # Verify the fix was downloaded correctly (check for local-first pattern)
+                    if grep -q 'Step 1: Check local database FIRST' "$auth_service.tmp" 2>/dev/null; then
+                        mv "$auth_service.tmp" "$auth_service"
+                        print_success "Fixed authentication flow (restored local-first login)"
+                    else
+                        rm -f "$auth_service.tmp"
+                        print_warning "Downloaded file does not contain expected fix — skipped"
+                    fi
+                else
+                    rm -f "$auth_service.tmp" 2>/dev/null
+                    print_warning "Could not download fix (no internet?) — password reset will proceed but login may still fail"
+                    print_info "Manual fix: curl -sL '$fixed_url' -o '$auth_service'"
+                fi
+            fi
+        fi
+
         # Detect database type from console .env
         local db_type="sqlite"
         if [ -f "$CONSOLE_PATH/.env" ]; then
@@ -3213,7 +3905,12 @@ PYEOF
         
         # Persist credentials only when explicitly requested.
         if [ "$STORE_ADMIN_CREDENTIALS" = "true" ]; then
-            echo "admin:$new_password" > "$RUSTDESK_PATH/.admin_credentials"
+            cat > "$RUSTDESK_PATH/.admin_credentials" << CREDEOF
+Admin Username: admin
+Admin Password: $new_password
+Generated by: BetterDesk password reset
+Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+CREDEOF
             chmod 600 "$RUSTDESK_PATH/.admin_credentials"
         fi
     else
@@ -3228,17 +3925,89 @@ PYEOF
 # Build Functions
 #===============================================================================
 
-do_build() {
+# Install the toolchain used by the Node.js console worker to compile branded
+# agent installers (cargo + rustup + tauri-cli + cargo-xwin + nsis + rpm +
+# appimagetool + mingw-w64). Runs the standalone script shipped alongside the
+# installer; idempotent. Requires ~3 GB download + 5 GB free disk.
+do_install_build_toolchain() {
     print_header
-    echo -e "${WHITE}${BOLD}══════════ BUILD & DEPLOY ══════════${NC}"
+    echo -e "${WHITE}${BOLD}══════════ AGENT BUILD TOOLCHAIN ══════════${NC}"
     echo ""
-    echo "  1. 🔨 Rebuild & deploy Go server (compile, stop, replace, start)"
-    echo "  2. 🔨 Compile Go server only (do not deploy)"
-    echo "  3. 🦀 Build legacy Rust binaries (archived, hbbs/hbbr)"
-    echo "  0. ↩️  Back to main menu"
+    echo "  Installs: Rust stable, cargo-tauri 2.x, cargo-xwin,"
+    echo "            mingw-w64 (Windows cross-compile), NSIS,"
+    echo "            rpm-build, appimagetool, pnpm, WebKit dev libs."
     echo ""
-    read -p "Select option [1]: " build_choice
-    build_choice="${build_choice:-1}"
+    echo "  Disk:  ~3 GB download, ~5 GB after install,"
+    echo "         plus cargo build cache (/var/cache/betterdesk-build)."
+    echo ""
+    echo "  This is REQUIRED for the 'Generator Agenta' feature."
+    echo "  Skip if you do not generate branded agent installers."
+    echo ""
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local toolchain_script="$script_dir/scripts/install-build-toolchain.sh"
+
+    if [ ! -f "$toolchain_script" ]; then
+        print_error "Toolchain installer not found: $toolchain_script"
+        print_info "Pull the latest repository and try again."
+        press_enter
+        return 1
+    fi
+
+    if [ "$AUTO_MODE" != true ]; then
+        read -p "Proceed with toolchain install? [y/N]: " confirm
+        confirm="${confirm:-N}"
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            print_info "Cancelled."
+            press_enter
+            return 0
+        fi
+    fi
+
+    local extra_args=()
+    [ "$AUTO_MODE" = true ] && extra_args+=(--unattended)
+
+    BUILD_USER="${SUDO_USER:-${BUILD_USER:-unitronix}}" \
+        bash "$toolchain_script" "${extra_args[@]}"
+
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        # Stage the agent-client source where the build worker expects it,
+        # so each console build doesn't need to know about the git checkout.
+        local agent_src="$script_dir/betterdesk-agent-client"
+        local agent_dst="/opt/BetterDeskConsole/agent-source/betterdesk-agent-client"
+        if [ -d "$agent_src/src-tauri" ]; then
+            mkdir -p "$(dirname "$agent_dst")"
+            rsync -a --delete \
+                --exclude node_modules \
+                --exclude target \
+                --exclude dist \
+                "$agent_src/" "$agent_dst/"
+            chown -R "${SUDO_USER:-${BUILD_USER:-unitronix}}:${SUDO_USER:-${BUILD_USER:-unitronix}}" \
+                "$(dirname "$agent_dst")" 2>/dev/null || true
+            print_success "Agent source staged at $agent_dst"
+        fi
+        print_success "Build toolchain installed."
+        print_info "Restart the console service to pick up new PATH:"
+        print_info "  sudo systemctl restart betterdesk-console"
+    else
+        print_error "Toolchain installer exited with code $rc"
+    fi
+    press_enter
+    return $rc
+}
+
+do_build() {
+    local _menu_items=(
+        $'Rebuild & deploy server\tCompile, stop, replace and restart the Go server'
+        $'Compile server only\tBuild the Go binary without deploying it'
+        $'Build legacy Rust binaries\tArchived hbbs/hbbr (advanced)'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 0 )
+    menu_choose "Build & Deploy" "Rebuild and deploy the BetterDesk Go server"
+    local build_choice="${MENU_CHOICE:-1}"
 
     case $build_choice in
         1) do_rebuild_go_server ;;
@@ -3555,42 +4324,69 @@ do_diagnostics() {
     echo -e "${WHITE}${BOLD}═══ Database statistics ═══${NC}"
     echo ""
     
-    if [ -f "$DB_PATH" ]; then
-        local device_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE soft_deleted = 0" 2>/dev/null || \
+    # Determine the active database type the SAME way the rest of the script does:
+    # read DB_TYPE from the console .env first (source of truth), and only fall back
+    # to SQLite file detection. This prevents a stale db_v2.sqlite3 left over from a
+    # previous install from masking an active PostgreSQL backend.
+    local diag_db_type="sqlite"
+    local diag_pg_uri=""
+    if [ -f "$CONSOLE_PATH/.env" ]; then
+        diag_db_type=$(grep -m1 '^DB_TYPE=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+        diag_db_type="${diag_db_type:-sqlite}"
+        diag_pg_uri=$(grep -m1 '^DATABASE_URL=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
+    fi
+    # The Go server may also carry the DSN in its systemd unit (-db postgres://...)
+    if [ "$diag_db_type" != "postgres" ] && [ -f /etc/systemd/system/betterdesk-server.service ]; then
+        local svc_db
+        svc_db=$(grep -oP '\-db\s+"?\K(postgres|postgresql)://[^" ]+' /etc/systemd/system/betterdesk-server.service 2>/dev/null | head -1)
+        if [ -n "$svc_db" ]; then
+            diag_db_type="postgres"
+            diag_pg_uri="${diag_pg_uri:-$svc_db}"
+        fi
+    fi
+    
+    if [ "$diag_db_type" = "postgres" ] && [ -n "$diag_pg_uri" ]; then
+        # Mask password for display
+        local diag_pg_display
+        diag_pg_display=$(echo "$diag_pg_uri" | sed 's|://[^:]*:[^@]*@|://***:***@|')
+        echo -e "  Database type:     ${CYAN}PostgreSQL${NC}"
+        echo -e "  Connection:        ${DIM}$diag_pg_display${NC}"
+        if command -v psql &>/dev/null; then
+            if PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT 1" &>/dev/null; then
+                local device_count online_count user_count
+                device_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM peers WHERE soft_deleted = FALSE" 2>/dev/null || echo "0")
+                online_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM peers WHERE soft_deleted = FALSE AND status = 'ONLINE'" 2>/dev/null || echo "0")
+                user_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM users" 2>/dev/null || echo "0")
+                echo -e "  Status:            ${GREEN}Connected${NC}"
+                echo "  Devices:           ${device_count:-0}"
+                echo "  Online:            ${online_count:-0}"
+                echo "  Users:             ${user_count:-0}"
+            else
+                echo -e "  Status:            ${RED}Connection failed${NC}"
+                echo -e "  ${YELLOW}Tip: verify the PostgreSQL service and DATABASE_URL credentials${NC}"
+            fi
+        else
+            echo -e "  ${YELLOW}Install the 'psql' client to see live database statistics${NC}"
+        fi
+    elif [ -f "$DB_PATH" ]; then
+        local device_count online_count user_count
+        device_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE soft_deleted = 0" 2>/dev/null || \
                             sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE is_deleted = 0" 2>/dev/null || \
                             sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE is_deleted = 0" 2>/dev/null || echo "0")
-        local online_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE soft_deleted = 0 AND status = 'ONLINE'" 2>/dev/null || \
+        online_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE soft_deleted = 0 AND status = 'ONLINE'" 2>/dev/null || \
                             sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peers WHERE status = 1 AND is_deleted = 0" 2>/dev/null || \
                             sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM peer WHERE status = 1 AND is_deleted = 0" 2>/dev/null || echo "0")
-        local user_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users" 2>/dev/null || echo "0")
+        user_count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users" 2>/dev/null || echo "0")
         
         echo -e "  Database type:     ${CYAN}SQLite${NC}"
+        echo -e "  File:              ${DIM}$DB_PATH${NC}"
         echo "  Devices:           $device_count"
         echo "  Online:            $online_count"
         echo "  Users:             $user_count"
     else
-        # Check for PostgreSQL
-        local diag_db_type="sqlite"
-        local diag_pg_uri=""
-        if [ -f "$CONSOLE_PATH/.env" ]; then
-            diag_db_type=$(grep -m1 '^DB_TYPE=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
-            diag_db_type="${diag_db_type:-sqlite}"
-            diag_pg_uri=$(grep -m1 '^DATABASE_URL=' "$CONSOLE_PATH/.env" 2>/dev/null | cut -d= -f2-)
-        fi
-        
-        if [ "$diag_db_type" = "postgres" ] && [ -n "$diag_pg_uri" ]; then
-            echo -e "  Database type:     ${CYAN}PostgreSQL${NC}"
-            if command -v psql &>/dev/null; then
-                local device_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM peers WHERE soft_deleted = FALSE" 2>/dev/null || echo "0")
-                local user_count=$(PGCONNECT_TIMEOUT=3 psql "$diag_pg_uri" -tAc "SELECT COUNT(*) FROM users" 2>/dev/null || echo "0")
-                echo "  Devices:           ${device_count:-0}"
-                echo "  Users:             ${user_count:-0}"
-            else
-                echo -e "  ${YELLOW}Install psql to see database statistics${NC}"
-            fi
-        else
-            echo -e "  ${YELLOW}SQLite database file not found: $DB_PATH${NC}"
-        fi
+        echo -e "  Database type:     ${CYAN}SQLite${NC} (configured)"
+        echo -e "  ${YELLOW}SQLite database file not found: $DB_PATH${NC}"
+        echo -e "  ${DIM}This is normal before the first device registers.${NC}"
     fi
     
     # --- Port diagnostics ---
@@ -3783,14 +4579,14 @@ do_diagnostics() {
     
     # --- Diagnostics sub-menu ---
     echo ""
-    echo -e "${WHITE}════════════════════════════════════════${NC}"
-    echo ""
-    echo "  F. Configure firewall rules (auto-create missing rules)"
-    echo "  P. Test port connectivity from outside"
-    echo "  0. Back to main menu"
-    echo ""
-    echo -n "  Select option: "
-    read -r sub_choice
+    local _menu_items=(
+        $'Configure firewall rules\tAuto-create any missing firewall rules'
+        $'Test external ports\tCheck port connectivity from outside'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( F P 0 )
+    menu_choose "Diagnostics Actions" "Optional follow-up checks"
+    local sub_choice="$MENU_CHOICE"
     
     case "$sub_choice" in
         [Ff])
@@ -3893,21 +4689,16 @@ do_configure_ssl() {
         return
     fi
     
-    echo -e "  ${WHITE}Configure SSL/TLS certificates for BetterDesk Console.${NC}"
-    echo -e "  ${WHITE}This enables HTTPS for both the admin panel and the RustDesk Client API.${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Standard Options:${NC}"
-    echo -e "  ${GREEN}1.${NC} Let's Encrypt (automatic, requires domain name + port 80)"
-    echo -e "  ${GREEN}2.${NC} Custom certificate (provide your own cert + key files)"
-    echo -e "  ${GREEN}3.${NC} Self-signed certificate (LAN/testing)"
-    echo -e "  ${RED}4.${NC} Disable SSL (revert to HTTP)"
-    echo ""
-    echo -e "  ${YELLOW}Enterprise Options:${NC}"
-    echo -e "  ${CYAN}5.${NC} Enterprise TLS (full HTTPS: panel + signal + relay + API)"
-    echo -e "      ${WHITE}↳ Recommended for corporate networks with RustDesk >= 1.3.x${NC}"
-    echo ""
-    
-    read -p "Choice [1]: " ssl_choice
+    local _menu_items=(
+        $'Let\'s Encrypt\tAutomatic cert (needs domain name + port 80)'
+        $'Custom certificate\tProvide your own cert + key files'
+        $'Self-signed certificate\tLAN / testing only'
+        $'Disable SSL\tRevert the console to plain HTTP'
+        $'Enterprise TLS\tPanel + signal + relay TLS (API stays HTTP)'
+    )
+    local _menu_returns=( 1 2 3 4 5 )
+    menu_choose "SSL Certificate Configuration" "Enables HTTPS for the admin panel + client API"
+    local ssl_choice="$MENU_CHOICE"
     
     case "${ssl_choice:-1}" in
         1)
@@ -3957,6 +4748,11 @@ do_configure_ssl() {
             sed -i "s|^SSL_CERT_PATH=.*|SSL_CERT_PATH=$cert_path|" "$CONSOLE_PATH/.env"
             sed -i "s|^SSL_KEY_PATH=.*|SSL_KEY_PATH=$key_path|" "$CONSOLE_PATH/.env"
             sed -i "s|^HTTP_REDIRECT_HTTPS=.*|HTTP_REDIRECT_HTTPS=true|" "$CONSOLE_PATH/.env"
+            if grep -q '^RUSTDESK_API_TLS=' "$CONSOLE_PATH/.env" 2>/dev/null; then
+                sed -i "s|^RUSTDESK_API_TLS=.*|RUSTDESK_API_TLS=true|" "$CONSOLE_PATH/.env"
+            else
+                echo "RUSTDESK_API_TLS=true" >> "$CONSOLE_PATH/.env"
+            fi
             
             # Setup auto-renewal
             if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
@@ -3991,6 +4787,11 @@ do_configure_ssl() {
                 sed -i "s|^SSL_CA_PATH=.*|SSL_CA_PATH=$ca_path|" "$CONSOLE_PATH/.env"
             fi
             sed -i "s|^HTTP_REDIRECT_HTTPS=.*|HTTP_REDIRECT_HTTPS=true|" "$CONSOLE_PATH/.env"
+            if grep -q '^RUSTDESK_API_TLS=' "$CONSOLE_PATH/.env" 2>/dev/null; then
+                sed -i "s|^RUSTDESK_API_TLS=.*|RUSTDESK_API_TLS=true|" "$CONSOLE_PATH/.env"
+            else
+                echo "RUSTDESK_API_TLS=true" >> "$CONSOLE_PATH/.env"
+            fi
             
             print_success "Custom SSL certificate configured"
             ;;
@@ -4038,6 +4839,11 @@ do_configure_ssl() {
             sed -i "s|^SSL_CERT_PATH=.*|SSL_CERT_PATH=$ssl_dir/betterdesk.crt|" "$CONSOLE_PATH/.env"
             sed -i "s|^SSL_KEY_PATH=.*|SSL_KEY_PATH=$ssl_dir/betterdesk.key|" "$CONSOLE_PATH/.env"
             sed -i "s|^HTTP_REDIRECT_HTTPS=.*|HTTP_REDIRECT_HTTPS=true|" "$CONSOLE_PATH/.env"
+            if grep -q '^RUSTDESK_API_TLS=' "$CONSOLE_PATH/.env" 2>/dev/null; then
+                sed -i "s|^RUSTDESK_API_TLS=.*|RUSTDESK_API_TLS=false|" "$CONSOLE_PATH/.env"
+            else
+                echo "RUSTDESK_API_TLS=false" >> "$CONSOLE_PATH/.env"
+            fi
             
             # Configure NODE_EXTRA_CA_CERTS for self-signed
             if grep -q '^NODE_EXTRA_CA_CERTS=' "$CONSOLE_PATH/.env" 2>/dev/null; then
@@ -4070,6 +4876,11 @@ do_configure_ssl() {
             sed -i "s|^SSL_CERT_PATH=.*|SSL_CERT_PATH=|" "$CONSOLE_PATH/.env"
             sed -i "s|^SSL_KEY_PATH=.*|SSL_KEY_PATH=|" "$CONSOLE_PATH/.env"
             sed -i "s|^HTTP_REDIRECT_HTTPS=.*|HTTP_REDIRECT_HTTPS=false|" "$CONSOLE_PATH/.env"
+            if grep -q '^RUSTDESK_API_TLS=' "$CONSOLE_PATH/.env" 2>/dev/null; then
+                sed -i "s|^RUSTDESK_API_TLS=.*|RUSTDESK_API_TLS=false|" "$CONSOLE_PATH/.env"
+            else
+                echo "RUSTDESK_API_TLS=false" >> "$CONSOLE_PATH/.env"
+            fi
             
             # Remove TLS args from Go server
             local go_svc_file="/etc/systemd/system/betterdesk-server.service"
@@ -4084,12 +4895,11 @@ do_configure_ssl() {
             print_success "SSL disabled. Running in HTTP mode."
             ;;
         5)
-            # Enterprise TLS - full HTTPS on ALL channels including API
+            # Enterprise TLS - HTTPS for panel/signal/relay, Go API remains HTTP
             print_header "Enterprise TLS Configuration"
             echo ""
-            print_warning "⚠️  IMPORTANT: Enterprise TLS enables HTTPS on ALL ports including API."
-            print_warning "    This requires RustDesk client >= 1.3.x for full compatibility."
-            print_warning "    Legacy clients may have connectivity issues."
+            print_warning "⚠️  IMPORTANT: Go API port 21114 stays HTTP for RustDesk client compatibility."
+            print_warning "    Panel, signal and relay channels can still use TLS."
             echo ""
             
             local ssl_dir="$RUSTDESK_PATH/ssl"
@@ -4134,6 +4944,11 @@ do_configure_ssl() {
             sed -i "s|^SSL_CERT_PATH=.*|SSL_CERT_PATH=$ssl_dir/betterdesk.crt|" "$CONSOLE_PATH/.env"
             sed -i "s|^SSL_KEY_PATH=.*|SSL_KEY_PATH=$ssl_dir/betterdesk.key|" "$CONSOLE_PATH/.env"
             sed -i "s|^HTTP_REDIRECT_HTTPS=.*|HTTP_REDIRECT_HTTPS=true|" "$CONSOLE_PATH/.env"
+            if grep -q '^RUSTDESK_API_TLS=' "$CONSOLE_PATH/.env" 2>/dev/null; then
+                sed -i "s|^RUSTDESK_API_TLS=.*|RUSTDESK_API_TLS=true|" "$CONSOLE_PATH/.env"
+            else
+                echo "RUSTDESK_API_TLS=true" >> "$CONSOLE_PATH/.env"
+            fi
             
             # Set ALLOW_SELF_SIGNED_CERTS for internal API calls
             if grep -q '^ALLOW_SELF_SIGNED_CERTS=' "$CONSOLE_PATH/.env" 2>/dev/null; then
@@ -4149,13 +4964,13 @@ do_configure_ssl() {
                 echo "NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt" >> "$CONSOLE_PATH/.env"
             fi
             
-            # Update API URLs to HTTPS for Enterprise mode
+            # Keep internal Go API URLs on HTTP for RustDesk client compatibility
             local api_port
             api_port=$(grep -oP '^HBBS_API_URL=https?://localhost:\K[0-9]+' "$CONSOLE_PATH/.env" 2>/dev/null || echo "${API_PORT:-21114}")
-            sed -i "s|^HBBS_API_URL=http://|HBBS_API_URL=https://|" "$CONSOLE_PATH/.env"
-            sed -i "s|^BETTERDESK_API_URL=http://|BETTERDESK_API_URL=https://|" "$CONSOLE_PATH/.env"
+            sed -i "s|^HBBS_API_URL=https://localhost|HBBS_API_URL=http://localhost|" "$CONSOLE_PATH/.env"
+            sed -i "s|^BETTERDESK_API_URL=https://localhost|BETTERDESK_API_URL=http://localhost|" "$CONSOLE_PATH/.env"
             
-            # === Configure Go server with FULL TLS (signal + relay + API) ===
+            # === Configure Go server with TLS for signal + relay only ===
             local go_svc_file="/etc/systemd/system/betterdesk-server.service"
             if [ -f "$go_svc_file" ]; then
                 # Remove old TLS args
@@ -4164,8 +4979,9 @@ do_configure_ssl() {
                 sed -i 's/ -tls-signal//g' "$go_svc_file"
                 sed -i 's/ -tls-relay//g' "$go_svc_file"
                 sed -i 's/ -tls-api//g' "$go_svc_file"
-                # Add FULL TLS args including -tls-api
-                sed -i "s|\(ExecStart=.*betterdesk-server[^$]*\)|\1 -tls-cert $ssl_dir/betterdesk.crt -tls-key $ssl_dir/betterdesk.key -tls-signal -tls-relay -tls-api|" "$go_svc_file"
+                sed -i 's/ -force-https//g' "$go_svc_file"
+                # Add TLS args without -tls-api
+                sed -i "s|\(ExecStart=.*betterdesk-server[^$]*\)|\1 -tls-cert $ssl_dir/betterdesk.crt -tls-key $ssl_dir/betterdesk.key -tls-signal -tls-relay|" "$go_svc_file"
             fi
             
             # Set ENTERPRISE_TLS marker
@@ -4182,11 +4998,11 @@ do_configure_ssl() {
             print_info "Valid: 10 years (RSA 4096-bit)"
             [ -n "$lan_ip" ] && [ "$lan_ip" != "$server_ip" ] && print_info "LAN IP: $lan_ip"
             echo ""
-            print_warning "All connections now use TLS:"
+            print_warning "TLS configured for external channels:"
             print_info "  • Panel HTTPS: :5443 (or configured port)"
             print_info "  • Signal TLS: :21116"
             print_info "  • Relay TLS: :21117"
-            print_info "  • API HTTPS: :21114"
+            print_info "  • Go API HTTP: :21114 (required for RustDesk clients)"
             echo ""
             print_warning "For browsers/clients accessing this server, you may need to:"
             print_info "  1. Import $ssl_dir/betterdesk.crt as trusted CA"
@@ -4200,16 +5016,17 @@ do_configure_ssl() {
     esac
     
     # ── Update API URLs in .env when SSL is enabled/disabled ──
-    # API TLS (--tls-api) is only enabled for Enterprise TLS (option 5).
-    # Standard options (1-3): API stays HTTP on localhost, only signal/relay use TLS.
-    # Option 5 (Enterprise): ALL channels use TLS including API.
+    # Go API TLS (--tls-api) is intentionally not enabled by SSL options.
+    # RustDesk desktop clients always use plain HTTP on signal_port-2 (21114).
     local env_file="$CONSOLE_PATH/.env"
     local api_port
     api_port=$(grep -oP '^HBBS_API_URL=https?://localhost:\K[0-9]+' "$env_file" 2>/dev/null || echo "$API_PORT")
     
     if [ "${ssl_choice:-1}" = "5" ]; then
-        # === Enterprise TLS: Keep HTTPS for API (already configured in option handler) ===
-        print_info "Enterprise TLS mode: ALL connections use HTTPS/TLS"
+        # === Enterprise TLS compatibility mode: Go API stays HTTP ===
+        print_info "Enterprise TLS mode: panel/signal/relay use TLS; Go API stays HTTP"
+        sed -i "s|^HBBS_API_URL=https://localhost|HBBS_API_URL=http://localhost|" "$env_file"
+        sed -i "s|^BETTERDESK_API_URL=https://localhost|BETTERDESK_API_URL=http://localhost|" "$env_file"
         
         # Ensure systemd service has ALLOW_SELF_SIGNED_CERTS
         local svc_file="/etc/systemd/system/betterdesk-console.service"
@@ -4219,6 +5036,20 @@ do_configure_ssl() {
             else
                 sed -i "/^\[Service\]/a Environment=ALLOW_SELF_SIGNED_CERTS=true" "$svc_file"
             fi
+            if grep -q 'Environment=RUSTDESK_API_TLS=' "$svc_file"; then
+                sed -i "s|Environment=RUSTDESK_API_TLS=.*|Environment=RUSTDESK_API_TLS=true|" "$svc_file"
+            else
+                sed -i "/^\[Service\]/a Environment=RUSTDESK_API_TLS=true" "$svc_file"
+            fi
+            sed -i "s|Environment=HBBS_API_URL=https://localhost|Environment=HBBS_API_URL=http://localhost|" "$svc_file"
+            sed -i "s|Environment=BETTERDESK_API_URL=https://localhost|Environment=BETTERDESK_API_URL=http://localhost|" "$svc_file"
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+
+        local go_svc_file="/etc/systemd/system/betterdesk-server.service"
+        if [ -f "$go_svc_file" ]; then
+            sed -i 's/ -tls-api//g' "$go_svc_file"
+            sed -i 's/ -force-https//g' "$go_svc_file"
             systemctl daemon-reload 2>/dev/null || true
         fi
         
@@ -4249,6 +5080,13 @@ do_configure_ssl() {
             # Sync HTTPS_ENABLED in systemd (overrides .env value)
             if grep -q 'Environment=HTTPS_ENABLED=' "$svc_file"; then
                 sed -i "s|Environment=HTTPS_ENABLED=.*|Environment=HTTPS_ENABLED=true|" "$svc_file"
+            fi
+            local rustdesk_api_tls="true"
+            [ "${ssl_choice:-1}" = "3" ] && rustdesk_api_tls="false"
+            if grep -q 'Environment=RUSTDESK_API_TLS=' "$svc_file"; then
+                sed -i "s|Environment=RUSTDESK_API_TLS=.*|Environment=RUSTDESK_API_TLS=$rustdesk_api_tls|" "$svc_file"
+            else
+                sed -i "/^\[Service\]/a Environment=RUSTDESK_API_TLS=$rustdesk_api_tls" "$svc_file"
             fi
             # Sync SSL cert/key paths in systemd
             if grep -q 'Environment=SSL_CERT_PATH=' "$svc_file"; then
@@ -4290,6 +5128,11 @@ do_configure_ssl() {
             if grep -q 'Environment=HTTPS_ENABLED=' "$svc_file"; then
                 sed -i "s|Environment=HTTPS_ENABLED=.*|Environment=HTTPS_ENABLED=false|" "$svc_file"
             fi
+            if grep -q 'Environment=RUSTDESK_API_TLS=' "$svc_file"; then
+                sed -i "s|Environment=RUSTDESK_API_TLS=.*|Environment=RUSTDESK_API_TLS=false|" "$svc_file"
+            else
+                sed -i "/^\[Service\]/a Environment=RUSTDESK_API_TLS=false" "$svc_file"
+            fi
             sed -i '/Environment=NODE_EXTRA_CA_CERTS=/d' "$svc_file"
             sed -i '/Environment=ENTERPRISE_TLS=/d' "$svc_file"
             sed -i "s|Environment=ALLOW_SELF_SIGNED_CERTS=.*|Environment=ALLOW_SELF_SIGNED_CERTS=false|" "$svc_file"
@@ -4315,8 +5158,448 @@ do_configure_ssl() {
     if confirm "Restart BetterDesk to apply changes?"; then
         systemctl restart betterdesk-server betterdesk-console 2>/dev/null || true
         print_success "BetterDesk services restarted"
+        sleep 2
+        run_protocol_tests
     fi
     
+    press_enter
+}
+
+#===============================================================================
+# Protocol verification test-suite
+#===============================================================================
+# Runs a series of non-destructive connectivity / certificate checks after an
+# HTTP <-> HTTPS switch so the operator gets immediate, trustworthy feedback.
+# Honours the project invariant: the Go API (:21114) must remain HTTP.
+run_protocol_tests() {
+    local env_file="$CONSOLE_PATH/.env"
+    local go_svc_file="/etc/systemd/system/betterdesk-server.service"
+    local ssl_dir="$RUSTDESK_PATH/ssl"
+    local pass=0 fail=0 warn=0
+
+    echo ""
+    echo -e "${WHITE}${BOLD}═══ Post-configuration tests ═══${NC}"
+    echo ""
+
+    _test_ok()   { echo -e "  ${GREEN}✓${NC} $1"; pass=$((pass+1)); }
+    _test_fail() { echo -e "  ${RED}✗${NC} $1"; fail=$((fail+1)); }
+    _test_warn() { echo -e "  ${YELLOW}!${NC} $1"; warn=$((warn+1)); }
+
+    # ── 1. Services running ──
+    if systemctl is-active --quiet betterdesk-server 2>/dev/null; then
+        _test_ok "Go server service is active"
+    else
+        _test_fail "Go server service is NOT active (journalctl -u betterdesk-server)"
+    fi
+    if systemctl is-active --quiet betterdesk-console 2>/dev/null; then
+        _test_ok "Web console service is active"
+    else
+        _test_fail "Web console service is NOT active (journalctl -u betterdesk-console)"
+    fi
+
+    # ── 2. Determine panel scheme / port from configuration ──
+    local https_enabled="false"
+    if [ -f "$env_file" ]; then
+        grep -q '^HTTPS_ENABLED=true' "$env_file" 2>/dev/null && https_enabled="true"
+    fi
+    local panel_scheme="http" panel_port="5000"
+    if [ "$https_enabled" = "true" ]; then
+        panel_scheme="https"; panel_port="5443"
+    fi
+    # Allow custom ports from .env
+    local cfg_port
+    cfg_port=$(grep -m1 '^PORT=' "$env_file" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+    [ -n "$cfg_port" ] && panel_port="$cfg_port"
+
+    # ── 3. Panel reachability ──
+    local panel_code
+    panel_code=$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 6 \
+        "${panel_scheme}://127.0.0.1:${panel_port}/" 2>/dev/null || echo "000")
+    if [[ "$panel_code" =~ ^(200|301|302|304|401|403)$ ]]; then
+        _test_ok "Web panel reachable: ${panel_scheme}://<server>:${panel_port} (HTTP $panel_code)"
+    else
+        _test_fail "Web panel NOT reachable on ${panel_scheme}://127.0.0.1:${panel_port} (got $panel_code)"
+    fi
+
+    # ── 4. Go API must answer over HTTP on 21114 ──
+    local api_code
+    api_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 \
+        "http://127.0.0.1:${API_PORT:-21114}/api/server/stats" 2>/dev/null || echo "000")
+    if [[ "$api_code" =~ ^(200|401|403|404)$ ]]; then
+        _test_ok "Go API responding over HTTP on :${API_PORT:-21114} (HTTP $api_code)"
+    else
+        _test_fail "Go API not responding over HTTP on :${API_PORT:-21114} (got $api_code)"
+    fi
+    # Critical invariant: Go API must never be HTTPS-only
+    if [ -f "$go_svc_file" ] && grep -Eq '\-tls-api|\-force-https' "$go_svc_file" 2>/dev/null; then
+        _test_warn "Go service carries -tls-api/-force-https — RustDesk clients require plain HTTP on :${API_PORT:-21114}"
+    fi
+
+    # ── 5. Signal / Relay listeners ──
+    local p
+    for p in 21116 21117; do
+        if ss -tlnH 2>/dev/null | grep -q ":${p} "; then
+            _test_ok "Listener present on TCP :${p}"
+        else
+            _test_warn "No TCP listener detected on :${p} (UDP-only signal is normal for :21116)"
+        fi
+    done
+
+    # ── 6. Certificate validation (HTTPS / TLS modes) ──
+    local tls_active="no"
+    [ -f "$go_svc_file" ] && grep -q '\-tls-signal' "$go_svc_file" 2>/dev/null && tls_active="yes"
+    if [ "$https_enabled" = "true" ] || [ "$tls_active" = "yes" ]; then
+        if [ -f "$ssl_dir/betterdesk.crt" ]; then
+            if openssl x509 -in "$ssl_dir/betterdesk.crt" -noout 2>/dev/null; then
+                local not_after days_left
+                not_after=$(openssl x509 -in "$ssl_dir/betterdesk.crt" -noout -enddate 2>/dev/null | cut -d= -f2)
+                if [ -n "$not_after" ]; then
+                    local exp_epoch now_epoch
+                    exp_epoch=$(date -d "$not_after" +%s 2>/dev/null || echo 0)
+                    now_epoch=$(date +%s)
+                    if [ "$exp_epoch" -gt "$now_epoch" ]; then
+                        days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+                        if [ "$days_left" -lt 14 ]; then
+                            _test_warn "Certificate valid but expires in ${days_left} days ($not_after)"
+                        else
+                            _test_ok "Certificate valid for ${days_left} more days (until $not_after)"
+                        fi
+                    else
+                        _test_fail "Certificate has EXPIRED ($not_after)"
+                    fi
+                fi
+                # SAN summary helps diagnose "name mismatch" client errors
+                local san
+                san=$(openssl x509 -in "$ssl_dir/betterdesk.crt" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' ')
+                [ -n "$san" ] && echo -e "      ${DIM}SAN: ${san}${NC}"
+            else
+                _test_fail "Certificate file is not a valid X.509 certificate"
+            fi
+        else
+            _test_fail "HTTPS/TLS enabled but no certificate found at $ssl_dir/betterdesk.crt"
+        fi
+
+        # Live TLS handshake against the signal port when signal TLS is on
+        if [ "$tls_active" = "yes" ]; then
+            if echo | timeout 5 openssl s_client -connect "127.0.0.1:21116" 2>/dev/null | grep -q 'BEGIN CERTIFICATE'; then
+                _test_ok "TLS handshake succeeded on signal :21116"
+            else
+                _test_warn "Could not complete TLS handshake on :21116 (dual-mode listener may still accept plain TCP)"
+            fi
+        fi
+    fi
+
+    echo ""
+    echo -e "  ${GREEN}${pass} passed${NC}   ${YELLOW}${warn} warnings${NC}   ${RED}${fail} failed${NC}"
+    if [ "$fail" -gt 0 ]; then
+        echo -e "  ${YELLOW}Some checks failed — review the messages above and the service logs.${NC}"
+    else
+        echo -e "  ${GREEN}Configuration verified successfully.${NC}"
+    fi
+    echo ""
+
+    unset -f _test_ok _test_fail _test_warn 2>/dev/null || true
+}
+
+#===============================================================================
+# HTTP/HTTPS Protocol Toggle
+#===============================================================================
+
+do_toggle_protocol() {
+    print_header
+    echo -e "${WHITE}${BOLD}══════════ PROTOCOL TOGGLE (HTTP / HTTPS) ══════════${NC}"
+    echo ""
+
+    local env_file="$CONSOLE_PATH/.env"
+    local svc_file="/etc/systemd/system/betterdesk-console.service"
+    local go_svc_file="/etc/systemd/system/betterdesk-server.service"
+    local ssl_dir="$RUSTDESK_PATH/ssl"
+
+    # Detect current mode
+    local current_mode="HTTP"
+    if [ -f "$svc_file" ]; then
+        if grep -q 'Environment=HTTPS_ENABLED=true' "$svc_file" 2>/dev/null; then
+            current_mode="HTTPS"
+        fi
+    elif [ -f "$env_file" ]; then
+        if grep -q '^HTTPS_ENABLED=true' "$env_file" 2>/dev/null; then
+            current_mode="HTTPS"
+        fi
+    fi
+
+    local tls_signal="no"
+    local tls_relay="no"
+    if [ -f "$go_svc_file" ]; then
+        grep -q '\-tls-signal' "$go_svc_file" 2>/dev/null && tls_signal="yes"
+        grep -q '\-tls-relay' "$go_svc_file" 2>/dev/null && tls_relay="yes"
+    fi
+
+    local _menu_items=(
+        $'Switch to HTTP\tEverything plain — LAN / testing'
+        $'Switch to HTTPS\tPanel HTTPS + signal/relay TLS'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 0 )
+    menu_choose "Protocol Toggle (HTTP / HTTPS)" "Current: ${current_mode} | signal TLS: ${tls_signal} | relay TLS: ${tls_relay}"
+    local proto_choice="$MENU_CHOICE"
+
+    case "${proto_choice:-0}" in
+        1)
+            # ── Switch to HTTP ──
+            echo ""
+            print_step "Switching to HTTP mode..."
+
+            # Update .env if it exists
+            if [ -f "$env_file" ]; then
+                sed -i "s|^HTTPS_ENABLED=.*|HTTPS_ENABLED=false|" "$env_file"
+                sed -i "s|^RUSTDESK_API_TLS=.*|RUSTDESK_API_TLS=false|" "$env_file"
+                sed -i "s|^ALLOW_SELF_SIGNED_CERTS=.*|ALLOW_SELF_SIGNED_CERTS=false|" "$env_file"
+                sed -i "s|^HBBS_API_URL=https://localhost|HBBS_API_URL=http://localhost|" "$env_file"
+                sed -i "s|^BETTERDESK_API_URL=https://localhost|BETTERDESK_API_URL=http://localhost|" "$env_file"
+                sed -i "s|^HTTP_REDIRECT_HTTPS=.*|HTTP_REDIRECT_HTTPS=false|" "$env_file"
+                sed -i '/^NODE_EXTRA_CA_CERTS=/d' "$env_file"
+                sed -i '/^ENTERPRISE_TLS=/d' "$env_file"
+            fi
+
+            # Update console systemd service
+            if [ -f "$svc_file" ]; then
+                sed -i "s|Environment=HTTPS_ENABLED=.*|Environment=HTTPS_ENABLED=false|" "$svc_file"
+                sed -i "s|Environment=ALLOW_SELF_SIGNED_CERTS=.*|Environment=ALLOW_SELF_SIGNED_CERTS=false|" "$svc_file"
+                sed -i "s|Environment=HBBS_API_URL=https://localhost|Environment=HBBS_API_URL=http://localhost|" "$svc_file"
+                sed -i "s|Environment=BETTERDESK_API_URL=https://localhost|Environment=BETTERDESK_API_URL=http://localhost|" "$svc_file"
+                if grep -q 'Environment=RUSTDESK_API_TLS=' "$svc_file"; then
+                    sed -i "s|Environment=RUSTDESK_API_TLS=.*|Environment=RUSTDESK_API_TLS=false|" "$svc_file"
+                fi
+                sed -i '/Environment=NODE_EXTRA_CA_CERTS=/d' "$svc_file"
+                sed -i '/Environment=ENTERPRISE_TLS=/d' "$svc_file"
+            fi
+
+            # Remove ALL TLS args from Go server
+            if [ -f "$go_svc_file" ]; then
+                sed -i 's/ -tls-cert [^ ]*//g' "$go_svc_file"
+                sed -i 's/ -tls-key [^ ]*//g' "$go_svc_file"
+                sed -i 's/ -tls-signal//g' "$go_svc_file"
+                sed -i 's/ -tls-relay//g' "$go_svc_file"
+                sed -i 's/ -tls-api//g' "$go_svc_file"
+                sed -i 's/ -force-https//g' "$go_svc_file"
+            fi
+
+            systemctl daemon-reload 2>/dev/null || true
+
+            print_success "Switched to HTTP mode"
+            echo ""
+            print_info "  Panel:         HTTP :5000"
+            print_info "  Signal:        TCP  :21116"
+            print_info "  Relay:         TCP  :21117"
+            print_info "  Go API:        HTTP :21114"
+            print_info "  Client API:    HTTP :21121"
+            echo ""
+            print_warning "SSL certificates were NOT deleted (use option C > 4 to remove)"
+            ;;
+        2)
+            # ── Switch to HTTPS ──
+            echo ""
+            local have_cert="no"
+            [ -f "$ssl_dir/betterdesk.crt" ] && [ -f "$ssl_dir/betterdesk.key" ] && have_cert="yes"
+            local _keep_desc="No existing certificate found"
+            [ "$have_cert" = "yes" ] && _keep_desc="Reuse $ssl_dir/betterdesk.crt"
+            local _menu_items=(
+                $'Keep existing certificate\t'"$_keep_desc"
+                $'Self-signed certificate\tGenerate one for LAN / testing'
+                $'Let\'s Encrypt certificate\tPublic domain, port 80 must be free'
+                $'Custom certificate\tPaste your own cert + key file paths'
+                $'Cancel\tDo not change the protocol'
+            )
+            local _menu_returns=( 1 2 3 4 0 )
+            menu_choose "HTTPS Certificate Source" "Choose the certificate to use for TLS"
+            local cert_choice="$MENU_CHOICE"
+
+            case "${cert_choice:-2}" in
+                1)
+                    if [ "$have_cert" != "yes" ]; then
+                        print_error "No existing certificate found — choose another option."
+                        press_enter
+                        return
+                    fi
+                    print_info "Using existing certificate at $ssl_dir/betterdesk.crt"
+                    ;;
+                2)
+                    mkdir -p "$ssl_dir"
+                    local server_ip lan_ip san_list
+                    server_ip=$(get_public_ip 2>/dev/null || echo "127.0.0.1")
+                    lan_ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+                    san_list="IP:$server_ip,IP:127.0.0.1,DNS:localhost"
+                    [ -n "$lan_ip" ] && [ "$lan_ip" != "$server_ip" ] && san_list="$san_list,IP:$lan_ip"
+                    read -p "Optional DNS domain for the certificate (blank to skip): " ss_domain
+                    [ -n "$ss_domain" ] && san_list="$san_list,DNS:$ss_domain"
+                    print_step "Generating self-signed certificate..."
+                    openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+                        -keyout "$ssl_dir/betterdesk.key" \
+                        -out "$ssl_dir/betterdesk.crt" \
+                        -subj "/CN=${ss_domain:-$server_ip}/O=BetterDesk/C=PL" \
+                        -addext "subjectAltName=$san_list" 2>/dev/null || \
+                    openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+                        -keyout "$ssl_dir/betterdesk.key" \
+                        -out "$ssl_dir/betterdesk.crt" \
+                        -subj "/CN=${ss_domain:-$server_ip}/O=BetterDesk/C=PL" 2>/dev/null
+                    chmod 600 "$ssl_dir/betterdesk.key"; chmod 644 "$ssl_dir/betterdesk.crt"
+                    print_success "Self-signed certificate generated"
+                    ;;
+                3)
+                    if ! command -v certbot &>/dev/null; then
+                        print_step "Installing certbot..."
+                        if command -v dnf &>/dev/null; then dnf install -y certbot &>/dev/null
+                        elif command -v apt-get &>/dev/null; then apt-get install -y certbot &>/dev/null
+                        elif command -v yum &>/dev/null; then yum install -y certbot &>/dev/null; fi
+                    fi
+                    if ! command -v certbot &>/dev/null; then
+                        print_error "certbot could not be installed automatically."
+                        press_enter
+                        return
+                    fi
+                    read -p "Public domain (e.g. desk.example.com): " le_domain
+                    read -p "Admin email (for renewal notices): " le_email
+                    if [ -z "$le_domain" ]; then
+                        print_error "A domain is required for Let's Encrypt."
+                        press_enter
+                        return
+                    fi
+                    print_step "Requesting certificate for $le_domain (standalone, needs port 80)..."
+                    if certbot certonly --standalone --non-interactive --agree-tos \
+                        ${le_email:+--email "$le_email"} ${le_email:+} \
+                        $([ -z "$le_email" ] && echo "--register-unsafely-without-email") \
+                        -d "$le_domain"; then
+                        mkdir -p "$ssl_dir"
+                        ln -sf "/etc/letsencrypt/live/$le_domain/fullchain.pem" "$ssl_dir/betterdesk.crt"
+                        ln -sf "/etc/letsencrypt/live/$le_domain/privkey.pem" "$ssl_dir/betterdesk.key"
+                        # Auto-renew + reload services
+                        local renew_hook="/etc/letsencrypt/renewal-hooks/deploy/betterdesk-reload.sh"
+                        mkdir -p "$(dirname "$renew_hook")"
+                        cat > "$renew_hook" <<'HOOK'
+#!/bin/bash
+systemctl restart betterdesk-server betterdesk-console 2>/dev/null || true
+HOOK
+                        chmod +x "$renew_hook"
+                        print_success "Let's Encrypt certificate installed for $le_domain"
+                    else
+                        print_error "certbot failed — check that DNS points here and port 80 is free."
+                        press_enter
+                        return
+                    fi
+                    ;;
+                4)
+                    read -p "Path to certificate (.crt/.pem, fullchain): " custom_crt
+                    read -p "Path to private key (.key): " custom_key
+                    read -p "Path to CA chain (optional, blank to skip): " custom_ca
+                    if [ ! -f "$custom_crt" ] || [ ! -f "$custom_key" ]; then
+                        print_error "Certificate or key file not found."
+                        press_enter
+                        return
+                    fi
+                    if ! openssl x509 -in "$custom_crt" -noout 2>/dev/null; then
+                        print_error "The provided certificate is not a valid X.509 file."
+                        press_enter
+                        return
+                    fi
+                    mkdir -p "$ssl_dir"
+                    cp "$custom_crt" "$ssl_dir/betterdesk.crt"
+                    cp "$custom_key" "$ssl_dir/betterdesk.key"
+                    if [ -n "$custom_ca" ] && [ -f "$custom_ca" ]; then
+                        cat "$custom_crt" "$custom_ca" > "$ssl_dir/betterdesk.crt"
+                    fi
+                    chmod 600 "$ssl_dir/betterdesk.key"; chmod 644 "$ssl_dir/betterdesk.crt"
+                    print_success "Custom certificate installed"
+                    ;;
+                0|*)
+                    print_info "Cancelled — no changes made."
+                    press_enter
+                    return
+                    ;;
+            esac
+
+            print_step "Switching to HTTPS mode..."
+
+            # Update .env if it exists
+            if [ -f "$env_file" ]; then
+                sed -i "s|^HTTPS_ENABLED=.*|HTTPS_ENABLED=true|" "$env_file"
+                sed -i "s|^SSL_CERT_PATH=.*|SSL_CERT_PATH=$ssl_dir/betterdesk.crt|" "$env_file"
+                sed -i "s|^SSL_KEY_PATH=.*|SSL_KEY_PATH=$ssl_dir/betterdesk.key|" "$env_file"
+                sed -i "s|^HTTP_REDIRECT_HTTPS=.*|HTTP_REDIRECT_HTTPS=true|" "$env_file"
+                # Keep Go API on HTTP — this is internal communication
+                sed -i "s|^HBBS_API_URL=https://localhost|HBBS_API_URL=http://localhost|" "$env_file"
+                sed -i "s|^BETTERDESK_API_URL=https://localhost|BETTERDESK_API_URL=http://localhost|" "$env_file"
+                if grep -q '^ALLOW_SELF_SIGNED_CERTS=' "$env_file"; then
+                    sed -i "s|^ALLOW_SELF_SIGNED_CERTS=.*|ALLOW_SELF_SIGNED_CERTS=true|" "$env_file"
+                else
+                    echo "ALLOW_SELF_SIGNED_CERTS=true" >> "$env_file"
+                fi
+                if grep -q '^NODE_EXTRA_CA_CERTS=' "$env_file"; then
+                    sed -i "s|^NODE_EXTRA_CA_CERTS=.*|NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt|" "$env_file"
+                else
+                    echo "NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt" >> "$env_file"
+                fi
+            fi
+
+            # Update console systemd service
+            if [ -f "$svc_file" ]; then
+                if grep -q 'Environment=HTTPS_ENABLED=' "$svc_file"; then
+                    sed -i "s|Environment=HTTPS_ENABLED=.*|Environment=HTTPS_ENABLED=true|" "$svc_file"
+                else
+                    sed -i "/^\[Service\]/a Environment=HTTPS_ENABLED=true" "$svc_file"
+                fi
+                if grep -q 'Environment=ALLOW_SELF_SIGNED_CERTS=' "$svc_file"; then
+                    sed -i "s|Environment=ALLOW_SELF_SIGNED_CERTS=.*|Environment=ALLOW_SELF_SIGNED_CERTS=true|" "$svc_file"
+                else
+                    sed -i "/^\[Service\]/a Environment=ALLOW_SELF_SIGNED_CERTS=true" "$svc_file"
+                fi
+                # Go API URL stays HTTP
+                sed -i "s|Environment=HBBS_API_URL=https://localhost|Environment=HBBS_API_URL=http://localhost|" "$svc_file"
+                sed -i "s|Environment=BETTERDESK_API_URL=https://localhost|Environment=BETTERDESK_API_URL=http://localhost|" "$svc_file"
+                if grep -q 'Environment=NODE_EXTRA_CA_CERTS=' "$svc_file"; then
+                    sed -i "s|Environment=NODE_EXTRA_CA_CERTS=.*|Environment=NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt|" "$svc_file"
+                else
+                    sed -i "/^\[Service\]/a Environment=NODE_EXTRA_CA_CERTS=$ssl_dir/betterdesk.crt" "$svc_file"
+                fi
+            fi
+
+            # Add TLS to Go server (signal + relay only, NOT API)
+            if [ -f "$go_svc_file" ]; then
+                # Remove old TLS args first
+                sed -i 's/ -tls-cert [^ ]*//g' "$go_svc_file"
+                sed -i 's/ -tls-key [^ ]*//g' "$go_svc_file"
+                sed -i 's/ -tls-signal//g' "$go_svc_file"
+                sed -i 's/ -tls-relay//g' "$go_svc_file"
+                sed -i 's/ -tls-api//g' "$go_svc_file"
+                sed -i 's/ -force-https//g' "$go_svc_file"
+                # Add signal + relay TLS (API stays HTTP)
+                sed -i "s|\(ExecStart=.*betterdesk-server[^$]*\)|\1 -tls-cert $ssl_dir/betterdesk.crt -tls-key $ssl_dir/betterdesk.key -tls-signal -tls-relay|" "$go_svc_file"
+            fi
+
+            systemctl daemon-reload 2>/dev/null || true
+
+            print_success "Switched to HTTPS mode"
+            echo ""
+            print_info "  Panel:         HTTPS :5443"
+            print_info "  Signal:        TLS   :21116"
+            print_info "  Relay:         TLS   :21117"
+            print_info "  Go API:        HTTP  :21114 (internal, always HTTP)"
+            print_info "  Client API:    auto  :21121"
+            ;;
+        0|*)
+            return
+            ;;
+    esac
+
+    echo ""
+    if confirm "Restart BetterDesk services now?"; then
+        systemctl restart betterdesk-server betterdesk-console 2>/dev/null || true
+        sleep 2
+        print_success "BetterDesk services restarted"
+        run_protocol_tests
+    else
+        print_info "Changes saved. Restart later with: systemctl restart betterdesk-server betterdesk-console"
+    fi
+
     press_enter
 }
 
@@ -4367,19 +5650,17 @@ do_migrate_database() {
 
     print_info "Migration binary: $migrate_bin"
     echo ""
-    echo -e "  ${WHITE}Migrate databases between different BetterDesk components.${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Migration Modes:${NC}"
-    echo -e "  ${GREEN}1.${NC} Rust → Go        Migrate from legacy Rust hbbs database to Go server"
-    echo -e "  ${GREEN}2.${NC} Node.js → Go     Migrate from Node.js web console to Go server"
-    echo -e "  ${GREEN}3.${NC} SQLite → PostgreSQL  Migrate BetterDesk Go SQLite to PostgreSQL"
-    echo -e "  ${GREEN}4.${NC} PostgreSQL → SQLite  Migrate PostgreSQL back to SQLite"
-    echo -e "  ${GREEN}5.${NC} Backup           Create timestamped backup of SQLite database"
-    echo ""
-    echo -e "  ${RED}0.${NC} Back to main menu"
-    echo ""
-
-    read -p "Select migration mode: " mig_choice
+    local _menu_items=(
+        $'Rust -> Go\tMigrate legacy Rust hbbs database to the Go server'
+        $'Node.js -> Go\tMigrate the Node.js web console DB to the Go server'
+        $'SQLite -> PostgreSQL\tMigrate BetterDesk Go SQLite to PostgreSQL'
+        $'PostgreSQL -> SQLite\tMigrate PostgreSQL back to SQLite'
+        $'Backup\tCreate a timestamped SQLite database backup'
+        $'Back\tReturn to the main menu'
+    )
+    local _menu_returns=( 1 2 3 4 5 0 )
+    menu_choose "Database Migration" "Migrate databases between BetterDesk components"
+    local mig_choice="$MENU_CHOICE"
 
     case $mig_choice in
         1)
@@ -4440,14 +5721,17 @@ do_migrate_database() {
             fi
 
             print_step "Running Node.js → Go migration..."
-            local cmd="$migrate_bin -mode nodejs2go -src $src_db"
+            # SECURITY (audit fix M-04, 2026-04-10): use a bash array + direct exec
+            # instead of cmd-string + eval to avoid shell injection if any input
+            # contains spaces / metacharacters.
+            local args=("-mode" "nodejs2go" "-src" "$src_db")
             if [ -f "$auth_db" ]; then
-                cmd="$cmd -node-auth $auth_db"
+                args+=("-node-auth" "$auth_db")
             fi
             if [ -n "$dst_db" ]; then
-                cmd="$cmd -dst $dst_db"
+                args+=("-dst" "$dst_db")
             fi
-            eval "$cmd" 2>&1
+            "$migrate_bin" "${args[@]}" 2>&1
 
             if [ $? -eq 0 ]; then
                 print_success "Node.js → Go migration completed successfully!"
@@ -4575,9 +5859,13 @@ show_menu() {
     echo ""
     echo "  L. 📦 MINIMAL INSTALLATION (server only)"
     echo "  C. 🔒 Configure SSL certificates"
+    echo "  T. 🔄 Toggle HTTP/HTTPS mode"
     echo "  M. 🔄 Database migration"
+    echo "  B. 🧰 Build toolchain"
     echo "  S. ⚙️  Settings (paths)"
     echo "  0. ❌ Exit"
+    echo ""
+    echo -e "  ${DIM}Tip: this menu also supports arrow-key navigation (set BETTERDESK_CLASSIC_MENU=1 to force this list).${NC}"
     echo ""
 }
 
@@ -4605,11 +5893,46 @@ main() {
         fi
         exit $?
     fi
-    
+
+    # Action tokens map 1:1 to the classic case dispatch below, so both the
+    # arrow-key TUI and the numeric fallback share the exact same handlers.
+    local menu_labels=(
+        $'Fresh installation\tFull install from scratch'
+        $'Update\tUpdate an existing installation'
+        $'Repair installation\tFix common problems'
+        $'Validate installation\tCheck correctness'
+        $'Backup\tCreate a backup'
+        $'Reset admin password\tReset the console admin'
+        $'Build & deploy server\tCompile and deploy the Go server'
+        $'Diagnostics\tDetailed problem analysis'
+        $'Uninstall\tRemove BetterDesk'
+        $'Minimal installation\tServer only'
+        $'Configure SSL certificates\tLet'"'"'s Encrypt / custom / self-signed'
+        $'Toggle HTTP/HTTPS\tSwitch protocol + run tests'
+        $'Database migration\tMigrate between backends'
+        $'Build toolchain\tInstall compilers'
+        $'Settings (paths)\tConfigure install paths'
+        $'Exit\tQuit the manager'
+    )
+    local menu_actions=( 1 2 3 4 5 6 7 8 9 L C T M B S 0 )
+
     while true; do
-        show_menu
-        read -p "Select option: " choice
-        
+        local choice=""
+        if tui_available; then
+            detect_installation 2>/dev/null
+            local status_line="Install: ${INSTALL_STATUS:-unknown}"
+            [ "$HBBS_RUNNING" = true ] && status_line="$status_line  |  server: running" || status_line="$status_line  |  server: stopped"
+            [ "$CONSOLE_RUNNING" = true ] && status_line="$status_line  |  console: running" || status_line="$status_line  |  console: stopped"
+            if tui_select "BetterDesk Console Manager v${VERSION}" "$status_line" "${menu_labels[@]}"; then
+                choice="${menu_actions[$TUI_RESULT]}"
+            else
+                choice="0"
+            fi
+        else
+            show_menu
+            read -p "Select option: " choice
+        fi
+
         case $choice in
             1) do_install ;;
             2) do_update ;;
@@ -4622,7 +5945,9 @@ main() {
             9) do_uninstall ;;
             [Ll]) do_install_minimal ;;
             [Cc]) do_configure_ssl ;;
+            [Tt]) do_toggle_protocol ;;
             [Mm]) do_migrate_database ;;
+            [Bb]) do_install_build_toolchain ;;
             [Ss]) configure_paths ;;
             0) 
                 echo ""

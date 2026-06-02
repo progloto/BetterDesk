@@ -15,10 +15,12 @@
     <link rel="stylesheet" href="/css/theme.css?v=<%= cacheVersion %>">
     <link rel="stylesheet" href="/css/transitions.css?v=<%= cacheVersion %>">
     <link rel="stylesheet" href="/css/notif-center.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/accessibility.css?v=<%= cacheVersion %>">
     <% if (!embed) { %>
     <link rel="stylesheet" href="/css/desktop-mode.css?v=<%= cacheVersion %>">
     <link rel="stylesheet" href="/css/desktop-widgets.css?v=<%= cacheVersion %>">
     <link rel="stylesheet" href="/css/tutorial.css?v=<%= cacheVersion %>">
+    <link rel="stylesheet" href="/css/beta31.css?v=<%= cacheVersion %>">
     <% } else { %>
     <link rel="stylesheet" href="/css/desktop-widget-overrides.css?v=<%= cacheVersion %>">
     <% } %>
@@ -28,7 +30,7 @@
         <% }); %>
     <% } %>
 </head>
-<body<%= embed ? ' class="embed-mode"' : '' %>>
+<body class="app-page<%= embed ? ' embed-mode' : '' %>">
     <div class="app-layout" id="app">
         <% if (!embed) { %>
         <!-- Sidebar -->
@@ -131,7 +133,9 @@
         // Global config
         window.BetterDesk = {
             lang: '<%= lang || "en" %>',
+            availableLanguages: <%- JSON.stringify(availableLanguageList || []) %>,
             translations: <%- JSON.stringify(translations || {}) %>,
+            cacheVersion: '<%= cacheVersion %>',
             csrfToken: '<%= typeof csrfToken !== 'undefined' ? csrfToken : '' %>',
             user: <%- JSON.stringify(user || null) %>,
             branding: <%- JSON.stringify(branding || {}) %>,
@@ -143,12 +147,14 @@
     <script src="/js/notifications.js?v=<%= cacheVersion %>"></script>
     <script src="/js/notif-center.js?v=<%= cacheVersion %>"></script>
     <script src="/js/modal.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/accessibility.js?v=<%= cacheVersion %>"></script>
     <script src="/js/app.js?v=<%= cacheVersion %>"></script>
     <% if (!embed) { %>
     <script src="/js/widget-plugins.js?v=<%= cacheVersion %>"></script>
     <script src="/js/desktop-widgets.js?v=<%= cacheVersion %>"></script>
     <script src="/js/desktop-mode.js?v=<%= cacheVersion %>"></script>
     <script src="/js/tutorial.js?v=<%= cacheVersion %>"></script>
+    <script src="/js/beta31.js?v=<%= cacheVersion %>"></script>
     <script nonce="<%= cspNonce %>">if (typeof Tutorial !== 'undefined') Tutorial.autoStart('console');</script>
     <% } %>
     <% if (typeof pageScripts !== 'undefined' && pageScripts.length) { %>

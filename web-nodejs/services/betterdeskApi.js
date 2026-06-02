@@ -8,12 +8,17 @@
  */
 
 const axios = require('axios');
+const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const config = require('../config/config');
 
+// Determine whether the Go API URL uses HTTPS so we only set the appropriate
+// agent. Setting httpsAgent on plain HTTP connections can trigger spurious
+// EPROTO / "wrong version number" errors on some axios/Node.js versions.
+const _isApiHttps = (config.betterdeskApiUrl || '').startsWith('https://');
+
 // Axios instance for BetterDesk Go API
-// Allow self-signed certificates for local TLS connections
 const apiClient = axios.create({
     baseURL: config.betterdeskApiUrl,
     timeout: config.betterdeskApiTimeout,
@@ -21,7 +26,10 @@ const apiClient = axios.create({
         'Content-Type': 'application/json',
         'X-API-Key': config.betterdeskApiKey
     },
-    httpsAgent: new https.Agent({ rejectUnauthorized: !config.allowSelfSignedCerts })
+    ...(_isApiHttps
+        ? { httpsAgent: new https.Agent({ rejectUnauthorized: !config.allowSelfSignedCerts }) }
+        : { httpAgent: new http.Agent({ keepAlive: true }) }
+    ),
 });
 
 // Retry once on 401 by reloading API key from file (handles race condition
@@ -35,7 +43,7 @@ apiClient.interceptors.response.use(undefined, async (error) => {
         if (body.includes('HTTP request to an HTTPS server') || body.includes('Client sent an HTTP request')) {
             _tlsMismatchWarned = true;
             console.error('[BetterDesk API] ⚠ TLS MISMATCH: Go server has TLS_API=Y enabled on port ' +
-                (config.betterdeskApiUrl || '21114') + ' but this console connects via HTTP.');
+                (config.betterdeskApiUrl || '21121') + ' but this console connects via HTTP.');
             console.error('[BetterDesk API]   Fix: remove TLS_API=Y from Go server environment or add -tls-api removal.');
             console.error('[BetterDesk API]   The API port must stay HTTP for console↔Go communication. See issue #104.');
         }
@@ -326,6 +334,52 @@ async function getAuditEvents(limit = 100) {
     }
 }
 
+// RustDesk Client API audit (consolidated onto the Go server, port 21121).
+// After the API-port consolidation the RustDesk clients report connection /
+// file / alarm audit events to the Go server, so the panel must read them
+// back from Go to stay consistent (especially on SQLite where Go and Node
+// use separate database files). Each getter returns { data, total } or null
+// on failure so callers can fall back to the local Node database.
+
+/**
+ * GET /api/audit/conn — connection audit events from the Go server.
+ */
+async function getClientAuditConnections(filters = {}) {
+    try {
+        const { data } = await apiClient.get('/audit/conn', { params: filters });
+        return { data: data.data || [], total: data.total || 0 };
+    } catch (err) {
+        console.warn('BetterDesk API getClientAuditConnections error:', err.message);
+        return null;
+    }
+}
+
+/**
+ * GET /api/audit/file — file-transfer audit events from the Go server.
+ */
+async function getClientAuditFiles(filters = {}) {
+    try {
+        const { data } = await apiClient.get('/audit/file', { params: filters });
+        return { data: data.data || [], total: data.total || 0 };
+    } catch (err) {
+        console.warn('BetterDesk API getClientAuditFiles error:', err.message);
+        return null;
+    }
+}
+
+/**
+ * GET /api/audit/alarm — security alarm audit events from the Go server.
+ */
+async function getClientAuditAlarms(filters = {}) {
+    try {
+        const { data } = await apiClient.get('/audit/alarm', { params: filters });
+        return { data: data.data || [], total: data.total || 0 };
+    } catch (err) {
+        console.warn('BetterDesk API getClientAuditAlarms error:', err.message);
+        return null;
+    }
+}
+
 // ========================== Config ===========================================
 
 /**
@@ -434,10 +488,12 @@ function normalisePeer(peer) {
         banned_at: peer.banned_at || null,
         folder_id: peer.folder_id || null,
         tags,
-        status_tier: peer.live_status || (isOnline ? 'online' : 'offline'),
+        status_tier: peer.live_status || peer.status_text || (isOnline ? 'online' : 'offline'),
         uuid: peer.uuid || '',
         nat_type: peer.nat_type || 0,
-        disabled: !!(peer.disabled || peer.soft_deleted)
+        disabled: !!(peer.disabled || peer.soft_deleted),
+        device_type: peer.device_type || '',
+        cdap_connected: !!peer.cdap_connected
     };
 }
 
@@ -666,12 +722,14 @@ async function getEnrollmentPending() {
  * @param {string} deviceId - Device ID to approve
  * @param {string} displayName - Operator-assigned display name
  * @param {string} syncMode - Sync mode: silent, standard, turbo
+ * @param {string} tags - Comma-separated tag list
  */
-async function approveEnrollment(deviceId, displayName, syncMode) {
+async function approveEnrollment(deviceId, displayName, syncMode, tags) {
     try {
         const { data } = await apiClient.post(`/enrollment/approve/${encodeURIComponent(deviceId)}`, {
             display_name: displayName || '',
-            sync_mode: syncMode || 'standard'
+            sync_mode: syncMode || 'standard',
+            tags: tags || ''
         });
         return wrap(data);
     } catch (e) {
@@ -682,10 +740,13 @@ async function approveEnrollment(deviceId, displayName, syncMode) {
 /**
  * Reject a pending enrollment request on Go server.
  * @param {string} deviceId - Device ID to reject
+ * @param {boolean} ban - Also ban the device so it cannot retry
  */
-async function rejectEnrollment(deviceId) {
+async function rejectEnrollment(deviceId, ban) {
     try {
-        const { data } = await apiClient.post(`/enrollment/reject/${encodeURIComponent(deviceId)}`);
+        const { data } = await apiClient.post(`/enrollment/reject/${encodeURIComponent(deviceId)}`, {
+            ban: !!ban
+        });
         return wrap(data);
     } catch (e) {
         return { success: false, error: e.message };
@@ -818,6 +879,141 @@ async function deleteRolePermission(role, permission) {
     }
 }
 
+// ========================== Help Requests ====================================
+
+/**
+ * GET /api/help/requests — list help requests
+ * @param {{ status?: string, device_id?: string, limit?: number }} filter
+ */
+async function listHelpRequests(filter = {}) {
+    try {
+        const params = {};
+        if (filter.status) params.status = filter.status;
+        if (filter.device_id) params.device_id = filter.device_id;
+        if (filter.limit) params.limit = filter.limit;
+        const { data } = await apiClient.get('/help/requests', { params });
+        const requests = Array.isArray(data) ? data : (data.requests || []);
+        return { success: true, data: requests };
+    } catch (err) {
+        if (err.response?.data) return wrap(err.response.data);
+        return { success: false, error: err.message };
+    }
+}
+
+/**
+ * POST /api/help/requests/:id/acknowledge
+ */
+async function acknowledgeHelpRequest(id) {
+    try {
+        const { data } = await apiClient.post(`/help/requests/${encodeURIComponent(id)}/acknowledge`);
+        return wrap(data);
+    } catch (err) {
+        if (err.response?.data) return wrap(err.response.data);
+        return { success: false, error: err.message };
+    }
+}
+
+/**
+ * POST /api/help/requests/:id/resolve
+ */
+async function resolveHelpRequest(id) {
+    try {
+        const { data } = await apiClient.post(`/help/requests/${encodeURIComponent(id)}/resolve`);
+        return wrap(data);
+    } catch (err) {
+        if (err.response?.data) return wrap(err.response.data);
+        return { success: false, error: err.message };
+    }
+}
+
+// ========================== LDAP Configuration =============================
+
+/**
+ * GET /api/auth/ldap/config — Get LDAP configuration (password masked)
+ */
+async function getLDAPConfig() {
+    try {
+        const { data } = await apiClient.get('/auth/ldap/config');
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * PUT /api/auth/ldap/config — Save LDAP configuration
+ */
+async function saveLDAPConfig(config) {
+    try {
+        const { data } = await apiClient.put('/auth/ldap/config', config);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * POST /api/auth/ldap/test — Test LDAP connection
+ */
+async function testLDAPConnection(config) {
+    try {
+        const { data } = await apiClient.post('/auth/ldap/test', config);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+// ========================== OIDC Configuration =============================
+
+/**
+ * GET /api/auth/oidc/config — Get OIDC configuration (secret masked)
+ */
+async function getOIDCConfig() {
+    try {
+        const { data } = await apiClient.get('/auth/oidc/config');
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * PUT /api/auth/oidc/config — Save OIDC configuration
+ */
+async function saveOIDCConfig(config) {
+    try {
+        const { data } = await apiClient.put('/auth/oidc/config', config);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * POST /api/auth/oidc/test — Test OIDC discovery
+ */
+async function testOIDCDiscovery(config) {
+    try {
+        const { data } = await apiClient.post('/auth/oidc/test', config);
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * GET /api/auth/oidc/status — Check if OIDC is enabled (public)
+ */
+async function getOIDCStatus() {
+    try {
+        const { data } = await apiClient.get('/auth/oidc/status');
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
 module.exports = {
     // Health / Stats
     getHealth,
@@ -845,6 +1041,9 @@ module.exports = {
     updatePeer,
     // Audit
     getAuditEvents,
+    getClientAuditConnections,
+    getClientAuditFiles,
+    getClientAuditAlarms,
     // Config
     getConfig,
     setConfig,
@@ -887,6 +1086,19 @@ module.exports = {
     listRolePermissionOverrides,
     setRolePermission,
     deleteRolePermission,
+    // LDAP Configuration
+    getLDAPConfig,
+    saveLDAPConfig,
+    testLDAPConnection,
+    // OIDC Configuration
+    getOIDCConfig,
+    saveOIDCConfig,
+    testOIDCDiscovery,
+    getOIDCStatus,
+    // Help Requests
+    listHelpRequests,
+    acknowledgeHelpRequest,
+    resolveHelpRequest,
     // Helpers
     normalisePeer,
     // Raw axios client (for services that need direct API access)

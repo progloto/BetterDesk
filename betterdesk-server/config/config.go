@@ -22,7 +22,7 @@ type Config struct {
 	// Network
 	SignalPort int // UDP+TCP signal port (default 21116)
 	RelayPort  int // TCP relay port (default 21117)
-	APIPort    int // HTTP API port (default 21114)
+	APIPort    int // HTTP API / RustDesk client-API port (default 21121, consolidated surface)
 
 	// Mode
 	Mode string // "all", "signal", "relay"
@@ -69,9 +69,45 @@ type Config struct {
 	InitAdminUser   string // Initial admin username (created on first start)
 	InitAdminPass   string // Initial admin password (auto-generated if empty)
 
+	// Signal rate limiting (registrations per IP per minute).
+	// Issue #122: large NAT deployments may need to raise or disable this
+	// (set to 0 to disable rate limiting entirely).
+	SignalRateLimitPerIP int
+
+	// SameNATRelay forces relay fallback when both peers connect from the
+	// same public IP (i.e. they sit behind the same NAT gateway).  Many
+	// consumer routers refuse hairpin NAT, so the LAN-address exchange that
+	// normally works in this case can silently fail and the connection
+	// times out (issue #121).  Default: enabled.
+	SameNATRelay bool
+
+	// P2PFirst enables the classic RustDesk hole-punching handshake: instead
+	// of immediately answering the initiator with the target's (still
+	// un-punched) address, the server forwards PunchHole to the target and
+	// waits for its PunchHoleSent before delivering the genuine
+	// PunchHoleResponse. This gives direct P2P a real chance to succeed
+	// (issue #157). If the target does not complete hole punching within
+	// P2PFallbackMs, a best-effort response is delivered so the client can
+	// fall back to relay instead of hanging. Default: enabled.
+	P2PFirst bool
+
+	// P2PFallbackMs is the grace period (milliseconds) the server waits for a
+	// target's PunchHoleSent before sending the relay-capable fallback
+	// response. Only used when P2PFirst is enabled. Default: 2000.
+	P2PFallbackMs int
+
 	// WebSocket security (M3)
 	AllowedWSOrigins    string // Comma-separated allowed WebSocket origins (empty = allow all)
 	APIAllowedWSOrigins string // Comma-separated allowed WebSocket origins for HTTP API events endpoint
+
+	// Metrics endpoint access control (audit fix H-03, 2026-04-10)
+	// MetricsAllowlist: comma-separated list of IP / CIDR allowed to call /metrics.
+	//   Empty + MetricsPublic=false => /metrics requires authentication.
+	//   Non-empty                  => /metrics is open to listed IPs only, no auth.
+	// MetricsPublic: when true, /metrics is reachable without auth from anywhere
+	//   (legacy behavior). Off by default.
+	MetricsAllowlist string
+	MetricsPublic    bool
 
 	// TLS for signal/relay/api (Phase 3 + Phase 21)
 	TLSSignal bool // Enable TLS on TCP signal (:21116) and WS signal (:21118)
@@ -94,18 +130,22 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		SignalPort:      21116,
-		RelayPort:       21117,
-		APIPort:         21114,
-		Mode:            "all",
-		DBPath:          "./db_v2.sqlite3",
-		KeyFile:         "id_ed25519",
-		JWTExpiry:       24,
-		RelayMaxConnsIP: 20,
-		EnrollmentMode:  EnrollmentModeOpen, // Backward compatible default
-		CDAPPort:        21122,
-		CDAPEnabled:     true, // Enabled by default; set CDAP_ENABLED=N for minimal installs
-		CDAPRateLimit:   30,
+		SignalPort:           21116,
+		RelayPort:            21117,
+		APIPort:              21121,
+		Mode:                 "all",
+		DBPath:               "./db_v2.sqlite3",
+		KeyFile:              "id_ed25519",
+		JWTExpiry:            24,
+		RelayMaxConnsIP:      20,
+		EnrollmentMode:       EnrollmentModeOpen, // Backward compatible default
+		CDAPPort:             21122,
+		CDAPEnabled:          true, // Enabled by default; set CDAP_ENABLED=N for minimal installs
+		CDAPRateLimit:        30,
+		SignalRateLimitPerIP: IPRateLimitRegistrations,
+		SameNATRelay:         true, // issue #121: auto-fallback to relay on shared public IP
+		P2PFirst:             true, // issue #157: give direct P2P a real chance before relay
+		P2PFallbackMs:        2000, // grace period for target hole punch before relay fallback
 	}
 }
 
@@ -201,6 +241,43 @@ func (c *Config) LoadEnv() {
 			c.RelayMaxConnsIP = n
 		}
 	}
+	// Issue #122: allow tuning the per-IP signal/registration rate limit
+	// without recompiling. Useful for large NAT deployments where many
+	// devices share the same public IP. Set to 0 to disable entirely.
+	if v := os.Getenv("SIGNAL_RATE_LIMIT_PER_IP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.SignalRateLimitPerIP = n
+		}
+	}
+	// Issue #121: when both peers share the same public IP, the LAN
+	// hole-punch path requires NAT hairpinning, which many consumer
+	// routers (and most cellular gateways) silently drop.  Enabled by
+	// default; set SAME_NAT_RELAY=N to fall back to the legacy LAN-exchange
+	// behavior.
+	if v := os.Getenv("SAME_NAT_RELAY"); v != "" {
+		switch strings.ToUpper(v) {
+		case "Y", "YES", "1", "TRUE", "ON":
+			c.SameNATRelay = true
+		case "N", "NO", "0", "FALSE", "OFF":
+			c.SameNATRelay = false
+		}
+	}
+	// Issue #157: P2P-first hole punching. Enabled by default so direct
+	// connections are attempted before relay. Set P2P_FIRST=N to restore the
+	// legacy behavior of answering the initiator immediately (always relay).
+	if v := os.Getenv("P2P_FIRST"); v != "" {
+		switch strings.ToUpper(v) {
+		case "Y", "YES", "1", "TRUE", "ON":
+			c.P2PFirst = true
+		case "N", "NO", "0", "FALSE", "OFF":
+			c.P2PFirst = false
+		}
+	}
+	if v := os.Getenv("P2P_FALLBACK_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.P2PFallbackMs = n
+		}
+	}
 	if v := os.Getenv("INIT_ADMIN_USER"); v != "" {
 		c.InitAdminUser = v
 	}
@@ -212,6 +289,12 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("API_WS_ALLOWED_ORIGINS"); v != "" {
 		c.APIAllowedWSOrigins = v
+	}
+	if v := os.Getenv("METRICS_IP_ALLOWLIST"); v != "" {
+		c.MetricsAllowlist = v
+	}
+	if strings.ToUpper(os.Getenv("METRICS_PUBLIC")) == "Y" || strings.ToUpper(os.Getenv("METRICS_PUBLIC")) == "YES" || os.Getenv("METRICS_PUBLIC") == "1" || strings.ToUpper(os.Getenv("METRICS_PUBLIC")) == "TRUE" {
+		c.MetricsPublic = true
 	}
 	if strings.ToUpper(os.Getenv("TLS_SIGNAL")) == "Y" {
 		c.TLSSignal = true
@@ -327,6 +410,23 @@ func (c *Config) GetAPIAllowedWSOrigins() []string {
 	origins := strings.Split(c.APIAllowedWSOrigins, ",")
 	result := make([]string, 0, len(origins))
 	for _, o := range origins {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			result = append(result, o)
+		}
+	}
+	return result
+}
+
+// GetMetricsAllowlist returns the parsed list of IP / CIDR allowed to call /metrics.
+// Used together with MetricsPublic to decide whether to require authentication.
+func (c *Config) GetMetricsAllowlist() []string {
+	if c.MetricsAllowlist == "" {
+		return nil
+	}
+	parts := strings.Split(c.MetricsAllowlist, ",")
+	result := make([]string, 0, len(parts))
+	for _, o := range parts {
 		o = strings.TrimSpace(o)
 		if o != "" {
 			result = append(result, o)

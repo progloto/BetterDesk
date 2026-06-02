@@ -4,6 +4,7 @@
 package cdap
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,11 +34,13 @@ type DesktopSession struct {
 
 // DesktopStartPayload is sent to the device to initiate a desktop session.
 type DesktopStartPayload struct {
-	SessionID string `json:"session_id"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	Quality   int    `json:"quality"` // JPEG quality 1-100
-	FPS       int    `json:"fps"`     // target frames per second
+	SessionID  string   `json:"session_id"`
+	Width      int      `json:"width"`
+	Height     int      `json:"height"`
+	Quality    int      `json:"quality"` // JPEG quality 1-100
+	FPS        int      `json:"fps"`     // target frames per second
+	Codecs     []string `json:"codecs,omitempty"`      // codecs the operator can decode
+	VideoCodec string   `json:"video_codec,omitempty"` // operator codec preference ("auto" = let agent choose)
 }
 
 // DesktopFramePayload is sent from the device to the browser.
@@ -51,17 +54,21 @@ type DesktopFramePayload struct {
 }
 
 // DesktopInputPayload is sent from the browser to the device.
+// It matches the Go agent's InputEvent schema so the server can translate
+// browser-side mouse/keyboard events into an executable device payload.
 type DesktopInputPayload struct {
-	SessionID string `json:"session_id"`
-	InputType string `json:"input_type"` // mouse_move, mouse_down, mouse_up, key_down, key_up, scroll
-	X         int    `json:"x,omitempty"`
-	Y         int    `json:"y,omitempty"`
-	Button    int    `json:"button,omitempty"` // 0=left, 1=middle, 2=right
-	Key       string `json:"key,omitempty"`    // key name (e.g. "Enter", "a")
-	Code      string `json:"code,omitempty"`   // key code (e.g. "KeyA")
-	Modifiers int    `json:"modifiers,omitempty"`
-	DeltaX    int    `json:"delta_x,omitempty"` // scroll delta
-	DeltaY    int    `json:"delta_y,omitempty"`
+	SessionID string   `json:"session_id"`
+	Type      string   `json:"type"`
+	X         int      `json:"x,omitempty"`
+	Y         int      `json:"y,omitempty"`
+	Button    int      `json:"button,omitempty"`
+	Key       string   `json:"key,omitempty"`
+	Code      string   `json:"code,omitempty"`
+	Text      string   `json:"text,omitempty"`
+	Modifiers []string `json:"modifiers,omitempty"`
+	DeltaX    int      `json:"delta_x,omitempty"`
+	DeltaY    int      `json:"delta_y,omitempty"`
+	Pressed   bool     `json:"pressed,omitempty"`
 }
 
 // DesktopResizePayload is sent when the browser viewport resizes.
@@ -79,7 +86,7 @@ type DesktopEndPayload struct {
 
 // StartDesktopSession creates a new remote desktop session between the
 // browser and a CDAP device for screen capture and input relay.
-func (g *Gateway) StartDesktopSession(ctx context.Context, browserConn *websocket.Conn, deviceID, username, role string, width, height, quality, fps int) (*DesktopSession, error) {
+func (g *Gateway) StartDesktopSession(ctx context.Context, browserConn *websocket.Conn, deviceID, username, role string, width, height, quality, fps int, codecs []string, videoCodec string) (*DesktopSession, error) {
 	dc := g.GetDeviceConn(deviceID)
 	if dc == nil {
 		return nil, fmt.Errorf("device %s not connected", deviceID)
@@ -125,11 +132,13 @@ func (g *Gateway) StartDesktopSession(ctx context.Context, browserConn *websocke
 	}
 
 	startPayload := DesktopStartPayload{
-		SessionID: sessionID,
-		Width:     width,
-		Height:    height,
-		Quality:   quality,
-		FPS:       fps,
+		SessionID:  sessionID,
+		Width:      width,
+		Height:     height,
+		Quality:    quality,
+		FPS:        fps,
+		Codecs:     codecs,
+		VideoCodec: videoCodec,
 	}
 	data, _ := json.Marshal(startPayload)
 	msg := &Message{
@@ -231,6 +240,53 @@ func (g *Gateway) HandleDesktopFrame(ctx context.Context, sessionID string, fram
 	return ds.browser.Write(ctx, websocket.MessageText, outData)
 }
 
+// frameHeaderSize is the fixed-size session-ID prefix on every binary
+// desktop frame from the agent. The agent zero-pads sessionID to this
+// length; the server uses it to route the frame to the correct browser
+// without parsing JSON.
+const frameHeaderSize = 64
+
+// HandleDesktopFrameBinary is the binary fast-path for desktop frames.
+// The payload format is: [frameHeaderSize bytes session ID, NUL-padded][raw JPEG bytes].
+// The raw JPEG is forwarded to the browser as a single binary WS frame —
+// no base64, no JSON. This is the difference between 1–3 fps and 30+ fps.
+func (g *Gateway) handleDesktopFrameBinary(ctx context.Context, _ *DeviceConn, data []byte) {
+	if len(data) < frameHeaderSize {
+		return
+	}
+	// Extract zero-padded session ID.
+	hdr := data[:frameHeaderSize]
+	end := bytes.IndexByte(hdr, 0)
+	if end < 0 {
+		end = frameHeaderSize
+	}
+	sessionID := string(hdr[:end])
+	if sessionID == "" {
+		return
+	}
+
+	val, ok := g.desktopSessions.Load(sessionID)
+	if !ok {
+		return
+	}
+	ds := val.(*DesktopSession)
+	if ds.closed.Load() {
+		return
+	}
+
+	frame := data[frameHeaderSize:]
+	if len(frame) == 0 {
+		return
+	}
+
+	ds.mu.Lock()
+	err := ds.browser.Write(ctx, websocket.MessageBinary, frame)
+	ds.mu.Unlock()
+	if err != nil && ctx.Err() == nil {
+		log.Printf("[cdap] desktop binary frame write failed for session %s: %v", sessionID, err)
+	}
+}
+
 // EndDesktopSession terminates a desktop session.
 func (g *Gateway) EndDesktopSession(ctx context.Context, sessionID, reason string) {
 	val, ok := g.desktopSessions.LoadAndDelete(sessionID)
@@ -248,11 +304,11 @@ func (g *Gateway) EndDesktopSession(ctx context.Context, sessionID, reason strin
 	}
 	data, _ := json.Marshal(endPayload)
 	msg := &Message{
-		Type:      "desktop_end",
+		Type:      "desktop_stop",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Payload:   data,
 	}
-	ds.deviceConn.WriteMessage(ctx, msg)
+	_ = ds.deviceConn.WriteMessage(ctx, msg)
 
 	endMsg, _ := json.Marshal(map[string]string{
 		"type":       "end",
@@ -273,4 +329,51 @@ func (g *Gateway) EndDesktopSession(ctx context.Context, sessionID, reason strin
 			"reason":     reason,
 		})
 	}
+}
+
+// HandleDesktopInputError forwards input injection failures from the device to
+// the browser session so operators get an actionable error instead of silent no-op input.
+func (g *Gateway) HandleDesktopInputError(ctx context.Context, _ *DeviceConn, msg *Message) {
+	var payload struct {
+		SessionID string `json:"session_id"`
+		Type      string `json:"type"`
+		Message   string `json:"message"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.SessionID == "" {
+		return
+	}
+
+	val, ok := g.desktopSessions.Load(payload.SessionID)
+	if !ok {
+		return
+	}
+	ds := val.(*DesktopSession)
+	if ds.closed.Load() {
+		return
+	}
+
+	text := payload.Message
+	if text == "" {
+		text = "remote input injection failed"
+	}
+	out, _ := json.Marshal(map[string]string{
+		"type":       "error",
+		"session_id": payload.SessionID,
+		"error":      text,
+	})
+	ds.mu.Lock()
+	_ = ds.browser.Write(ctx, websocket.MessageText, out)
+	ds.mu.Unlock()
+}
+
+func (g *Gateway) cleanupDeviceSessions(deviceID, reason string) {
+	g.desktopSessions.Range(func(key, value any) bool {
+		ds, ok := value.(*DesktopSession)
+		if !ok || ds.DeviceID != deviceID {
+			return true
+		}
+		g.EndDesktopSession(context.Background(), ds.ID, reason)
+		g.desktopSessions.Delete(key)
+		return true
+	})
 }

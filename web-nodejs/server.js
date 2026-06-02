@@ -18,12 +18,13 @@ const https = require('https');
 const config = require('./config/config');
 const securityMiddleware = require('./middleware/security');
 const { initI18n } = require('./middleware/i18n');
-const { apiLimiter } = require('./middleware/rateLimiter');
+const { apiLimiter, widgetLimiter } = require('./middleware/rateLimiter');
 const { csrfTokenProvider, doubleCsrfProtection, downgradeToHttp: csrfDowngradeToHttp } = require('./middleware/csrf');
 const { roleHasPermission, isSuperAdminRole } = require('./middleware/auth');
 const authService = require('./services/authService');
 const serverBackend = require('./services/serverBackend');
 const db = require('./services/database');
+const userSync = require('./services/userSync');
 const { initWsProxy } = require('./services/wsRelay');
 const { initBdRelay } = require('./services/bdRelay');
 const { initChatRelay } = require('./services/chatRelay');
@@ -137,7 +138,14 @@ app.use('/wallpapers', express.static(path.join(__dirname, 'wallpapers'), {
     immutable: true
 }));
 
-// Rate limiting for API
+// Rate limiting for API.
+// SECURITY (audit fix M-03, 2026-04-10): high-frequency widget refresh paths
+// have their own higher-quota limiter mounted BEFORE the general one so they
+// are still bounded but do not eat into the regular API budget.
+const widgetPaths = ['/api/stats', '/api/server/status', '/api/devices', '/api/audit/conn'];
+for (const p of widgetPaths) {
+    app.use(p, widgetLimiter);
+}
 app.use('/api/', apiLimiter);
 
 // RustDesk Client API — mounted BEFORE CSRF because desktop clients use Bearer
@@ -167,19 +175,19 @@ app.use((req, res, next) => {
     next();
 });
 
-// CSRF protection — generate token for views, validate on POST/PUT/DELETE/PATCH
-// Skip CSRF for device-facing API routes (/api/bd/*) — these use Bearer token
-// or X-Device-Id header authentication, not browser cookie-based CSRF.
+// CSRF protection — generate token for views, validate on POST/PUT/DELETE/PATCH.
+// Skip CSRF for device-facing API routes (/api/bd/*) — these MUST authenticate
+// via Bearer access token (session-cookie fallback is rejected in requireDeviceAuth).
+//
+// SECURITY (audit fix C-02, 2026-04-10): the previous Origin-based CSRF skip
+// for Tauri webview origins (`tauri://localhost`, `https://tauri.localhost`,
+// `http://localhost:1420`) was removed — `Origin` is freely forgeable by any
+// non-browser HTTP client, so it is unsafe as a CSRF-bypass signal. Tauri
+// desktop clients receive the CSRF token via `csrfTokenProvider` and must
+// echo it back in the `X-CSRF-Token` header (csrf-csrf double-submit).
 app.use(csrfTokenProvider);
 app.use((req, res, next) => {
     if (req.path.startsWith('/api/bd/')) {
-        return next();
-    }
-    // Skip CSRF for BetterDesk desktop clients (Tauri) — they are not
-    // vulnerable to CSRF attacks (not browser tabs). Identified by origin.
-    const origin = req.headers.origin || '';
-    const tauriOrigins = ['http://localhost:1420', 'tauri://localhost', 'https://tauri.localhost'];
-    if (req.path.startsWith('/api/') && tauriOrigins.includes(origin)) {
         return next();
     }
     doubleCsrfProtection(req, res, next);
@@ -219,7 +227,16 @@ app.use((err, req, res, next) => {
 // 404 Not Found
 app.use((req, res, next) => {
     res.status(404);
-    
+
+    // Log unmatched /api/* and /ws/* paths only (avoid noise from missing
+    // static assets like favicons).  Diagnostics suggestion credit:
+    // progloto (PR #81).
+    if (req.originalUrl.startsWith('/api/') || req.originalUrl.startsWith('/ws/')) {
+        const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+        const ua = String(req.headers['user-agent'] || '').slice(0, 80);
+        console.warn(`[panel] 404 ${req.method} ${req.originalUrl} from ${ip} ua="${ua}"`);
+    }
+
     if (req.accepts('html')) {
         res.render('errors/404', {
             title: req.t ? req.t('errors.not_found') : 'Not Found',
@@ -264,6 +281,46 @@ app.use((err, req, res, next) => {
 // ============ Startup ============
 
 /**
+ * Warn if the user set Go-server-only TLS env vars in the Node.js environment.
+ * These variables (TLS_CERT, TLS_KEY) are read exclusively by the Go server.
+ * The Node.js console uses SSL_CERT_PATH / SSL_KEY_PATH instead.
+ * Silently ignoring them causes issue #104 — port 21121 stays HTTP while the
+ * RustDesk client expects HTTPS, producing InvalidContentType errors.
+ */
+function warnGoTlsEnvVars() {
+    const hasTlsCert = !!process.env.TLS_CERT;
+    const hasTlsKey  = !!process.env.TLS_KEY;
+    if (!hasTlsCert && !hasTlsKey) return;
+
+    const hasSslCertPath = !!process.env.SSL_CERT_PATH;
+    const hasSslKeyPath  = !!process.env.SSL_KEY_PATH;
+
+    if (hasTlsCert || hasTlsKey) {
+        console.warn('');
+        console.warn('  ┌─────────────────────────────────────────────────────┐');
+        console.warn('  │  ⚠  MISCONFIGURATION WARNING — TLS / SSL           │');
+        console.warn('  ├─────────────────────────────────────────────────────┤');
+        console.warn('  │  TLS_CERT / TLS_KEY are Go server environment       │');
+        console.warn('  │  variables and are IGNORED by this Node.js console. │');
+        console.warn('  │                                                     │');
+        console.warn('  │  To enable HTTPS on this console set:               │');
+        console.warn('  │    SSL_CERT_PATH=/path/to/fullchain.pem             │');
+        console.warn('  │    SSL_KEY_PATH=/path/to/privkey.pem                │');
+        console.warn('  │                                                     │');
+        if (!hasSslCertPath && !hasSslKeyPath) {
+            console.warn('  │  ❌ SSL_CERT_PATH and SSL_KEY_PATH are NOT set.    │');
+            console.warn('  │     Port 21121 (RustDesk Client API) is HTTP.     │');
+            console.warn('  │     Clients connecting via HTTPS will fail with   │');
+            console.warn('  │     InvalidContentType errors.                    │');
+        } else {
+            console.warn('  │  ✅ SSL_CERT_PATH / SSL_KEY_PATH are set — OK.    │');
+        }
+        console.warn('  └─────────────────────────────────────────────────────┘');
+        console.warn('');
+    }
+}
+
+/**
  * Load SSL certificates for HTTPS
  */
 function loadSslCertificates() {
@@ -298,6 +355,41 @@ function loadSslCertificates() {
     }
 }
 
+function attachPlainHttpTlsHint(server, port) {
+    server.on('tlsClientError', (err, socket) => {
+        const message = String(err && err.message || '');
+        const looksLikePlainHttp = /wrong version number|http request|unknown protocol|packet length/i.test(message);
+        if (!looksLikePlainHttp || !socket || socket.destroyed) return;
+
+        const body = JSON.stringify({
+            error: `RustDesk Client API on port ${port} requires HTTPS. Use https://<server>:${port}.`
+        });
+        const response = [
+            'HTTP/1.1 400 Bad Request',
+            'Content-Type: application/json; charset=utf-8',
+            'Cache-Control: no-store',
+            'Connection: close',
+            `Content-Length: ${Buffer.byteLength(body)}`,
+            '',
+            body
+        ].join('\r\n');
+
+        try {
+            socket.end(response);
+        } catch (_) {
+            socket.destroy();
+        }
+        console.warn(`RustDesk API: rejected plain HTTP on HTTPS port ${port}`);
+    });
+}
+
+function shouldUseRustDeskApiTls(sslOptions) {
+    const mode = String(config.rustdeskApiTls || 'auto').toLowerCase();
+    if (mode === 'false' || mode === '0' || mode === 'off' || mode === 'http') return false;
+    if (mode === 'true' || mode === '1' || mode === 'on' || mode === 'https') return !!sslOptions;
+    return !!sslOptions;
+}
+
 /**
  * Create HTTP redirect server (redirects all HTTP to HTTPS)
  */
@@ -312,6 +404,9 @@ function createHttpRedirectServer() {
 }
 
 async function startServer() {
+    // Warn early about common TLS misconfiguration (Go env vars used instead of Node.js vars)
+    warnGoTlsEnvVars();
+
     try {
         // Initialize database adapter (creates tables, runs migrations)
         await db.init();
@@ -320,8 +415,15 @@ async function startServer() {
         const brandingService = require('./services/brandingService');
         await brandingService.loadBranding();
 
+        // Recover/sync global users before deciding whether a default admin is needed.
+        // This protects upgrades where local auth.db was recreated but Go still has users.
+        await userSync.backfillFromGo();
+
         // Ensure default admin exists
         await authService.ensureDefaultAdmin();
+
+        // Keep Go organization-linkable users aligned with the panel store.
+        await userSync.backfillFromNode();
         
         let server;
         let protocol = 'http';
@@ -406,6 +508,18 @@ async function startServer() {
 
         // Start LAN Discovery UDP service
         startDiscoveryService();
+
+        // Start branded agent installer build worker (Generator Agenta / Phase 2).
+        // Disabled when AGENT_BUILD_WORKER=off — useful for hosts without the
+        // build toolchain (e.g. small consoles that only proxy to a build node).
+        if (process.env.AGENT_BUILD_WORKER !== 'off') {
+            try {
+                const agentBuildWorker = require('./services/agentBuildWorker');
+                agentBuildWorker.startWorker();
+            } catch (err) {
+                console.warn('[server] agent build worker disabled:', err.message);
+            }
+        }
         
         // ============ RustDesk Client API Server (dedicated port) ============
         let apiServer = null;
@@ -522,8 +636,14 @@ function startRustDeskApiServer() {
     const registrationRoutes = require('./routes/registration.routes');
     apiApp.use('/api/bd', registrationRoutes);
 
-    // Catch-all for any unmatched routes (should not reach here due to pathWhitelist)
+    // Catch-all for any unmatched routes (should not reach here due to pathWhitelist).
+    // We log every miss so missing RustDesk client compatibility endpoints are
+    // easy to spot in operations.  Diagnostics suggestion credit:
+    // progloto (PR #81).
     apiApp.use((req, res) => {
+        const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+        const ua = String(req.headers['user-agent'] || '').slice(0, 80);
+        console.warn(`[rustdesk-api] 404 ${req.method} ${req.originalUrl} from ${ip} ua="${ua}"`);
         res.status(404).end();
     });
 
@@ -540,17 +660,23 @@ function startRustDeskApiServer() {
         res.status(500).json({ error: 'Server error' });
     });
 
-    // Start HTTP or HTTPS server for RustDesk Client API
-    // Port 21121 is internet-facing — always use TLS if valid certs are available,
-    // regardless of HTTPS_ENABLED (which controls the admin panel port).
+    // Start HTTP or HTTPS server for RustDesk Client API. By default TLS is used
+    // when certs are available, but self-signed deployments may set
+    // RUSTDESK_API_TLS=false because stock RustDesk clients cannot trust a
+    // private CA here. Keep that exception explicit: it affects only :21121.
     let apiServerInstance;
     const sslOptions = loadSslCertificates();
-    if (sslOptions) {
+    const useApiTls = shouldUseRustDeskApiTls(sslOptions);
+    if (useApiTls) {
         apiServerInstance = https.createServer(sslOptions, apiApp);
+        attachPlainHttpTlsHint(apiServerInstance, config.apiPort);
         console.log(`  ║   API TLS:   Enabled (HTTPS on :${config.apiPort})`.padEnd(53) + '║');
     } else {
-        if (config.sslCertPath || config.sslKeyPath) {
+        if ((config.sslCertPath || config.sslKeyPath) && config.rustdeskApiTls !== 'false') {
             console.warn(`WARNING: SSL certs configured but invalid — API running insecure HTTP on :${config.apiPort}`);
+        }
+        if (sslOptions && String(config.rustdeskApiTls || '').toLowerCase() === 'false') {
+            console.warn(`WARNING: RUSTDESK_API_TLS=false — RustDesk Client API is HTTP on :${config.apiPort}. Use only behind a trusted network/VPN or with a low-privilege account.`);
         }
         apiServerInstance = http.createServer(apiApp);
     }
@@ -587,12 +713,13 @@ function startRustDeskApiServer() {
  */
 function printStartupBanner(protocol, port) {
     const sslStatus = config.httpsEnabled ? '🔒 HTTPS' : '🔓 HTTP';
-    // API port 21121 auto-enables TLS if valid certs exist (regardless of HTTPS_ENABLED)
+    // API port 21121 can use a separate TLS mode for RustDesk client compatibility.
     const apiHasCerts = config.sslCertPath && config.sslKeyPath && 
                         fs.existsSync(config.sslCertPath) && fs.existsSync(config.sslKeyPath);
-    const apiProtocol = apiHasCerts ? 'HTTPS' : 'HTTP';
+    const apiProtocol = shouldUseRustDeskApiTls(apiHasCerts ? {} : null) ? 'HTTPS' : 'HTTP';
     const apiStatus = config.apiEnabled ? `✅ Port ${config.apiPort} (${apiProtocol})` : '❌ Disabled';
     const panelUrl = `${protocol}://${config.host}:${port}`;
+    const goApiUrl = redactUrlForLog(config.betterdeskApiUrl || process.env.BETTERDESK_API_URL || 'http://localhost:21114/api');
     console.log('');
     console.log('  ╔══════════════════════════════════════════════════╗');
     console.log('  ║                                                  ║');
@@ -605,7 +732,7 @@ function printStartupBanner(protocol, port) {
         console.log(`  ║   Redirect:   http://${config.host}:${config.port} → :${config.httpsPort}`.padEnd(53) + '║');
     }
     console.log(`  ║   Client API: ${apiStatus}`.padEnd(53) + '║');
-    console.log(`  ║   Go API:     http://localhost:21114/api`.padEnd(53) + '║');
+    console.log(`  ║   Go API:     ${goApiUrl}`.padEnd(53) + '║');
     console.log(`  ║   Mode:       ${config.nodeEnv}`.padEnd(53) + '║');
     console.log(`  ║   Security:   ${sslStatus}`.padEnd(53) + '║');
     const dbLabel = (db.DB_TYPE === 'postgres' || db.DB_TYPE === 'postgresql')
@@ -637,6 +764,48 @@ function printStartupBanner(protocol, port) {
         console.log('  ⚠️  NOTICE [SECURITY]: TRUST_PROXY is enabled (' + trustProxy + ').');
         console.log('     Ensure a trusted reverse proxy sets X-Forwarded-For correctly.');
         console.log('');
+    }
+
+    // L-01 (audit 2026-04-10): warn about disabled proxy trust in production
+    // — rate limiters and audit logs will see the proxy IP, not the client IP.
+    if (process.env.NODE_ENV === 'production' && (!trustProxy || trustProxy === false || trustProxy === 0)) {
+        console.log('  ⚠️  WARNING [SECURITY]: NODE_ENV=production but TRUST_PROXY is disabled.');
+        console.log('     If the panel is behind a reverse proxy (nginx, Cloudflare, ALB,');
+        console.log('     Traefik…) rate-limit keys and audit logs will record the proxy IP,');
+        console.log('     not the real client IP. Set TRUST_PROXY=1 (single proxy) or a CIDR list.');
+        console.log('');
+    }
+
+    // H-04 (audit 2026-04-10): unconditional banner when the RustDesk client
+    // API TOTP bypass is enabled, regardless of acknowledgement — the bypass
+    // weakens 2FA on the WAN-facing :21121 endpoint and operators MUST be
+    // aware of it on every restart.
+    if (config.rustdeskApiDisableTotp) {
+        if (!config.rustdeskApiDisableTotpAck) {
+            console.log('  ⛔  ERROR  [SECURITY]: RUSTDESK_API_DISABLE_TOTP=true but ACK flag is missing.');
+            console.log('     The bypass is IGNORED. Set RUSTDESK_API_DISABLE_TOTP_ACKNOWLEDGED=true');
+            console.log('     to confirm you accept disabling 2FA on the RustDesk client login.');
+            console.log('');
+        } else {
+            console.log('  ⚠️  WARNING [SECURITY]: TOTP is DISABLED on the RustDesk client API (:21121).');
+            console.log('     RustDesk desktop clients can log in with username+password only.');
+            console.log('     The web panel still enforces 2FA independently.');
+            console.log('');
+        }
+    }
+}
+
+function redactUrlForLog(rawUrl) {
+    const value = String(rawUrl || '').trim();
+    if (!value) return '';
+
+    try {
+        const parsed = new URL(value);
+        parsed.username = '';
+        parsed.password = '';
+        return parsed.toString();
+    } catch (_) {
+        return value.replace(/\/\/[^/@]+@/, '//***@');
     }
 }
 
