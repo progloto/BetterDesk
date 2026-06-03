@@ -673,6 +673,11 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	result := make([]peerResponse, len(peers))
 	for i, p := range peers {
 		liveOnline := s.peers.IsOnline(p.ID, config.RegTimeout)
+		
+		liveStatus := peer.StatusOffline
+		if liveOnline {
+			liveStatus = peer.StatusOnline
+		}
 
 		// Map string status to numeric for Flutter compatibility
 		statusInt := 0
@@ -685,9 +690,9 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		if cdapConnected && !liveOnline {
 			liveOnline = true
 			liveStatus = peer.StatusOnline
+			statusInt = 1
 		}
 
-		statusInt := 1
 		if p.Disabled {
 			statusInt = 0
 		}
