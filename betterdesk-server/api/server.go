@@ -474,11 +474,6 @@ func (s *Server) Start(ctx context.Context) error {
 		w.Write([]byte(`{"error":"not found"}`))
 	})
 
-	// Catch-all for 404 logging
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] 404 NOT FOUND: %s %s from %s", r.Method, r.URL.Path, s.remoteIP(r))
-		http.NotFound(w, r)
-	})
 
 	addr := fmt.Sprintf(":%d", s.cfg.APIPort)
 	s.httpSrv = &http.Server{
